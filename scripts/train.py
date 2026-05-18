@@ -94,7 +94,22 @@ def main() -> None:
     )
 
     train_dst_pool = np.unique(loaded.train.destinations)
-    trainer = Trainer(config=config, train_dst_pool=train_dst_pool)
+    # Node features are dataset-static (when present); edge features are
+    # per-edge — Tempest already carries them in walks. Both flow into
+    # EmbeddingStore as learned residual projections when available.
+    edge_feat_dim = (
+        int(loaded.train.edge_feat.shape[1]) if loaded.train.edge_feat is not None else 0
+    )
+    print(
+        f"  node_feat: {'present, d=' + str(loaded.node_feat.shape[1]) if loaded.node_feat is not None else 'absent'}  "
+        f"edge_feat: {'present, d=' + str(edge_feat_dim) if edge_feat_dim > 0 else 'absent'}"
+    )
+    trainer = Trainer(
+        config=config,
+        train_dst_pool=train_dst_pool,
+        node_feat=loaded.node_feat,
+        edge_feat_dim=edge_feat_dim,
+    )
 
     # Derive alignment time-scale from training timestamps if not set explicitly.
     if config.alignment_time_scale <= 0:

@@ -41,6 +41,8 @@ class Trainer:
         self,
         config: Config,
         train_dst_pool: np.ndarray,
+        node_feat: Optional[np.ndarray] = None,   # [n_nodes, d_node_feat] or None
+        edge_feat_dim: int = 0,                    # d_edge_feat from train.edge_feat
         device: Optional[torch.device] = None,
     ):
         self.config = config
@@ -48,7 +50,15 @@ class Trainer:
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu",
         )
 
-        self.embedding_store = EmbeddingStore(config.max_node_count, config.d_emb).to(self.device)
+        # The EmbeddingStore fuses node + edge features (when present) into
+        # the same dual-table representation the link MLP and alignment loss
+        # both consume — no special-case code paths anywhere else.
+        self.embedding_store = EmbeddingStore(
+            n_nodes=config.max_node_count,
+            d_emb=config.d_emb,
+            node_feat=node_feat,
+            edge_feat_dim=edge_feat_dim,
+        ).to(self.device)
         self.link_predictor = LinkPredictor(config.d_emb, config.d_hidden_link).to(self.device)
         self.walk_gen = WalkGenerator(
             is_directed=config.is_directed,
@@ -96,8 +106,14 @@ class Trainer:
         seeds_np = np.unique(batch.src)
         walks = self.walk_gen.walks_for_nodes(seeds_np)
         nodes = walks.nodes.to(self.device).long().clamp_min(0)
-        e_target_seed = self.embedding_store.target(walks.seeds.to(self.device))  # [N, d]
-        e_context_all = self.embedding_store.context(nodes)                       # [N*K, L, d]
+        edge_feats = (
+            walks.edge_feats.to(self.device) if walks.edge_feats is not None else None
+        )
+        e_target_seed = self.embedding_store.target(walks.seeds.to(self.device))   # [N, d]
+        # context_walk fuses node-feature residuals (via context) AND edge-
+        # feature residuals (at positions p ≥ 1) automatically when the
+        # dataset has them. Each augmentation is a no-op when absent.
+        e_context_all = self.embedding_store.context_walk(nodes, edge_feats)      # [N*K, L, d]
 
         t_query = torch.full(
             (walks.seeds.shape[0],), int(batch.t_max), dtype=torch.long, device=self.device,
@@ -138,7 +154,7 @@ class Trainer:
         v_t = torch.from_numpy(all_v).long().to(self.device)
 
         logits = self.link_predictor(
-            self.embedding_store.target(u_t),
+            self.embedding_store.target(u_t),      # node_feat residual folded in
             self.embedding_store.target(v_t),
             self.embedding_store.context(u_t),
             self.embedding_store.context(v_t),
