@@ -12,16 +12,33 @@ Node features         Learned at every lookup. The per-feature projection
                       final projection learns the channel weighting:
                         target(u)  = target_final(  [E_target[u]  || proj_t(nf[u])] )
                         context(u) = context_final( [E_context[u] || proj_c(nf[u])] )
-                      proj_c is SHARED between context() and context_walk()
-                      so a node's contextual feature representation is the
-                      same in both consumers.
+                      target() and context() are the canonical primitives —
+                      EVERY downstream site (link MLP, uniformity, walk
+                      context) reads through them, so node-feature fusion
+                      happens exactly once per role.
 
-Edge features         Runtime, alignment-loss only.
-                        context_walk(...) = context_walk_final(
-                                              [E_context[node]
-                                               || proj_c(nf[node])     (if present)
-                                               || proj_e(edge_feat)]   (if present)
-                                            )
+Walk context          Runtime, alignment-loss only. Each walk position
+                      represents a node u in its CONTEXT role (someone
+                      that has shown up in another node's recent past),
+                      augmented by the feature of the hop that connects
+                      u to the next position toward the seed:
+
+                        context_walk[p] = context_walk_final(
+                            [ context(node[p])        # u in context role
+                            ‖ proj_e(edge_feat[p])    # edge (node[p], node[p+1])
+                            ]
+                        )
+
+                      Edge index p (NOT p-1) matches the timestamp at the
+                      same walk position: both describe the hop that
+                      leaves position p toward position p+1 — the same
+                      edge the alignment loss weights by recency.
+
+                      The `target` table is touched only as the SEED side
+                      of alignment, never at walk-internal positions —
+                      that asymmetry is what makes the two tables earn
+                      their keep (see top-level design note).
+
                       Edge features never reach the LinkPredictor — per
                       the no-leak rule (negatives don't have edges).
 
@@ -102,12 +119,14 @@ class EmbeddingStore(nn.Module):
             nn.Linear(d_emb + nf_extra, d_emb) if nf_extra > 0 else None
         )
 
-        # context_walk site additionally concatenates the projected edge
-        # feature. No fusion needed when neither feature is present.
+        # context_walk site: concatenates context(u) ‖ proj_e(edge).
+        # context(u) is d_emb on output (already fuses node features when
+        # present). The walk-level final only earns its keep when an edge
+        # feature is being mixed in — otherwise it's just context(u).
         ef_extra = d_emb if self.has_edge_feat else 0
-        walk_in = d_emb + nf_extra + ef_extra
+        walk_in = d_emb + ef_extra
         self.context_walk_final = (
-            nn.Linear(walk_in, d_emb) if walk_in > d_emb else None
+            nn.Linear(walk_in, d_emb) if ef_extra > 0 else None
         )
 
     @torch.no_grad()
@@ -155,46 +174,61 @@ class EmbeddingStore(nn.Module):
         walk_nodes: torch.Tensor,                  # [N*K, L] long, padding-safe (≥0)
         walk_edge_feats: Optional[torch.Tensor],   # [N*K, L-1, d_edge] or None
     ) -> torch.Tensor:
-        """Per-position context vector for a batch of walks.
+        """Per-position walk representation: context role + hop's edge feature.
 
-        Composition at each position p (only present channels contribute):
-            E_context[walk_nodes[p]]                           (identity)
-            ‖ node_feat_proj_context(node_feat[walk_nodes[p]]) (per-node feat)
-            ‖ edge_feat_proj(walk_edge_feats[p-1])             (incoming edge, p ≥ 1)
-            → context_walk_final → d_emb
+        At each walk position p ∈ [0, L):
 
-        Padding positions are NOT masked here — the downstream alignment
-        loss masks them out via `lens`. Position 0's edge-feat slot is
-        zero-padded (no incoming edge).
+            context(node[p])             # u in context role, node-feat fused
+            ‖ edge_feat_proj(ef[p])      # edge (node[p], node[p+1]), same
+                                         # hop as timestamps[p]
+            → context_walk_final         # → d_emb
+
+        Edge-feat at the seed position (p = lens-1) doesn't exist (no
+        out-going hop) and is right-padded with zeros; the alignment
+        loss masks the seed position anyway, so the value there never
+        contributes. Padding positions are also masked downstream via
+        `lens`.
+
+        The `target` table is intentionally not consumed here — it gets
+        gradient only as the seed side of the alignment loss, keeping
+        the two-table asymmetry sharp.
         """
-        e = self.E_context(walk_nodes)              # [N*K, L, d_emb]
-        parts = [e]
+        c = self.context(walk_nodes)                # [N*K, L, d_emb]
 
-        if self.has_node_feat:
-            nf_proj = self.node_feat_proj_context(self.node_feat[walk_nodes])  # [N*K, L, d_emb]
-            parts.append(nf_proj)
+        if walk_edge_feats is None or not self.has_edge_feat:
+            return c
 
-        if walk_edge_feats is not None and self.has_edge_feat:
-            ef_proj = self.edge_feat_proj(walk_edge_feats.float())             # [N*K, L-1, d_emb]
-            ef_padded = torch.nn.functional.pad(ef_proj, (0, 0, 1, 0))         # [N*K, L,   d_emb]
-            parts.append(ef_padded)
-
-        if self.context_walk_final is None:
-            return e                                # neither nf nor ef present
-        return self.context_walk_final(torch.cat(parts, dim=-1))
+        ef_proj = self.edge_feat_proj(walk_edge_feats.float())             # [N*K, L-1, d_emb]
+        # Right-pad: edge_feats[p] sits at position p of the padded tensor
+        # so it aligns with timestamps[p] for the same hop (matches the
+        # alignment loss's `ts[p]` indexing). Seed position p=lens-1 gets
+        # zero — masked out downstream.
+        ef_padded = torch.nn.functional.pad(ef_proj, (0, 0, 0, 1))         # [N*K, L,   d_emb]
+        return self.context_walk_final(torch.cat([c, ef_padded], dim=-1))
 
 
 class LinkPredictor(nn.Module):
-    """8-block MLP head:
-        input = concat([
-          E_t[u], E_t[v], E_t[u]·E_t[v], |E_t[u]−E_t[v]|,
-          E_c[u], E_c[v], E_c[u]·E_c[v], |E_c[u]−E_c[v]|,
-        ])  ∈ ℝ^{8·d}
-    Returns raw logits (no sigmoid — paired with BCE-with-logits).
+    """8-block MLP head with CROSS-TABLE interactions.
 
-    The `target()` / `context()` arguments are the FEATURE-AUGMENTED vectors
-    coming from EmbeddingStore.target / .context — node-feature residuals
-    are folded in upstream, so the link MLP gets them for free.
+    The alignment loss trains the cosine geometry between target(seed) and
+    context(walk-neighbour) — i.e. target ↔ context is the supervised
+    interaction. The link MLP exposes exactly that interaction (in both
+    directions) so the BCE signal can lean on it directly instead of
+    re-learning it from scratch:
+
+        input = concat([
+          target(u),  context(v),  target(u)·context(v),  |target(u)−context(v)|,   ← u→v direction
+          target(v),  context(u),  target(v)·context(u),  |target(v)−context(u)|,   ← v→u direction
+        ])  ∈ ℝ^{8·d}
+
+    Both directions are included because the head is called on ordered
+    (u, v) pairs but the dataset's directionality isn't always clean —
+    letting the MLP weight u→v vs v→u itself is cheaper than committing
+    to one direction at the head and losing the signal on the other.
+
+    The arguments are the FEATURE-AUGMENTED vectors coming from
+    EmbeddingStore.target / .context — node-feature residuals are folded
+    in upstream, so the link MLP gets them for free.
     """
 
     def __init__(self, d_emb: int, hidden: int = 128, dropout: float = 0.0):
@@ -218,8 +252,10 @@ class LinkPredictor(nn.Module):
     ) -> torch.Tensor:
         x = torch.cat(
             [
-                e_t_u, e_t_v, e_t_u * e_t_v, (e_t_u - e_t_v).abs(),
-                e_c_u, e_c_v, e_c_u * e_c_v, (e_c_u - e_c_v).abs(),
+                # u→v direction: target(u) ↔ context(v) is the trained pair
+                e_t_u, e_c_v, e_t_u * e_c_v, (e_t_u - e_c_v).abs(),
+                # v→u direction: target(v) ↔ context(u)
+                e_t_v, e_c_u, e_t_v * e_c_u, (e_t_v - e_c_u).abs(),
             ],
             dim=-1,
         )

@@ -21,6 +21,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tgb-name", required=True)
     p.add_argument("--tgb-root", default="datasets")
     p.add_argument("--use-gpu", action="store_true")
+    # `--is-directed` / `--no-is-directed` overrides the per-dataset default
+    # in data.py::default_is_directed (e.g. tgbl-wiki is undirected by default;
+    # pass `--is-directed` to feed Tempest in directed mode instead).
+    p.add_argument("--is-directed", default=None, action=argparse.BooleanOptionalAction)
 
     # Model
     p.add_argument("--d-emb", type=int, default=128)
@@ -61,17 +65,21 @@ def main() -> None:
 
     print(f"Loading TGB dataset: {args.tgb_name}")
     loaded = load_tgb(args.tgb_name, root=args.tgb_root)
+    is_directed = (
+        args.is_directed if args.is_directed is not None else loaded.is_directed
+    )
+    directed_note = "" if args.is_directed is None else " (CLI override)"
     print(
         f"  N={loaded.max_node_count}  "
         f"train={len(loaded.train.sources)}  val={len(loaded.val.sources)}  "
-        f"test={len(loaded.test.sources)}  is_directed={loaded.is_directed}  "
+        f"test={len(loaded.test.sources)}  is_directed={is_directed}{directed_note}  "
         f"eval_metric={loaded.eval_metric}",
     )
 
     config = Config(
         tgb_name=loaded.name,
         max_node_count=loaded.max_node_count,
-        is_directed=loaded.is_directed,
+        is_directed=is_directed,
         d_emb=args.d_emb,
         d_hidden_link=args.d_hidden_link,
         max_walk_len=args.max_walk_len,

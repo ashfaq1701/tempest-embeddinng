@@ -100,19 +100,24 @@ class Trainer:
 
     def _embedding_step(self, batch: Batch) -> tuple[float, float]:
         """Alignment + uniformity from walks sampled from the PRE-ingest state."""
-        # Seeds: unique source nodes of the current batch. Walks reflect
-        # each source's strictly-past neighborhood — current batch's edges
-        # are NOT yet in Tempest.
-        seeds_np = np.unique(batch.src)
+        # Seeds: union of src and tgt of the current batch. Walking from
+        # BOTH sides matters on bipartite-flavored datasets (e.g. tgbl-wiki:
+        # users → pages). Seeding only on batch.src would leave target(page)
+        # and context(user) with no alignment-loss signal — the link MLP
+        # would then have to train half the embedding tables on BCE alone.
+        # Union seeding gives every node touched by the batch a chance to
+        # pull its target view via alignment.
+        seeds_np = np.unique(np.concatenate([batch.src, batch.tgt]))
         walks = self.walk_gen.walks_for_nodes(seeds_np)
         nodes = walks.nodes.to(self.device).long().clamp_min(0)
         edge_feats = (
             walks.edge_feats.to(self.device) if walks.edge_feats is not None else None
         )
         e_target_seed = self.embedding_store.target(walks.seeds.to(self.device))   # [N, d]
-        # context_walk fuses node-feature residuals (via context) AND edge-
-        # feature residuals (at positions p ≥ 1) automatically when the
-        # dataset has them. Each augmentation is a no-op when absent.
+        # context_walk fuses node-feature residuals (via context) AND the
+        # edge-feature of the hop leaving each walk position (right-padded
+        # at the seed slot, which the alignment loss masks out anyway).
+        # Each augmentation is a no-op when the dataset doesn't have it.
         e_context_all = self.embedding_store.context_walk(nodes, edge_feats)      # [N*K, L, d]
 
         t_query = torch.full(
