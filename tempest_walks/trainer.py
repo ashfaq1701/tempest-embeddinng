@@ -58,6 +58,7 @@ class Trainer:
             d_emb=config.d_emb,
             node_feat=node_feat,
             edge_feat_dim=edge_feat_dim,
+            node_feat_init_layers=config.node_feat_init_layers,
         ).to(self.device)
         self.link_predictor = LinkPredictor(config.d_emb, config.d_hidden_link).to(self.device)
         self.walk_gen = WalkGenerator(
