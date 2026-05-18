@@ -1,32 +1,35 @@
 """Dual-table embedding store + 8-block link MLP.
 
+Composition (concat + final projection — robust to differing feature scales).
+
 Identity tables       E_target, E_context  ∈  ℝ^[n_nodes, d_emb]
                       Always Xavier-uniform init. No feature-based init —
                       that would freeze node features at construction
                       time, breaking streaming-feature datasets.
 
-Node features         Learned residuals at every lookup. When the
-                      dataset supplies node_feat:
-                        target(u)  = E_target[u]  + node_feat_proj_t(node_feat[u])
-                        context(u) = E_context[u] + node_feat_proj_c(node_feat[u])
-                      target / context have SEPARATE projections so a
-                      node can express different semantics in each role.
-                      The projections are ordinary nn.Linear modules —
-                      gradients flow into both `E` and the projections
-                      independently via the optimizer, never by in-place
-                      mutation. Streaming node-feature updates: just
-                      overwrite the registered buffer (or call
-                      `update_node_feat`) — next forward picks them up.
+Node features         Learned at every lookup. The per-feature projection
+                      brings raw features into d_emb scale; the per-site
+                      final projection learns the channel weighting:
+                        target(u)  = target_final(  [E_target[u]  || proj_t(nf[u])] )
+                        context(u) = context_final( [E_context[u] || proj_c(nf[u])] )
+                      proj_c is SHARED between context() and context_walk()
+                      so a node's contextual feature representation is the
+                      same in both consumers.
 
 Edge features         Runtime, alignment-loss only.
-                        context_walk(...) = context(walk_nodes)
-                                          + edge_feat_proj(walk_edge_feats)
-                                            at positions p ≥ 1
+                        context_walk(...) = context_walk_final(
+                                              [E_context[node]
+                                               || proj_c(nf[node])     (if present)
+                                               || proj_e(edge_feat)]   (if present)
+                                            )
                       Edge features never reach the LinkPredictor — per
                       the no-leak rule (negatives don't have edges).
 
-All three feature projections are instantiated ONLY if the dataset has
-the corresponding features. Zero params, zero compute on absent channels.
+All projection modules are instantiated ONLY when the corresponding
+feature is present. Zero params, zero compute on absent channels.
+Gradients flow independently into E and each projection via the
+optimizer; nothing is mutated in-place during the forward pass.
+Streaming feature updates: overwrite the buffer with `update_node_feat`.
 """
 
 from typing import Optional
@@ -62,9 +65,9 @@ class EmbeddingStore(nn.Module):
         nn.init.xavier_uniform_(self.E_target.weight)
         nn.init.xavier_uniform_(self.E_context.weight)
 
-        # ── runtime: node features → learned residual at every lookup ───
-        # Buffer is non-persistent so checkpoints don't lock in a stale
-        # feature matrix; callers can overwrite it for streaming updates
+        # ── Per-feature projections (bring raw features to d_emb scale) ──
+        # Node features. Buffer is non-persistent so checkpoints don't
+        # lock in a stale feature matrix; callers can swap the matrix
         # via `update_node_feat`.
         self.has_node_feat = node_feat is not None
         if self.has_node_feat:
@@ -81,12 +84,31 @@ class EmbeddingStore(nn.Module):
             self.node_feat_proj_target = None
             self.node_feat_proj_context = None
 
-        # ── runtime: per-hop edge features → residual in walk context ───
+        # Edge features.
         self.has_edge_feat = edge_feat_dim > 0
         if self.has_edge_feat:
             self.edge_feat_proj = nn.Linear(edge_feat_dim, d_emb)
         else:
             self.edge_feat_proj = None
+
+        # ── Per-site final fusion projections (concat → d_emb) ──────────
+        # target / context sites concatenate E with node-feat projection
+        # (when present). When no node features, no fusion is needed.
+        nf_extra = d_emb if self.has_node_feat else 0
+        self.target_final = (
+            nn.Linear(d_emb + nf_extra, d_emb) if nf_extra > 0 else None
+        )
+        self.context_final = (
+            nn.Linear(d_emb + nf_extra, d_emb) if nf_extra > 0 else None
+        )
+
+        # context_walk site additionally concatenates the projected edge
+        # feature. No fusion needed when neither feature is present.
+        ef_extra = d_emb if self.has_edge_feat else 0
+        walk_in = d_emb + nf_extra + ef_extra
+        self.context_walk_final = (
+            nn.Linear(walk_in, d_emb) if walk_in > d_emb else None
+        )
 
     @torch.no_grad()
     def update_node_feat(self, new_node_feat: np.ndarray) -> None:
@@ -109,20 +131,24 @@ class EmbeddingStore(nn.Module):
         self.node_feat.copy_(new)
 
     # ------------------------------------------------------------------ #
-    # Lookups (feature-augmented residuals when features are present).
+    # Lookups (concat raw E with per-feature projections, then a learned
+    # final Linear collapses back to d_emb. When no features are present
+    # the final projection is None and we just return E directly.)
     # ------------------------------------------------------------------ #
 
     def target(self, ids: torch.Tensor) -> torch.Tensor:
-        x = self.E_target(ids)
-        if self.has_node_feat:
-            x = x + self.node_feat_proj_target(self.node_feat[ids])
-        return x
+        e = self.E_target(ids)
+        if not self.has_node_feat:
+            return e
+        nf_proj = self.node_feat_proj_target(self.node_feat[ids])
+        return self.target_final(torch.cat([e, nf_proj], dim=-1))
 
     def context(self, ids: torch.Tensor) -> torch.Tensor:
-        x = self.E_context(ids)
-        if self.has_node_feat:
-            x = x + self.node_feat_proj_context(self.node_feat[ids])
-        return x
+        e = self.E_context(ids)
+        if not self.has_node_feat:
+            return e
+        nf_proj = self.node_feat_proj_context(self.node_feat[ids])
+        return self.context_final(torch.cat([e, nf_proj], dim=-1))
 
     def context_walk(
         self,
@@ -131,20 +157,31 @@ class EmbeddingStore(nn.Module):
     ) -> torch.Tensor:
         """Per-position context vector for a batch of walks.
 
-        Composition at each position p:
-          x[p] = E_context[walk_nodes[p]]                          (identity)
-               + node_feat_proj_context(node_feat[walk_nodes[p]])  (this node's static features)
-               + edge_feat_proj(walk_edge_feats[p-1])              (incoming-edge feature, p ≥ 1)
+        Composition at each position p (only present channels contribute):
+            E_context[walk_nodes[p]]                           (identity)
+            ‖ node_feat_proj_context(node_feat[walk_nodes[p]]) (per-node feat)
+            ‖ edge_feat_proj(walk_edge_feats[p-1])             (incoming edge, p ≥ 1)
+            → context_walk_final → d_emb
 
         Padding positions are NOT masked here — the downstream alignment
-        loss masks them out via `lens`. Position 0 has no incoming edge.
+        loss masks them out via `lens`. Position 0's edge-feat slot is
+        zero-padded (no incoming edge).
         """
-        x = self.context(walk_nodes)                          # [N*K, L, d] — already includes node-feat residual
+        e = self.E_context(walk_nodes)              # [N*K, L, d_emb]
+        parts = [e]
+
+        if self.has_node_feat:
+            nf_proj = self.node_feat_proj_context(self.node_feat[walk_nodes])  # [N*K, L, d_emb]
+            parts.append(nf_proj)
+
         if walk_edge_feats is not None and self.has_edge_feat:
-            ef_proj = self.edge_feat_proj(walk_edge_feats.float())  # [N*K, L-1, d]
-            ef_padded = torch.nn.functional.pad(ef_proj, (0, 0, 1, 0))
-            x = x + ef_padded
-        return x
+            ef_proj = self.edge_feat_proj(walk_edge_feats.float())             # [N*K, L-1, d_emb]
+            ef_padded = torch.nn.functional.pad(ef_proj, (0, 0, 1, 0))         # [N*K, L,   d_emb]
+            parts.append(ef_padded)
+
+        if self.context_walk_final is None:
+            return e                                # neither nf nor ef present
+        return self.context_walk_final(torch.cat(parts, dim=-1))
 
 
 class LinkPredictor(nn.Module):
