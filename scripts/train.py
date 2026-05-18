@@ -25,10 +25,6 @@ def parse_args() -> argparse.Namespace:
     # Model
     p.add_argument("--d-emb", type=int, default=128)
     p.add_argument("--d-hidden-link", type=int, default=128)
-    p.add_argument("--node-feat-init-layers", type=int, default=2, choices=(1, 2),
-                   help="Depth of the projection used to initialise E_target/"
-                        "E_context from node_feat. 1 (linear) or 2 (Linear→GELU→"
-                        "Linear). No effect when the dataset has no node features.")
 
     # Walks
     p.add_argument("--max-walk-len", type=int, default=20)
@@ -78,7 +74,6 @@ def main() -> None:
         is_directed=loaded.is_directed,
         d_emb=args.d_emb,
         d_hidden_link=args.d_hidden_link,
-        node_feat_init_layers=args.node_feat_init_layers,
         max_walk_len=args.max_walk_len,
         num_walks_per_node=args.num_walks_per_node,
         walk_bias=args.walk_bias,

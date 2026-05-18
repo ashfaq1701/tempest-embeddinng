@@ -1,18 +1,32 @@
 """Dual-table embedding store + 8-block link MLP.
 
-Node features  — INIT ONLY. When `node_feat` is supplied, a 1–2 layer
-  MLP projects each node's raw feature vector to d_emb and that result
-  is copy_()'d into E_target / E_context as the initial table values
-  (separate projections for the two roles). The MLP weights are
-  discarded after __init__; from training time onward the model treats
-  the tables as ordinary learnable embeddings.
-  When `node_feat` is None, Xavier-uniform init.
+Identity tables       E_target, E_context  ∈  ℝ^[n_nodes, d_emb]
+                      Always Xavier-uniform init. No feature-based init —
+                      that would freeze node features at construction
+                      time, breaking streaming-feature datasets.
 
-Edge features — runtime, alignment-loss only. `edge_feat_proj :
-  Linear(d_ef → d_emb)` projects each per-hop edge feature, and the
-  result is added as a residual to the corresponding walk-context
-  position (the edge between (p-1, p) lands on position p; position 0
-  is padded with zero). Edge features never reach the LinkPredictor.
+Node features         Learned residuals at every lookup. When the
+                      dataset supplies node_feat:
+                        target(u)  = E_target[u]  + node_feat_proj_t(node_feat[u])
+                        context(u) = E_context[u] + node_feat_proj_c(node_feat[u])
+                      target / context have SEPARATE projections so a
+                      node can express different semantics in each role.
+                      The projections are ordinary nn.Linear modules —
+                      gradients flow into both `E` and the projections
+                      independently via the optimizer, never by in-place
+                      mutation. Streaming node-feature updates: just
+                      overwrite the registered buffer (or call
+                      `update_node_feat`) — next forward picks them up.
+
+Edge features         Runtime, alignment-loss only.
+                        context_walk(...) = context(walk_nodes)
+                                          + edge_feat_proj(walk_edge_feats)
+                                            at positions p ≥ 1
+                      Edge features never reach the LinkPredictor — per
+                      the no-leak rule (negatives don't have edges).
+
+All three feature projections are instantiated ONLY if the dataset has
+the corresponding features. Zero params, zero compute on absent channels.
 """
 
 from typing import Optional
@@ -37,28 +51,37 @@ class EmbeddingStore(nn.Module):
         d_emb: int,
         node_feat: Optional[np.ndarray] = None,
         edge_feat_dim: int = 0,
-        node_feat_init_layers: int = 2,           # 1 or 2 — depth of the init MLP
     ):
         super().__init__()
         self.n_nodes = n_nodes
         self.d_emb = d_emb
 
+        # Identity tables: Xavier-uniform init, always.
         self.E_target = nn.Embedding(n_nodes, d_emb)
         self.E_context = nn.Embedding(n_nodes, d_emb)
+        nn.init.xavier_uniform_(self.E_target.weight)
+        nn.init.xavier_uniform_(self.E_context.weight)
 
-        # ── init: node-features (when present) project once, then the
-        #         projection is discarded; the two tables are ordinary
-        #         learnable embeddings from training time onward. ──────
-        if node_feat is not None:
-            self._init_from_node_features(
-                np.asarray(node_feat, dtype=np.float32),
-                num_layers=node_feat_init_layers,
+        # ── runtime: node features → learned residual at every lookup ───
+        # Buffer is non-persistent so checkpoints don't lock in a stale
+        # feature matrix; callers can overwrite it for streaming updates
+        # via `update_node_feat`.
+        self.has_node_feat = node_feat is not None
+        if self.has_node_feat:
+            self.register_buffer(
+                "node_feat",
+                torch.from_numpy(np.asarray(node_feat, dtype=np.float32)),
+                persistent=False,
             )
+            d_nf = int(node_feat.shape[1])
+            self.node_feat_proj_target = nn.Linear(d_nf, d_emb)
+            self.node_feat_proj_context = nn.Linear(d_nf, d_emb)
         else:
-            nn.init.xavier_uniform_(self.E_target.weight)
-            nn.init.xavier_uniform_(self.E_context.weight)
+            self.node_feat = None
+            self.node_feat_proj_target = None
+            self.node_feat_proj_context = None
 
-        # ── runtime: per-hop edge features → residual in walk context ──
+        # ── runtime: per-hop edge features → residual in walk context ───
         self.has_edge_feat = edge_feat_dim > 0
         if self.has_edge_feat:
             self.edge_feat_proj = nn.Linear(edge_feat_dim, d_emb)
@@ -66,50 +89,40 @@ class EmbeddingStore(nn.Module):
             self.edge_feat_proj = None
 
     @torch.no_grad()
-    def _init_from_node_features(self, node_feat: np.ndarray, num_layers: int) -> None:
-        """Initialize E_target / E_context from a 1-2 layer projection of
-        node_feat. Two SEPARATE projections (one per role) so the two
-        tables don't start out identical. Projection modules are discarded
-        once weights are copied — no node-feature pathway at runtime.
-        """
-        assert num_layers in (1, 2), f"node_feat_init_layers must be 1 or 2, got {num_layers}"
-        d_nf = int(node_feat.shape[1])
-        nf = torch.from_numpy(node_feat).float()                # [n_nodes, d_nf]
-
-        def _build_proj() -> nn.Module:
-            if num_layers == 1:
-                return nn.Linear(d_nf, self.d_emb)
-            return nn.Sequential(
-                nn.Linear(d_nf, self.d_emb),
-                nn.GELU(),
-                nn.Linear(self.d_emb, self.d_emb),
+    def update_node_feat(self, new_node_feat: np.ndarray) -> None:
+        """Replace the static node-feature buffer with a fresh matrix.
+        Use this on datasets where node features evolve in time —
+        between batches/phases the new values are picked up automatically
+        by the next `target(...)` / `context(...)` call. Shape must match
+        the original (n_nodes, d_node_feat)."""
+        if not self.has_node_feat:
+            raise RuntimeError("update_node_feat called but EmbeddingStore was "
+                               "constructed without node features.")
+        new = torch.from_numpy(np.asarray(new_node_feat, dtype=np.float32)).to(
+            self.node_feat.device,
+        )
+        if new.shape != self.node_feat.shape:
+            raise ValueError(
+                f"shape mismatch: existing {tuple(self.node_feat.shape)} vs "
+                f"new {tuple(new.shape)}",
             )
-
-        proj_t = _build_proj()
-        proj_c = _build_proj()
-        # Xavier-style init on the projection layers so the projected
-        # embeddings have unit-ish variance, comparable to xavier_uniform_
-        # init for the no-features path.
-        for p in list(proj_t.parameters()) + list(proj_c.parameters()):
-            if p.dim() >= 2:
-                nn.init.xavier_uniform_(p)
-            else:
-                nn.init.zeros_(p)
-
-        self.E_target.weight.copy_(proj_t(nf))                  # [n_nodes, d_emb]
-        self.E_context.weight.copy_(proj_c(nf))
-        # proj_t / proj_c are local — they go out of scope here and are
-        # released. No persistent node-feature module remains on self.
+        self.node_feat.copy_(new)
 
     # ------------------------------------------------------------------ #
-    # Lookups (raw — node features no longer enter at runtime).
+    # Lookups (feature-augmented residuals when features are present).
     # ------------------------------------------------------------------ #
 
     def target(self, ids: torch.Tensor) -> torch.Tensor:
-        return self.E_target(ids)
+        x = self.E_target(ids)
+        if self.has_node_feat:
+            x = x + self.node_feat_proj_target(self.node_feat[ids])
+        return x
 
     def context(self, ids: torch.Tensor) -> torch.Tensor:
-        return self.E_context(ids)
+        x = self.E_context(ids)
+        if self.has_node_feat:
+            x = x + self.node_feat_proj_context(self.node_feat[ids])
+        return x
 
     def context_walk(
         self,
@@ -118,12 +131,15 @@ class EmbeddingStore(nn.Module):
     ) -> torch.Tensor:
         """Per-position context vector for a batch of walks.
 
-        Edge-feature residuals are added at position p ≥ 1 (the edge
-        between (p-1, p) lands on position p). Position 0 has no incoming
-        edge → no residual. Padding positions are NOT masked here —
-        the downstream alignment loss masks them out via `lens`.
+        Composition at each position p:
+          x[p] = E_context[walk_nodes[p]]                          (identity)
+               + node_feat_proj_context(node_feat[walk_nodes[p]])  (this node's static features)
+               + edge_feat_proj(walk_edge_feats[p-1])              (incoming-edge feature, p ≥ 1)
+
+        Padding positions are NOT masked here — the downstream alignment
+        loss masks them out via `lens`. Position 0 has no incoming edge.
         """
-        x = self.context(walk_nodes)                          # [N*K, L, d]
+        x = self.context(walk_nodes)                          # [N*K, L, d] — already includes node-feat residual
         if walk_edge_feats is not None and self.has_edge_feat:
             ef_proj = self.edge_feat_proj(walk_edge_feats.float())  # [N*K, L-1, d]
             ef_padded = torch.nn.functional.pad(ef_proj, (0, 0, 1, 0))

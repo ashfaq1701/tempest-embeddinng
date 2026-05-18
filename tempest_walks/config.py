@@ -13,10 +13,6 @@ class Config:
     # Model
     d_emb: int = 128
     d_hidden_link: int = 128
-    # Depth of the linear projection used to initialize E_target / E_context
-    # from `node_feat` (when the dataset provides node features). 1 or 2.
-    # No effect when node_feat is absent (Xavier-uniform init is used then).
-    node_feat_init_layers: int = 2
 
     # Walks (Tempest)
     max_walk_len: int = 20
