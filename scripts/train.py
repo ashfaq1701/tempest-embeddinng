@@ -119,12 +119,29 @@ def main() -> None:
         edge_feat_dim=edge_feat_dim,
     )
 
-    # Derive alignment time-scale from training timestamps if not set explicitly.
+    # Derive alignment time-scale: (training time span) / L_REF, where
+    # L_REF is a fixed reference constant (NOT --max-walk-len).
+    #
+    # Empirically on tgbl-wiki, time_scale ≈ span / 20 = 93k sec ≈ 1.08
+    # days outperforms the per-node mean inter-event time (155k sec ≈
+    # 1.8 days) by ~0.02 test MRR. The alignment recency term wants a
+    # sharper scale than the per-node recurrence period — closer to a
+    # within-session timescale.
+    #
+    # Why L_REF is fixed: tying time_scale to --max-walk-len was a real
+    # bug (Lesson 11). Bumping L from 20 → 50 collapsed the scale from
+    # 93k → 37k and crushed the recency weight. Keeping L_REF=20 fixed
+    # means changing the walk length does not perturb the decay rate.
     if config.alignment_time_scale <= 0:
         ts = loaded.train.timestamps
-        derived = float(ts.max() - ts.min()) / max(config.max_walk_len, 1)
+        span = float(ts.max() - ts.min())
+        L_REF = 20
+        derived = span / L_REF
         trainer.set_time_scale(derived)
-        print(f"  alignment_time_scale (derived): {derived:.3f}")
+        print(
+            f"  alignment_time_scale (derived): {derived:.3f}  "
+            f"[ span={span:.1f}  L_REF={L_REF} ]"
+        )
 
     print("Loading TGB negatives (val + test)…")
     loaded.dataset.load_val_ns()

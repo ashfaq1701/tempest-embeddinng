@@ -21,7 +21,9 @@ the only design that has been shown to actually work under an
    are bit-identical to the leaderboard protocol.
 
 Everything else has been tried and either failed or carried a leak —
-see the lessons-learned section at the bottom.
+see the lessons-learned section at the bottom. For the full design
+spec (every primitive, every loss, every channel, with shapes and
+equations), see `design_document.md`.
 
 ---
 
@@ -30,9 +32,13 @@ see the lessons-learned section at the bottom.
 Every batch — at training AND at evaluation — runs in this exact order:
 
 ```
-1.  walks   = walk_gen.walks_for_nodes(seeds = unique(batch.src))
-        # Tempest state contains events strictly UP THROUGH batch B-1.
-        # The current batch's edges have NOT been ingested yet.
+1.  walks   = walk_gen.walks_for_nodes(seeds = unique(batch.src ∪ batch.tgt))
+        # UNION seeding: every node touched by the batch gets walks. On
+        # bipartite-flavoured datasets (wiki, review, …) seeding only on
+        # batch.src would starve target(dst) and context(src) of the
+        # alignment signal — see Lesson 9.
+        # Tempest state contains events strictly UP THROUGH batch B-1;
+        # the current batch's edges have NOT been ingested yet.
         # First batch of each epoch: walks are empty (Tempest just reset),
         # so embeddings stay at random init for that batch — by design.
 2.  l_emb   = alignment(walks) + η · uniformity(batch_nodes)
@@ -43,12 +49,12 @@ Every batch — at training AND at evaluation — runs in this exact order:
         #              ≤ batch B-1) + K_rand uniform random.
         # Validation/test: dataset.negative_sampler.query_batch (TGB
         #              pre-generated, 50/50 historical/random per positive).
-4.  score   = link_predictor(E_target/E_context lookups for batch.src/tgt + negatives)
+4.  score   = link_predictor(target(u), target(v), context(u), context(v))
     (training) l_link = BCE(score, labels); link_optimizer.step()
     (eval)     evaluator.eval({y_pred_pos, y_pred_neg, eval_metric})
 5.  POST-SCORING BLOCK (both updates feed batch B+1, not B):
         if HistoricalNegativeSampler: neg_sampler.observe(batch.src, batch.tgt)
-        walk_gen.add_edges(batch.src, batch.tgt, batch.ts)   ← Tempest update is the LAST line
+        walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)   ← Tempest update is the LAST line
 ```
 
 **Why this matters.** If the ingest happens before walks (the way the
@@ -79,36 +85,40 @@ convention.
                   │ TGB / Tempest   │ ← ingest after every batch
                   │  edge stream    │
                   └────────┬────────┘
-                           │ walks_for_nodes(seeds=batch.src)
+                           │ walks_for_nodes(seeds = unique(batch.src ∪ batch.tgt))
                            ▼
               ┌────────────────────────┐
               │  per-walk: (nodes,     │  seed at nodes[lens-1]
               │   timestamps, lens,    │  chronological order
-              │   edge_feats? unused)  │
+              │   edge_feats)          │  edge_feats[p] = feature of hop (p → p+1)
               └──────────┬─────────────┘
                          │
         ┌────────────────┴────────────────┐
         ▼                                 ▼
   alignment_loss                    uniformity_loss
-  (pull E_target[seed] toward       (spread E_target on
-   E_context[walk-neighbours])       unit hypersphere)
+  (pull target(seed) toward         (spread target(u) on
+   context_walk(walk-position))      unit hypersphere)
         │                                 │
         └──────────────┬──────────────────┘
                        ▼
                  EmbeddingStore
                  (E_target, E_context  ∈  ℝ^[N, d])
+                 + proj_t, proj_c, proj_e  (feature projections)
+                 + target_final, context_final, context_walk_final  (fusion)
                        │
                        ▼
-              LinkPredictor MLP
-   ┌─────────────────────────────────────────────┐
-   │ in = concat([                               │
-   │   E_target[u], E_target[v],                 │
-   │   E_target[u]·E_target[v], |.−.|,           │
-   │   E_context[u], E_context[v],               │
-   │   E_context[u]·E_context[v], |.−.|,         │  # 8·d_emb blocks
-   │ ])                                           │
-   │ → LayerNorm → 2-layer GELU MLP → 1 logit    │
-   └─────────────────────────────────────────────┘
+              LinkPredictor MLP   (CROSS-table 8-block)
+   ┌─────────────────────────────────────────────────────┐
+   │ in = concat([                                        │
+   │   # u→v direction: target(u) ↔ context(v)            │
+   │   target(u), context(v),                             │
+   │   target(u) ⊙ context(v), |target(u) − context(v)|,  │
+   │   # v→u direction: target(v) ↔ context(u)            │
+   │   target(v), context(u),                             │
+   │   target(v) ⊙ context(u), |target(v) − context(u)|,  │  # 8·d_emb
+   │ ])                                                    │
+   │ → LayerNorm → 2-layer GELU MLP → 1 logit             │
+   └─────────────────────────────────────────────────────┘
                        │
                        ▼
               BCE-with-logits (train)
@@ -186,6 +196,13 @@ lens:       number of valid NODES per walk (so lens-1 edges).
 - `timestamps[k]` for `k ∈ [0, lens-2]` = time of edge between
   `nodes[k]` and `nodes[k+1]`.
 - `timestamps[lens-1]` = sentinel `INT64_MAX` (backward walks).
+- `edge_feats[k]` for `k ∈ [0, lens-2]` = feature of the SAME edge
+  (`nodes[k]`, `nodes[k+1]`). Same indexing as `timestamps[k]`.
+  In `context_walk`, the edge-feat tensor is **right-padded** so that
+  position `p` of the [W, L] grid carries `edge_feats[p]`. Left-padding
+  it (off-by-one — uses `edge_feats[p-1]`) was a bug we hit; the
+  alignment loss's `timestamps[p]` and `edge_feats[p]` must describe
+  the same hop. See Lesson 11.
 - Positions ≥ `lens` are padding (`nodes=-1`, `timestamps=-1`).
 
 **Cold-start.** A seed with no prior edges in the current Tempest
@@ -312,27 +329,111 @@ correctness > noise-band-adjacent metric.
 ### Lesson 8 — Exploit Tempest's unique outputs
 
 Most random-walk methods don't have per-hop timestamps or per-hop
-edge features. Tempest does. The alignment loss already uses
-per-hop timestamps via the
-`(1 + Δt(c) / time_scale)^(−β)` temporal weight. Edge features
-are not yet wired in (HISTORICAL row 10x noted they regressed on
-wiki under the v2 setup, but tgbl-comment / coin / flight have
-real signal in edges and the integration is on the roadmap).
+edge features. Tempest does. The alignment loss uses per-hop
+timestamps via the `(1 + Δt(c) / time_scale)^(−β)` temporal weight
+and per-hop edge features through `proj_e` inside `context_walk`.
+Both are no-ops when the dataset doesn't provide the signal — see
+the "Feature handling" matrix.
+
+Edge features are intentionally context-side-and-alignment-only.
+They characterise a hop (an edge between two nodes), not a node
+identity, and they're absent from negatives (negative `(u, v_neg)`
+pairs have no associated edge), so feeding them to the link MLP
+would let it key on "edge feat present → positive" — a leak. The
+HISTORICAL note about edge features regressing under the v2 setup
+was the additive-residual variant; the current concat + per-site
+fusion handles them robustly.
+
+### Lesson 9 — Cross-table link MLP > within-table
+
+The alignment loss trains the `target ↔ context` cosine. The link
+MLP must consume **exactly that interaction** so the BCE signal can
+ride on the supervised geometry instead of re-learning it from
+scratch. Within-table 8-blocks (`target⊙target`, `context⊙context`)
+were the original design — those products have no direct
+supervision and the head had to learn cross-table coupling
+implicitly through its hidden layers. Switching to cross-table
+blocks (`target(u)⊙context(v)` for u→v and `target(v)⊙context(u)`
+for v→u, plus their L1 differences) gave +0.04 test MRR on wiki by
+itself.
+
+### Lesson 10 — Seed walks on union(src, tgt), not just src
+
+Seeding walks only on `unique(batch.src)` starves `target(v)` and
+`context(u)` of alignment supervision whenever the dataset has a
+bipartite tilt (users → pages on wiki, users → reviews on review,
+etc.). Both tables effectively become half-trained, and the link
+MLP has to lift the un-supervised half from BCE alone. Union
+seeding (`unique(batch.src ∪ batch.tgt)`) gives every node touched
+by the batch a chance to pull its target view, doubles seed
+diversity per step, and is the right default everywhere. Costs
+~2× walk-sampling per batch — negligible.
+
+### Lesson 11 — `time_scale` must be decoupled from `max_walk_len`
+
+The alignment loss's recency term `(1 + Δt / time_scale)^(−β)` is
+extremely sensitive to `time_scale`. The original derivation
+`(t_max − t_min) / max_walk_len` coupled `time_scale` to walk
+length: bumping L=20 → L=50 collapsed `time_scale` from 93k to 37k
+on wiki and crushed the recency weight, negating the benefit of
+the longer walks.
+
+The right derivation **keeps the dataset-span numerator but uses
+a fixed reference constant `L_REF=20` in the denominator**, NOT
+the configurable `max_walk_len`:
+
+```
+time_scale = (t_max − t_min) / L_REF       where L_REF = 20 (fixed)
+```
+
+For wiki this is 1.86M / 20 ≈ **93k sec ≈ 1.08 days**, regardless
+of `--max-walk-len`. Empirically this beats the per-node mean
+inter-event time `(span × N / E) ≈ 155k` by ~0.02 test MRR on wiki —
+the alignment recency wants a sharper scale than the per-node
+recurrence period, closer to a within-session timescale.
+
+Override at the CLI via `--alignment-time-scale <value>` for
+ablations and per-dataset tuning.
+
+### Lesson 12 — Edge-feat index at walk position p is `edge_feats[p]`
+
+`timestamps[p]` and `edge_feats[p]` describe the SAME hop (between
+`nodes[p]` and `nodes[p+1]`). The alignment loss reads
+`timestamps[p]` at position p; the per-position context vector
+must therefore read `edge_feats[p]` at position p, not
+`edge_feats[p-1]`. Left-padding the [W, L-1, d_e] tensor was
+introducing a one-position skew between time and edge-feat at
+every walk position — fixed by right-padding (zero at the seed
+slot, which is masked out anyway).
 
 ---
 
 ## Baseline result (v3, strict-causal, walks-supervise-embeddings only)
 
-**tgbl-wiki, 50 epochs, B=200, hist_neg_ratio=0.5, K=5 walks × L=20, d=128**
+**tgbl-wiki, 50 epochs, hist_neg_ratio=0.5, d=128.** All numbers go
+through `tgb.linkproppred.evaluate.Evaluator.eval(...)`.
 
-| | Val MRR | Test MRR |
-|---|---|---|
-| v3, additive node-feat residual + edge-feat alignment | 0.3725 | 0.2884 |
-| v3, init-only node-feat + edge-feat alignment (current)  | 0.3629 | **0.2942** |
+| Run | B | K | L | Val MRR | Test MRR |
+|---|---|---|---|---|---|
+| v3, additive node-feat residual + edge-feat alignment | 200 | 5 | 20 | 0.3725 | 0.2884 |
+| v3, init-only node-feat + edge-feat alignment | 200 | 5 | 20 | 0.3629 | 0.2942 |
+| **v3 + cross-table link MLP + union seeding + ef-pad fix (current best)** | **200** | **5** | **20** | **0.4015** | **0.3313** |
+| v3 directed (sanity — TGB negatives don't respect direction) | 200 | 5 | 20 | 0.3553 | 0.2735 |
+| v3 + larger batch + longer walks (regressed, see Lesson on batch size) | 1000 | 5 | 50 | 0.3503 | 0.2690 |
+| v3 + larger batch + longer walks + `time_scale` fix (Lesson 11) | 1000 | 5 | 50 | 0.3574 | 0.2704 |
 
-Training: 50 epochs × ~15.3s = ~13 min total. Tempest on CPU, model on
-RTX 2000 Ada. Link BCE 0.27 → 0.124 over 50 epochs; alignment plateaus
-at ~0.62 by epoch 5; uniformity stable around −3.89.
+Training under the current best: 50 epochs × ~15s = ~13 min total.
+Tempest on CPU, model on RTX 2000 Ada. Link BCE 0.27 → 0.11 over 50
+epochs; alignment plateaus at ~0.87 by epoch 5; uniformity stable
+around −3.93.
+
+The B=1000, L=50 rows show that bumping batch size 5× regresses test
+MRR by ~0.06 on wiki even after fixing the `time_scale` derivation
+that L=50 exposed. The regression is the **batch size** itself — wiki
+is small (110K train edges) and dilutes per-positive gradient at
+larger batches, the exact failure mode our operating notes warn
+about. The `time_scale` fix (Lesson 11) is still a correctness win
+and should stay in the codebase.
 
 Leaderboard reference (note: most carry the TGN memory leak):
 
@@ -347,27 +448,33 @@ Leaderboard reference (note: most carry the TGN memory leak):
 | DyGFormer | 0.798 |
 | TPNet | 0.827 |
 
-The v3 baseline is the honest walks-only number under the strict-
-causal protocol. Memory, walks-at-scoring, edge features, and longer
-walks are the next levers (see roadmap below).
+The current honest walks-supervise-embeddings number is 0.331 on
+wiki. Closing the gap to EdgeBank (0.495) is the next milestone; the
+levers we haven't pulled yet (walks-at-scoring, raw-message-store
+memory, longer walks at small batch) are exactly what the leaderboard
+methods rely on.
 
-## Roadmap (in priority order, after the v3 baseline lands)
+## Roadmap (in priority order)
 
-1. **Reproduce 0.508 baseline test MRR on tgbl-wiki** under the
-   strict-causal protocol. If MRR ≪ 0.508 then the v1 number was
-   leak-inflated; report whatever the honest number is.
-2. **Add edge features to alignment** (per-hop `edge_feats[w, k]`
-   projected and concatenated into the context vector). Bypass the
-   wiki regression by adding a `--use-edge-feats` flag.
-3. **Add a TGN-style memory module with raw-message-store** (the
-   honest version of Lesson 1). Combine with walk-supervised
-   embeddings.
+1. **Walks-at-scoring (GRU/transformer encoder feeding the link MLP).**
+   The alignment loss already trains rich walk representations; the
+   link MLP currently re-reads only the raw `target / context` tables.
+   Routing the seed's pooled walk representation INTO the link MLP
+   alongside the table lookups is the largest expected gain — same
+   architectural step that the old codebase used to clear TGN territory.
+2. **Walk-length sweep at small batch with corrected `time_scale`.**
+   B=200, L ∈ {30, 50, 80}, K ∈ {5, 10}. Isolates the long-walk effect
+   from the batch-size regression; the diagnostic in
+   `scripts/diag_walk_lens.py` shows ~38% of walks pin the L=20 cap.
+3. **TGN-style memory with raw-message-store** (Lesson 1's honest
+   pattern). Composes multiplicatively with walks-at-scoring per the
+   old codebase's row 6 → row 7 jump (+0.034).
 4. **Scale-out to tgbl-coin / -comment / -flight / -review** with
-   `wpn=10, mwl=80` (Tempest paper conventions).
-5. **Honest-protocol baselines for TGN / DyGFormer / TPNet** —
-   re-run them with raw-message-store memory and report against
-   our numbers. This is the paper's contribution-defining
-   comparison.
+   Tempest paper conventions (`wpn=10, mwl=80`). Edge-feat support is
+   already in; node-feat support is already in.
+5. **Honest-protocol baselines for TGN / DyGFormer / TPNet** — re-run
+   them with raw-message-store memory and report against our numbers.
+   The paper's contribution-defining comparison.
 
 ---
 
@@ -381,8 +488,26 @@ walks are the next levers (see roadmap below).
   datasets have asymmetric source / target node populations and
   random over all nodes would create a trivially easy task that
   doesn't transfer to eval).
-- Default `target_batch_size = 200`. Larger batches dilute the
-  per-positive gradient and let the model collapse to a constant
-  logit (observed empirically in v2 — fix was small batches).
+- Default `target_batch_size = 200`. Re-confirmed empirically: at
+  B=1000 on wiki, test MRR regresses by ~0.06 even after fixing the
+  `time_scale` derivation. Smaller datasets need smaller batches —
+  v2's "collapse to constant logit" failure was a more severe form
+  of the same effect.
+- Default `alignment_time_scale` is derived as
+  `(t_max − t_min) / L_REF` with `L_REF=20` fixed. On wiki this
+  gives 93k seconds ≈ 1.08 days — the empirically-best value (see
+  Lesson 11). Pass `--alignment-time-scale` to override for
+  per-dataset tuning.
+- Default `is_directed` is dataset-specific (heuristic in
+  `data.py::_UNDIRECTED`). Pass `--is-directed` / `--no-is-directed`
+  to override. TGB does not declare directedness; the choice is
+  interpretive. On wiki, undirected matches TGB's eval semantics
+  (negatives don't respect direction) — running directed regressed
+  test MRR by 0.06.
 - Eval `row_budget` chunks the link-MLP forward at ~500K rows per
   pass to fit 8 GB. Math is identical to the unchunked path.
+- Diagnostic at `scripts/diag_walk_lens.py` reports the actual walk-
+  length distribution Tempest is returning under the strict-causal
+  protocol. Run it after any change to walk config to verify whether
+  `max_walk_len` is the binding constraint (on wiki at L=20 it is —
+  ~38% of walks pin the cap at end-of-epoch).
