@@ -1,0 +1,24 @@
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Data + run artifacts (not source)
+datasets/
+logs/
+*.log
+*.pt
+*.pth
+*.ckpt
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

@@ -1,0 +1,49 @@
+"""Top-level run config. TGB-only."""
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Config:
+    # Required (set per-dataset by the entry script after load_tgb).
+    tgb_name: str
+    max_node_count: int
+    is_directed: bool
+
+    # Model
+    d_emb: int = 128
+    d_hidden_link: int = 128
+
+    # Walks (Tempest)
+    max_walk_len: int = 20
+    num_walks_per_node: int = 5
+    walk_bias: str = "ExponentialWeight"
+
+    # Alignment loss
+    temporal_decay_exp: float = 0.5      # β in (1 + Δt/time_scale)^(-β)
+    alignment_time_scale: float = -1.0   # ≤ 0 ⇒ derive from training time range
+
+    # Uniformity loss
+    eta_uniform: float = 1.0
+    uniformity_temperature: float = 2.0
+    uniformity_cap: int = 20_000
+
+    # Link prediction
+    num_neg_per_pos: int = 10            # K negatives per positive
+    # Mixture of TGB-style negatives at TRAINING time. hist_neg_ratio=0.5
+    # matches TGB's eval-time 50/50 historical/random mix — keeping train
+    # and eval distributions aligned (see CLAUDE.md negatives section).
+    # 0 disables the historical channel (uniform random only).
+    hist_neg_ratio: float = 0.5
+    reservoir_size: int = 32             # per-source Vitter-R reservoir (M)
+
+    # Optimization
+    emb_lr: float = 1e-3
+    link_lr: float = 1e-3
+    target_batch_size: int = 200
+    num_epochs: int = 50
+
+    # System
+    tgb_root: str = "datasets"
+    use_gpu: bool = False
+    seed: int = 42
