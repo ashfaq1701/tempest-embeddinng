@@ -19,6 +19,14 @@ class Config:
     num_walks_per_node: int = 5
     walk_bias: str = "ExponentialWeight"
 
+    # Walk encoder (Phase 1 — GRU over per-position walk inputs feeds
+    # the alignment loss; d_gru must equal d_emb because the cosine
+    # compares target(seed) directly with the GRU output).
+    use_walk_encoder: bool = True
+    d_time: int = 16
+    d_role: int = 8
+    walk_encoder_dropout: float = 0.1
+
     # Alignment loss
     temporal_decay_exp: float = 0.5      # β in (1 + Δt/time_scale)^(-β)
     alignment_time_scale: float = -1.0   # ≤ 0 ⇒ derive from training time range

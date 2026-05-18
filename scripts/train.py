@@ -35,6 +35,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-walks-per-node", type=int, default=5)
     p.add_argument("--walk-bias", default="ExponentialWeight")
 
+    # Walk encoder (Phase 1: GRU over per-position walk inputs feeding the
+    # alignment loss in place of context_walk).
+    p.add_argument("--use-walk-encoder", default=True,
+                   action=argparse.BooleanOptionalAction,
+                   help="Enable the GRU walk encoder (Phase 1). "
+                        "Pass --no-use-walk-encoder for the legacy "
+                        "context_walk path.")
+    p.add_argument("--d-time", type=int, default=16)
+    p.add_argument("--d-role", type=int, default=8)
+    p.add_argument("--walk-encoder-dropout", type=float, default=0.1)
+
     # Losses
     p.add_argument("--temporal-decay-exp", type=float, default=0.5)
     p.add_argument("--alignment-time-scale", type=float, default=-1.0)
@@ -85,6 +96,10 @@ def main() -> None:
         max_walk_len=args.max_walk_len,
         num_walks_per_node=args.num_walks_per_node,
         walk_bias=args.walk_bias,
+        use_walk_encoder=args.use_walk_encoder,
+        d_time=args.d_time,
+        d_role=args.d_role,
+        walk_encoder_dropout=args.walk_encoder_dropout,
         temporal_decay_exp=args.temporal_decay_exp,
         alignment_time_scale=args.alignment_time_scale,
         eta_uniform=args.eta_uniform,
@@ -147,6 +162,10 @@ def main() -> None:
     loaded.dataset.load_val_ns()
     loaded.dataset.load_test_ns()
 
+    # Phase 2: pass the walk generator + encoder + derived time_scale to the
+    # Evaluator so it can encode walks for each batch's union of pos+neg
+    # node IDs and feed h_u/h_v to the link MLP — same Phase 2 protocol as
+    # training, just no backward.
     eval_val = Evaluator(
         embedding_store=trainer.embedding_store,
         link_predictor=trainer.link_predictor,
@@ -154,6 +173,9 @@ def main() -> None:
         device=trainer.device,
         tgb_dataset_name=loaded.name,
         eval_metric=loaded.eval_metric,
+        walk_gen=trainer.walk_gen,
+        walk_encoder=trainer.walk_encoder,
+        time_scale=trainer._time_scale,
     )
     eval_test = Evaluator(
         embedding_store=trainer.embedding_store,
@@ -162,6 +184,9 @@ def main() -> None:
         device=trainer.device,
         tgb_dataset_name=loaded.name,
         eval_metric=loaded.eval_metric,
+        walk_gen=trainer.walk_gen,
+        walk_encoder=trainer.walk_encoder,
+        time_scale=trainer._time_scale,
     )
 
     print(f"Model device: {trainer.device}    Tempest device: cpu")

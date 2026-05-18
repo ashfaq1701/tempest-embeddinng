@@ -54,6 +54,8 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
 class EmbeddingStore(nn.Module):
@@ -208,32 +210,39 @@ class EmbeddingStore(nn.Module):
 
 
 class LinkPredictor(nn.Module):
-    """8-block MLP head with CROSS-TABLE interactions.
+    """12-block MLP head with cross-table + walk-encoded interactions.
 
-    The alignment loss trains the cosine geometry between target(seed) and
-    context(walk-neighbour) — i.e. target ↔ context is the supervised
-    interaction. The link MLP exposes exactly that interaction (in both
-    directions) so the BCE signal can lean on it directly instead of
-    re-learning it from scratch:
+    Three channel groups, each contributing 4 blocks of [a, b, a⊙b, |a−b|]:
 
-        input = concat([
-          target(u),  context(v),  target(u)·context(v),  |target(u)−context(v)|,   ← u→v direction
-          target(v),  context(u),  target(v)·context(u),  |target(v)−context(u)|,   ← v→u direction
-        ])  ∈ ℝ^{8·d}
+      group 1 — u→v direction (raw): target(u) ↔ context(v)
+      group 2 — v→u direction (raw): target(v) ↔ context(u)
+      group 3 — walk-encoded:        h_seed_u ↔ h_seed_v
 
-    Both directions are included because the head is called on ordered
-    (u, v) pairs but the dataset's directionality isn't always clean —
-    letting the MLP weight u→v vs v→u itself is cheaper than committing
-    to one direction at the head and losing the signal on the other.
+    Groups 1+2 expose the cross-table dot-product geometry the alignment
+    loss trains. Group 3 exposes the walk-summary representation the GRU
+    encoder builds — the channel that closes the "alignment trains, link
+    can't see it" disconnect that crippled Phase 1.
 
-    The arguments are the FEATURE-AUGMENTED vectors coming from
-    EmbeddingStore.target / .context — node-feature residuals are folded
-    in upstream, so the link MLP gets them for free.
+    When the walk encoder is OFF (use_walk_encoder=False), pass h_u/h_v
+    = target(u)/target(v) as a fallback — `n_walk_blocks=0` builds an
+    8-block head that ignores h entirely. The block count is fixed at
+    construction time.
     """
 
-    def __init__(self, d_emb: int, hidden: int = 128, dropout: float = 0.0):
+    def __init__(
+        self,
+        d_emb: int,
+        hidden: int = 128,
+        dropout: float = 0.0,
+        n_walk_blocks: int = 4,
+    ):
         super().__init__()
-        in_d = 8 * d_emb
+        # 8 raw blocks (cross-table, both directions) + up to 4 walk-encoded.
+        if n_walk_blocks not in (0, 4):
+            raise ValueError(f"n_walk_blocks must be 0 or 4, got {n_walk_blocks}")
+        self.n_walk_blocks = n_walk_blocks
+        n_blocks = 8 + n_walk_blocks
+        in_d = n_blocks * d_emb
         self.norm = nn.LayerNorm(in_d)
         self.net = nn.Sequential(
             nn.Linear(in_d, hidden),
@@ -249,14 +258,174 @@ class LinkPredictor(nn.Module):
         self,
         e_t_u: torch.Tensor, e_t_v: torch.Tensor,
         e_c_u: torch.Tensor, e_c_v: torch.Tensor,
+        h_u: Optional[torch.Tensor] = None,
+        h_v: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        x = torch.cat(
-            [
-                # u→v direction: target(u) ↔ context(v) is the trained pair
-                e_t_u, e_c_v, e_t_u * e_c_v, (e_t_u - e_c_v).abs(),
-                # v→u direction: target(v) ↔ context(u)
-                e_t_v, e_c_u, e_t_v * e_c_u, (e_t_v - e_c_u).abs(),
-            ],
-            dim=-1,
-        )
+        parts = [
+            # u→v direction: target(u) ↔ context(v) is the trained pair
+            e_t_u, e_c_v, e_t_u * e_c_v, (e_t_u - e_c_v).abs(),
+            # v→u direction: target(v) ↔ context(u)
+            e_t_v, e_c_u, e_t_v * e_c_u, (e_t_v - e_c_u).abs(),
+        ]
+        if self.n_walk_blocks > 0:
+            if h_u is None or h_v is None:
+                raise ValueError(
+                    "LinkPredictor was built with n_walk_blocks>0 but h_u/h_v "
+                    "were not provided. Pass walk-summary tensors (or "
+                    "target(u)/target(v) as a manual fallback).",
+                )
+            # Walk-encoded direction-agnostic: h carries path context already
+            parts.extend([h_u, h_v, h_u * h_v, (h_u - h_v).abs()])
+        x = torch.cat(parts, dim=-1)
         return self.net(self.norm(x)).squeeze(-1)
+
+
+class WalkEncoder(nn.Module):
+    """Single-layer GRU over per-position walk inputs.
+
+    Replaces the per-position `context_walk` fusion in the alignment loss
+    with a stateful representation that aggregates the entire walk-prefix
+    into each position's hidden state.
+
+    Per-position input at walk position p of walk w:
+
+        x_{w,p} = [ context(u_p)                            # d_emb
+                  ‖ role_embed(SEED if p==lens-1 else 0)    # d_role
+                  ‖ time_embed(Δt = t_query − ts[p])        # d_time
+                  ‖ proj_e(eps[p])  (right-padded at seed)  # d_emb  (if ef)
+                  ]
+
+    `context(u)` is the existing embedding primitive (fuses E_context with
+    node-feature projection when present). `proj_e` is **shared** with
+    EmbeddingStore's `edge_feat_proj` — same projection, two consumers.
+    `time_embed` is a small MLP on the (normalised, log-transformed) Δt.
+
+    Direction: the GRU runs forward in chronological order. Position 0 is
+    the oldest reachable neighbour; position `lens-1` is the seed.
+    `h_{w, lens-1}` therefore carries the full walk's accumulated context.
+
+    Cold-start: walks with `lens == 0` (seeds with no past) get
+    `lens.clamp_min(1)` before packing so `pack_padded_sequence` doesn't
+    crash. The resulting single-position GRU output is on a junk node
+    (the padding `-1` clamped to 0), but the alignment loss masks the
+    whole walk out (no non-seed positions when lens ≤ 1) so it contributes
+    nothing. Watch this when later phases feed h_seed into the link MLP.
+
+    `d_gru` must equal `d_emb` because the alignment-loss cosine compares
+    `target(seed) ∈ ℝ^{d_emb}` with the GRU's hidden state directly.
+    """
+
+    def __init__(
+        self,
+        embedding_store: "EmbeddingStore",
+        d_gru: int = 128,
+        d_time: int = 16,
+        d_role: int = 8,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        d_emb = embedding_store.d_emb
+        if d_gru != d_emb:
+            raise ValueError(
+                f"d_gru ({d_gru}) must equal d_emb ({d_emb}) — the alignment "
+                f"cosine compares target(seed) ∈ R^d_emb with GRU outputs."
+            )
+        # Hold a reference to EmbeddingStore WITHOUT registering it as a
+        # submodule — that way `self.parameters()` does NOT double-count
+        # E_target/E_context/proj_*/etc. (which the trainer already optimizes
+        # via embedding_store.parameters()). Gradient flow through
+        # `self.embedding_store.context(...)` still works because the
+        # autograd graph is independent of module registration.
+        object.__setattr__(self, "embedding_store", embedding_store)
+        self.d_emb = d_emb
+        self.d_gru = d_gru
+        self.d_time = d_time
+        self.d_role = d_role
+        self.has_edge_feat = embedding_store.has_edge_feat
+
+        # 2 role indices: 0 = INTERMEDIATE, 1 = SEED.
+        self.role_embed = nn.Embedding(2, d_role)
+        # Time MLP on [Δt_norm, log(1 + Δt_norm)]. Two-layer GELU.
+        self.mlp_time = nn.Sequential(
+            nn.Linear(2, d_time),
+            nn.GELU(),
+            nn.Linear(d_time, d_time),
+        )
+
+        d_in = d_emb + d_role + d_time
+        if self.has_edge_feat:
+            d_in += d_emb  # projected edge feat (shared proj_e)
+
+        self.gru = nn.GRU(
+            input_size=d_in,
+            hidden_size=d_gru,
+            num_layers=1,
+            batch_first=True,
+        )
+        self.input_dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        walk_nodes: torch.Tensor,         # [W, L] long, padding=clamped to 0
+        walk_timestamps: torch.Tensor,    # [W, L] int64; seed slot = INT64_MAX sentinel
+        lens: torch.Tensor,               # [W] long
+        walk_edge_feats: Optional[torch.Tensor],  # [W, L-1, d_e] or None
+        t_query: torch.Tensor,            # [W] int64 (per-walk query time)
+        time_scale: float,
+    ) -> torch.Tensor:
+        """Returns h: [W, L, d_gru]. Positions ≥ lens_w are zero-padded
+        (pad_packed_sequence default). The alignment-loss mask still
+        excludes them via the same `lens` it already uses.
+        """
+        device = walk_nodes.device
+        W, L = walk_nodes.shape
+
+        # Identity + (optional) node-feat fusion through the canonical
+        # primitive — proj_c and context_final are reused, not duplicated.
+        c = self.embedding_store.context(walk_nodes)                # [W, L, d_emb]
+
+        # Role embedding: SEED at lens-1, INTERMEDIATE elsewhere.
+        positions = torch.arange(L, device=device).unsqueeze(0)     # [1, L]
+        seed_pos = (lens - 1).clamp_min(0).unsqueeze(1)             # [W, 1]
+        is_seed = (positions == seed_pos).long()                    # [W, L]
+        role = self.role_embed(is_seed)                             # [W, L, d_role]
+
+        # Time embedding. Δt = t_query − timestamps[p], clamped at 0.
+        # The seed slot's timestamp is the INT64_MAX sentinel — replace
+        # it with t_query so Δt at the seed is 0 (cleanly "now").
+        t_q = t_query.unsqueeze(1)                                  # [W, 1]
+        ts_for_dt = torch.where(positions == seed_pos, t_q, walk_timestamps)
+        dt = (t_q - ts_for_dt).clamp_min(0).float()                 # [W, L]
+        dt_norm = dt / max(time_scale, 1e-6)
+        time_input = torch.stack(                                   # [W, L, 2]
+            [dt_norm, torch.log1p(dt_norm)], dim=-1,
+        )
+        time_h = self.mlp_time(time_input)                          # [W, L, d_time]
+
+        parts = [c, role, time_h]
+        if self.has_edge_feat:
+            if walk_edge_feats is not None:
+                ef = self.embedding_store.edge_feat_proj(walk_edge_feats.float())  # [W, L-1, d_emb]
+                # Right-pad to align edge_feats[p] with timestamps[p] at the
+                # same walk position; seed slot gets zero.
+                ef = F.pad(ef, (0, 0, 0, 1))                        # [W, L, d_emb]
+            else:
+                # Empty Tempest (first batch after reset) returns no edge
+                # feats. The walks are also empty (lens=0) so the alignment
+                # loss masks them anyway, but the GRU still needs an input
+                # of the right width — feed zeros.
+                ef = torch.zeros(W, L, self.d_emb, dtype=c.dtype, device=device)
+            parts.append(ef)
+
+        x = torch.cat(parts, dim=-1)                                # [W, L, d_in]
+        x = self.input_dropout(x)
+
+        # Pack and run GRU. Clamp lens ≥ 1 for cold-start safety; the
+        # alignment loss masks lens ≤ 1 walks out anyway, so the junk
+        # single-position computation doesn't contribute. enforce_sorted
+        # False lets us skip the sort.
+        safe_lens = lens.clamp_min(1).to("cpu")  # PackedSequence needs CPU lengths
+        packed = pack_padded_sequence(x, safe_lens, batch_first=True, enforce_sorted=False)
+        h_packed, _ = self.gru(packed)
+        h, _ = pad_packed_sequence(h_packed, batch_first=True, total_length=L)
+        return h                                                    # [W, L, d_gru]
