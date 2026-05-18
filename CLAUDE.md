@@ -327,7 +327,8 @@ real signal in edges and the integration is on the roadmap).
 
 | | Val MRR | Test MRR |
 |---|---|---|
-| v3 baseline | 0.3725 | **0.2884** |
+| v3, additive node-feat residual + edge-feat alignment | 0.3725 | 0.2884 |
+| v3, init-only node-feat + edge-feat alignment (current)  | 0.3629 | **0.2942** |
 
 Training: 50 epochs × ~15.3s = ~13 min total. Tempest on CPU, model on
 RTX 2000 Ada. Link BCE 0.27 → 0.124 over 50 epochs; alignment plateaus
