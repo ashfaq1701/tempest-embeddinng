@@ -32,8 +32,12 @@ Plan v2.2 committed at `7ceeebe`.
 
 ## Phase 0.5 — Time encoding ablation
 
-**Status:** COMPLETE. Decision: "composes additively" — keep Component 0,
-proceed to Phase 1.
+**Status:** COMPLETE. Decision: "composes additively" — keep Component 0
+(LOCKED in v2.2 §6.1). Next gate is anchor validation per v2.2 §3.
+
+> Note: the original v1.5 successor was "Phase 1" (alignment-weighting
+> ablation). v2.2 supersedes that lattice — see §0 of v2.md and the
+> anchor validation / Phase S sections below.
 
 **Implementation commit:** `199de30` on `feature/walk-distribution-embedding`.
 
@@ -188,14 +192,22 @@ are retired.
 - 2 epochs each — matches the single-seed checkpoint that hit Test 0.7070.
 - Wall-clock budget: ~30 min total.
 
-**Decision gate:**
-- 3/3 seeds within ±0.03 of 0.71 ⇒ anchor confirmed; launch Phase S
-  with floor = anchor mean.
-- Anchor mean drifts > 0.05 below 0.71 ⇒ pause Phase S; re-investigate
-  the diagnostic with a 4th seed before committing to the 12-hour budget.
-- Variance across seeds > 0.10 ⇒ the 0.71 was a lucky seed; reset the
-  floor to whichever bucket the mean falls in and proceed with reduced
-  confidence in any Phase S "win" claim.
+**Decision gate (verbatim from v2.2 §3.2):**
+- **mean test MRR ≥ 0.70 with std ≤ 0.02** ⇒ anchor confirmed; Phase S
+  anchors at the mean. Proceed.
+- **0.65 ≤ mean < 0.70** ⇒ anchor partially validated. Phase S anchors
+  at the verified mean (whatever it is), not the 0.71 from the smoke.
+  v2.2 §4.4 success criterion adjusts accordingly.
+- **mean < 0.65 or std > 0.04** ⇒ the 0.71 smoke was lucky. Stop.
+  Investigate before Phase S. Likely causes to check: did the diagnostic's
+  training loop use a different config than v2.2 expects? Was the 2-epoch
+  run somehow different (different batch ordering, different walk-gen
+  state)?
+
+**Lock-in after anchor validation (v2.2 §3.3):** the verified mean test
+MRR becomes the **Phase 0.5 baseline** for all downstream comparisons.
+Every Phase S configuration is judged against this number, not against
+0.71.
 
 **Sanity checks before launch:**
 - [ ] Trainer respects `--num-epochs 2` and stops cleanly.
@@ -258,6 +270,22 @@ by > anchor std.
 | Cell ID | Group | Config | Val MRR | Test MRR | Best ep | Walltime |
 |---|---|---|---|---|---|---|
 
+**Phase S deliverables (v2.2 §4.5):**
+
+1. **Anchor validation results** (3 seeds, mean ± std) — recorded under §3 above.
+2. **Best configuration:** which choice from each of A1, A2, A3, C, D, E.
+3. **Comparison matrix:** all explored points sorted by test MRR.
+   Annotated with which Group(s) each varies. Include the A2-off
+   configuration explicitly.
+4. **Interpretive summary:** does walks-supervision help, hurt, or break
+   even on wiki? Under what conditions? What does Group E's outcome say
+   about whether the cross-table embeddings carry signal at all?
+5. **Recommended base for P1–P3:** the locked configuration. P1+ phases
+   run on top of this.
+6. **Per-epoch divergence shape** for top 3 configurations (val MRR +
+   test MRR per epoch). We want to see whether the alignment-on configs
+   diverge after some epoch or stabilize.
+
 **Phase S exit summary:**
 - Cells run / total budget used:
 - Winning config:
@@ -269,8 +297,16 @@ by > anchor std.
 
 **Status:** blocked on Phase S.
 
+**Skip condition (v2.2 §5 P1):** Skip P1 if Phase S locked in A2-off
+(no alignment) — without walks supervision, `max_time_capacity` is
+irrelevant. Go straight to P2 pre-flight or skip to P3.
+
 **Sweep:** `max_time_capacity ∈ {6h, 1d, 3d, 7d, ∞}` (seconds:
-`{21600, 86400, 259200, 604800, -1}`) on the Phase S winner.
+`{21600, 86400, 259200, 604800, -1}`) on the Phase S winner. Three
+seeds for the chosen window.
+
+**Decision criterion (v2.2 §5 P1):** if any window beats `∞` by ≥0.02
+test MRR (mean across seeds), lock in.
 
 **Results:**
 | window | Val MRR | Test MRR | Notes |
@@ -282,23 +318,31 @@ by > anchor std.
 
 ## P2 — Multi-view (conditional)
 
-**Status:** blocked on P1. Conditional gate: skip if Phase S winner is
-single-view and the walk-distribution-divergence pre-flight shows
-mean JS < 0.05 between Exponential and TemporalNode2Vec.
+**Status:** blocked on P1.
 
-**Pre-flight (mandatory if not skipped):** walk-distribution JS by
-degree bucket on `mid_80pct` / `low_decile` / `high_decile` seeds.
+**Skip conditions (v2.2 §5 P2):**
+- Skip if Phase S locked in A2-off (no alignment).
+- Skip if Phase S Group E selected "no cross-table" (Option E.2) — the
+  multi-view comparison is moot under a Component-0-only head.
+- Skip if aggregate walk-distribution JS divergence is < 0.05 across
+  all degree buckets — the structural view collapses to the recency
+  view on this dataset.
+
+**Pre-flight (mandatory if not skipped, ~10 min):** walk-distribution
+JS by degree bucket on `mid_80pct` / `low_decile` / `high_decile`
+seeds.
 
 **Pre-flight results:**
 | bucket | mean JS | p50 JS |
 |---|---|---|
 
-**Decision rule check:**
-- `mid_80pct` mean JS > 0.1 → proceed; <0.05 → skip P2; in between → proceed with caution.
-
 **Training (if proceeding):** add `walk_bias="TemporalNode2Vec", p=1.0,
 q=0.25` view; add `E_context_S` + `proj_c_S` + `context_S_final`; dual
-contrastive loss `L_R + λ_S · L_S` with `λ_S = 1.0`.
+contrastive loss `L_R + λ_S · L_S` with `λ_S = 1.0`. Link MLP gets 2
+additional structural-view interaction blocks (Hadamard interactions
+only, per v1.5 §4 Component 3).
+
+**Decision criterion (v2.2 §5 P2):** +0.02 over P1 base = proceed.
 
 **Results:**
 - Val MRR:
@@ -311,24 +355,28 @@ contrastive loss `L_R + λ_S · L_S` with `λ_S = 1.0`.
 
 ## P3 — Within-method ablation matrix + error analysis
 
-**Status:** blocked on P2.
+**Status:** blocked on P2. Budget ~2 hrs per v2.2 §5 P3.
 
-**Ablation matrix (one row per cumulative addition):**
+**Ablation matrix (v2.2 §5 P3 — 4–6 rows depending on which earlier
+phases applied):**
+
 | Row | Config | Val MRR | Test MRR | Δ vs row above |
 |---|---|---|---|---|
-| 1 | Phase 0 baseline                                |   |   | — |
-| 2 | + Component 0 (time encoding)                   |   |   |   |
-| 3 | + early stopping (anchor-validated)             |   |   |   |
-| 4 | + Phase S winning Group A/C/D config            |   |   |   |
-| 5 | + Phase S winning Group E head                  |   |   |   |
-| 6 | + P1 `max_time_capacity_R`                      |   |   |   |
-| 7 | + P2 multi-view (if applied)                    |   |   |   |
-| 8 | P3 final config                                 |   |   |   |
+| 1 | Phase 0 reference (the 0.33 baseline)                          |   |   | — |
+| 2 | Phase 0.5 (Component 0, current alignment, 50 ep, over-trained) | 0.4377 | 0.3940 |   |
+| 3 | Anchor-validated Phase 0.5 (Component 0, early-stopped)         |   |   |   |
+| 4 | Phase S winner (locked base)                                    |   |   |   |
+| 5 | P1 winner (if P1 applied; otherwise skip)                       |   |   |   |
+| 6 | P2 winner (if P2 applied; otherwise skip)                       |   |   |   |
+| 7 | Capacity-matched control (if P2 applied): single-view d_emb=192 vs P2's two-view d_emb=128 — `3·128 = 2·192 = 384·N` table parameters strictly matched (v1.5 §6 row 7b) |   |   | (vs row 6) |
 
-**Error analysis** (post-hoc on row 8):
+**Error analysis** (post-hoc, no extra training; v2.2 §5 P3):
 - By positive `(u, v)` recency bucket (never seen / <1h / <1d / <1w / older):
 - By source degree (low/mid/high tercile):
-- Hub-positive vs non-hub-positive split:
+- Whether v is a hub (top-K most popular destinations):
+
+Identifies where the multi-view (or windowed-walk) signal pays off, if
+at all.
 
 ---
 
