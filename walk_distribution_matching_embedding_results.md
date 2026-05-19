@@ -317,8 +317,27 @@ by > anchor std.
 
 **Results matrix:** (filled in run-by-run)
 
-| Cell ID | Group | Config | Val MRR | Test MRR | Best ep | Walltime |
-|---|---|---|---|---|---|---|
+| Cell ID | Group | Config | Seed | Val MRR | Test MRR | Best ep | Walltime |
+|---|---|---|---|---|---|---|---|
+| anchor   | A2 (on)  | λ_align=1.0, 2 ep flat                       | 42 | 0.7447 | 0.7088 | — | 87 s |
+| anchor   | A2 (on)  | λ_align=1.0, 2 ep flat                       |  7 | 0.7427 | 0.7060 | — | 83 s |
+| anchor   | A2 (on)  | λ_align=1.0, 2 ep flat                       | 13 | 0.7420 | 0.7062 | — | 83 s |
+| A2-on    | A2 (on)  | λ_align=1.0, early-stop patience=4, ≤12 ep   | 42 | 0.7444 | 0.7083 | 2 | ~7 min |
+| A2-off   | A2 (off) | λ_align=0.0, early-stop patience=4, ≤12 ep   | 42 | 0.7448 | 0.7092 | 4 | ~9 min |
+| A2-off   | A2 (off) | λ_align=0.0, early-stop patience=4, ≤12 ep   |  7 | 0.7458 | 0.7099 | 3 | ~8 min |
+| A2-off   | A2 (off) | λ_align=0.0, early-stop patience=4, ≤12 ep   | 13 | 0.7438 | 0.7075 | 3 | ~8 min |
+
+**Group-level summary so far:**
+
+| Group | Config | Test mean ± std (3 seeds) | Δ vs anchor | Verdict |
+|---|---|---|---|---|
+| A2 (on)  | λ_align=1.0 (anchor) | 0.7070 ± 0.0016 | — (floor)  | locked floor |
+| **A2 (off)** | **λ_align=0.0** | **0.7089 ± 0.0012** | **+0.0019** | **A2-off wins by > anchor std; v2.2 §4.4 ties-go-to-simpler ⇒ A2-off locked** |
+
+**Implications:**
+- Group A1 (within-family weighting), A3 (supervision target) are now moot — no alignment supervision exists to weight or re-target.
+- Group C (joint training `λ_link`): becomes the relevant remaining question. Under A2-off, embeddings are uniformity-only. Does enabling BCE backprop into embeddings (`λ_link > 0`) recover anything?
+- **Group E (head structure)** is the natural next: under A2-off + Group E.2 (Component-0-only head, drops cross-table reads), the head no longer reads the uniformity-only embeddings. If E.2 ≈ E.1 cross-table, that says cross-table reads of those embeddings are noise; if E.2 wins, dropping them is a simplification.
 
 **Phase S deliverables (v2.2 §4.5):**
 
