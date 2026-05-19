@@ -66,6 +66,9 @@ def parse_args() -> argparse.Namespace:
     # Memory module (TGN-style raw-message-store)
     p.add_argument("--use-memory", default=True,
                    action=argparse.BooleanOptionalAction)
+    # Direct-recurrence (EdgeBank-style) feature
+    p.add_argument("--use-eb-feat", default=True,
+                   action=argparse.BooleanOptionalAction)
 
     # Losses
     p.add_argument("--temporal-decay-exp", type=float, default=0.5)
@@ -132,6 +135,7 @@ def main() -> None:
         node_enc_ff_dim=args.node_enc_ff_dim,
         use_co_feat=args.use_co_feat,
         use_memory=args.use_memory,
+        use_eb_feat=args.use_eb_feat,
         temporal_decay_exp=args.temporal_decay_exp,
         alignment_time_scale=args.alignment_time_scale,
         eta_uniform=args.eta_uniform,
@@ -212,6 +216,7 @@ def main() -> None:
         node_history=trainer.node_history,
         node_encoder=trainer.node_encoder,
         co_encoder=trainer.co_encoder,
+        eb_encoder=trainer.eb_encoder,
         memory=trainer.memory,
         time_scale=trainer._time_scale,
     )
@@ -228,6 +233,7 @@ def main() -> None:
         node_history=trainer.node_history,
         node_encoder=trainer.node_encoder,
         co_encoder=trainer.co_encoder,
+        eb_encoder=trainer.eb_encoder,
         memory=trainer.memory,
         time_scale=trainer._time_scale,
     )

@@ -55,6 +55,10 @@ class Config:
     # as residual to target(u) (alongside DyG node_h) at the link MLP input.
     use_memory: bool = True
 
+    # Direct-recurrence (EdgeBank-style) feature: is the candidate v in u's
+    # recent K_history events? Plus symmetric u-in-v and recency.
+    use_eb_feat: bool = True
+
     # Alignment loss
     temporal_decay_exp: float = 0.5      # β in (1 + Δt/time_scale)^(-β)
     alignment_time_scale: float = -1.0   # ≤ 0 ⇒ derive from training time range

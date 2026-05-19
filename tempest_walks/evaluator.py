@@ -23,6 +23,7 @@ from .memory import NodeMemory
 from .model import (
     CoOccurrenceEncoder,
     CrossPairAttention,
+    EdgeBankFeature,
     EmbeddingStore,
     LinkPredictor,
     NodeEncoder,
@@ -66,7 +67,9 @@ class Evaluator:
         node_history: Optional[NodeHistory] = None,
         node_encoder: Optional[NodeEncoder] = None,
         co_encoder: Optional[CoOccurrenceEncoder] = None,
+        eb_encoder: Optional[EdgeBankFeature] = None,
         memory: Optional[NodeMemory] = None,
+        t_max_for_batch: Optional[int] = None,
         time_scale: Optional[float] = None,
     ):
         # Lazy import so this module loads without py-tgb installed.
@@ -91,6 +94,7 @@ class Evaluator:
         self.node_history = node_history
         self.node_encoder = node_encoder
         self.co_encoder = co_encoder
+        self.eb_encoder = eb_encoder
         self.memory = memory
         self.time_scale = time_scale
         # Consistency checks: each augmentation needs its full support set.
@@ -138,12 +142,13 @@ class Evaluator:
         # Phase 4: read each unique node's history and run the node encoder,
         # producing a per-seed dynamic node embedding. Also cache nb_t/vc_t
         # for the co-occurrence encoder to reuse without re-reading.
-        node_h_lookup: Optional[Tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor]] = None
+        node_h_lookup: Optional[Tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None
         if self.node_encoder is not None:
             node_h_lookup = self._encode_history_for_batch(seeds_np, batch.t_max)
 
         scores = self._score_chunked(
             all_u, all_v, counts, seed_w_lookup, node_h_lookup,
+            t_max=batch.t_max,
         )
 
         scores_np = scores.cpu().numpy()
@@ -224,7 +229,7 @@ class Evaluator:
         self,
         seeds_np: np.ndarray,
         t_max: int,
-    ) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Read per-node interaction history for every unique seed,
         run the DyGFormer-style node encoder, AND cache the neighbor /
         valid-count tensors so the co-occurrence encoder can reuse them.
@@ -264,7 +269,7 @@ class Evaluator:
             t_query=tq,
             time_scale=self.time_scale,
         )
-        return seeds_np, node_h, nb_t, vc_t
+        return seeds_np, node_h, nb_t, vc_t, hts_t
 
     def _score_chunked(
         self,
@@ -272,7 +277,8 @@ class Evaluator:
         all_v: torch.Tensor,
         counts: List[int],
         seed_w_lookup: Optional[Tuple[np.ndarray, torch.Tensor]] = None,
-        node_h_lookup: Optional[Tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        node_h_lookup: Optional[Tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        t_max: Optional[int] = None,
     ) -> torch.Tensor:
         """Score [P] rows through the link predictor in row_budget-sized chunks.
 
@@ -317,10 +323,11 @@ class Evaluator:
             np.searchsorted(seeds_np, all_v_np),
         ).long().to(self.device)
 
-        # Optional node-encoder + co-occurrence lookups.
+        # Optional node-encoder + co-occurrence + edgebank lookups.
         node_h_tensor: Optional[torch.Tensor] = None
         hist_nb_tensor: Optional[torch.Tensor] = None
         hist_vc_tensor: Optional[torch.Tensor] = None
+        hist_hts_tensor: Optional[torch.Tensor] = None
         if node_h_lookup is not None:
             assert np.array_equal(node_h_lookup[0], seeds_np), (
                 "node_h_lookup seed array must match the walk-encoder's "
@@ -329,6 +336,7 @@ class Evaluator:
             node_h_tensor = node_h_lookup[1]                  # [N_unique, d]
             hist_nb_tensor = node_h_lookup[2]                 # [N_unique, K]
             hist_vc_tensor = node_h_lookup[3]                 # [N_unique]
+            hist_hts_tensor = node_h_lookup[4]                # [N_unique, K]
 
         for start, end in rows:
             u = all_u[start:end]
@@ -353,19 +361,30 @@ class Evaluator:
                 e_t_v = e_t_v + self.memory.read(v)
 
             co_feat: Optional[torch.Tensor] = None
+            eb_feat: Optional[torch.Tensor] = None
             if (
-                self.co_encoder is not None
-                and hist_nb_tensor is not None
+                hist_nb_tensor is not None
                 and hist_vc_tensor is not None
             ):
                 nb_u = hist_nb_tensor[u_idx]
                 nb_v = hist_nb_tensor[v_idx]
                 vc_u = hist_vc_tensor[u_idx]
                 vc_v = hist_vc_tensor[v_idx]
-                co_feat = self.co_encoder(nb_u, nb_v, vc_u, vc_v)
+                if self.co_encoder is not None:
+                    co_feat = self.co_encoder(nb_u, nb_v, vc_u, vc_v)
+                if self.eb_encoder is not None and hist_hts_tensor is not None:
+                    hts_u = hist_hts_tensor[u_idx]
+                    hts_v = hist_hts_tensor[v_idx]
+                    eb_feat = self.eb_encoder(
+                        nb_u=nb_u, nb_v=nb_v, hts_u=hts_u, hts_v=hts_v,
+                        vc_u=vc_u, vc_v=vc_v,
+                        u_ids=u, v_ids=v,
+                        t_max=int(t_max) if t_max is not None else 0,
+                        time_scale=self.time_scale,
+                    )
 
             out[start:end] = self.link_predictor(
-                e_t_u, e_t_v, e_c_u, e_c_v, w_u, w_v, co_feat,
+                e_t_u, e_t_v, e_c_u, e_c_v, w_u, w_v, co_feat, eb_feat,
             )
 
         return out

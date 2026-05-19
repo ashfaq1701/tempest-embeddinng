@@ -32,6 +32,7 @@ from .memory import NodeMemory
 from .model import (
     CoOccurrenceEncoder,
     CrossPairAttention,
+    EdgeBankFeature,
     EmbeddingStore,
     LinkPredictor,
     NodeEncoder,
@@ -74,15 +75,20 @@ class Trainer:
         # sees its inputs, so we don't need Hadamard/L1/cross-table blocks.
         # Optional 5th channel: co-occurrence projection (requires node_history).
         co_feat_enabled = config.use_co_feat and config.use_node_encoder
+        eb_feat_enabled = config.use_eb_feat and config.use_node_encoder
         self.link_predictor = LinkPredictor(
             config.d_emb,
             config.d_hidden_link,
             dropout=config.link_dropout,
             use_co_feat=co_feat_enabled,
+            use_eb_feat=eb_feat_enabled,
         ).to(self.device)
         self.co_encoder: Optional[CoOccurrenceEncoder] = None
         if co_feat_enabled:
             self.co_encoder = CoOccurrenceEncoder(d_emb=config.d_emb).to(self.device)
+        self.eb_encoder: Optional[EdgeBankFeature] = None
+        if eb_feat_enabled:
+            self.eb_encoder = EdgeBankFeature(d_emb=config.d_emb).to(self.device)
         # Cross-pair attention head — pair-conditioned walk summary.
         # Lives with the link side: parameters are scoring-specific
         # (the alignment loss doesn't touch them).
@@ -174,6 +180,8 @@ class Trainer:
             link_params += list(self.node_encoder.parameters())
         if self.co_encoder is not None:
             link_params += list(self.co_encoder.parameters())
+        if self.eb_encoder is not None:
+            link_params += list(self.eb_encoder.parameters())
         if self.memory is not None:
             link_params += list(self.memory.parameters())
         self.link_optimizer = torch.optim.Adam(link_params, lr=config.link_lr)
@@ -410,17 +418,28 @@ class Trainer:
 
         # Optional co-occurrence feature from per-pair history overlap.
         co_feat: Optional[torch.Tensor] = None
-        if self.co_encoder is not None and self.node_history is not None:
+        eb_feat: Optional[torch.Tensor] = None
+        if self.node_history is not None:
             # nb_t, vc_t already gathered above when node_encoder ran.
-            # If node_encoder is off but co_encoder is on (not currently a
-            # supported config), would need a separate read here.
             nb_u = nb_t[u_idx_t]                                            # [P, K]
             nb_v = nb_t[v_idx_t]
             vc_u_p = vc_t[u_idx_t]                                          # [P]
             vc_v_p = vc_t[v_idx_t]
-            co_feat = self.co_encoder(nb_u, nb_v, vc_u_p, vc_v_p)           # [P, d_emb]
+            if self.co_encoder is not None:
+                co_feat = self.co_encoder(nb_u, nb_v, vc_u_p, vc_v_p)       # [P, d_emb]
+            if self.eb_encoder is not None:
+                hts_u = hts_t[u_idx_t]
+                hts_v = hts_t[v_idx_t]
+                eb_feat = self.eb_encoder(
+                    nb_u=nb_u, nb_v=nb_v, hts_u=hts_u, hts_v=hts_v,
+                    vc_u=vc_u_p, vc_v=vc_v_p,
+                    u_ids=u_t, v_ids=v_t,
+                    t_max=int(batch.t_max), time_scale=self._time_scale,
+                )
 
-        logits = self.link_predictor(e_t_u, e_t_v, e_c_u, e_c_v, w_u, w_v, co_feat)
+        logits = self.link_predictor(
+            e_t_u, e_t_v, e_c_u, e_c_v, w_u, w_v, co_feat, eb_feat,
+        )
         labels = torch.cat([
             torch.ones(B, device=self.device),
             torch.zeros(B * K_neg, device=self.device),
@@ -474,6 +493,8 @@ class Trainer:
                 self.node_encoder.train()
             if self.co_encoder is not None:
                 self.co_encoder.train()
+            if self.eb_encoder is not None:
+                self.eb_encoder.train()
             if self.memory is not None:
                 self.memory.train()
             t0 = time.perf_counter()
@@ -543,6 +564,8 @@ class Trainer:
             self.node_encoder.eval()
         if self.co_encoder is not None:
             self.co_encoder.eval()
+        if self.eb_encoder is not None:
+            self.eb_encoder.eval()
         if self.memory is not None:
             self.memory.eval()
         total = 0.0

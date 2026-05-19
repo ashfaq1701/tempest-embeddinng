@@ -180,11 +180,13 @@ class LinkPredictor(nn.Module):
         hidden: int = 128,
         dropout: float = 0.0,
         use_co_feat: bool = False,
+        use_eb_feat: bool = False,
     ):
         super().__init__()
         self.use_co_feat = use_co_feat
-        # 8 cross-table + 4 walk-encoded + (1 if co_feat) — all d_emb wide
-        n_blocks = 8 + 4 + (1 if use_co_feat else 0)
+        self.use_eb_feat = use_eb_feat
+        # 8 cross-table + 4 walk-encoded + (1 if co_feat) + (1 if eb_feat)
+        n_blocks = 8 + 4 + (1 if use_co_feat else 0) + (1 if use_eb_feat else 0)
         in_d = n_blocks * d_emb
         self.norm = nn.LayerNorm(in_d)
         self.net = nn.Sequential(
@@ -206,6 +208,7 @@ class LinkPredictor(nn.Module):
         w_u: torch.Tensor,
         w_v: torch.Tensor,
         co_feat: Optional[torch.Tensor] = None,
+        eb_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         parts = [
             # u→v cross-table: target(u) interacts with context(v)
@@ -222,6 +225,13 @@ class LinkPredictor(nn.Module):
                     "co_feat was not passed to forward()."
                 )
             parts.append(co_feat)
+        if self.use_eb_feat:
+            if eb_feat is None:
+                raise ValueError(
+                    "LinkPredictor was built with use_eb_feat=True but "
+                    "eb_feat was not passed to forward()."
+                )
+            parts.append(eb_feat)
         x = torch.cat(parts, dim=-1)
         return self.net(self.norm(x)).squeeze(-1)
 
@@ -310,6 +320,118 @@ class CrossPairAttention(nn.Module):
         v_attended = v_attended * (~u_all_masked).float().unsqueeze(-1)
 
         return h_u_seq + u_attended, h_v_seq + v_attended
+
+
+class EdgeBankFeature(nn.Module):
+    """Direct (u, v) pair recurrence — EdgeBank-style features made
+    differentiable.
+
+    For each (u, v) pair at time t, looks at u's history (nb_u, hts_u)
+    and v's history (nb_v, hts_v) and produces:
+      - v_in_u_hist:     1 if v appears anywhere in u's recent K events
+      - u_in_v_hist:     1 if u appears anywhere in v's recent K events
+      - recency_v_in_u:  if v_in_u_hist, normalized Δt = (t_max −
+                         last_time_v_in_u_hist) / time_scale; else a large
+                         positive value (means "no recent interaction")
+      - recency_u_in_v:  symmetric
+      - log(1 + recency_*)  — log-scale duplicates of the above
+
+    Six scalars total → small MLP → d_emb. The first two are exactly
+    EdgeBank-tw's signal. The recency features add temporal granularity
+    (just `was this in history` vs `how recently was this in history`).
+
+    Disambiguates direct recurrence from the shared-neighbor recurrence
+    that CoOccurrenceEncoder captures: those are second-order (do u and v
+    share common neighbors); this is first-order (is v itself a past
+    neighbor of u). On wiki, the first-order signal is what EdgeBank
+    captures — and EdgeBank reaches 0.571 with that alone.
+    """
+
+    def __init__(self, d_emb: int):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(6, d_emb),
+            nn.GELU(),
+            nn.Linear(d_emb, d_emb),
+        )
+
+    @staticmethod
+    def compute_features(
+        nb_u: torch.Tensor,      # [P, K] u's history neighbors (-1 for padding)
+        nb_v: torch.Tensor,      # [P, K] v's history neighbors
+        hts_u: torch.Tensor,     # [P, K] u's history timestamps (-1 for padding)
+        hts_v: torch.Tensor,
+        vc_u: torch.Tensor,      # [P] valid count for u
+        vc_v: torch.Tensor,
+        u_ids: torch.Tensor,     # [P] u's node IDs
+        v_ids: torch.Tensor,     # [P] v's node IDs
+        t_max: int,
+        time_scale: float,
+    ) -> torch.Tensor:
+        """Returns [P, 6] feature vector."""
+        device = nb_u.device
+        K = nb_u.shape[1]
+        positions = torch.arange(K, device=device).unsqueeze(0)
+        mask_u = positions < vc_u.unsqueeze(1)                          # [P, K]
+        mask_v = positions < vc_v.unsqueeze(1)
+
+        # is v in u's history?
+        match_v_in_u = (nb_u == v_ids.unsqueeze(1)) & mask_u             # [P, K]
+        v_in_u_hist = match_v_in_u.any(dim=1).float()                    # [P]
+
+        # is u in v's history?
+        match_u_in_v = (nb_v == u_ids.unsqueeze(1)) & mask_v
+        u_in_v_hist = match_u_in_v.any(dim=1).float()
+
+        # recency: time since most recent v-in-u event (or huge value if never)
+        # Tensor of times where match is True; -1 elsewhere.
+        ts_v_in_u = torch.where(match_v_in_u, hts_u, torch.full_like(hts_u, -1))
+        max_ts_v_in_u = ts_v_in_u.max(dim=1).values.float()              # [P]; -1 if never
+        # If v never in u's history, set Δt to a large value (say 10*time_scale)
+        no_match_u = max_ts_v_in_u < 0
+        delta_v_in_u = torch.where(
+            no_match_u,
+            torch.full_like(max_ts_v_in_u, 10.0 * time_scale),
+            (float(t_max) - max_ts_v_in_u).clamp_min(0.0),
+        )
+        recency_v_in_u = delta_v_in_u / max(time_scale, 1e-6)
+
+        ts_u_in_v = torch.where(match_u_in_v, hts_v, torch.full_like(hts_v, -1))
+        max_ts_u_in_v = ts_u_in_v.max(dim=1).values.float()
+        no_match_v = max_ts_u_in_v < 0
+        delta_u_in_v = torch.where(
+            no_match_v,
+            torch.full_like(max_ts_u_in_v, 10.0 * time_scale),
+            (float(t_max) - max_ts_u_in_v).clamp_min(0.0),
+        )
+        recency_u_in_v = delta_u_in_v / max(time_scale, 1e-6)
+
+        return torch.stack([
+            v_in_u_hist,
+            u_in_v_hist,
+            recency_v_in_u,
+            recency_u_in_v,
+            torch.log1p(recency_v_in_u),
+            torch.log1p(recency_u_in_v),
+        ], dim=-1)                                                       # [P, 6]
+
+    def forward(
+        self,
+        nb_u: torch.Tensor,
+        nb_v: torch.Tensor,
+        hts_u: torch.Tensor,
+        hts_v: torch.Tensor,
+        vc_u: torch.Tensor,
+        vc_v: torch.Tensor,
+        u_ids: torch.Tensor,
+        v_ids: torch.Tensor,
+        t_max: int,
+        time_scale: float,
+    ) -> torch.Tensor:
+        feats = self.compute_features(
+            nb_u, nb_v, hts_u, hts_v, vc_u, vc_v, u_ids, v_ids, t_max, time_scale,
+        )
+        return self.proj(feats)
 
 
 class CoOccurrenceEncoder(nn.Module):
