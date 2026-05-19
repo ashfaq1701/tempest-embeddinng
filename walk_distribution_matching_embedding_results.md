@@ -417,14 +417,16 @@ Three bugs were found and fixed during this sweep — see chronological log belo
 
 Per the v2.2 §3.2 anchor std of 0.0016, Cells 6 and 2 are statistically tied. Both clear A2-off floor (0.7092) by > anchor std.
 
-### Multi-seed validation (seeds 7 + 13) on top-2
+### Multi-seed validation (seeds 7 + 13) on top-2 — FINAL
 
 | Cell | Config | Seed 42 | Seed 7 | Seed 13 | Mean ± std | Cliff observed? |
 |---|---|---|---|---|---|---|
-| 2 | Triplet | 0.7112 | 0.7116 | 0.7088 | **0.7105 ± 0.0014** | none across all 3 seeds |
-| 6 | SGNS + normbrake | 0.7113 | 0.7073 | (running, ep 14, val climbing) | TBD | **seed 7 shows cliff** (peak 0.7394 ep8 → 0.7104 ep13, Δ −0.029) |
+| 2 | **Triplet** | 0.7112 | 0.7116 | 0.7088 | **0.7105 ± 0.0014** | **none across all 3 seeds** |
+| 6 | SGNS + normbrake | 0.7113 | 0.7073 | 0.7116 (at ep25, killed early) | 0.7101 ± 0.0024 | **seed 7 cliffed** (peak 0.7394 ep8 → 0.7104 ep13, Δ −0.029); seed 13 stable plateau |
 
-**Interim winner: Cell 2 (Triplet).** Tighter cross-seed variance and *no cliff observed on any seed*. Cell 6 has higher seed-42 peak but cross-seed unstable. Final pick deferred until Cell 6 seed 13 completes.
+**Wiki §4.7 winner: Cell 2 (Triplet, no auxiliary).** Tied with SGNS+nb on mean test MRR within anchor std (0.0016), but Triplet has 1.7× tighter cross-seed variance and **zero cliffs across all 3 seeds**. The SGNS+nb seed-7 cliff is dispositive — even with normbrake actively engaged (L_nb falling 24.7 → 2.0 monotone), the embedding/link-MLP coupling drift produces a 0.029 cliff post-peak. Triplet's bounded hinge eliminates this failure mode by construction (∇L=0 once positives clear the margin) rather than after-the-fact regularization.
+
+**Cell 5 (Triplet + normbrake) confirmed dormant** — L_nb = 0.0 throughout all 12 epochs on seed 42. Triplet's col norms stay around 1.0 (well below the 3.87 threshold), so normbrake never fires. This validates v2.3 §4.7.6 criterion F: triplet self-limits as designed and doesn't need external regularization. The "Triplet + normbrake" combination is a strict no-op overhead — drop normbrake from the locked architecture.
 
 ### Three bugs found and fixed during this sweep (chronological)
 
