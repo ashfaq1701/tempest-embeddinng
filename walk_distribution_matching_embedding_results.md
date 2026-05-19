@@ -363,6 +363,8 @@ by > anchor std.
 
 **Status:** in implementation as of 2026-05-19. Pre-registration committed.
 
+**Generalization guard (v2.3 §4.7.0):** wiki is the calibration point, not the optimization target. All hyperparameters are literature defaults — no wiki-specific tweaking of `m`, `τ`, `k`, `P_n^0.75`, `t`, lr schedule, or `λ_normbrake`. The only empirically-calibrated value is normbrake's `threshold_norm = 1.5 × anchor_col_norm`; the *procedure* is portable (re-calibrate per dataset), the `1.5×` constant is the same across datasets. No post-hoc wiki tuning. Cliff behavior, not wiki peak, is the win condition.
+
 **Win condition (per v2.3 §2 + §4.7.2):** *eliminate the over-training cliff*, NOT lift wiki peak. Wiki is recurrence-saturated (`is_cold_start_uv` carries the EdgeBank-tw signal natively at the head); no loss-family change is expected to lift peak meaningfully. The diagnostic-load-bearing finding is the 5×-column-norm-growth → −0.28 test MRR cliff over 50 epochs under alignment+uniformity. A loss whose gradient is structurally bounded eliminates the cliff.
 
 **Roll-back to E.1 head:** §4.7 runs under E.1 (cross-table) because under the wiki-Phase-S-winning E.2 the embeddings are unread at scoring and the loss-family search dedup-collapses (v2.2 §4.6). If §4.7 lifts the number under E.1, production architecture becomes E.1 + §4.7 winner. Otherwise fall back to E.2 + A2-off.

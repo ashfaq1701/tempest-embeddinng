@@ -175,6 +175,20 @@ The agent has latitude in execution. Guidance for that latitude:
 
 The original Group A3 (per-position / endpoint / multi-endpoint contrastive) was three variants within the *same* inner-product-similarity family. The Phase 0.5 diagnostic (5× column-norm growth correlating with −0.28 test MRR decline) and the A2 result (alignment+uniformity is neutral on wiki) jointly suggest the *loss family itself* is the candidate to revise, not just its weighting or target position. §4.7 replaces the original A3 spec.
 
+### 4.7.0 Generalization guard (constraint on the entire search)
+
+The loss search runs on wiki to *identify* the winning family, but **the winning configuration must transfer to review (and later coin / flight / comment) without per-dataset hyperparameter tuning.** Wiki is one calibration point, not the optimization target.
+
+Rules:
+
+1. **All hyperparameters in §4.7.1 are literature defaults.** No wiki-specific tweaking of `m` (triplet margin), `τ_contrastive` (InfoNCE temperature), `k` (SGNS negatives count), `P_n^0.75` (SGNS negative distribution), Mikolov subsampling `t=1e-5`, SGNS lr schedule, or `λ_normbrake = 0.1`. If a literature value seems off on wiki, leave it — the cross-dataset transfer story is the priority.
+2. **The only empirically-calibrated value is the normbrake threshold.** The *procedure* (`threshold = 1.5 × anchor_col_norm`) is portable; the *number* (~0.54 on wiki) is dataset-specific. **On review and the server datasets, re-run the calibration with that dataset's own anchor checkpoint.** The `1.5×` multiplier is the constant; do not adjust it just to make wiki nicer.
+3. **No post-hoc wiki tuning.** If Cell 2 (Triplet) ties anchor at 0.69 with a clean cliff, accept it. Do not lower `m` to 0.4 to push wiki peak up — that would over-fit the search to wiki.
+4. **If decision criterion G (§4.7.6) forces raising the `1.5×` multiplier to `2.5×` on wiki, the new value applies to all future datasets too.** One constant across datasets, not per-dataset constants.
+5. **Cliff behavior, not wiki peak, is the win condition.** Wiki is recurrence-saturated; no primary is expected to lift peak (§2). The winning loss is the one whose cliff stays clean *across* wiki and review — that's the transferable property.
+
+The constraint is explicit because the v1.5 baseline failed exactly this test: it was tuned on wiki, looked great, but the "knobs that worked on wiki" turned out to be wiki-specific recurrence-exploits. v2.3 §4.7 is a recovery from that mode, not a repeat of it.
+
 ### 4.7.1 Candidates
 
 Three primary loss families, plus one diagnostic-derived auxiliary regularizer. All four are specified in detail in the archived `loss_function_search_ammendum.md`; §4.7 keeps the load-bearing summary here.
