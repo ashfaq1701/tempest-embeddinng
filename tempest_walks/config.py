@@ -44,6 +44,16 @@ class Config:
     #       test of "does walks-supervision help on this dataset?"
     lambda_align: float = 1.0
 
+    # Phase S Group E — link MLP head structure (v2.2 §4.1 / §6.4).
+    # "cross_table"      = E.1 (8-block cross-table + Component 0; anchor).
+    # "component_0_only" = E.2 (drop cross-table reads entirely; head sees
+    #                          only Φ(Δt_u/v/uv) + 3 cold-start bits).
+    head_mode: str = "cross_table"
+    # E.3 (when head_mode="cross_table"): dropout applied to the 8·d
+    # cross-table block before concatenation with Component 0. 0 = no
+    # dropout (E.1).
+    cross_table_dropout: float = 0.0
+
     # Uniformity loss
     eta_uniform: float = 1.0
     uniformity_temperature: float = 2.0

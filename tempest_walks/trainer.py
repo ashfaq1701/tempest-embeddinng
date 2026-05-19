@@ -68,6 +68,8 @@ class Trainer:
             hidden=config.d_hidden_link,
             use_time_encoding=config.use_time_encoding,
             d_time=2 * config.time_enc_k,
+            head_mode=config.head_mode,
+            cross_table_dropout=config.cross_table_dropout,
         ).to(self.device)
         self.time_encoder: Optional[TimeEncoder] = None
         self.time_state: Optional[NodeTimeState] = None

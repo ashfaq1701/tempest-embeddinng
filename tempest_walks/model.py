@@ -254,7 +254,7 @@ class TimeEncoder(nn.Module):
 
 
 class LinkPredictor(nn.Module):
-    """8-block cross-table MLP head + Component 0 time encoding.
+    """Configurable head — 8-block cross-table and/or Component 0 time encoding.
 
     The alignment loss trains the cosine geometry between target(seed) and
     context(walk-neighbour) — i.e. target ↔ context is the supervised
@@ -262,18 +262,24 @@ class LinkPredictor(nn.Module):
     directions) so the BCE signal can lean on it directly instead of
     re-learning it from scratch.
 
-    Input layout:
+    Heads (Phase S Group E):
+      E.1 `head_mode="cross_table"` + `cross_table_dropout=0` (default; anchor):
+          [ target(u), context(v), target(u)⊙context(v), |target(u)−context(v)|,   ← u→v
+            target(v), context(u), target(v)⊙context(u), |target(v)−context(u)|,   ← v→u
+            Φ(Δt_u), Φ(Δt_v), Φ(Δt_uv),                                            ← Component 0
+            is_cold_start_u, is_cold_start_v, is_cold_start_uv ]                   ← bits
+          input dim = 8·d + 3·d_time + 3
 
-        [ target(u), context(v), target(u)⊙context(v), |target(u)−context(v)|,   ← u→v
-          target(v), context(u), target(v)⊙context(u), |target(v)−context(u)|,   ← v→u
+      E.2 `head_mode="component_0_only"`: drops the 8-block cross-table entirely.
+          [ Φ(Δt_u), Φ(Δt_v), Φ(Δt_uv), is_cold_start_u, is_cold_start_v, is_cold_start_uv ]
+          input dim = 3·d_time + 3
+          Requires `use_time_encoding=True` (otherwise the head has no inputs).
 
-          Φ(Δt_u), Φ(Δt_v), Φ(Δt_uv),                                            ← Component 0
-          is_cold_start_u, is_cold_start_v, is_cold_start_uv                     ← 3 binary bits
-        ]  ∈ ℝ^{8·d + 3·d_time + 3}
+      E.3 `head_mode="cross_table"` + `cross_table_dropout > 0`: same layout as E.1,
+          but the 8·d cross-table block is passed through nn.Dropout(p) BEFORE
+          concatenation with the Component 0 block.
 
-    The Component 0 inputs are gated by `use_time_encoding=True` at
-    construction; when False, the head collapses to the original 8-block
-    cross-table layout (input dim = 8·d).
+    The Component 0 inputs are gated by `use_time_encoding=True` at construction.
     """
 
     def __init__(
@@ -283,13 +289,29 @@ class LinkPredictor(nn.Module):
         dropout: float = 0.0,
         use_time_encoding: bool = False,
         d_time: int = 32,
+        head_mode: str = "cross_table",
+        cross_table_dropout: float = 0.0,
     ):
         super().__init__()
+        if head_mode not in ("cross_table", "component_0_only"):
+            raise ValueError(
+                f"head_mode must be 'cross_table' or 'component_0_only', got {head_mode!r}"
+            )
+        if head_mode == "component_0_only" and not use_time_encoding:
+            raise ValueError(
+                "head_mode='component_0_only' requires use_time_encoding=True "
+                "(otherwise the head has no inputs)."
+            )
         self.use_time_encoding = use_time_encoding
         self.d_time = d_time
-        in_d = 8 * d_emb
+        self.head_mode = head_mode
+        self.cross_table_dropout = nn.Dropout(cross_table_dropout) if cross_table_dropout > 0 else None
+
+        in_d = 0
+        if head_mode == "cross_table":
+            in_d += 8 * d_emb
         if use_time_encoding:
-            in_d = in_d + 3 * d_time + 3                                   # Φ(Δt_u/v/uv) + 3 cold-start bits
+            in_d += 3 * d_time + 3
         self.norm = nn.LayerNorm(in_d)
         self.net = nn.Sequential(
             nn.Linear(in_d, hidden),
@@ -312,12 +334,17 @@ class LinkPredictor(nn.Module):
         is_cold_v: Optional[torch.Tensor] = None,
         is_cold_uv: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        parts = [
-            # u→v direction: target(u) ↔ context(v) is the trained pair
-            e_t_u, e_c_v, e_t_u * e_c_v, (e_t_u - e_c_v).abs(),
-            # v→u direction: target(v) ↔ context(u)
-            e_t_v, e_c_u, e_t_v * e_c_u, (e_t_v - e_c_u).abs(),
-        ]
+        parts = []
+        if self.head_mode == "cross_table":
+            x_ct = torch.cat([
+                # u→v direction: target(u) ↔ context(v) is the trained pair
+                e_t_u, e_c_v, e_t_u * e_c_v, (e_t_u - e_c_v).abs(),
+                # v→u direction: target(v) ↔ context(u)
+                e_t_v, e_c_u, e_t_v * e_c_u, (e_t_v - e_c_u).abs(),
+            ], dim=-1)
+            if self.cross_table_dropout is not None:
+                x_ct = self.cross_table_dropout(x_ct)
+            parts.append(x_ct)
         if self.use_time_encoding:
             if any(t is None for t in (phi_dt_u, phi_dt_v, phi_dt_uv, is_cold_u, is_cold_v, is_cold_uv)):
                 raise ValueError(

@@ -48,6 +48,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda-align", type=float, default=1.0,
                    help="Scalar on alignment loss. 0 turns walks-supervision off "
                         "(Phase S Group A2). Anchor uses 1.0.")
+    # Phase S Group E (v2.2 §4.1 / §6.4): link MLP head structure.
+    p.add_argument("--head-mode", choices=["cross_table", "component_0_only"],
+                   default="cross_table",
+                   help="E.1 cross_table (anchor) vs E.2 component_0_only "
+                        "(drops cross-table reads entirely).")
+    p.add_argument("--cross-table-dropout", type=float, default=0.0,
+                   help="E.3: dropout on the 8·d cross-table block before "
+                        "concatenation with Component 0. Only used when "
+                        "--head-mode=cross_table.")
 
     # Optimization
     p.add_argument("--num-neg-per-pos", type=int, default=10)
@@ -108,6 +117,8 @@ def main() -> None:
         uniformity_temperature=args.uniformity_temperature,
         align_weighting=args.align_weighting,
         lambda_align=args.lambda_align,
+        head_mode=args.head_mode,
+        cross_table_dropout=args.cross_table_dropout,
         num_neg_per_pos=args.num_neg_per_pos,
         hist_neg_ratio=args.hist_neg_ratio,
         reservoir_size=args.reservoir_size,
