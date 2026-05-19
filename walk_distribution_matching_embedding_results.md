@@ -245,6 +245,36 @@ three anchor seeds). Phase S configurations are judged against this
 floor; gains must be > 0.0016 (anchor std) to count as a real "win"
 per v2.2 §4.4.
 
+#### Init-divergence sanity check (post-anchor, before Phase S)
+
+The bit-tight 0.001 cross-seed agreement on per-epoch loss values is
+unusual enough to verify seed plumbing isn't broken before committing
+12 hours to Phase S's multi-seed validation in §4.3 (which becomes
+meaningless if seeds aren't actually independent).
+
+Script: `scripts/init_divergence_check.py`. Dumps `E_target[0:3]`,
+`E_context[0:3]`, `link_mlp.net[0].weight[0, 0:3]`, and the
+negative-sampler's first 5 RNG draws right after `Trainer.__init__`,
+before any forward pass, for each anchor seed.
+
+| Channel | Identical across {42, 7, 13}? |
+|---|---|
+| E_target init                       | False ✓ |
+| E_context init                      | False ✓ |
+| link_mlp first-Linear weight        | False ✓ |
+| neg_sampler.rng first-5 draws       | False ✓ |
+| time_encoder.omegas                 | True (deterministic geometric schedule from `k=16`, no randomness — expected) |
+
+**Verdict: seed plumbing is healthy.** Init genuinely varies; the
+bit-tight trajectory reproduction is a real property of the loss
+surface, not a plumbing bug.
+
+**Paper finding:** at 2 epochs on tgbl-wiki, Component 0's recurrence
+signal is so dominant that Xavier-uniform inits differing by ~0.02 in
+absolute value still collapse to the same loss within 0.001 across
+independent seeds. Worth a methodology-section sentence regardless of
+Phase S outcomes.
+
 ---
 
 ## Phase S — Bounded search frame (v2.2 §4)
