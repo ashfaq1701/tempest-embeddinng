@@ -46,6 +46,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--d-role", type=int, default=8)
     p.add_argument("--walk-encoder-dropout", type=float, default=0.1)
 
+    # Cross-pair attention (Phase 3 — DyGFormer-style)
+    p.add_argument("--xpair-n-heads", type=int, default=4)
+    p.add_argument("--xpair-dropout", type=float, default=0.1)
+    p.add_argument("--link-dropout", type=float, default=0.0)
+
     # Losses
     p.add_argument("--temporal-decay-exp", type=float, default=0.5)
     p.add_argument("--alignment-time-scale", type=float, default=-1.0)
@@ -100,6 +105,9 @@ def main() -> None:
         d_time=args.d_time,
         d_role=args.d_role,
         walk_encoder_dropout=args.walk_encoder_dropout,
+        xpair_n_heads=args.xpair_n_heads,
+        xpair_dropout=args.xpair_dropout,
+        link_dropout=args.link_dropout,
         temporal_decay_exp=args.temporal_decay_exp,
         alignment_time_scale=args.alignment_time_scale,
         eta_uniform=args.eta_uniform,
@@ -162,10 +170,11 @@ def main() -> None:
     loaded.dataset.load_val_ns()
     loaded.dataset.load_test_ns()
 
-    # Phase 2: pass the walk generator + encoder + derived time_scale to the
-    # Evaluator so it can encode walks for each batch's union of pos+neg
-    # node IDs and feed h_u/h_v to the link MLP — same Phase 2 protocol as
-    # training, just no backward.
+    # Phase 3: pass walk generator + encoder + cross-pair attention to the
+    # Evaluator. Per-batch it samples walks for unique(pos ∪ neg) nodes,
+    # builds per-seed sequences, then runs cross-pair attention inside the
+    # chunk loop to produce pair-conditioned W(u), W(v) for the 4-channel
+    # link MLP.
     eval_val = Evaluator(
         embedding_store=trainer.embedding_store,
         link_predictor=trainer.link_predictor,
@@ -175,6 +184,7 @@ def main() -> None:
         eval_metric=loaded.eval_metric,
         walk_gen=trainer.walk_gen,
         walk_encoder=trainer.walk_encoder,
+        cross_pair_attn=trainer.cross_pair_attn,
         time_scale=trainer._time_scale,
     )
     eval_test = Evaluator(
@@ -186,6 +196,7 @@ def main() -> None:
         eval_metric=loaded.eval_metric,
         walk_gen=trainer.walk_gen,
         walk_encoder=trainer.walk_encoder,
+        cross_pair_attn=trainer.cross_pair_attn,
         time_scale=trainer._time_scale,
     )
 

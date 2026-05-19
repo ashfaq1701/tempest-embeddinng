@@ -210,39 +210,32 @@ class EmbeddingStore(nn.Module):
 
 
 class LinkPredictor(nn.Module):
-    """12-block MLP head with cross-table + walk-encoded interactions.
+    """4-channel MLP head: [E(u) ‖ E(v) ‖ W(u) ‖ W(v)].
 
-    Three channel groups, each contributing 4 blocks of [a, b, a⊙b, |a−b|]:
+    Simpler than the prior 12-block design — relies on CrossPairAttention
+    (a separate module) to do all the interaction work *before* the head
+    sees its inputs. The MLP itself is just a non-linear scorer on the
+    concatenated raw inputs; no Hadamard / L1 / cross-table blocks.
 
-      group 1 — u→v direction (raw): target(u) ↔ context(v)
-      group 2 — v→u direction (raw): target(v) ↔ context(u)
-      group 3 — walk-encoded:        h_seed_u ↔ h_seed_v
+    Per-channel contract:
+      - E(u), E(v):  identity-table node embeddings (typically target()).
+                     Stable per-node, independent of (u, v) pairing.
+      - W(u), W(v):  walk-summary embeddings AFTER cross-pair attention —
+                     each side has already attended to the other's walk,
+                     so co-occurrence / shared-history signal is folded
+                     into W before the MLP sees it.
 
-    Groups 1+2 expose the cross-table dot-product geometry the alignment
-    loss trains. Group 3 exposes the walk-summary representation the GRU
-    encoder builds — the channel that closes the "alignment trains, link
-    can't see it" disconnect that crippled Phase 1.
-
-    When the walk encoder is OFF (use_walk_encoder=False), pass h_u/h_v
-    = target(u)/target(v) as a fallback — `n_walk_blocks=0` builds an
-    8-block head that ignores h entirely. The block count is fixed at
-    construction time.
+    Why 4 raw channels instead of 12 hand-crafted interactions: the
+    cross-pair attention is a learned interaction. Stacking it under
+    Hadamard / L1 blocks would just give the MLP two stages of feature
+    cross — wasteful and harder to train. The MLP becomes a clean
+    "is this combination of identity + walk-context-aware-summaries
+    consistent with a positive link?" classifier.
     """
 
-    def __init__(
-        self,
-        d_emb: int,
-        hidden: int = 128,
-        dropout: float = 0.0,
-        n_walk_blocks: int = 4,
-    ):
+    def __init__(self, d_emb: int, hidden: int = 128, dropout: float = 0.0):
         super().__init__()
-        # 8 raw blocks (cross-table, both directions) + up to 4 walk-encoded.
-        if n_walk_blocks not in (0, 4):
-            raise ValueError(f"n_walk_blocks must be 0 or 4, got {n_walk_blocks}")
-        self.n_walk_blocks = n_walk_blocks
-        n_blocks = 8 + n_walk_blocks
-        in_d = n_blocks * d_emb
+        in_d = 4 * d_emb
         self.norm = nn.LayerNorm(in_d)
         self.net = nn.Sequential(
             nn.Linear(in_d, hidden),
@@ -256,28 +249,112 @@ class LinkPredictor(nn.Module):
 
     def forward(
         self,
-        e_t_u: torch.Tensor, e_t_v: torch.Tensor,
-        e_c_u: torch.Tensor, e_c_v: torch.Tensor,
-        h_u: Optional[torch.Tensor] = None,
-        h_v: Optional[torch.Tensor] = None,
+        e_u: torch.Tensor,
+        e_v: torch.Tensor,
+        w_u: torch.Tensor,
+        w_v: torch.Tensor,
     ) -> torch.Tensor:
-        parts = [
-            # u→v direction: target(u) ↔ context(v) is the trained pair
-            e_t_u, e_c_v, e_t_u * e_c_v, (e_t_u - e_c_v).abs(),
-            # v→u direction: target(v) ↔ context(u)
-            e_t_v, e_c_u, e_t_v * e_c_u, (e_t_v - e_c_u).abs(),
-        ]
-        if self.n_walk_blocks > 0:
-            if h_u is None or h_v is None:
-                raise ValueError(
-                    "LinkPredictor was built with n_walk_blocks>0 but h_u/h_v "
-                    "were not provided. Pass walk-summary tensors (or "
-                    "target(u)/target(v) as a manual fallback).",
-                )
-            # Walk-encoded direction-agnostic: h carries path context already
-            parts.extend([h_u, h_v, h_u * h_v, (h_u - h_v).abs()])
-        x = torch.cat(parts, dim=-1)
+        x = torch.cat([e_u, e_v, w_u, w_v], dim=-1)
         return self.net(self.norm(x)).squeeze(-1)
+
+
+class CrossPairAttention(nn.Module):
+    """DyGFormer-style cross-pair attention between two walk sequences.
+
+    For each (u, v) pair, both walks (pre-pooled per-position encodings)
+    attend to each other so the resulting per-position outputs carry
+    co-occurrence / shared-history structure. Pooling those gives W(u)
+    and W(v) — pair-conditioned walk summaries that feed the link MLP.
+
+    Pre-LN residual block in both directions:
+        h_u_out = h_u + MHA( LN(h_u), LN(h_v), LN(h_v) )
+        h_v_out = h_v + MHA( LN(h_v), LN(h_u), LN(h_u) )
+
+    Two separate MHAs (one per direction) — they have different roles
+    even on undirected datasets: u attending to v looks for "what of u's
+    history is supported by v's neighbours", v attending to u looks for
+    the symmetric direction.
+
+    `key_padding_mask` is `True` for positions that should be MASKED OUT
+    (padding / cold-start beyond the walk's true length). Caller passes
+    `(~valid_mask)` where valid_mask is True at real positions.
+    """
+
+    def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.0):
+        super().__init__()
+        self.ln_u = nn.LayerNorm(d_model)
+        self.ln_v = nn.LayerNorm(d_model)
+        self.u_attn_v = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=n_heads,
+            dropout=dropout, batch_first=True,
+        )
+        self.v_attn_u = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=n_heads,
+            dropout=dropout, batch_first=True,
+        )
+
+    def forward(
+        self,
+        h_u_seq: torch.Tensor,   # [P, L, d]
+        h_v_seq: torch.Tensor,   # [P, L, d]
+        u_valid_mask: torch.Tensor,  # [P, L]  True where valid (real walk position)
+        v_valid_mask: torch.Tensor,  # [P, L]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (h_u_out, h_v_out) — same shapes as inputs.
+
+        Cold-start guarantee: if any row of u_valid_mask or v_valid_mask is
+        all-False, the corresponding row's attention reduces to an identity
+        (we override with the residual h_*_seq itself) to avoid NaN.
+        """
+        # MHA's key_padding_mask: True = MASK OUT
+        u_kpm = ~u_valid_mask
+        v_kpm = ~v_valid_mask
+
+        # Detect all-masked rows on each side and force at least one valid
+        # key for MHA to consume (otherwise softmax over empty produces NaN).
+        # We blend the cold-start rows OUT of the attention output below.
+        u_all_masked = u_kpm.all(dim=1, keepdim=True)   # [P, 1]
+        v_all_masked = v_kpm.all(dim=1, keepdim=True)
+        u_kpm_safe = u_kpm.clone()
+        v_kpm_safe = v_kpm.clone()
+        u_kpm_safe[:, 0] = u_kpm_safe[:, 0] & ~u_all_masked.squeeze(-1)
+        v_kpm_safe[:, 0] = v_kpm_safe[:, 0] & ~v_all_masked.squeeze(-1)
+
+        u_q = self.ln_u(h_u_seq)
+        v_q = self.ln_v(h_v_seq)
+
+        # u attends to v's walk
+        u_attended, _ = self.u_attn_v(
+            query=u_q, key=v_q, value=v_q,
+            key_padding_mask=v_kpm_safe,
+            need_weights=False,
+        )
+        # v attends to u's walk
+        v_attended, _ = self.v_attn_u(
+            query=v_q, key=u_q, value=u_q,
+            key_padding_mask=u_kpm_safe,
+            need_weights=False,
+        )
+
+        # Zero out attention contribution for cold-start rows (no info on
+        # the other side to attend to). Residual carries them forward.
+        u_attended = u_attended * (~v_all_masked).float().unsqueeze(-1)
+        v_attended = v_attended * (~u_all_masked).float().unsqueeze(-1)
+
+        return h_u_seq + u_attended, h_v_seq + v_attended
+
+
+def masked_mean_pool(
+    h_seq: torch.Tensor,        # [P, L, d]
+    valid_mask: torch.Tensor,   # [P, L]
+) -> torch.Tensor:
+    """Mean-pool over the valid positions of each row. Rows that are
+    all-invalid pool to zero (and the caller should substitute a fallback
+    like target(node) before passing to the link MLP)."""
+    mask_f = valid_mask.float().unsqueeze(-1)            # [P, L, 1]
+    summed = (h_seq * mask_f).sum(dim=1)                  # [P, d]
+    counts = mask_f.sum(dim=1).clamp_min(1e-6)            # [P, 1]
+    return summed / counts
 
 
 class WalkEncoder(nn.Module):

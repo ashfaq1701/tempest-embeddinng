@@ -27,7 +27,13 @@ from .config import Config
 from .data import Batch
 from .evaluator import Evaluator
 from .losses import alignment_loss, link_bce, uniformity_loss
-from .model import EmbeddingStore, LinkPredictor, WalkEncoder
+from .model import (
+    CrossPairAttention,
+    EmbeddingStore,
+    LinkPredictor,
+    WalkEncoder,
+    masked_mean_pool,
+)
 from .negatives import (
     HistoricalNegativeSampler,
     NegativeSampler,
@@ -59,15 +65,24 @@ class Trainer:
             node_feat=node_feat,
             edge_feat_dim=edge_feat_dim,
         ).to(self.device)
-        # Phase 2: with the walk encoder on, the link MLP grows from 8 blocks
-        # to 12 (adds h_u/h_v/h_u⊙h_v/|h_u−h_v|). When the encoder is off,
-        # we fall back to the original 8-block head.
-        n_walk_blocks = 4 if config.use_walk_encoder else 0
+        # Phase 3: 4-channel link MLP [E(u) ‖ E(v) ‖ W(u) ‖ W(v)] —
+        # cross-pair attention does the interaction work BEFORE the MLP
+        # sees its inputs, so we don't need Hadamard/L1/cross-table blocks.
         self.link_predictor = LinkPredictor(
             config.d_emb,
             config.d_hidden_link,
-            n_walk_blocks=n_walk_blocks,
+            dropout=config.link_dropout,
         ).to(self.device)
+        # Cross-pair attention head — pair-conditioned walk summary.
+        # Lives with the link side: parameters are scoring-specific
+        # (the alignment loss doesn't touch them).
+        self.cross_pair_attn: Optional[CrossPairAttention] = None
+        if config.use_walk_encoder:
+            self.cross_pair_attn = CrossPairAttention(
+                d_model=config.d_emb,
+                n_heads=config.xpair_n_heads,
+                dropout=config.xpair_dropout,
+            ).to(self.device)
         # Walk encoder (Phase 1): GRU over per-position walk inputs.
         # d_gru is fixed to d_emb so its output can be directly cosine-
         # compared against target(seed) in the alignment loss. The encoder
@@ -112,50 +127,68 @@ class Trainer:
         if self.walk_encoder is not None:
             emb_params += list(self.walk_encoder.parameters())
         self.emb_optimizer = torch.optim.Adam(emb_params, lr=config.emb_lr)
-        self.link_optimizer = torch.optim.Adam(
-            self.link_predictor.parameters(), lr=config.link_lr,
-        )
+        link_params = list(self.link_predictor.parameters())
+        if self.cross_pair_attn is not None:
+            link_params += list(self.cross_pair_attn.parameters())
+        self.link_optimizer = torch.optim.Adam(link_params, lr=config.link_lr)
         self._time_scale = config.alignment_time_scale  # overridden after dataset load
 
     # ------------------------------------------------------------------ #
     # Per-batch step (strict-causal: ingest is the LAST thing).
     # ------------------------------------------------------------------ #
 
-    def _compute_seed_h(
+    def _compute_seed_seq(
         self,
         walks: WalkData,
         h_walks: torch.Tensor,
         seeds_tensor: torch.Tensor,
-    ) -> torch.Tensor:
-        """Extract a per-seed walk-summary vector from the GRU output.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-seed averaged walk SEQUENCE for cross-pair attention.
 
-        h_walks: [N*K, L, d_emb] — GRU hidden states at every position.
-        seeds_tensor: [N] long — unique seeds in the order walks were sampled.
-
-        Returns: [N, d_emb] — for each unique seed, the mean of h_{w, lens_w-1}
-        over the K walks of that seed (only walks with lens > 0 contribute).
-        All-cold-start seeds (every walk has lens=0) fall back to target(seed).
+        h_walks: [N*K, L, d] — GRU outputs at every position of every walk.
+        Returns:
+            h_seq:     [N, L, d]  — at each position p, the mean of
+                                    h_walks[seed_i * K : (seed_i+1) * K, p, :]
+                                    over walks where lens > p (i.e. position
+                                    p is real for that walk).
+            valid_mask: [N, L]    — True if at least one walk of that seed
+                                    has lens > p (so position p is real).
+                                    Cold-start seeds (all-zero) get
+                                    valid_mask[i, 0]=True and h_seq[i, 0, :]
+                                    = target(seed_i) as a fallback.
         """
         K = walks.K
-        walk_lens = walks.lens.to(self.device).long()                              # [N*K]
-        # h at the seed slot of every walk (clamp to 0 for safety).
-        arange_w = torch.arange(h_walks.shape[0], device=self.device)
-        seed_pos = (walk_lens - 1).clamp_min(0)
-        h_at_seed_per_walk = h_walks[arange_w, seed_pos, :]                        # [N*K, d]
-        has_walk = (walk_lens > 0).float().unsqueeze(-1)                           # [N*K, 1]
-
         N = seeds_tensor.shape[0]
-        h_at_seed_per_walk = h_at_seed_per_walk.reshape(N, K, -1)                  # [N, K, d]
-        has_walk = has_walk.reshape(N, K, 1)                                       # [N, K, 1]
+        L = h_walks.shape[1]
+        d = h_walks.shape[2]
+        walk_lens = walks.lens.to(self.device).long()                              # [N*K]
 
-        h_sum = (h_at_seed_per_walk * has_walk).sum(dim=1)                         # [N, d]
-        h_cnt = has_walk.sum(dim=1).clamp_min(1.0)                                 # [N, 1]
-        h_avg = h_sum / h_cnt                                                      # [N, d]
+        positions = torch.arange(L, device=self.device).unsqueeze(0)              # [1, L]
+        per_walk_valid = positions < walk_lens.unsqueeze(1)                        # [N*K, L]
 
-        # Cold-start fallback: seeds whose every walk has lens=0 → target(seed).
-        no_walk = (has_walk.sum(dim=1) == 0).float()                               # [N, 1]
-        target_seeds = self.embedding_store.target(seeds_tensor)                   # [N, d]
-        return h_avg * (1.0 - no_walk) + target_seeds * no_walk
+        h_walks_re = h_walks.reshape(N, K, L, d)
+        valid_re = per_walk_valid.reshape(N, K, L)
+
+        valid_f = valid_re.float().unsqueeze(-1)                                   # [N, K, L, 1]
+        h_sum = (h_walks_re * valid_f).sum(dim=1)                                  # [N, L, d]
+        h_cnt = valid_f.sum(dim=1).clamp_min(1.0)                                  # [N, L, 1]
+        h_seq = h_sum / h_cnt                                                      # [N, L, d]
+
+        valid_mask = valid_re.any(dim=1)                                           # [N, L]
+
+        # Cold-start fallback: seeds whose every walk has lens=0 — no valid
+        # position at all. Inject target(seed) into position 0 so cross-pair
+        # attention has something to attend FROM and so the masked_mean_pool
+        # doesn't return zero.
+        no_walk_any = ~valid_mask.any(dim=1)                                       # [N]
+        if no_walk_any.any():
+            target_seeds = self.embedding_store.target(seeds_tensor)
+            h_seq = h_seq.clone()
+            valid_mask = valid_mask.clone()
+            h_seq[no_walk_any, 0, :] = target_seeds[no_walk_any]
+            valid_mask[no_walk_any, 0] = True
+
+        return h_seq, valid_mask
 
     def _step(self, batch: Batch) -> tuple[float, float, float]:
         """Unified Phase 2 step: walks → encoder → alignment + uniformity + link,
@@ -212,8 +245,9 @@ class Trainer:
             time_scale=self._time_scale,
         )                                                                          # [N*K, L, d]
 
-        # ── (5) Per-seed walk-summary h (target() fallback for cold-start) ────
-        seed_h = self._compute_seed_h(walks, h_walks, seeds_tensor)               # [N, d]
+        # ── (5) Per-seed walk SEQUENCE (avg over K, target() cold-start fallback)
+        seed_seq, seq_mask = self._compute_seed_seq(walks, h_walks, seeds_tensor)
+        # seed_seq: [N, L, d]   seq_mask: [N, L]
 
         # ── (6a) Alignment: target(seed) ↔ GRU outputs along the walk ────────
         e_target_seed = self.embedding_store.target(seeds_tensor)                  # [N, d]
@@ -235,27 +269,35 @@ class Trainer:
             cap=self.config.uniformity_cap,
         )
 
-        # ── (6c) Link prediction: 8 raw blocks + 4 walk-encoded blocks ───────
-        # Map every (u, v) pair's node IDs to their position in seeds_np so we
-        # can gather seed_h. seeds_np is sorted unique → searchsorted is O(log N).
+        # ── (6c) Link prediction: 4-channel MLP [E(u), E(v), W(u), W(v)] ──
+        # W(u), W(v) are PAIR-CONDITIONED — they come from cross-pair attention
+        # between u's walk sequence and v's walk sequence. Gather per-pair
+        # sequences, run cross-attention, pool, then score.
         all_u = np.concatenate([batch.src, neg_src.reshape(-1).astype(np.int64)])
         all_v = np.concatenate([batch.tgt, neg_tgt.reshape(-1).astype(np.int64)])
         u_idx_in_seeds = np.searchsorted(seeds_np, all_u)
         v_idx_in_seeds = np.searchsorted(seeds_np, all_v)
         u_idx_t = torch.from_numpy(u_idx_in_seeds).long().to(self.device)
         v_idx_t = torch.from_numpy(v_idx_in_seeds).long().to(self.device)
-        h_u = seed_h[u_idx_t]
-        h_v = seed_h[v_idx_t]
+
+        h_u_seq = seed_seq[u_idx_t]            # [P, L, d]
+        h_v_seq = seed_seq[v_idx_t]
+        u_mask = seq_mask[u_idx_t]             # [P, L]
+        v_mask = seq_mask[v_idx_t]
+
+        # Cross-pair attention: both sides attend to the other's walk
+        h_u_attn, h_v_attn = self.cross_pair_attn(h_u_seq, h_v_seq, u_mask, v_mask)
+
+        # Masked mean pool → pair-conditioned walk summaries
+        w_u = masked_mean_pool(h_u_attn, u_mask)   # [P, d]
+        w_v = masked_mean_pool(h_v_attn, v_mask)   # [P, d]
 
         u_t = torch.from_numpy(all_u).long().to(self.device)
         v_t = torch.from_numpy(all_v).long().to(self.device)
-        logits = self.link_predictor(
-            self.embedding_store.target(u_t),
-            self.embedding_store.target(v_t),
-            self.embedding_store.context(u_t),
-            self.embedding_store.context(v_t),
-            h_u, h_v,
-        )
+        e_u = self.embedding_store.target(u_t)     # [P, d]
+        e_v = self.embedding_store.target(v_t)     # [P, d]
+
+        logits = self.link_predictor(e_u, e_v, w_u, w_v)
         labels = torch.cat([
             torch.ones(B, device=self.device),
             torch.zeros(B * K_neg, device=self.device),
@@ -293,6 +335,8 @@ class Trainer:
             self.link_predictor.train()
             if self.walk_encoder is not None:
                 self.walk_encoder.train()
+            if self.cross_pair_attn is not None:
+                self.cross_pair_attn.train()
             t0 = time.perf_counter()
             sum_align = sum_uniform = sum_link = 0.0
             n = 0
@@ -324,6 +368,8 @@ class Trainer:
         self.link_predictor.eval()
         if self.walk_encoder is not None:
             self.walk_encoder.eval()
+        if self.cross_pair_attn is not None:
+            self.cross_pair_attn.eval()
         total = 0.0
         n = 0
         for batch in batches:

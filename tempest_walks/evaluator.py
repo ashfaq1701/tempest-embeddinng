@@ -18,16 +18,30 @@ import numpy as np
 import torch
 
 from .data import Batch
-from .model import EmbeddingStore, LinkPredictor, WalkEncoder
+from .model import (
+    CrossPairAttention,
+    EmbeddingStore,
+    LinkPredictor,
+    WalkEncoder,
+    masked_mean_pool,
+)
 from .negatives import NegativeSampler
 from .walks import WalkGenerator
 
 
 _ROW_BUDGET_AT_D128 = 500_000
 
+# Cross-pair attention is much heavier per row than the bare link MLP —
+# every pair needs h_u_seq [L, d] and h_v_seq [L, d] gathered plus an
+# attention matrix [L, L, n_heads] computed in two directions. Empirically
+# the safe budget at L=20, d=128, n_heads=4 on 8 GB VRAM is ~10K rows
+# per chunk (vs 500K for the plain link MLP).
+_ROW_BUDGET_AT_D128_XPAIR = 10_000
 
-def _row_budget_for_d_emb(d_emb: int) -> int:
-    return max(50_000, _ROW_BUDGET_AT_D128 * 128 // d_emb)
+
+def _row_budget_for_d_emb(d_emb: int, with_cross_pair: bool) -> int:
+    base = _ROW_BUDGET_AT_D128_XPAIR if with_cross_pair else _ROW_BUDGET_AT_D128
+    return max(5_000 if with_cross_pair else 50_000, base * 128 // d_emb)
 
 
 class Evaluator:
@@ -44,6 +58,7 @@ class Evaluator:
         # the PRE-batch Tempest state.
         walk_gen: Optional[WalkGenerator] = None,
         walk_encoder: Optional[WalkEncoder] = None,
+        cross_pair_attn: Optional[CrossPairAttention] = None,
         time_scale: Optional[float] = None,
     ):
         # Lazy import so this module loads without py-tgb installed.
@@ -55,19 +70,22 @@ class Evaluator:
         self.device = device
         self.eval_metric = eval_metric
         self.tgb_eval = TGBEvaluator(name=tgb_dataset_name)
-        self.row_budget = _row_budget_for_d_emb(embedding_store.d_emb)
+        self.row_budget = _row_budget_for_d_emb(
+            embedding_store.d_emb,
+            with_cross_pair=cross_pair_attn is not None,
+        )
         self.walk_gen = walk_gen
         self.walk_encoder = walk_encoder
+        self.cross_pair_attn = cross_pair_attn
         self.time_scale = time_scale
-        # Consistency check: if the link MLP wants walk blocks, we need
-        # both a walk generator and encoder.
-        if link_predictor.n_walk_blocks > 0 and (
-            walk_gen is None or walk_encoder is None or time_scale is None
+        # Consistency check: with the walk encoder + cross-pair attn, all
+        # three components must be wired together.
+        if walk_encoder is not None and (
+            walk_gen is None or cross_pair_attn is None or time_scale is None
         ):
             raise ValueError(
-                "LinkPredictor.n_walk_blocks > 0 but Evaluator was constructed "
-                "without walk_gen / walk_encoder / time_scale — eval would "
-                "have no h_u/h_v to feed into the head.",
+                "Evaluator with walk_encoder requires walk_gen, "
+                "cross_pair_attn, and time_scale to all be provided.",
             )
 
     @torch.no_grad()
@@ -78,14 +96,14 @@ class Evaluator:
 
         all_u, all_v, counts = self._interleave(batch, neg_src, neg_tgt, B)
 
-        # Phase 2: walk-encode all unique nodes in this batch once, then look
-        # h up per-pair. Within-batch deduplication is the cache — same role
-        # as Phase 3's planned cross-batch cache, but scoped to one batch.
-        seed_h_lookup: Optional[Tuple[np.ndarray, torch.Tensor]] = None
+        # Phase 3: walk-encode all unique nodes in this batch once, build the
+        # per-seed sequence (avg over K walks per position) + valid mask.
+        # Per-pair cross-attention happens inside the chunk loop.
+        seed_seq_lookup: Optional[Tuple[np.ndarray, torch.Tensor, torch.Tensor]] = None
         if self.walk_encoder is not None:
-            seed_h_lookup = self._encode_walks_for_batch(all_u, all_v, batch.t_max)
+            seed_seq_lookup = self._encode_walks_for_batch(all_u, all_v, batch.t_max)
 
-        scores = self._score_chunked(all_u, all_v, counts, seed_h_lookup)
+        scores = self._score_chunked(all_u, all_v, counts, seed_seq_lookup)
 
         scores_np = scores.cpu().numpy()
         total = 0.0
@@ -107,9 +125,15 @@ class Evaluator:
         all_u: torch.Tensor,
         all_v: torch.Tensor,
         t_max: int,
-    ) -> Tuple[np.ndarray, torch.Tensor]:
+    ) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor]:
         """Sample walks for every unique node in this batch, run the encoder
-        once, return (sorted_seeds_np, seed_h: [N_unique, d_emb]).
+        once, return per-seed walk SEQUENCES + valid masks for cross-pair
+        attention to consume per pair.
+
+        Returns:
+            seeds_np  : np.ndarray   sorted unique seed ids
+            seed_seq  : [N, L, d_emb] per-position mean over K walks
+            seq_mask  : [N, L] bool  True at valid (real-walk) positions
 
         Strict-causal: walks come from the CURRENT Tempest state (the trainer
         ingests AFTER calling evaluate_batch). Same protocol as training.
@@ -128,6 +152,7 @@ class Evaluator:
         )
         seeds_tensor = walks.seeds.to(self.device).long()
         K = walks.K
+        L = nodes.shape[1]
         t_query_per_walk = torch.full(
             (seeds_tensor.shape[0] * K,), int(t_max),
             dtype=torch.long, device=self.device,
@@ -141,29 +166,37 @@ class Evaluator:
             time_scale=self.time_scale,
         )                                                                          # [N*K, L, d]
 
-        # Per-seed walk summary: mean of h[w, lens_w-1] over K walks,
-        # target() fallback for all-cold-start seeds.
-        arange_w = torch.arange(h_walks.shape[0], device=self.device)
-        seed_pos = (walk_lens - 1).clamp_min(0)
-        h_at_seed_per_walk = h_walks[arange_w, seed_pos, :]                        # [N*K, d]
-        has_walk = (walk_lens > 0).float().unsqueeze(-1)                           # [N*K, 1]
+        # Per-position avg over K walks (same logic as Trainer._compute_seed_seq).
         N = seeds_tensor.shape[0]
-        h_at_seed_per_walk = h_at_seed_per_walk.reshape(N, K, -1)
-        has_walk = has_walk.reshape(N, K, 1)
-        h_sum = (h_at_seed_per_walk * has_walk).sum(dim=1)
-        h_cnt = has_walk.sum(dim=1).clamp_min(1.0)
-        h_avg = h_sum / h_cnt
-        no_walk = (has_walk.sum(dim=1) == 0).float()
-        target_seeds = self.embedding_store.target(seeds_tensor)
-        seed_h = h_avg * (1.0 - no_walk) + target_seeds * no_walk                  # [N, d]
-        return seeds_np, seed_h
+        d = h_walks.shape[2]
+        positions = torch.arange(L, device=self.device).unsqueeze(0)
+        per_walk_valid = positions < walk_lens.unsqueeze(1)                        # [N*K, L]
+        h_walks_re = h_walks.reshape(N, K, L, d)
+        valid_re = per_walk_valid.reshape(N, K, L)
+        valid_f = valid_re.float().unsqueeze(-1)
+        h_sum = (h_walks_re * valid_f).sum(dim=1)
+        h_cnt = valid_f.sum(dim=1).clamp_min(1.0)
+        seed_seq = h_sum / h_cnt                                                   # [N, L, d]
+        seq_mask = valid_re.any(dim=1)                                             # [N, L]
+
+        # Cold-start fallback: nodes with every walk lens=0 — inject
+        # target(seed) at position 0 so cross-pair attention has a key/value.
+        no_walk_any = ~seq_mask.any(dim=1)
+        if no_walk_any.any():
+            target_seeds = self.embedding_store.target(seeds_tensor)
+            seed_seq = seed_seq.clone()
+            seq_mask = seq_mask.clone()
+            seed_seq[no_walk_any, 0, :] = target_seeds[no_walk_any]
+            seq_mask[no_walk_any, 0] = True
+
+        return seeds_np, seed_seq, seq_mask
 
     def _score_chunked(
         self,
         all_u: torch.Tensor,
         all_v: torch.Tensor,
         counts: List[int],
-        seed_h_lookup: Optional[Tuple[np.ndarray, torch.Tensor]] = None,
+        seed_seq_lookup: Optional[Tuple[np.ndarray, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Score [P] rows through the link predictor in row_budget-sized chunks.
 
@@ -171,8 +204,10 @@ class Evaluator:
         across chunks. Pure cap on memory; the math is identical to the
         unchunked path.
 
-        When `seed_h_lookup` is supplied (Phase 2), the link MLP also reads
-        h_u/h_v per row, gathered from the per-batch encoded lookup.
+        Cross-pair attention runs PER CHUNK because every row has its own
+        (u, v) pair → its own pair-conditioned W(u), W(v). The per-batch
+        walk encoding happens once (in `_encode_walks_for_batch`); per-chunk
+        we just gather sequences and run MHA.
         """
         group_sizes = [1 + c for c in counts]
         rows = []
@@ -189,39 +224,45 @@ class Evaluator:
 
         out = torch.empty(int(all_u.shape[0]), dtype=torch.float32, device=self.device)
 
-        if seed_h_lookup is not None:
-            seeds_np, seed_h = seed_h_lookup
-            # Pre-compute the (u, v) → seed-index lookups once for the whole
-            # batch — keeps per-chunk overhead minimal.
-            all_u_np = all_u.cpu().numpy().astype(np.int64)
-            all_v_np = all_v.cpu().numpy().astype(np.int64)
-            u_idx_full = torch.from_numpy(
-                np.searchsorted(seeds_np, all_u_np),
-            ).long().to(self.device)
-            v_idx_full = torch.from_numpy(
-                np.searchsorted(seeds_np, all_v_np),
-            ).long().to(self.device)
+        # Walk-encoded path requires the lookup AND the cross-pair attention.
+        if seed_seq_lookup is None or self.cross_pair_attn is None:
+            raise RuntimeError(
+                "Evaluator was constructed without walk_encoder/cross_pair_attn "
+                "but the current LinkPredictor is the 4-channel variant that "
+                "requires walk-encoded W(u), W(v). Wire those in.",
+            )
+
+        seeds_np, seed_seq, seq_mask = seed_seq_lookup
+        all_u_np = all_u.cpu().numpy().astype(np.int64)
+        all_v_np = all_v.cpu().numpy().astype(np.int64)
+        u_idx_full = torch.from_numpy(
+            np.searchsorted(seeds_np, all_u_np),
+        ).long().to(self.device)
+        v_idx_full = torch.from_numpy(
+            np.searchsorted(seeds_np, all_v_np),
+        ).long().to(self.device)
 
         for start, end in rows:
             u = all_u[start:end]
             v = all_v[start:end]
-            if seed_h_lookup is not None:
-                h_u = seed_h[u_idx_full[start:end]]
-                h_v = seed_h[v_idx_full[start:end]]
-                out[start:end] = self.link_predictor(
-                    self.embedding_store.target(u),
-                    self.embedding_store.target(v),
-                    self.embedding_store.context(u),
-                    self.embedding_store.context(v),
-                    h_u, h_v,
-                )
-            else:
-                out[start:end] = self.link_predictor(
-                    self.embedding_store.target(u),
-                    self.embedding_store.target(v),
-                    self.embedding_store.context(u),
-                    self.embedding_store.context(v),
-                )
+            u_idx = u_idx_full[start:end]
+            v_idx = v_idx_full[start:end]
+
+            h_u_seq = seed_seq[u_idx]                       # [P_chunk, L, d]
+            h_v_seq = seed_seq[v_idx]
+            u_mask = seq_mask[u_idx]                        # [P_chunk, L]
+            v_mask = seq_mask[v_idx]
+
+            h_u_attn, h_v_attn = self.cross_pair_attn(
+                h_u_seq, h_v_seq, u_mask, v_mask,
+            )
+            w_u = masked_mean_pool(h_u_attn, u_mask)         # [P_chunk, d]
+            w_v = masked_mean_pool(h_v_attn, v_mask)
+
+            e_u = self.embedding_store.target(u)
+            e_v = self.embedding_store.target(v)
+            out[start:end] = self.link_predictor(e_u, e_v, w_u, w_v)
+
         return out
 
     def _interleave(

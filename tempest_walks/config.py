@@ -27,6 +27,12 @@ class Config:
     d_role: int = 8
     walk_encoder_dropout: float = 0.1
 
+    # Cross-pair attention (Phase 3 — DyGFormer-style; pair-conditioned
+    # walk summaries feed into the 4-channel link MLP).
+    xpair_n_heads: int = 4
+    xpair_dropout: float = 0.1
+    link_dropout: float = 0.0
+
     # Alignment loss
     temporal_decay_exp: float = 0.5      # β in (1 + Δt/time_scale)^(-β)
     alignment_time_scale: float = -1.0   # ≤ 0 ⇒ derive from training time range
