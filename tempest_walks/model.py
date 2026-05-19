@@ -207,33 +207,89 @@ class EmbeddingStore(nn.Module):
         return self.context_walk_final(torch.cat([c, ef_padded], dim=-1))
 
 
+class TimeEncoder(nn.Module):
+    """Functional time encoding (Xu et al. 2020) — Φ(Δt) ∈ ℝ^{2k}.
+
+    Standard recipe used by TGAT / TGN / DyGFormer:
+
+        Φ(Δt) = [cos(ω_1·Δt), sin(ω_1·Δt), ..., cos(ω_k·Δt), sin(ω_k·Δt)]
+
+    The k frequencies ω_i are LEARNABLE parameters (initialised to a
+    geometric schedule so the encoder starts as a Fourier-style basis).
+    d_time = 2·k.
+
+    Input is expected to be Δt PRE-CLAMPED to a sane range (the caller is
+    responsible — Component 0 of the design clamps Δt to time_scale × 100
+    so cold-start sentinel values don't make the learned ω_i explode).
+
+    The buffer `inv_freq_init` keeps the geometric init in `state_dict` for
+    diagnostics — the actual trainable values are stored in `self.omegas`.
+    """
+
+    def __init__(self, k: int = 16, time_scale: float = 1.0):
+        super().__init__()
+        self.k = int(k)
+        # Initialise ω_i geometrically over a wide range (Xu et al. 2020).
+        # The scale is normalised against time_scale so the encoder is
+        # dataset-aware at init: ω_i covers periods from ~time_scale up to
+        # ~time_scale / 1000 (i.e., very-recent variation is at high freq,
+        # long-ago variation at low freq).
+        i = torch.arange(k, dtype=torch.float32)
+        init_omegas = (1.0 / time_scale) * (1000.0 ** (-i / max(k - 1, 1)))
+        self.omegas = nn.Parameter(init_omegas)
+
+    def forward(self, dt: torch.Tensor) -> torch.Tensor:
+        """dt: [..., ] float tensor. Returns [..., 2k] tensor with
+        [cos(ω_1·dt), sin(ω_1·dt), ..., cos(ω_k·dt), sin(ω_k·dt)] along the
+        last axis."""
+        # dt: [..., ], omegas: [k]
+        phases = dt.unsqueeze(-1) * self.omegas                            # [..., k]
+        # Stack cos and sin along last axis, then flatten so it's
+        # [cos_1, sin_1, cos_2, sin_2, ...] in pairs.
+        cos = torch.cos(phases)
+        sin = torch.sin(phases)
+        # Interleave so neighboring entries are (cos_i, sin_i):
+        stacked = torch.stack([cos, sin], dim=-1)                          # [..., k, 2]
+        return stacked.flatten(start_dim=-2)                                # [..., 2k]
+
+
 class LinkPredictor(nn.Module):
-    """8-block MLP head with CROSS-TABLE interactions.
+    """8-block cross-table MLP head + Component 0 time encoding.
 
     The alignment loss trains the cosine geometry between target(seed) and
     context(walk-neighbour) — i.e. target ↔ context is the supervised
     interaction. The link MLP exposes exactly that interaction (in both
     directions) so the BCE signal can lean on it directly instead of
-    re-learning it from scratch:
+    re-learning it from scratch.
 
-        input = concat([
-          target(u),  context(v),  target(u)·context(v),  |target(u)−context(v)|,   ← u→v direction
-          target(v),  context(u),  target(v)·context(u),  |target(v)−context(u)|,   ← v→u direction
-        ])  ∈ ℝ^{8·d}
+    Input layout:
 
-    Both directions are included because the head is called on ordered
-    (u, v) pairs but the dataset's directionality isn't always clean —
-    letting the MLP weight u→v vs v→u itself is cheaper than committing
-    to one direction at the head and losing the signal on the other.
+        [ target(u), context(v), target(u)⊙context(v), |target(u)−context(v)|,   ← u→v
+          target(v), context(u), target(v)⊙context(u), |target(v)−context(u)|,   ← v→u
 
-    The arguments are the FEATURE-AUGMENTED vectors coming from
-    EmbeddingStore.target / .context — node-feature residuals are folded
-    in upstream, so the link MLP gets them for free.
+          Φ(Δt_u), Φ(Δt_v), Φ(Δt_uv),                                            ← Component 0
+          is_cold_start_u, is_cold_start_v, is_cold_start_uv                     ← 3 binary bits
+        ]  ∈ ℝ^{8·d + 3·d_time + 3}
+
+    The Component 0 inputs are gated by `use_time_encoding=True` at
+    construction; when False, the head collapses to the original 8-block
+    cross-table layout (input dim = 8·d).
     """
 
-    def __init__(self, d_emb: int, hidden: int = 128, dropout: float = 0.0):
+    def __init__(
+        self,
+        d_emb: int,
+        hidden: int = 128,
+        dropout: float = 0.0,
+        use_time_encoding: bool = False,
+        d_time: int = 32,
+    ):
         super().__init__()
+        self.use_time_encoding = use_time_encoding
+        self.d_time = d_time
         in_d = 8 * d_emb
+        if use_time_encoding:
+            in_d = in_d + 3 * d_time + 3                                   # Φ(Δt_u/v/uv) + 3 cold-start bits
         self.norm = nn.LayerNorm(in_d)
         self.net = nn.Sequential(
             nn.Linear(in_d, hidden),
@@ -249,14 +305,28 @@ class LinkPredictor(nn.Module):
         self,
         e_t_u: torch.Tensor, e_t_v: torch.Tensor,
         e_c_u: torch.Tensor, e_c_v: torch.Tensor,
+        phi_dt_u: Optional[torch.Tensor] = None,
+        phi_dt_v: Optional[torch.Tensor] = None,
+        phi_dt_uv: Optional[torch.Tensor] = None,
+        is_cold_u: Optional[torch.Tensor] = None,
+        is_cold_v: Optional[torch.Tensor] = None,
+        is_cold_uv: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        x = torch.cat(
-            [
-                # u→v direction: target(u) ↔ context(v) is the trained pair
-                e_t_u, e_c_v, e_t_u * e_c_v, (e_t_u - e_c_v).abs(),
-                # v→u direction: target(v) ↔ context(u)
-                e_t_v, e_c_u, e_t_v * e_c_u, (e_t_v - e_c_u).abs(),
-            ],
-            dim=-1,
-        )
+        parts = [
+            # u→v direction: target(u) ↔ context(v) is the trained pair
+            e_t_u, e_c_v, e_t_u * e_c_v, (e_t_u - e_c_v).abs(),
+            # v→u direction: target(v) ↔ context(u)
+            e_t_v, e_c_u, e_t_v * e_c_u, (e_t_v - e_c_u).abs(),
+        ]
+        if self.use_time_encoding:
+            if any(t is None for t in (phi_dt_u, phi_dt_v, phi_dt_uv, is_cold_u, is_cold_v, is_cold_uv)):
+                raise ValueError(
+                    "LinkPredictor was constructed with use_time_encoding=True "
+                    "but one of phi_dt_*/is_cold_* was None at forward time."
+                )
+            parts.extend([phi_dt_u, phi_dt_v, phi_dt_uv])
+            # Cold-start bits as 3 separate scalars (one per pair-row).
+            # Shape: [P, 1] each.
+            parts.extend([is_cold_u, is_cold_v, is_cold_uv])
+        x = torch.cat(parts, dim=-1)
         return self.net(self.norm(x)).squeeze(-1)

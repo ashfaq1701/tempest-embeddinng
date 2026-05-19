@@ -147,21 +147,24 @@ def main() -> None:
     loaded.dataset.load_val_ns()
     loaded.dataset.load_test_ns()
 
-    eval_val = Evaluator(
+    _eval_kwargs = dict(
         embedding_store=trainer.embedding_store,
         link_predictor=trainer.link_predictor,
-        neg_sampler=TGBNegativeSampler(loaded.dataset, split_mode="val"),
         device=trainer.device,
         tgb_dataset_name=loaded.name,
         eval_metric=loaded.eval_metric,
+        time_encoder=trainer.time_encoder,
+        time_state=trainer.time_state,
+        time_scale=trainer._time_scale,
+        cold_start_dt_clamp_factor=config.cold_start_dt_clamp_factor,
+    )
+    eval_val = Evaluator(
+        neg_sampler=TGBNegativeSampler(loaded.dataset, split_mode="val"),
+        **_eval_kwargs,
     )
     eval_test = Evaluator(
-        embedding_store=trainer.embedding_store,
-        link_predictor=trainer.link_predictor,
         neg_sampler=TGBNegativeSampler(loaded.dataset, split_mode="test"),
-        device=trainer.device,
-        tgb_dataset_name=loaded.name,
-        eval_metric=loaded.eval_metric,
+        **_eval_kwargs,
     )
 
     print(f"Model device: {trainer.device}    Tempest device: cpu")

@@ -14,6 +14,15 @@ class Config:
     d_emb: int = 128
     d_hidden_link: int = 128
 
+    # Component 0: time encoding at the link MLP (Phase 0.5 of the
+    # walk-distribution-matched design).
+    # Inputs Δt_u, Δt_v, Δt_uv go through a learned functional time
+    # encoder Φ (Xu et al. 2020) with `time_enc_k` frequencies. Three
+    # binary cold-start flags are concatenated as scalars alongside.
+    use_time_encoding: bool = True
+    time_enc_k: int = 16                       # → d_time = 2·k = 32
+    cold_start_dt_clamp_factor: float = 100.0  # Δt clamped to factor × time_scale
+
     # Walks (Tempest)
     max_walk_len: int = 20
     num_walks_per_node: int = 5

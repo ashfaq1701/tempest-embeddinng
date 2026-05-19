@@ -12,14 +12,15 @@ Per-row activation grows linearly with d_emb, so the row budget scales
 inversely with d_emb.
 """
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 
 from .data import Batch
-from .model import EmbeddingStore, LinkPredictor
+from .model import EmbeddingStore, LinkPredictor, TimeEncoder
 from .negatives import NegativeSampler
+from .timestate import NodeTimeState
 
 
 _ROW_BUDGET_AT_D128 = 500_000
@@ -38,6 +39,14 @@ class Evaluator:
         device: torch.device,
         tgb_dataset_name: str,
         eval_metric: str,
+        # Component 0 hooks: time encoder + per-node state. When the
+        # link predictor was constructed with use_time_encoding=True,
+        # these MUST be provided — otherwise we raise loudly rather than
+        # silently feeding zeros and producing wrong scores.
+        time_encoder: Optional[TimeEncoder] = None,
+        time_state: Optional[NodeTimeState] = None,
+        time_scale: Optional[float] = None,
+        cold_start_dt_clamp_factor: float = 100.0,
     ):
         # Lazy import so this module loads without py-tgb installed.
         from tgb.linkproppred.evaluate import Evaluator as TGBEvaluator
@@ -49,6 +58,19 @@ class Evaluator:
         self.eval_metric = eval_metric
         self.tgb_eval = TGBEvaluator(name=tgb_dataset_name)
         self.row_budget = _row_budget_for_d_emb(embedding_store.d_emb)
+        self.time_encoder = time_encoder
+        self.time_state = time_state
+        self.time_scale = time_scale
+        self.cold_start_dt_clamp_factor = cold_start_dt_clamp_factor
+        # Wiring consistency: if the link predictor expects time inputs,
+        # the encoder + state + scale must all be wired.
+        if getattr(link_predictor, "use_time_encoding", False):
+            if time_encoder is None or time_state is None or time_scale is None:
+                raise ValueError(
+                    "LinkPredictor was built with use_time_encoding=True, but "
+                    "Evaluator was constructed without time_encoder / time_state "
+                    "/ time_scale. Wire those in (typically via trainer.*)."
+                )
 
     @torch.no_grad()
     def evaluate_batch(self, batch: Batch) -> Tuple[float, int]:
@@ -57,7 +79,7 @@ class Evaluator:
         B = len(batch.src)
 
         all_u, all_v, counts = self._interleave(batch, neg_src, neg_tgt, B)
-        scores = self._score_chunked(all_u, all_v, counts)
+        scores = self._score_chunked(all_u, all_v, counts, t_query=int(batch.t_max))
 
         scores_np = scores.cpu().numpy()
         total = 0.0
@@ -74,8 +96,44 @@ class Evaluator:
             cursor += 1 + K
         return total, B
 
+    def _time_features_for_chunk(
+        self,
+        u_chunk: torch.Tensor,
+        v_chunk: torch.Tensor,
+        t_query: int,
+    ) -> tuple:
+        """Compute (Φ(Δt_u), Φ(Δt_v), Φ(Δt_uv), is_cold_u, is_cold_v, is_cold_uv)
+        for a chunk of (u, v) pairs. Reads PRE-batch NodeTimeState — strict
+        causal: evaluator's evaluate_batch is called BEFORE the trainer's
+        post-scoring time_state.update for this batch."""
+        u_np = u_chunk.cpu().numpy().astype(np.int64)
+        v_np = v_chunk.cpu().numpy().astype(np.int64)
+        last_u_np, last_v_np, last_uv_np = self.time_state.query(u_np, v_np)
+        clamp_to = float(self.time_scale) * float(self.cold_start_dt_clamp_factor)
+        dt_u_np = np.clip((float(t_query) - last_u_np).astype(np.float32), 0.0, clamp_to)
+        dt_v_np = np.clip((float(t_query) - last_v_np).astype(np.float32), 0.0, clamp_to)
+        dt_uv_np = np.clip((float(t_query) - last_uv_np).astype(np.float32), 0.0, clamp_to)
+        cold_u_np = (last_u_np == 0).astype(np.float32)
+        cold_v_np = (last_v_np == 0).astype(np.float32)
+        cold_uv_np = (last_uv_np == 0).astype(np.float32)
+
+        dt_u = torch.from_numpy(dt_u_np).to(self.device)
+        dt_v = torch.from_numpy(dt_v_np).to(self.device)
+        dt_uv = torch.from_numpy(dt_uv_np).to(self.device)
+        phi_u = self.time_encoder(dt_u)
+        phi_v = self.time_encoder(dt_v)
+        phi_uv = self.time_encoder(dt_uv)
+        cold_u = torch.from_numpy(cold_u_np).to(self.device).unsqueeze(-1)
+        cold_v = torch.from_numpy(cold_v_np).to(self.device).unsqueeze(-1)
+        cold_uv = torch.from_numpy(cold_uv_np).to(self.device).unsqueeze(-1)
+        return phi_u, phi_v, phi_uv, cold_u, cold_v, cold_uv
+
     def _score_chunked(
-        self, all_u: torch.Tensor, all_v: torch.Tensor, counts: List[int],
+        self,
+        all_u: torch.Tensor,
+        all_v: torch.Tensor,
+        counts: List[int],
+        t_query: int,
     ) -> torch.Tensor:
         """Score [P] rows through the link predictor in row_budget-sized chunks.
 
@@ -100,12 +158,25 @@ class Evaluator:
         for start, end in rows:
             u = all_u[start:end]
             v = all_v[start:end]
-            out[start:end] = self.link_predictor(
-                self.embedding_store.target(u),
-                self.embedding_store.target(v),
-                self.embedding_store.context(u),
-                self.embedding_store.context(v),
-            )
+            if self.time_encoder is not None and self.time_state is not None:
+                phi_u, phi_v, phi_uv, cold_u, cold_v, cold_uv = self._time_features_for_chunk(
+                    u, v, t_query,
+                )
+                out[start:end] = self.link_predictor(
+                    self.embedding_store.target(u),
+                    self.embedding_store.target(v),
+                    self.embedding_store.context(u),
+                    self.embedding_store.context(v),
+                    phi_u, phi_v, phi_uv,
+                    cold_u, cold_v, cold_uv,
+                )
+            else:
+                out[start:end] = self.link_predictor(
+                    self.embedding_store.target(u),
+                    self.embedding_store.target(v),
+                    self.embedding_store.context(u),
+                    self.embedding_store.context(v),
+                )
         return out
 
     def _interleave(
