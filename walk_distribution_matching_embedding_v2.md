@@ -219,7 +219,14 @@ Decision criterion: +0.02 over P1 base = proceed.
 
 Identifies where the multi-view (or windowed-walk) signal pays off, if at all.
 
-### P4: Honest-protocol re-baseline (its own phase, ~1 week)
+### P4: Honest-protocol re-baseline (its own phase, ~1 week) — **DEFERRED**
+
+> **Status (2026-05-19): DEFERRED.** Right now the optimisation track
+> (Phase S → P1 → P2 → P3) is what pushes OUR number up. P4 is a
+> paper-narrative move; it does not improve our test MRR, only the
+> framing in which we publish it. Resume after P3 lands or whenever
+> the user explicitly un-defers. The rest of this section is preserved
+> as the scope-of-work for that future resumption.
 
 This is the paper-defining experiment from §8, broken out per v2.1 pushback 5.
 

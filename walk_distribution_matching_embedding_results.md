@@ -444,9 +444,16 @@ Repeat P3 row 8 (final config) on:
 
 ---
 
-## P4 — Honest-protocol re-baseline (paper-defining)
+## P4 — Honest-protocol re-baseline (paper-defining) — **DEFERRED**
 
-**Status:** scheduled separately, ~1 week effort (v2.2 §5). Not in the
+**Status (2026-05-19): DEFERRED** per user direction. The optimisation
+track (Phase S → P1 → P2 → P3) is what improves OUR test MRR; P4 is a
+paper-narrative move that re-baselines competitor methods under
+strict-causal protocol but does not raise our number. Resume after P3
+lands or whenever explicitly un-deferred. Scope preserved below for
+future resumption.
+
+**Original scope:** scheduled separately, ~1 week effort (v2.2 §5). Not in the
 Phase S 12-hour budget.
 
 **Scope:** TPNet, DyGFormer, TGN re-run under strict-causal regime
