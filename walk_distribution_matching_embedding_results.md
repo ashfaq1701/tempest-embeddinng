@@ -79,6 +79,100 @@ Total wall clock: ~14 min training + ~3 min eval = ~17 min.
 
 ---
 
+### Phase 0.5 — Diagnostics (Diagnostic 1, 2, 3 from user's plan)
+
+Diagnostic script: `scripts/phase0_5_diag.py`. Trains Phase 0.5 from scratch
+then runs all three probes in-process. Two runs captured (2-epoch toy smoke
+and full 50-epoch).
+
+#### Diagnostic 1: cold-start prevalence
+
+| split | is_cold_start_uv | is_cold_start_u | is_cold_start_v |
+|---|---|---|---|
+| val  | 99.2% | 5.8% | 3.0% |
+| test | 99.1% | 5.9% | 0.5% |
+
+Δt_uv channel is virtually always "cold-start" at val/test — because TGB
+serves ~999 random destinations per positive, the (u, v) pair has never
+been seen for ~99.9% of scored rows. **The `is_cold_start_uv` bit, not the
+continuous `Φ(Δt_uv)`, is the dominant Component 0 signal.** This is
+essentially the EdgeBank "is this pair recurring?" lookup made
+differentiable as a binary feature.
+
+#### Diagnostic 3: column-norm analysis (50-epoch model)
+
+| position group | mean L2 column norm | ratio vs cross-table |
+|---|---|---|
+| cross-table (slots 0:8·d)            | 1.985 | 1.0× |
+| time encoding (slots 8·d:8·d+3·d_t)  | 1.218 | 0.61× |
+| cold-start bits (last 3 slots)       | 3.526 | **1.78×** |
+
+The model AMPLIFIED the cold-start bit columns to 1.78× the cross-table
+mean (and 2.89× the time-encoding mean). §12.1's LayerNorm-wash concern
+is therefore RESOLVED for the 50-epoch model — proceed without the
+parallel-MLP mitigation.
+
+#### Diagnostic 2: zero-out ablation (50-epoch)
+
+| split | full Phase 0.5 | Component 0 zeroed | drop |
+|---|---|---|---|
+| val  | 0.4654 | 0.0531 | **−0.412** |
+| test | 0.4269 | 0.0280 | **−0.399** |
+
+User's decision threshold: `>0.04 drop ⇒ proceed`. Actual drop is 10×
+that — Component 0 is doing essentially all of the model's predictive
+work. The walks-supervised cross-table embeddings, when isolated, score
+roughly at random.
+
+#### Surprise finding — 2-epoch beats 50-epoch by 0.28 test MRR
+
+The diagnostic smoke (2-epoch training, otherwise identical) recorded:
+
+| training length | Val MRR (full) | Test MRR (full) | Test (zeroed) |
+|---|---|---|---|
+| **2 epochs**  | **0.7451** | **0.7070** | 0.0170 |
+| 50 epochs | 0.4654 | 0.4269 | 0.0280 |
+
+A 2-epoch Phase 0.5 model reaches Test 0.71 on wiki — within range of
+TGN (0.690) and CAWN (0.711). The SAME architecture trained for 50
+epochs drops to 0.43.
+
+Why: at init, the link MLP can't use the random cross-table embeddings,
+so it learns the simple "trust `is_cold_start_uv`" rule → near-EdgeBank
+accuracy after 2 epochs. Over training, alignment+uniformity pull the
+cross-table embeddings toward walk-co-occurrence geometry; the link MLP
+tries to USE that signal alongside cold-start; the result is a model
+that's WORSE at TGB-style link prediction than the 2-epoch checkpoint.
+
+Cross-table column norms grow from 0.36 (2-ep) to 1.99 (50-ep) — the
+embeddings ARE learning structure. But that structure hurts prediction.
+
+#### Decision following diagnostics
+
+Per the user's stated decision rule (zero-out drop > 0.04 ⇒ proceed),
+**we satisfy the gate to advance to Phase 1**. But the 2-epoch finding
+is structurally important: the v1.5 plan locks in Phase 0.5 at 0.39
+when the architecture's TRUE early-stopping ceiling is ~0.71. Downstream
+phases should be measured against the early-stopping number, not the
+over-trained one.
+
+Three paths forward, in priority order (waiting on user confirmation):
+
+1. **Early-stop Phase 0.5 lock-in.** Re-train with `num_epochs ∈ {2, 3,
+   5, 10}` and pick the val-MRR peak. Use that as the Phase 0.5 base for
+   Phase 1+.
+2. **Phase 1 (loss-weighting A/B/C) at both 2-epoch and 50-epoch
+   budgets.** Tells us whether variants B (1/K only) or C (uniform) dodge
+   the over-training drag.
+3. **Bigger rethink.** The 2-epoch result suggests that
+   alignment+uniformity is actively *fighting* the EdgeBank-recurrence
+   signal on this dataset. The walks would still be useful as supervision
+   for OTHER targets (e.g., Phase 2's endpoint contrastive on walk
+   endpoints rather than positions), but not for the current cross-table
+   pull.
+
+---
+
 ## Phase 1 — Loss-weighting ablation
 
 **Status:** blocked on Phase 0.5
@@ -266,13 +360,19 @@ encoder / DyG / memory / EdgeBank-feature from the overnight session).
   walk_gen.add_edges; reads only pre-scoring; resets per training epoch
   only). All call sites grep'd and verified.
 
-**Phase 0.5 — result:**
+**Phase 0.5 — result (50 epochs, the v1.5 plan default):**
 - Val 0.4377 / Test 0.3940 vs Phase 0 (0.4015 / 0.3313). Δ test = +0.063.
 - Falls in the "composes additively" decision band. Keep, proceed.
-- Lower than the +0.10 "major work" threshold, but the SHAPE of the
-  signal matches expectation: link BCE settles ~0.10 (vs Phase 0's
-  ~0.11) → the time features give the head measurable signal; alignment
-  loss unchanged at ~0.874 → Component 0 is correctly orthogonal to the
-  alignment supervision (it never touches that loss).
+- Link BCE settles ~0.10 (vs Phase 0's ~0.11) → time features give the
+  head measurable signal; alignment loss unchanged at ~0.874 → Component
+  0 is correctly orthogonal to the alignment supervision (it never
+  touches that loss).
+
+**Phase 0.5 diagnostics (post hoc):** the 50-epoch number is artificially
+low. Component 0 + an untrained cross-table reaches Test 0.71 at 2 epochs;
+50 epochs degrades it to 0.43 because alignment+uniformity supervision
+pulls the cross-table embeddings into a geometry that's WORSE for TGB-
+style link prediction than the random init. See Diagnostics section
+below.
 
 ---
