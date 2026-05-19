@@ -464,10 +464,47 @@ All MRR through `tgb.linkproppred.evaluate.Evaluator.eval(...)`.
 | Phase 4 @ 15 epochs (early stop) | 0.4847 | 0.3906 | Worse — model still learning past ep 15 |
 | Phase 5 — Phase 4 + raw-message-store memory | 0.5198 | 0.4396 | Memory adds +0.003 test (marginal) |
 | Phase 5 + d_emb=192 (capacity sweep) | 0.5066 | 0.4093 | REGRESSED — capacity hurts on this dataset |
-| **Phase 6 — Phase 5 + EdgeBank-style direct recurrence feature** | **0.5264** | **0.4902** | **+0.0506 test from EdgeBank's direct (u,v)-in-history signal — biggest single jump of the session** |
+| **Phase 6 — Phase 5 + EdgeBank-style direct recurrence (K_history=32, WINNER)** | **0.5264** | **0.4902** | **+0.0506 test — biggest single architectural jump of the session** |
+| Phase 6 with K_history=64 | 0.4874 | 0.4437 | REGRESSED — wiki's recurrence is short-horizon, more history adds noise |
 
-Training cost (Phase 6): 50 epochs × ~77 s = ~64 min + ~6 min eval.
+Training cost (Phase 6, K_history=32): 50 epochs × ~77 s = ~64 min + ~6 min eval.
 Tempest on CPU, model on RTX 2000 Ada (8 GB VRAM).
+
+### Cumulative gain: +0.159 test MRR over Phase 0 baseline
+
+```
+Phase 0 baseline:                                       Test 0.3313
++ walk encoder (GRU over per-position context)  +0.098  Test 0.4289
++ DyG + co + memory (cumulative)                +0.011  Test 0.4396
++ EdgeBank direct recurrence                    +0.051  Test 0.4902 ← final
+```
+
+The walk encoder gives ~60% of the total gain. EdgeBank-style direct
+recurrence is the single biggest pull beyond that. DyG transformer +
+memory module add only marginal value on top of the walk encoder —
+their information overlap is high on this dataset (all three approximate
+"what has u been doing recently"). EdgeBank's contribution is different:
+it directly answers "is THIS specific (u, v) pair recurrent?", a
+first-order signal that the others only approximate.
+
+### Branch map (all pushed to origin)
+
+| Branch | Test MRR | What it adds |
+|---|---|---|
+| `master` | (docs only) | baseline + docs |
+| `feature/gru-walk-embedder` | 0.429 (Phase 2) | GRU walk encoder + 12-block link MLP |
+| `feature/xpair-attention` | 0.383 (Phase 3) | cross-pair attn + 4-channel — DON'T MERGE |
+| `feature/dyg-node-encoder` | (not measured alone) | DyG node encoder + history buffer |
+| `feature/co-occurrence` | (not measured alone) | co-occurrence channel |
+| `feature/dyg-co-on-phase2` | 0.436 (Phase 4) | DyG + co with Phase 2's link MLP |
+| `feature/raw-msg-memory` | (module only, not wired) | NodeMemory standalone |
+| `feature/phase4-plus-memory` | 0.440 (Phase 5) | Phase 4 + memory wired |
+| `feature/phase5-cap192` | 0.409 (regressed) | d_emb=192 ablation |
+| **`feature/edgebank-feature`** | **0.490 (Phase 6, WINNER)** | EdgeBank direct-recurrence channel |
+| `feature/eb-khistory-64` | 0.444 (regressed) | K_history=64 ablation |
+
+To merge the winner into master: `git merge feature/edgebank-feature`
+plus rerun once for a clean baseline number with the latest CLAUDE.md.
 
 Leaderboard reference (note: most carry the TGN memory leak):
 
