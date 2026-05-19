@@ -18,41 +18,64 @@ decision was made at each phase. Maintained as the implementation proceeds.
 
 ## Phase 0.5 — Time encoding ablation
 
-**Status:** pending implementation
+**Status:** COMPLETE. Decision: "composes additively" — keep Component 0,
+proceed to Phase 1.
 
-**Goal:** measure how much Component 0 (time encoding at the link MLP)
-alone moves the needle on the master baseline (Test MRR ~0.33).
+**Implementation commit:** `199de30` on `feature/walk-distribution-embedding`.
 
-**Implementation checklist:**
-- [ ] Add `last_event_time` array (n_nodes, int64) and `last_edge_time`
-      sparse dict to `Trainer`
-- [ ] Maintain both in the post-scoring block (training AND eval), AFTER
-      `walk_gen.add_edges` and `reservoir.observe`
-- [ ] Reset `last_event_time` (zeros) at the start of each training epoch;
-      `last_edge_time` is a fresh dict per epoch
-- [ ] Add `time_encoder` module: learned ω_i, k=16, d_time=32
-- [ ] At link-MLP forward: compute Δt_u, Δt_v, Δt_uv; clamp to
-      `time_scale × 100` before Φ; compute 3 binary cold-start bits
-- [ ] Extend `LinkPredictor` input from `8·d` to `8·d + 3·d_time + 3`
-- [ ] Smoke-test: confirm Δt features differ between (u, v_pos, t) and
-      (u, v_neg, t), and that `last_*_time` updates only in post-scoring
-- [ ] Quick sanity run (5 batches, watch link BCE) before launching 50-epoch
+**Implementation summary:**
+- New module `tempest_walks/timestate.py` — NodeTimeState class with
+  per-node `last_event_time` (np.ndarray) + per-pair `last_edge_time`
+  (sparse dict, symmetric key). Unit-tested with 7 cases (empty init,
+  single event, max-reduce per node, pair-symmetric alias, duplicate-pair
+  max-reduce, reset, empty update).
+- `TimeEncoder` (model.py): k=16 learnable ω_i with dataset-aware
+  geometric init from `time_scale`. Verified Φ(0) = [1,0,1,0,...].
+- `LinkPredictor` extended: when `use_time_encoding=True`, input grows
+  from `8·d` to `8·d + 3·d_time + 3` (3 cold-start bits as scalars).
+- Trainer + Evaluator wiring: read state pre-scoring, write state post-
+  scoring (LAST line of post-scoring block, after walk_gen.add_edges).
+- Strict-causal audit (3×): writes in post-scoring only, reads pre-
+  scoring only, reset per training epoch only. Documented in commit msg.
+- Smoke tests: 20-batch end-to-end training + 1 val eval batch, no NaN,
+  link BCE drops 0.70 → 0.47, time_state accumulates correctly.
 
 **Configuration for the training run:**
-- All Phase 0 defaults (B=200, K=5, L=20, d=128, hist_neg_ratio=0.5)
-- Component 0 enabled
-- Component 1.5 (node-feature fusion) preserved as-is — no-op on wiki
+- Phase 0 defaults: B=200, K=5, L=20, d=128, hist_neg_ratio=0.5
+- Component 0 ENABLED: time_enc_k=16, cold_start_dt_clamp_factor=100.0
+- Component 1.5 inactive on wiki (no node features)
+- time_scale derived: 93132.6 (span/20 formula)
+- 50 epochs
 
-**Decision criterion (from v1.5 §6 Phase 0.5):**
-- ≥ +0.10 over Phase 0 (0.33): time encoding doing major work; lock in.
-- +0.03 to +0.10: composes additively; keep.
-- < +0.03: surprising. Debug `last_edge_time` population first.
+**Training-loss trajectory (key checkpoints):**
 
-**Results:** (to be filled in)
-- Val MRR:
-- Test MRR:
-- Δ vs Phase 0 baseline (0.331):
-- Decision:
+| epoch | align | uniform | link | epoch_time |
+|---|---|---|---|---|
+| 1   | 0.8905 | -3.8902 | 0.1916 | 19.8 s |
+| 5   | 0.875… | -3.92  | ~0.14  | ~17 s |
+| 10  | 0.875  | -3.92  | ~0.12  | ~17 s |
+| 25  | 0.874  | -3.93  | ~0.11  | ~17 s |
+| 50  | 0.8741 | -3.9341 | 0.0962 | 16.9 s |
+
+Total wall clock: ~14 min training + ~3 min eval = ~17 min.
+
+**Results:**
+- **Val MRR: 0.4377** (vs Phase 0 baseline 0.4015 → **Δ = +0.0362**)
+- **Test MRR: 0.3940** (vs Phase 0 baseline 0.3313 → **Δ = +0.0627**)
+- Decision criterion bucket: **"+0.03 to +0.10" → composes additively**
+- **Decision: KEEP Component 0; lock in for all downstream phases.**
+
+**Notes for paper:**
+- The test gain is roughly comparable to the +0.051 we saw overnight from
+  the discrete `is_v_in_u_history` EdgeBank-style feature. Component 0's
+  `Φ(Δt_uv)` plus `is_cold_start_uv` is the CONTINUOUS version of the
+  same signal — at much lower implementation cost (no K_history buffer,
+  no per-batch history reads of variable-sized neighbor sets).
+- Link BCE at epoch 50: 0.096 (lower than Phase 0's 0.11) — the time
+  features are giving the link MLP measurable signal it didn't have.
+- Alignment loss is essentially unchanged from Phase 0 (~0.874) because
+  Component 0 doesn't touch the alignment-side at all. This confirms
+  Component 0 is correctly orthogonal to the alignment supervision.
 
 ---
 
@@ -221,5 +244,35 @@ defends as "leaderboard inflation + first leak-free competitive method."
 Use this section as a flat timeline of decisions, bugs, surprises, and
 fixes — anything that wouldn't fit in the per-phase tables but matters
 for paper write-up.
+
+**Session start:** branched `feature/walk-distribution-embedding` off
+`master @ b246b87` (the v3 baseline). Verified master cleanly contains
+only Phase 0 architecture (EmbeddingStore + LinkPredictor, no walk
+encoder / DyG / memory / EdgeBank-feature from the overnight session).
+
+**Phase 0.5 — implementation:**
+- Created `tempest_walks/timestate.py` from scratch. Symmetric pair-key
+  design (`(min, max)`) avoids tracking the same (u, v) ⇄ (v, u) twice.
+- Used `np.maximum.at` for the per-node max-reduce — handles duplicate
+  indices correctly (a normal `[idx] = max(...)` would silently drop
+  duplicates).
+- TimeEncoder ω_i geometric init: 1 / (time_scale × 1000^(i/(k-1))).
+  Verified Φ(0) = [1,0,1,0,...] (cos(0)=1, sin(0)=0).
+- Cold-start handling: Δt clamped to time_scale × 100 BEFORE Φ; the
+  binary `is_cold_start` bit is the actual signal. Per v1.5 §12.1, the
+  bit might get LayerNorm-attenuated; flagged as watch-list, not
+  pre-emptively complicated.
+- 3× strict-causal audit clean (writes only in post-scoring after
+  walk_gen.add_edges; reads only pre-scoring; resets per training epoch
+  only). All call sites grep'd and verified.
+
+**Phase 0.5 — result:**
+- Val 0.4377 / Test 0.3940 vs Phase 0 (0.4015 / 0.3313). Δ test = +0.063.
+- Falls in the "composes additively" decision band. Keep, proceed.
+- Lower than the +0.10 "major work" threshold, but the SHAPE of the
+  signal matches expectation: link BCE settles ~0.10 (vs Phase 0's
+  ~0.11) → the time features give the head measurable signal; alignment
+  loss unchanged at ~0.874 → Component 0 is correctly orthogonal to the
+  alignment supervision (it never touches that loss).
 
 ---
