@@ -17,8 +17,9 @@ Two optimizers, run sequentially per batch:
   - link_optimizer      ← BCE(logits, labels).backward()
 """
 
+import copy
 import time
-from typing import Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import numpy as np
 import torch
@@ -263,9 +264,78 @@ class Trainer:
     # Phase loops.
     # ------------------------------------------------------------------ #
 
-    def train(self, batches: Iterable[Batch]) -> None:
+    def _model_state_snapshot(self) -> Dict[str, Any]:
+        """Deep-copy of model weights only (NOT walk_gen / time_state /
+        neg_sampler — those are state buffers, restored by reset() each
+        epoch). Used by early-stopping to remember the best epoch."""
+        snap: Dict[str, Any] = {
+            "embedding_store": copy.deepcopy(self.embedding_store.state_dict()),
+            "link_predictor": copy.deepcopy(self.link_predictor.state_dict()),
+        }
+        if self.time_encoder is not None:
+            snap["time_encoder"] = copy.deepcopy(self.time_encoder.state_dict())
+        return snap
+
+    def _load_model_state(self, snap: Dict[str, Any]) -> None:
+        self.embedding_store.load_state_dict(snap["embedding_store"])
+        self.link_predictor.load_state_dict(snap["link_predictor"])
+        if self.time_encoder is not None and "time_encoder" in snap:
+            self.time_encoder.load_state_dict(snap["time_encoder"])
+
+    def train(
+        self,
+        batches: Iterable[Batch],
+        val_evaluator: Optional[Evaluator] = None,
+        val_batches_factory: Optional[Callable[[], Iterable[Batch]]] = None,
+        test_evaluator: Optional[Evaluator] = None,
+        test_batches_factory: Optional[Callable[[], Iterable[Batch]]] = None,
+        early_stop_patience: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Train up to `config.num_epochs`.
+
+        Returns a summary dict. If `val_evaluator` is None, behaves like
+        the original train(): just trains num_epochs and returns an empty
+        per-epoch curve.
+
+        If `val_evaluator` is provided, runs val eval AFTER each training
+        epoch (TGB streaming convention: state at start of val eval is
+        end-of-training-epoch). Tracks the best-val-MRR checkpoint and
+        deep-copies model weights when val improves.
+
+        If `test_evaluator` is also provided, runs test eval whenever val
+        improves and pins `best_test_mrr` to the same epoch as
+        `best_val_mrr` (so the two reported numbers come from the same
+        model snapshot). Test eval starts from end-of-val state — same
+        as the no-early-stop path.
+
+        If `early_stop_patience` is set (and val_evaluator is provided),
+        stops after that many epochs without val improvement.
+
+        Best weights are restored before return so subsequent calls
+        (e.g. a final evaluator outside this function) read the best
+        snapshot. The walk_gen / time_state / neg_sampler buffers remain
+        in their end-of-last-epoch state — if you need a clean re-eval
+        from end-of-training-only state, call walk_gen.reset() and
+        re-ingest training edges separately.
+        """
         batches = list(batches)
-        for epoch in range(self.config.num_epochs):
+        n_epochs = self.config.num_epochs
+        do_val = val_evaluator is not None and val_batches_factory is not None
+        do_test = (
+            test_evaluator is not None and test_batches_factory is not None and do_val
+        )
+
+        best_val_mrr = -float("inf")
+        best_test_mrr: Optional[float] = None
+        best_epoch = 0
+        best_state: Optional[Dict[str, Any]] = None
+        epochs_no_improve = 0
+        per_epoch_val: List[float] = []
+        per_epoch_test: List[float] = []
+        stopped_at_epoch = n_epochs
+
+        for epoch in range(n_epochs):
+            # ── Per-epoch reset — wipes any prior per-epoch eval mutations ──
             self.walk_gen.reset()
             if isinstance(self.neg_sampler_train, HistoricalNegativeSampler):
                 self.neg_sampler_train.reset()
@@ -282,29 +352,85 @@ class Trainer:
                 l_align, l_uniform = self._embedding_step(batch)
                 l_link = self._link_step(batch)
                 # ── Post-scoring strict-causal block (feeds batch B+1) ──
-                # Reservoir observe AND Tempest ingest run AFTER scoring.
-                # Both contain events up through (and including) batch B
-                # only when batch B+1's loop begins.
                 if isinstance(self.neg_sampler_train, HistoricalNegativeSampler):
                     self.neg_sampler_train.observe(batch.src, batch.tgt)
                 self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
                 if self.time_state is not None:
-                    # LAST write of the post-scoring block. After this line
-                    # NodeTimeState reflects events ≤ batch B; batch B+1's
-                    # _time_features call at the start of _link_step will
-                    # see this state.
                     self.time_state.update(batch.src, batch.tgt, batch.ts)
                 sum_align += l_align
                 sum_uniform += l_uniform
                 sum_link += l_link
                 n += 1
-            dt = time.perf_counter() - t0
+            train_dt = time.perf_counter() - t0
+
+            # ── Per-epoch val + (conditional) test eval ──
+            val_mrr: Optional[float] = None
+            test_mrr: Optional[float] = None
+            eval_dt = 0.0
+            if do_val:
+                t1 = time.perf_counter()
+                val_mrr = self.evaluate(val_batches_factory(), val_evaluator)
+                per_epoch_val.append(float(val_mrr))
+                improved = val_mrr > best_val_mrr
+                if improved:
+                    best_val_mrr = float(val_mrr)
+                    best_epoch = epoch + 1
+                    best_state = self._model_state_snapshot()
+                    epochs_no_improve = 0
+                    # Pin test_mrr to the same epoch as best val.
+                    if do_test:
+                        test_mrr = self.evaluate(test_batches_factory(), test_evaluator)
+                        best_test_mrr = float(test_mrr)
+                        per_epoch_test.append(float(test_mrr))
+                else:
+                    epochs_no_improve += 1
+                eval_dt = time.perf_counter() - t1
+
+            # ── Per-epoch log ──
+            tag = f"  epoch {epoch+1}/{n_epochs}  "
+            tag += f"align={sum_align/n:.4f}  uniform={sum_uniform/n:.4f}  "
+            tag += f"link={sum_link/n:.4f}  train {train_dt:.1f}s"
+            if val_mrr is not None:
+                tag += f"  val {val_mrr:.4f}"
+                if test_mrr is not None:
+                    tag += f"  test {test_mrr:.4f} (new best)"
+                tag += f"  eval {eval_dt:.1f}s"
+                tag += f"  patience {epochs_no_improve}/{early_stop_patience or '-'}"
+            print(tag, flush=True)
+
+            # ── Early-stop check ──
+            if (
+                do_val
+                and early_stop_patience is not None
+                and epochs_no_improve >= early_stop_patience
+            ):
+                stopped_at_epoch = epoch + 1
+                print(
+                    f"  early stop at epoch {stopped_at_epoch}; "
+                    f"best epoch was {best_epoch} (val {best_val_mrr:.4f})",
+                    flush=True,
+                )
+                break
+
+        # ── Restore best weights (if any val tracking happened) ──
+        if best_state is not None:
+            self._load_model_state(best_state)
             print(
-                f"  epoch {epoch+1}/{self.config.num_epochs}  "
-                f"align={sum_align/n:.4f}  uniform={sum_uniform/n:.4f}  "
-                f"link={sum_link/n:.4f}  {dt:.1f}s",
+                f"  restored best weights from epoch {best_epoch} "
+                f"(val {best_val_mrr:.4f}"
+                + (f", test {best_test_mrr:.4f}" if best_test_mrr is not None else "")
+                + ")",
                 flush=True,
             )
+
+        return {
+            "best_epoch": best_epoch,
+            "best_val_mrr": float(best_val_mrr) if do_val else None,
+            "best_test_mrr": best_test_mrr,
+            "stopped_at_epoch": stopped_at_epoch,
+            "per_epoch_val_mrr": per_epoch_val,
+            "per_epoch_test_mrr": per_epoch_test,
+        }
 
     @torch.no_grad()
     def evaluate(self, batches: Iterable[Batch], evaluator: Evaluator) -> float:

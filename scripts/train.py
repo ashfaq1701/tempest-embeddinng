@@ -57,6 +57,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-batch-size", type=int, default=200)
     p.add_argument("--num-epochs", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
+    # Early stopping. When > 0, per-epoch val eval runs after each
+    # training epoch; trainer keeps the best-val checkpoint and breaks
+    # after this many epochs of no improvement. test_mrr is pinned to
+    # the same epoch as best_val_mrr (same model snapshot).
+    # When 0 (default), behaves like before: trains num_epochs flat,
+    # then val + test eval once.
+    p.add_argument("--early-stop-patience", type=int, default=0,
+                   help="Patience (in epochs) for early stopping on val "
+                        "MRR. 0 = disabled (legacy behaviour).")
 
     return p.parse_args()
 
@@ -172,16 +181,46 @@ def main() -> None:
     )
 
     print(f"Model device: {trainer.device}    Tempest device: cpu")
-    print("=== Training ===")
-    trainer.train(create_batches(loaded.train, config.target_batch_size))
+    if args.early_stop_patience and args.early_stop_patience > 0:
+        # Early-stopping path: per-epoch val (+ test on new-best) eval
+        # happens inside trainer.train(); the test number is pinned to
+        # the same epoch as best val, so we report directly from the
+        # summary dict — no second outer eval pass.
+        print(f"=== Training (early stop patience={args.early_stop_patience}) ===")
+        summary = trainer.train(
+            create_batches(loaded.train, config.target_batch_size),
+            val_evaluator=eval_val,
+            val_batches_factory=lambda: create_batches(
+                loaded.val, config.target_batch_size,
+            ),
+            test_evaluator=eval_test,
+            test_batches_factory=lambda: create_batches(
+                loaded.test, config.target_batch_size,
+            ),
+            early_stop_patience=args.early_stop_patience,
+        )
+        print(f"\n=== Summary (best epoch {summary['best_epoch']}) ===")
+        print(f"  stopped_at_epoch    : {summary['stopped_at_epoch']}")
+        print(f"  best_val_{loaded.eval_metric:<14}: {summary['best_val_mrr']:.4f}")
+        if summary["best_test_mrr"] is not None:
+            print(f"  best_test_{loaded.eval_metric:<13}: {summary['best_test_mrr']:.4f}")
+        print(f"  per_epoch_val_{loaded.eval_metric:<8}: "
+              + ", ".join(f"{v:.4f}" for v in summary["per_epoch_val_mrr"]))
+    else:
+        print("=== Training ===")
+        trainer.train(create_batches(loaded.train, config.target_batch_size))
 
-    print("=== Validation ===")
-    val_metric = trainer.evaluate(create_batches(loaded.val, config.target_batch_size), eval_val)
-    print(f"Val {loaded.eval_metric}: {val_metric:.4f}")
+        print("=== Validation ===")
+        val_metric = trainer.evaluate(
+            create_batches(loaded.val, config.target_batch_size), eval_val,
+        )
+        print(f"Val {loaded.eval_metric}: {val_metric:.4f}")
 
-    print("=== Test ===")
-    test_metric = trainer.evaluate(create_batches(loaded.test, config.target_batch_size), eval_test)
-    print(f"Test {loaded.eval_metric}: {test_metric:.4f}")
+        print("=== Test ===")
+        test_metric = trainer.evaluate(
+            create_batches(loaded.test, config.target_batch_size), eval_test,
+        )
+        print(f"Test {loaded.eval_metric}: {test_metric:.4f}")
 
 
 if __name__ == "__main__":
