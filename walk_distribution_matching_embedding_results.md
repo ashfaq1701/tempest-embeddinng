@@ -1,10 +1,24 @@
 # Walk-Distribution-Matched Temporal Embeddings — Running Results & Session Transcript
 
-Companion to `walk_distribution_matching_embedding.md` (v1.5). This document
-records what was implemented, what was run, what the numbers were, and what
-decision was made at each phase. Maintained as the implementation proceeds.
+Companion to `walk_distribution_matching_embedding_v2.md` (v2.2, anchored
+Phase S frame; superseded the v1.5 fixed 8-phase progression after the
+Phase 0.5 diagnostic). Records what was implemented, what was run, what
+the numbers were, and what decision was made at each phase.
 
 **Branch:** `feature/walk-distribution-embedding` (off `master` @ `b246b87`).
+Plan v2.2 committed at `7ceeebe`.
+
+**Plan-document trail:**
+- v1.5 (`b246b87`): fixed 8-phase plan, master.
+- v2.0: introduced Phase S search frame as replacement for v1.5's fixed
+  progression. Five issues flagged on review.
+- v2.1: addressed all five (Group E added; anchor validation §3; A split
+  into A1/A2/A3; floor = anchor-validated mean; P4 broken out).
+- **v2.2 (`7ceeebe`, current):** adds §4.6 "deduplicate by effective
+  compute graph" clause so redundant Phase S cells are skipped when
+  search-space dimensions collapse (e.g., under Option E.2 head, the
+  embeddings are not read at scoring, so most A2/`λ_link` combinations
+  are mathematically equivalent at the link MLP).
 
 **Starting state confirmed:**
 - `master` is at the v3 baseline (no walk encoder, no DyG, no memory, no
@@ -150,86 +164,113 @@ embeddings ARE learning structure. But that structure hurts prediction.
 #### Decision following diagnostics
 
 Per the user's stated decision rule (zero-out drop > 0.04 ⇒ proceed),
-**we satisfy the gate to advance to Phase 1**. But the 2-epoch finding
-is structurally important: the v1.5 plan locks in Phase 0.5 at 0.39
-when the architecture's TRUE early-stopping ceiling is ~0.71. Downstream
-phases should be measured against the early-stopping number, not the
+the gate is satisfied. But the 2-epoch finding is structurally
+important: the v1.5 plan locks in Phase 0.5 at 0.39 when the
+architecture's TRUE early-stopping ceiling is ~0.71. Downstream phases
+should be measured against the early-stopping number, not the
 over-trained one.
 
-Three paths forward, in priority order (waiting on user confirmation):
-
-1. **Early-stop Phase 0.5 lock-in.** Re-train with `num_epochs ∈ {2, 3,
-   5, 10}` and pick the val-MRR peak. Use that as the Phase 0.5 base for
-   Phase 1+.
-2. **Phase 1 (loss-weighting A/B/C) at both 2-epoch and 50-epoch
-   budgets.** Tells us whether variants B (1/K only) or C (uniform) dodge
-   the over-training drag.
-3. **Bigger rethink.** The 2-epoch result suggests that
-   alignment+uniformity is actively *fighting* the EdgeBank-recurrence
-   signal on this dataset. The walks would still be useful as supervision
-   for OTHER targets (e.g., Phase 2's endpoint contrastive on walk
-   endpoints rather than positions), but not for the current cross-table
-   pull.
+**This finding triggered the v1.5 → v2.0 → v2.1 → v2.2 plan rewrite.**
+The original linear "Phase 1 / 1.5 / 2 / 3 / 4 / 5 / 6" lattice is
+replaced by an anchored bounded-search frame (see plan v2.2). The
+sections below follow that new structure; the v1.5 phase placeholders
+are retired.
 
 ---
 
-## Phase 1 — Loss-weighting ablation
+## Anchor validation (v2.2 §3)
 
-**Status:** blocked on Phase 0.5
+**Status:** PENDING — gates Phase S launch.
 
-(template below; fill in after Phase 0.5 result)
+**Configuration (verbatim from v2.2 §3):**
+- Re-run Phase 0.5 config with early stopping (patience=5 on val MRR).
+- 3 seeds: {42, 7, 13}.
+- 2 epochs each — matches the single-seed checkpoint that hit Test 0.7070.
+- Wall-clock budget: ~30 min total.
 
-**Variants:**
-- A: `1/K · (1 + Δt/τ)^(-β)` (control, current)
-- B: `1/K` only
-- C: uniform `α = 1`
+**Decision gate:**
+- 3/3 seeds within ±0.03 of 0.71 ⇒ anchor confirmed; launch Phase S
+  with floor = anchor mean.
+- Anchor mean drifts > 0.05 below 0.71 ⇒ pause Phase S; re-investigate
+  the diagnostic with a 4th seed before committing to the 12-hour budget.
+- Variance across seeds > 0.10 ⇒ the 0.71 was a lucky seed; reset the
+  floor to whichever bucket the mean falls in and proceed with reduced
+  confidence in any Phase S "win" claim.
+
+**Sanity checks before launch:**
+- [ ] Trainer respects `--num-epochs 2` and stops cleanly.
+- [ ] NodeTimeState resets between seeds (no cross-seed leakage).
+- [ ] TGB Evaluator state is independent per seed.
+- [ ] Logged outputs distinguish seeds (filename / stdout tag).
 
 **Results:**
-| Variant | Val MRR | Test MRR | Notes |
+| Seed | Val MRR | Test MRR | Walltime |
 |---|---|---|---|
+| 42 |   |   |   |
+| 7  |   |   |   |
+| 13 |   |   |   |
+| mean ± std |   |   | — |
 
 **Decision:**
 
 ---
 
-## Phase 1.5 — Joint training ablation
+## Phase S — Bounded search frame (v2.2 §4)
 
-**Status:** blocked on Phase 1
+**Status:** blocked on anchor validation.
 
-**Sweep:** `λ_link ∈ {0, 0.1, 0.3, 1.0}` on Phase 1 winner.
+**Budget:** 12 hours wall clock. Hard stop. Each run uses early stopping
+(patience=5 on val MRR) so under-trained variants don't burn budget on
+the over-training cliff.
 
-**Results:**
-| λ_link | Val MRR | Test MRR | Notes |
+**Groups (v2.2 §4.1):**
+
+| Group | Knob | Cells | Notes |
 |---|---|---|---|
+| A1 | within-family weighting | A / B / C from v1.5 | only when alignment is on |
+| A2 | alignment loss | on / off | gates whether A1 has any effect |
+| A3 | supervision target | walk-position / walk-endpoint (Phase 2 of v1.5) | conditional on A2=on |
+| C  | joint training `λ_link` | {0, 0.1, 0.3, 1.0} | gradient flow from BCE into embeddings |
+| D  | embedding regularisation | none / weight-decay / freeze-after-epoch-2 | counters over-training drag |
+| E  | link MLP head | E.1 cross-table / E.2 Component-0-only / E.3 cross-table+dropout | the v2.0 → v2.1 fix |
 
-**Decision:**
+**Deduplication clause (v2.2 §4.6):** When configurations collapse to
+the same effective compute graph, do NOT run duplicates. Specifically
+under **E.2** (Component-0-only head), embeddings are not read at
+scoring, so the link BCE provides no gradient to them regardless of
+`λ_link`; A2-on vs A2-off then differ only in whether the unread
+embeddings are alignment-trained. Skip those redundant cells.
+
+**Success floor (v2.2 §4.4):** anchor-validated baseline mean (from §3
+above), NOT 0.65. A Phase S cell is a "win" only if it beats this floor
+by > anchor std.
+
+**Sanity checks before launch:**
+- [ ] Each group's CLI flags wired into `scripts/train.py`.
+- [ ] Early-stopping criterion logged (val_mrr, patience, best epoch).
+- [ ] Run-log captures: group, cell ID, walltime, val/test MRR,
+  early-stop epoch, BCE@best, align@best.
+- [ ] Compute-graph collapse detector before launching each cell (avoid
+  E.2 × A2 × `λ_link` duplicates).
+
+**Results matrix:** (filled in run-by-run)
+
+| Cell ID | Group | Config | Val MRR | Test MRR | Best ep | Walltime |
+|---|---|---|---|---|---|---|
+
+**Phase S exit summary:**
+- Cells run / total budget used:
+- Winning config:
+- Δ over anchor floor:
 
 ---
 
-## Phase 2 — Walk-endpoint contrastive (single view)
+## P1 — Window sweep on Phase S winner
 
-**Status:** blocked on Phase 1.5
+**Status:** blocked on Phase S.
 
-**Implementation note:** replace alignment loss with SGNS-style contrastive
-matching on walk endpoints. Uses Tempest's `nodes[w, 0]` as the endpoint
-(deepest valid past node in chronological-return convention). K_neg=5 per
-walk; negatives uniform over `train_destinations`.
-
-**Results:**
-- Val MRR:
-- Test MRR:
-- Fallback applied (if any):
-
-**Decision:**
-
----
-
-## Phase 3 — `max_time_capacity` sweep
-
-**Status:** blocked on Phase 2
-
-**Sweep:** `max_time_capacity ∈ {6h, 1d, 3d, 7d, ∞}` (in seconds:
-`{21600, 86400, 259200, 604800, -1}`).
+**Sweep:** `max_time_capacity ∈ {6h, 1d, 3d, 7d, ∞}` (seconds:
+`{21600, 86400, 259200, 604800, -1}`) on the Phase S winner.
 
 **Results:**
 | window | Val MRR | Test MRR | Notes |
@@ -239,77 +280,61 @@ walk; negatives uniform over `train_destinations`.
 
 ---
 
-## Phase 4 — Two-view multi-bias
+## P2 — Multi-view (conditional)
 
-**Status:** blocked on Phase 3
+**Status:** blocked on P1. Conditional gate: skip if Phase S winner is
+single-view and the walk-distribution-divergence pre-flight shows
+mean JS < 0.05 between Exponential and TemporalNode2Vec.
 
-**Pre-flight (mandatory):** walk-distribution divergence by degree bucket.
-Run `compute_per_seed_js_divergence` from v1.5 §9 on `mid_80pct` /
-`low_decile` / `high_decile` seeds.
+**Pre-flight (mandatory if not skipped):** walk-distribution JS by
+degree bucket on `mid_80pct` / `low_decile` / `high_decile` seeds.
 
 **Pre-flight results:**
 | bucket | mean JS | p50 JS |
 |---|---|---|
 
 **Decision rule check:**
-- `mid_80pct` mean JS > 0.1 → proceed; <0.05 → re-evaluate; in between → proceed with caution.
+- `mid_80pct` mean JS > 0.1 → proceed; <0.05 → skip P2; in between → proceed with caution.
 
-**Training:** add `walk_bias="TemporalNode2Vec", p=1.0, q=0.25` view; add
-`E_context_S` + `proj_c_S` + `context_S_final`; dual contrastive loss
-`L_R + λ_S · L_S` with `λ_S = 1.0`.
+**Training (if proceeding):** add `walk_bias="TemporalNode2Vec", p=1.0,
+q=0.25` view; add `E_context_S` + `proj_c_S` + `context_S_final`; dual
+contrastive loss `L_R + λ_S · L_S` with `λ_S = 1.0`.
 
 **Results:**
 - Val MRR:
 - Test MRR:
-- Δ vs Phase 3:
+- Δ vs P1:
 
 **Decision:**
 
 ---
 
-## Phase 5 — Per-view tuning
+## P3 — Within-method ablation matrix + error analysis
 
-**Status:** blocked on Phase 4
+**Status:** blocked on P2.
 
-(Up to ~11 runs across structural-view `max_time_capacity` × `q` × `λ_S`.)
-
-**Results:** (best per-knob)
-| knob | best value | Val MRR | Test MRR |
-|---|---|---|---|
-
-**Final hyperparameters:**
-
----
-
-## Phase 6 — Ablation matrix + error analysis
-
-**Status:** blocked on Phase 5
-
-**Ablation matrix (9 training runs):**
+**Ablation matrix (one row per cumulative addition):**
 | Row | Config | Val MRR | Test MRR | Δ vs row above |
 |---|---|---|---|---|
-| 1   | Phase 0 baseline                         |   |   | — |
-| 2   | + Component 0 (time encoding)            |   |   |   |
-| 3   | + Phase 1 weighting winner               |   |   |   |
-| 4   | + Phase 1.5 joint-training winner        |   |   |   |
-| 5   | + Phase 2 endpoint contrastive           |   |   |   |
-| 6   | + Phase 3 max_time_capacity_R            |   |   |   |
-| 7a  | + Phase 4 multi-view (d=128)             |   |   |   |
-| 7b  | Single-view d=192 (parameter-matched)    |   |   | (vs 7a) |
-| 8   | Phase 5 final (tuned, multi-view)        |   |   |   |
+| 1 | Phase 0 baseline                                |   |   | — |
+| 2 | + Component 0 (time encoding)                   |   |   |   |
+| 3 | + early stopping (anchor-validated)             |   |   |   |
+| 4 | + Phase S winning Group A/C/D config            |   |   |   |
+| 5 | + Phase S winning Group E head                  |   |   |   |
+| 6 | + P1 `max_time_capacity_R`                      |   |   |   |
+| 7 | + P2 multi-view (if applied)                    |   |   |   |
+| 8 | P3 final config                                 |   |   |   |
 
-**Central ablation claim (row 7a vs 7b):**
-
-**Error analysis** (post-hoc on row 8 / Phase 5 final):
+**Error analysis** (post-hoc on row 8):
 - By positive `(u, v)` recency bucket (never seen / <1h / <1d / <1w / older):
 - By source degree (low/mid/high tercile):
 - Hub-positive vs non-hub-positive split:
 
 ---
 
-## Cross-dataset extension (optional, post-Phase-6)
+## Cross-dataset extension (optional, post-P3)
 
-Repeat Phase 6 row 8 (Phase 5 final config) on:
+Repeat P3 row 8 (final config) on:
 - tgbl-coin
 - tgbl-flight
 - tgbl-review
@@ -321,11 +346,15 @@ Repeat Phase 6 row 8 (Phase 5 final config) on:
 
 ---
 
-## Paper-defining experiment (optional, biggest upside)
+## P4 — Honest-protocol re-baseline (paper-defining)
 
-Honest-protocol re-baselines for TPNet, DyGFormer, TGN under strict-causal
-regime. The contribution: if those numbers drop AND ours holds, the paper
-defends as "leaderboard inflation + first leak-free competitive method."
+**Status:** scheduled separately, ~1 week effort (v2.2 §5). Not in the
+Phase S 12-hour budget.
+
+**Scope:** TPNet, DyGFormer, TGN re-run under strict-causal regime
+(pre-ingest walk supervision, post-scoring state update). If those
+numbers drop AND ours holds, the paper defends as "leaderboard
+inflation + first leak-free competitive method."
 
 **Re-baseline results:**
 | Method | Original test MRR | Honest-protocol test MRR | Δ |
@@ -374,5 +403,36 @@ low. Component 0 + an untrained cross-table reaches Test 0.71 at 2 epochs;
 pulls the cross-table embeddings into a geometry that's WORSE for TGB-
 style link prediction than the random init. See Diagnostics section
 below.
+
+**Plan rewrite v1.5 → v2.0:** the 2-epoch finding broke v1.5's fixed
+linear progression. Phase 1 (alignment-weighting ablation) was already
+implemented (commit `68d32f1`, `align_weighting` A/B/C variants) and
+its first variant launched; we stopped it before the v2.0 plan was
+finalised. v2.0 introduced the Phase S bounded-search frame.
+
+**v2.0 review pushback (five issues):**
+1. Head structure was over-locked — cross-table column norms grew 5×
+   while test MRR dropped 0.28; the head should be searchable.
+2. The 0.71 was a single seed, not a multi-seed result; anchor unvalidated.
+3. Group A conflated within-family weighting (A1), alignment on/off
+   (A2), and supervision target (A3).
+4. Success floor of "≥ 0.65" was soft given the 0.71 anchor.
+5. Honest-protocol re-baseline of TPNet/DyGFormer/TGN was buried as one
+   row of P3; realistically a multi-day effort of its own.
+
+**v2.1:** addressed all five (Group E added to Phase S; anchor
+validation §3 as 30-min pre-Phase-S step; A split into A1/A2/A3;
+floor = anchor-validated baseline mean; P4 broken out as ~1-week
+phase). Re-reviewed.
+
+**v2.2 (`7ceeebe`, current):** added the §4.6 "deduplicate by effective
+compute graph, not nominal hyperparameters" clause. Catches the
+collapse under Option E.2 (Component-0-only head): embeddings are not
+read at scoring, so most A2/`λ_link` combinations are mathematically
+equivalent at the link MLP and should not be run twice.
+
+**Pending implementation:** anchor validation (v2.2 §3) is the next
+gate — 3 seeds {42, 7, 13} × 2 epochs, ~30 min total. No experiment
+launched yet under the v2.x plan.
 
 ---
