@@ -17,30 +17,13 @@ Node features         Learned at every lookup. The per-feature projection
                       context) reads through them, so node-feature fusion
                       happens exactly once per role.
 
-Walk context          Runtime, alignment-loss only. Each walk position
-                      represents a node u in its CONTEXT role (someone
-                      that has shown up in another node's recent past),
-                      augmented by the feature of the hop that connects
-                      u to the next position toward the seed:
-
-                        context_walk[p] = context_walk_final(
-                            [ context(node[p])        # u in context role
-                            ‖ proj_e(edge_feat[p])    # edge (node[p], node[p+1])
-                            ]
-                        )
-
-                      Edge index p (NOT p-1) matches the timestamp at the
-                      same walk position: both describe the hop that
-                      leaves position p toward position p+1 — the same
-                      edge the alignment loss weights by recency.
-
-                      The `target` table is touched only as the SEED side
-                      of alignment, never at walk-internal positions —
-                      that asymmetry is what makes the two tables earn
-                      their keep (see top-level design note).
-
-                      Edge features never reach the LinkPredictor — per
-                      the no-leak rule (negatives don't have edges).
+Walk-position features now come from `WalkEncoder` (a GRU over the
+chronological walk sequence), not from the legacy `context_walk`
+per-position fusion that lived here. The walk encoder consumes
+`context(u)` at every hop, so `proj_c` / `context_final` are still
+exercised — they just aren't bundled with `proj_e` inside this module.
+`edge_feat_proj` is shared with the walk encoder so the per-edge
+projection is defined exactly once.
 
 All projection modules are instantiated ONLY when the corresponding
 feature is present. Zero params, zero compute on absent channels.
@@ -121,15 +104,11 @@ class EmbeddingStore(nn.Module):
             nn.Linear(d_emb + nf_extra, d_emb) if nf_extra > 0 else None
         )
 
-        # context_walk site: concatenates context(u) ‖ proj_e(edge).
-        # context(u) is d_emb on output (already fuses node features when
-        # present). The walk-level final only earns its keep when an edge
-        # feature is being mixed in — otherwise it's just context(u).
-        ef_extra = d_emb if self.has_edge_feat else 0
-        walk_in = d_emb + ef_extra
-        self.context_walk_final = (
-            nn.Linear(walk_in, d_emb) if ef_extra > 0 else None
-        )
+        # NOTE: the legacy `context_walk` per-position fusion module that
+        # used to live here has been removed — the WalkEncoder (in this
+        # file, below) now does all walk-position encoding. We keep
+        # `edge_feat_proj` because it's reused by the walk encoder and
+        # by the DyGFormer-style NodeEncoder.
 
     @torch.no_grad()
     def update_node_feat(self, new_node_feat: np.ndarray) -> None:
@@ -170,43 +149,6 @@ class EmbeddingStore(nn.Module):
             return e
         nf_proj = self.node_feat_proj_context(self.node_feat[ids])
         return self.context_final(torch.cat([e, nf_proj], dim=-1))
-
-    def context_walk(
-        self,
-        walk_nodes: torch.Tensor,                  # [N*K, L] long, padding-safe (≥0)
-        walk_edge_feats: Optional[torch.Tensor],   # [N*K, L-1, d_edge] or None
-    ) -> torch.Tensor:
-        """Per-position walk representation: context role + hop's edge feature.
-
-        At each walk position p ∈ [0, L):
-
-            context(node[p])             # u in context role, node-feat fused
-            ‖ edge_feat_proj(ef[p])      # edge (node[p], node[p+1]), same
-                                         # hop as timestamps[p]
-            → context_walk_final         # → d_emb
-
-        Edge-feat at the seed position (p = lens-1) doesn't exist (no
-        out-going hop) and is right-padded with zeros; the alignment
-        loss masks the seed position anyway, so the value there never
-        contributes. Padding positions are also masked downstream via
-        `lens`.
-
-        The `target` table is intentionally not consumed here — it gets
-        gradient only as the seed side of the alignment loss, keeping
-        the two-table asymmetry sharp.
-        """
-        c = self.context(walk_nodes)                # [N*K, L, d_emb]
-
-        if walk_edge_feats is None or not self.has_edge_feat:
-            return c
-
-        ef_proj = self.edge_feat_proj(walk_edge_feats.float())             # [N*K, L-1, d_emb]
-        # Right-pad: edge_feats[p] sits at position p of the padded tensor
-        # so it aligns with timestamps[p] for the same hop (matches the
-        # alignment loss's `ts[p]` indexing). Seed position p=lens-1 gets
-        # zero — masked out downstream.
-        ef_padded = torch.nn.functional.pad(ef_proj, (0, 0, 0, 1))         # [N*K, L,   d_emb]
-        return self.context_walk_final(torch.cat([c, ef_padded], dim=-1))
 
 
 class LinkPredictor(nn.Module):
