@@ -1,24 +1,29 @@
 # Walk-Distribution-Matched Temporal Embeddings
 
-**Design & Execution Plan (v2.2 — anchored Phase S frame)**
+**Design & Execution Plan (v2.3 — Phase S architecture locked, loss-family search integrated)**
 
 ---
 
-## 0. What changed from v2.0
+## 0. What changed from v2.0 → v2.1 → v2.2 → v2.3
 
-v2.0 introduced the Phase S search frame as a replacement for v1.5's fixed eight-phase progression. The agent review of v2.0 surfaced five issues, all valid:
+**v2.1** fixed five issues with v2.0's Phase S frame: Group E added (head structure searchable); anchor validation §3 (3 seeds, gates Phase S); Group A split A1/A2/A3 (weighting / on-off / target); §4.4 floor = anchor-validated mean; P4 broken out as ~1-week phase.
 
-1. The link MLP head structure was over-locked. The diagnostic showed cross-table column norms growing 5× while test MRR dropped 0.28 — the head structure should be part of the search, not assumed.
-2. The 0.71 anchor was a single 2-epoch smoke, not a multi-seed result. The whole Phase S frame was anchored on an unvalidated number.
-3. Group A conflated three different bets: within-family weighting (A1), alignment on/off (A2), and supervision objective (A3). Mixed comparisons produce uninterpretable matrices.
-4. Success criterion of "≥ 0.65" was soft given the 0.71 anchor — the actual floor should be early-stopped Phase 0.5 baseline.
-5. The honest-protocol re-baseline of TPNet/DyGFormer/TGN was buried as one row of P3, when realistically it's its own multi-day effort.
+**v2.2** added §4.6's deduplicate-by-effective-compute-graph clause so redundant Phase S cells are skipped when search-space dimensions collapse (e.g., A2 × `λ_link` under E.2).
 
-**v2.1 fixes all five.** Structure becomes:
+**v2.3 (current)** records Phase S progress so far and integrates the loss-family amendment as a revised Group A3:
 
-**Anchor validation (30 min)** → **Phase S (12 hours)** → **P1 (window sweep)** → **P2 (multi-view, conditional)** → **P3 (within-method ablation matrix + error analysis)** → **P4 (honest-protocol re-baseline, ~1 week)**.
+- **Wiki anchor (§3) CONFIRMED** at test 0.7070 ± 0.0016 across seeds {42, 7, 13}.
+- **Group A2 (alignment on/off) SEARCHED.** A2-off wins by +0.0019 test MRR (0.7089 vs 0.7070). Per v2.2 §4.4 ties-go-to-simpler, A2-off is the wiki Phase S A2 winner.
+- **Group E (link MLP head) SEARCHED under A2-off.** E.2 (Component-0-only head, 99-dim input) ties E.1 (cross-table, 1123-dim) at 0.7079 ± 0.0005 vs 0.7089 ± 0.0012 — Δ −0.0010, inside both stds. Simpler wins: E.2 is the wiki Phase S E winner under A2-off.
+- **Phase 0.5 over-training cliff confirmed.** 2-ep test 0.7070 vs 50-ep test 0.4269 under alignment+uniformity. Cross-table column norms grow 5× over 50 epochs. The cliff is the load-bearing diagnostic for v2.3's loss-search direction.
+- **Group A3 (supervision target) REVISED** — original spec (per-position / endpoint / multi-endpoint, all within the same inner-product-similarity family) is replaced by a loss-family search per §4.7 below. Triplet, InfoNCE, SGNS, plus a diagnostic-derived norm-brake regularizer. Decision: pick a primary that eliminates the cliff and transfers cross-dataset; wiki peak is expected to *tie* the anchor regardless of loss change.
+- **Loss-family amendment integrated.** The standalone `loss_function_search_ammendum.md` is archival as of v2.3; its load-bearing content lives in §4.7.
 
-The thesis ("walk sampler's distribution is the supervision signal") survives. The paper-defining experiment (P4) is now correctly budgeted.
+**Execution structure (v2.3, post wiki A2+E lock):**
+
+**Loss-family search §4.7 (6 cells on wiki, ~3 hours)** → **Apply winning loss to tgbl-review-v2** → **P1 / P2 / P3 conditional refinement** → **Cross-dataset deployment (server / A40 for tgbl-coin / -flight / -comment)** → **P4 deferred until production architecture is locked**.
+
+The thesis ("walk sampler's distribution is the supervision signal") was directly tested by Group A2 and *did not survive on wiki* — alignment loss is at best neutral on a recurrence-saturated dataset. v2.3 keeps the thesis as a cross-dataset claim, to be re-tested on review and the server datasets.
 
 ---
 
@@ -32,19 +37,23 @@ The open question, surfaced by the diagnostic: **does walks-supervision help, hu
 
 ---
 
-## 2. What we know going in (locked findings from Phase 0.5)
+## 2. What we know going in (locked findings — Phase 0.5 + wiki Phase S A2/E)
 
-These are non-negotiable for v2.1 and downstream phases:
+These are non-negotiable for v2.3 and downstream phases:
 
-1. **Time encoding works substantially on wiki.** Component 0 + random-init cross-table → Test MRR provisionally 0.71 at 2 epochs (subject to anchor validation in §3). The `is_cold_start_uv` bit alone is doing most of the work (99.1% of test pairs are uv-cold-start; the bit carries the EdgeBank-recurrence signal natively).
+1. **Time encoding works substantially on wiki.** Component 0 + random-init cross-table → Test MRR **0.7070 ± 0.0016 at 2 epochs** across 3 seeds (anchor confirmed §3). The `is_cold_start_uv` bit alone is doing most of the work (99.1% of test pairs are uv-cold-start; the bit carries the EdgeBank-recurrence signal natively).
 
 2. **Cold-start bits do not get LayerNorm-washed.** Column-norm analysis showed the 3 bits get amplified to 1.78× the cross-table mean (50-epoch model). The §12.1 mitigation is unnecessary.
 
-3. **Walks-as-currently-supervised hurt at 50 epochs.** Cross-table column norms grow 5× from 2-ep to 50-ep; test MRR drops 0.28. The embeddings are learning *something*, and that something correlates negatively with eval.
+3. **Walks-as-currently-supervised hurt at 50 epochs (the over-training cliff).** Cross-table column norms grow 5× from 2-ep (~0.36) to 50-ep (~1.99); test MRR drops 0.28 from 0.7070 → 0.4269 under alignment+uniformity. The embeddings are learning *something*, and that something correlates negatively with eval. **Eliminating this cliff is the load-bearing win condition for §4.7's loss-family search**, not lifting wiki peak.
 
-4. **The strict-causal protocol works.** No leak shape surfaced in the diagnostic.
+4. **Walks-supervision is at best neutral on wiki (Group A2 result).** A2-off (`λ_align = 0`) tests at 0.7089 ± 0.0012 vs anchor 0.7070 ± 0.0016 — Δ +0.0019, just above anchor std. Per v2.2 §4.4 ties-to-simpler, **A2-off locks on wiki**. The thesis "walks distribution IS the supervision signal" was directly tested and did not produce a measurable lift; remains an open question for non-recurrence-saturated datasets.
 
-5. **TGB serves ~999 random negatives per positive at eval.** For tgbl-wiki, ~99% of negatives are cold-start at the (u,v) level. The eval task is dominantly "is this pair recurring?"
+5. **Cross-table reads of uniformity-only embeddings are noise (Group E result under A2-off).** E.2 (Component-0-only head, 99-dim) at 0.7079 ± 0.0005 ties E.1 (8-block cross-table, 1123-dim) at 0.7089 ± 0.0012 — Δ −0.0010 within both stds. **E.2 locks** under A2-off. Cross-seed std drops to 0.0005 (no embedding-table init variance contributes when embeddings are unread at scoring), confirming the dedup-via-compute-graph reasoning empirically.
+
+6. **The strict-causal protocol works.** No leak shape surfaced in the diagnostic; the protocol's order (walks pre-ingest, ingest post-scoring last) was audited 3× in code.
+
+7. **TGB serves ~999 random negatives per positive at eval.** For tgbl-wiki, ~99% of negatives are cold-start at the (u,v) level. The eval task is dominantly "is this pair recurring?" — which is why wiki is recurrence-saturated and why §4.7 expects wiki peak to tie the anchor regardless of loss choice.
 
 ---
 
@@ -74,36 +83,26 @@ The verified mean test MRR becomes the **Phase 0.5 baseline** for all downstream
 
 This is not a "run a sweep" phase. It's a "let Claude Code explore and report findings" phase, with bounded scope and clear decision criteria.
 
-### 4.1 What Phase S is allowed to vary
+### 4.1 What Phase S is allowed to vary (status per group as of v2.3)
 
-**Group A1 — Within-family alignment weighting:** when alignment loss is active, what weighting?
+**Group A1 — Within-family alignment weighting:** PENDING — only relevant if a primary loss in §4.7 stays within the alignment family.
 - Current: `1/K · (1 + Δt/τ)^(-β)`
 - `1/K` only
 - Uniform `α = 1` over walk positions
 
-**Group A2 — Alignment on/off:** is walks-supervision useful at all on this dataset?
-- Alignment on (the A1 winner)
-- Alignment off (`λ_align = 0`; link MLP only, on random-init embeddings)
+**Group A2 — Alignment on/off (`λ_align`):** **WIKI COMPLETE.** A2-off (`λ_align = 0`) wins by +0.0019 (0.7089 vs 0.7070). Locked on wiki; revisited per-dataset.
 
-**Group A3 — Supervision objective (if A2 says "on"):** if alignment is useful, what target?
-- Current per-position alignment (the A1 winner from above)
-- Endpoint contrastive (SGNS on walk endpoints, the v1.5 Phase 2 idea)
-- Multi-endpoint contrastive (sample K endpoint-like positions per walk)
+**Group A3 — Supervision objective:** **REVISED into a loss-family search** — see §4.7. The original spec (per-position / endpoint / multi-endpoint, all within inner-product-similarity) is replaced by three primaries (InfoNCE / Triplet / SGNS) plus a diagnostic-derived norm-brake regularizer.
 
-**Group C — Joint training:** does link BCE backprop into embeddings help?
+**Group C — Joint training:** PENDING — depends on §4.7 outcome (under E.2, `λ_link` is dedup-moot; under E.1 with a new primary loss it becomes relevant again).
 - `λ_link ∈ {0, 0.1, 0.3, 1.0}`
 
-**Group D — Embedding regularization (NEW):**
+**Group D — Embedding regularization:** PARTIALLY SUBSUMED by §4.7's normbrake auxiliary. Weight decay variants stay relevant as the §4.7 4-way ablation control to distinguish normbrake's novelty from reparameterised WD.
 - Embedding-table dropout (0, 0.1, 0.3)
 - Weight decay on `E_target, E_context` (0, 1e-5, 1e-4)
-- Stop-gradient on alignment loss past epoch N (early-stop just the embedding-side)
+- Stop-gradient on alignment loss past epoch N
 
-**Group E — Link MLP head structure (NEW per v2.0 → v2.1):**
-- 8-block cross-table (current)
-- **No cross-table blocks** (only Φ(Δt) + cold-start bits — the minimal Component-0-only head)
-- 8-block cross-table with cross-table-output dropout
-
-Group E exists because the diagnostic suggests the cross-table blocks may be net-negative when the embeddings have over-trained into the wrong geometry. The "no cross-table" variant is the cheapest representation of "trust Component 0 only." If it ties or beats the 8-block version, that's a major finding.
+**Group E — Link MLP head structure:** **WIKI COMPLETE under A2-off.** E.2 (Component-0-only, 99-dim) ties E.1 (8-block cross-table, 1123-dim) at 0.7079 ± 0.0005. Locked on wiki under A2-off. **§4.7 loss search rolls back to E.1** because under E.2 the embeddings are unread at scoring, which dedup-collapses any loss-family search.
 
 ### 4.2 What Phase S is NOT allowed to vary (locked)
 
@@ -169,6 +168,117 @@ The agent has latitude in execution. Guidance for that latitude:
 - **If something surprising happens, follow the surprise.** Examples: one loss variant produces stable training while others diverge — investigate why; joint training helps massively when alignment is absent but not when alignment is present — that's a finding about coupling; Group E "no cross-table" wins — that's a paper-defining finding worth multi-seed validation immediately.
 - **Deduplicate by effective compute graph, not nominal hyperparameters.** When Phase S configurations would be mathematically equivalent (e.g., Option E.2 means embeddings are never read at scoring, so A2-on/off and `λ_link` collapse to the same gradient flow), the agent should NOT run duplicate experiments. Specifically: under E.2 the embeddings receive no link-BCE gradient regardless of `λ_link`, and A2-on differs from A2-off only in whether the (unread) embeddings are also trained by the alignment loss. Recognise these collapses and skip the redundant cells in the comparison matrix.
 - **Phase S budget is 12 hours.** Don't expand into a multi-day project. If you run out of budget, report what you have.
+
+---
+
+## 4.7 Group A3 (REVISED): loss-family search
+
+The original Group A3 (per-position / endpoint / multi-endpoint contrastive) was three variants within the *same* inner-product-similarity family. The Phase 0.5 diagnostic (5× column-norm growth correlating with −0.28 test MRR decline) and the A2 result (alignment+uniformity is neutral on wiki) jointly suggest the *loss family itself* is the candidate to revise, not just its weighting or target position. §4.7 replaces the original A3 spec.
+
+### 4.7.1 Candidates
+
+Three primary loss families, plus one diagnostic-derived auxiliary regularizer. All four are specified in detail in the archived `loss_function_search_ammendum.md`; §4.7 keeps the load-bearing summary here.
+
+**A3.1 — Multi-positive InfoNCE with positional weighting.**
+For each walk, anchor = `target(seed)`, positives = `context(walk_position_i)` weighted by `w(i) = 1/K · (1+Δt/τ_pos)^(-β)`, negatives = in-batch other anchors' contexts + uniform random destinations. Temperature `τ_contrastive = 0.1`. **`η_uniform = 0` (mandatory).** Sample negatives from unigram^0.75 over training destinations to mitigate heavy-tail false-positive collisions on wiki. Direct empirical precedent: NeurTWs (Jin et al., NeurIPS 2022) Table 4 Ablation 5 shows BCE deteriorates vs multi-negative contrastive on every continuous-time-graph dataset they tested.
+
+**A3.2 — Triplet/margin loss with semi-hard mining.**
+For each walk, sample one positive `p ~ Cat({n_0..n_{L-2}}, weights={w(i)})`, one uniform-random negative `q`. **Cosine similarity** (not raw dot product), margin `m = 0.5`. Semi-hard mining mask: only triplets with `pos_sim − neg_sim < m AND neg_sim < pos_sim` contribute gradient. **`η_uniform = 0`; add `weight_decay_emb = 1e-4`** to supply the norm control uniformity used to provide. One triplet per walk (over-sampling causes spurious gradient correlation). NEVER enable hard mining — bipartite graphs collapse under it.
+
+**A3.3 — SGNS (Skip-gram with negative sampling).**
+For each (anchor `u`, walk position `v` with weight `w(i)`): `pos = σ(target(u)·context(v))`, sample `k=5` negatives `v_- ~ unigram^0.75` over training destinations, `neg = σ(−target(u)·context(v_-))`. Loss = BCE-with-logits. Mikolov-style subsampling `t=1e-5` discards frequent positives. Linear lr decay `0.025 → 1e-3` over 5 epochs (Mikolov schedule); without it expect early-epoch divergence on negative gradients. **`η_uniform = 0`.** The only candidate with a principled stopping criterion: Levy & Goldberg (NIPS 2014) factorization → stop when Frobenius distance between `target·contextᵀ` and shifted PMI plateaus.
+
+**A3.x_normbrake — Custom diagnostic-derived norm-brake regularizer (auxiliary; composes with any primary).**
+Per-column L2 hinge: `excess = max(0, ||E[:,j]|| − threshold)`, loss = mean(excess²) over `E_target` and `E_context`. Threshold = `1.5 × anchor_col_norm` (calibrated once from the anchor's best-val checkpoint; from the diagnostic's 2-ep mean ≈ 0.36, threshold ≈ 0.54). `λ_normbrake = 0.1`. Derived directly from the diagnostic finding that the cliff is caused by unbounded column-norm growth — penalises growth past the empirically observed "safe" regime. **No published precedent in this exact form** (matrix-factorisation column-norm regularisation is well-known, but the empirical calibration to the cliff threshold is custom).
+
+### 4.7.2 Why each candidate, ranked by cliff-elimination strength
+
+| Criterion | InfoNCE (A3.1) | **Triplet (A3.2)** | SGNS (A3.3) |
+|---|---|---|---|
+| Cliff elimination mechanism | none (NPC coupling keeps pulling) | **literal ∇=0 once margin clears** | sigmoid saturation (soft) |
+| Theoretical guarantee on stopping | none | **strongest (mathematical)** | shifted-PMI plateau (soft) |
+| Cosine vs raw-dot scale stability | raw-dot scale issue | **cosine bounded [-1,1]** | sigmoid bounded |
+| Predicted wiki peak (amendment §4) | 0.700 ± 0.020 | 0.690 ± 0.020 | 0.695 ± 0.020 |
+| Predicted wiki cliff (50-ep − peak) | −0.05 to −0.10 | **±0.01 (largely eliminated)** | −0.05 |
+| Predicted cross-dataset uplift | +0.03–0.08 | +0.02–0.05 | **+0.04–0.07 (best transfer rep)** |
+| Implementation cost | ~30 LOC | **~20 LOC (lowest)** | ~50 LOC (unigram cache + lr sched) |
+| Failure mode | false-neg in-batch on heavy-tail | margin mis-tune | wrong neg dist, anisotropy |
+
+**The cliff is the load-bearing diagnostic.** Triplet (A3.2) has the strongest theoretical fit — its gradient structurally bounds at convergence, which is exactly what the diagnostic's 5×-column-norm-growth failure mode demands.
+
+### 4.7.3 Pre-registered predictions (commit before running)
+
+| Cell | Config | Predicted test MRR | Predicted cliff (50 ep − peak) | Confidence |
+|---|---|---|---|---|
+| 1 | InfoNCE alone | 0.70 ± 0.02 | −0.05 | medium |
+| 2 | **Triplet alone** | **0.69 ± 0.02** | **±0.01** | **high (theory)** |
+| 3 | SGNS alone | 0.695 ± 0.02 | −0.05 | medium |
+| 4 | InfoNCE + normbrake | 0.70 ± 0.02 | ±0.02 | medium |
+| 5 | Triplet + normbrake | 0.69 ± 0.02 | ±0.01 (normbrake dormant) | high |
+| 6 | SGNS + normbrake | 0.695 ± 0.02 | ±0.02 | medium |
+
+**Prior winner (pending data): Cell 5 (Triplet + normbrake), or Cell 2 (Triplet alone) if normbrake is dormant.** Updated to Cell 1/3/4/6 only if data show > 0.005 advantage over Cell 2 on multi-seed reproduction.
+
+### 4.7.4 Execution plan (six single-seed cells, then multi-seed top-2)
+
+Six cells per amendment §5.1, executed under E.1 head (NOT E.2 — under E.2 the dedup clause collapses all six to one):
+
+```
+Cell 1: --primary-loss infonce  --lambda-normbrake 0
+Cell 2: --primary-loss triplet  --lambda-normbrake 0
+Cell 3: --primary-loss sgns     --lambda-normbrake 0
+Cell 4: --primary-loss infonce  --lambda-normbrake 0.1
+Cell 5: --primary-loss triplet  --lambda-normbrake 0.1
+Cell 6: --primary-loss sgns     --lambda-normbrake 0.1
+```
+
+All cells: seed 42, `--num-epochs 50 --early-stop-patience 5`, `--head-mode cross_table` (E.1).
+
+**Normbrake threshold calibration (BEFORE Cells 4–6):** load the seed-42 anchor's best-val checkpoint, compute joint mean per-column L2 norm of `E_target` ∪ `E_context`, lock `normbrake_threshold = 1.5 × that_mean`. ~30 seconds, not a training cell.
+
+**Wall budget:** 6 × ~9 min single-seed = ~1 hour. Plus ~30–40 min for multi-seed top-2 on seeds {7, 13}. Within the v2.2 §4.3 12-hour Phase S budget by a wide margin.
+
+### 4.7.5 Per-cell logging
+
+For each cell:
+1. Best epoch (per patience=5 early stopping)
+2. Best val MRR + best test MRR (pinned to the same epoch)
+3. **Per-epoch test MRR trajectory** (the cliff diagnostic)
+4. **Per-epoch column-norm trajectory** of `E_target ∪ E_context` (cliff cause signal)
+5. **Per-epoch `L_normbrake`** (for Cells 4–6 only — should be near zero for Cell 5 if triplet self-limits as designed; non-zero for Cells 4/6 if cliff occurred)
+6. Wall time / epoch
+7. Hyperparameter values used
+
+### 4.7.6 Decision rules
+
+After Cells 1–3 (primary alone):
+- **A — clear winner:** any of A3.1/A3.2/A3.3 beats A2-off (0.7092) by > 0.0016 reproducibly across seeds → that's the primary. Multi-seed validate, lock.
+- **B — all tie within noise (EXPECTED on wiki):** loss form isn't the wiki peak bottleneck. Pick the cell with cleanest cliff shape (smallest decline from peak over 4 epochs post-stop). Per §2 goal-shaping, this is the *expected* outcome and is fine.
+- **C — a cell shows no peak by epoch 10:** that loss is genuinely fixing the cliff. Run it longer. Multi-seed validate immediately — most important deliverable.
+- **D — all three regress below A2-off (0.7092):** loss-family change is harmful on wiki under E.1. Two possibilities: implementation bug (verify) OR alignment+uniformity was actually right for this task (a paper finding in its own right). Proceed to Cells 4–6 to test whether normbrake rescues anything.
+
+After Cells 4–6 (primary + normbrake):
+- **E — normbrake fixes cliff (column norms stay < `1.5 × threshold` across 50 ep AND test MRR holds within 0.02 of peak):** paper-novel finding. Multi-seed validate.
+- **F — normbrake dormant (`L_normbrake ≈ 0` throughout):** primary already self-limits (likely Cell 5 with triplet). Drop normbrake from production. No paper finding, no harm done.
+- **G — normbrake always-active (`L_normbrake > 0.5` throughout):** threshold too tight. Re-calibrate from a post-Cell-1 checkpoint instead of the anchor, OR raise `1.5×` multiplier to `2.5×`.
+- **H — normbrake hurts (test MRR regress > 0.005):** drop. Report as informative.
+- **I — normbrake duplicates weight decay:** run the 4-way ablation (no-aux / WD-only / normbrake-only / both) on the winning primary BEFORE any v2.3+ lock. **This is paper-integrity-critical** — without it, the normbrake contribution claim is unsupported.
+
+### 4.7.7 Stop conditions (don't burn budget)
+
+- Stop if any cell gives test MRR ≥ 0.7090 with clean cliff (≤ 0.02 decline from peak over 50 ep). Strong evidence; multi-seed validate immediately.
+- Stop if all 6 cells regress below A2-off (0.7092) by > 0.005. Lock A2-off + E.2 (current Phase S winner) and move to cross-dataset validation.
+- DO NOT stop just because peaks tie within noise. The cliff shape is the more important signal per §2.
+
+### 4.7.8 What's NOT in §4.7 (explicitly removed)
+
+- **EdgeBank-as-teacher distillation.** Considered in the amendment v1.1, removed in v1.2: distilling a known heuristic into the embeddings dilutes the contribution claim from "we found a useful walks-supervised loss family" to "we trained embeddings to encode EdgeBank." Out of scope for this paper.
+- **Decoupled Contrastive Loss (DCL):** marginal expected gain over A3.1; possible cliff regression.
+- **Barlow-Twins / VICReg:** inductive-bias mismatch (augmented-views vs role asymmetry of target/context).
+- **Hawkes-process log-likelihood:** implementation cost too high for Phase S; pilot in a separate workstream.
+- **Supervised contrastive, BYOL/SimSiam, mutual-information bounds, masked walk modeling, BPR:** ruled out (no class labels / inductive mismatch / dominated by NeurTWs / misaligned with task).
+
+The archival `loss_function_search_ammendum.md` (in repo root) preserves the full reasoning behind each inclusion and exclusion.
 
 ---
 
@@ -281,7 +391,11 @@ How these tables are *used* in the link MLP (Group E) is part of Phase S. The ta
 
 When node features present, three projections (proj_t, proj_c) + three fusion layers (target_final, context_final). No-op when `d_n = 0`. tgbl-wiki sits in bottom-left of regime matrix (ef present, nf absent → plain identity lookups).
 
-### 6.4 Link MLP head (FLOATING — Phase S Group E decides)
+### 6.4 Link MLP head (Phase S Group E result + §4.7 roll-back to E.1)
+
+**Wiki Phase S E result (post v2.2):** E.2 (Component-0-only, 99-dim) ties E.1 (cross-table, 1123-dim) at 0.7079 ± 0.0005 vs 0.7089 ± 0.0012 under A2-off. Simpler-wins-ties → **E.2 locks on wiki under A2-off**.
+
+**§4.7 roll-back:** the loss-family search uses **E.1** as the default head, because under E.2 the embeddings are unread at scoring and any loss-family change becomes dedup-moot (§4.6). If §4.7 lifts the production number under E.1, the final architecture is E.1 + the §4.7 winner. If §4.7 doesn't lift, fall back to the simpler E.2 + A2-off.
 
 Possible heads:
 
@@ -390,7 +504,7 @@ The leaderboard target is "competitive under honest protocol." Absolute MRR rang
 
 ---
 
-## 11. What's deliberately NOT in v2.1
+## 11. What's deliberately NOT in v2.3 (preserved across v2.1 → v2.3)
 
 - Walk encoder (deferred; the diagnostic suggests adding sequence models on top of an unstable base is the wrong direction)
 - TGN-style memory (roadmap; honest raw-message-store version only)
@@ -457,12 +571,17 @@ Per May 2026 audit, top performers appear leak-free under within-batch state-upd
 
 ---
 
-## 14. Process for v2.1 → v2.2+
+## 14. Process for v2.3 → v2.4+
 
-After anchor validation completes: confirm or adjust the Phase 0.5 baseline number in v2.2. After Phase S completes: write v2.2 with the locked base configuration as a real committed plan (no more search). After P1/P2/P3 land: v2.3 has the ablation matrix and error analysis. After P4 lands: v2.4 has the honest-protocol comparison and final paper narrative.
+v2.3 records the wiki Phase S A2 + E results and integrates the loss-family amendment as §4.7. The standalone `loss_function_search_ammendum.md` is archival as of v2.3 — its load-bearing content lives in §4.7; the full reasoning trail stays on disk for future reference.
 
-v2.1 is a search frame with bounded latitude and a clearly-budgeted multi-phase plan. v2.2+ are committed plans built on Phase S's locked outputs.
+**Next steps:**
+- **v2.4 (post-§4.7):** lock the §4.7 winner (primary + optional normbrake). If §4.7 lifts wiki past 0.7089 reproducibly across seeds, production architecture is E.1 + §4.7 winner; otherwise fall back to E.2 + A2-off (the current Phase S wiki winner at 0.7079 ± 0.0005).
+- **Apply v2.4-locked architecture to tgbl-review-v2** on the laptop. Verifies cross-dataset transfer before committing.
+- **Ship to A40 server for tgbl-coin / -flight / -comment / -review-full** (these need >8 GB VRAM, not laptop-feasible).
+- **v2.5 (post-P1/P2/P3):** within-method ablation matrix with the locked architecture across all five datasets.
+- **v2.6 (post-P4):** honest-protocol re-baseline. Currently deferred (paper-narrative work, not number-improvement work).
 
 ---
 
-*Document version: v2.2, May 2026. Fix from v2.1: §4.6 adds a "deduplicate by effective compute graph, not nominal hyperparameters" guideline so the agent skips redundant cells in the comparison matrix when search-space dimensions collapse (e.g., under E.2 head, embeddings are never read at scoring, so A2-on/off and `λ_link` differ only in whether the unread embeddings are alignment-trained — most combinations there are mathematically equivalent at the link MLP). Preserved from v2.1: (1) Group E added to Phase S — link MLP head structure searchable (E.1 cross-table / E.2 Component-0-only / E.3 cross-table+dropout); (2) anchor validation §3, 30-min pre-Phase-S step, 3 seeds, gates Phase S launch; (3) Group A split into A1 (within-family weighting), A2 (alignment on/off), A3 (supervision target); (4) §4.4 success criterion floor explicit at anchor-validated baseline; (5) honest-protocol re-baseline extracted from P3 into its own ~1-week P4. Companion to Tempest paper (Salehin et al., arXiv:2605.16182).*
+*Document version: v2.3, May 2026. Changes from v2.2: (1) §0 integrates the wiki Phase S A2 and E results (A2-off wins by +0.0019; E.2 ties E.1 under A2-off and locks via simpler-wins); (2) §2 promotes the over-training cliff (5× column-norm growth → 0.28 test MRR drop over 50 epochs) to a load-bearing locked finding; (3) §4.1 adds status flags per Phase S group; (4) §4.7 REVISES Group A3 as a loss-family search — three primaries (InfoNCE / Triplet / SGNS) plus a diagnostic-derived norm-brake regularizer, integrating the previously-standalone `loss_function_search_ammendum.md`; (5) §4.7 includes pre-registered predictions (Cell 5 Triplet+normbrake = prior winner) and a comparative ranking; (6) §6.4 records the E.2 lock on wiki + the §4.7 roll-back to E.1 for the loss search; (7) §14 sketches the v2.3 → v2.4 → v2.5 → v2.6 evolution. Preserved from v2.2: §4.6 deduplicate-by-effective-compute-graph clause (applies to §4.7 as well — under E.2 all primaries dedup-collapse, which is why §4.7 uses E.1). Preserved from v2.1: Group E, anchor validation §3, Group A split (now A1/A2 only — A3 is revised), §4.4 anchor-validated floor, P4 broken out (currently deferred). Companion to Tempest paper (Salehin et al., arXiv:2605.16182).*

@@ -1,24 +1,18 @@
 # Walk-Distribution-Matched Temporal Embeddings — Running Results & Session Transcript
 
-Companion to `walk_distribution_matching_embedding_v2.md` (v2.2, anchored
-Phase S frame; superseded the v1.5 fixed 8-phase progression after the
-Phase 0.5 diagnostic). Records what was implemented, what was run, what
-the numbers were, and what decision was made at each phase.
+Companion to `walk_distribution_matching_embedding_v2.md` (v2.3 —
+Phase S wiki A2/E locked, loss-family search integrated). Records what
+was implemented, what was run, what the numbers were, and what decision
+was made at each phase.
 
 **Branch:** `feature/walk-distribution-embedding` (off `master` @ `b246b87`).
-Plan v2.2 committed at `7ceeebe`.
 
 **Plan-document trail:**
 - v1.5 (`b246b87`): fixed 8-phase plan, master.
-- v2.0: introduced Phase S search frame as replacement for v1.5's fixed
-  progression. Five issues flagged on review.
-- v2.1: addressed all five (Group E added; anchor validation §3; A split
-  into A1/A2/A3; floor = anchor-validated mean; P4 broken out).
-- **v2.2 (`7ceeebe`, current):** adds §4.6 "deduplicate by effective
-  compute graph" clause so redundant Phase S cells are skipped when
-  search-space dimensions collapse (e.g., under Option E.2 head, the
-  embeddings are not read at scoring, so most A2/`λ_link` combinations
-  are mathematically equivalent at the link MLP).
+- v2.0: Phase S search frame replaces v1.5's fixed progression.
+- v2.1: Group E added; anchor §3; A split A1/A2/A3; floor = anchor mean; P4 broken out.
+- v2.2 (`7ceeebe`): §4.6 deduplicate-by-effective-compute-graph clause.
+- **v2.3 (current):** integrates wiki Phase S results (A2-off locks, E.2 locks) and folds the standalone `loss_function_search_ammendum.md` into §4.7. Group A3 is REVISED to a loss-family search (InfoNCE / Triplet / SGNS + diagnostic-derived norm-brake). Pre-registered predictions: Cell 5 (Triplet + normbrake) is the prior winner; cliff elimination — not wiki peak — is the win condition.
 
 **Starting state confirmed:**
 - `master` is at the v3 baseline (no walk encoder, no DyG, no memory, no
@@ -355,10 +349,71 @@ by > anchor std.
    test MRR per epoch). We want to see whether the alignment-on configs
    diverge after some epoch or stabilize.
 
-**Phase S exit summary:**
-- Cells run / total budget used:
-- Winning config:
-- Δ over anchor floor:
+**Phase S exit summary (wiki, A2 + E groups, v2.3):**
+- Cells run: 1 smoke (A2-on early-stop) + 3 anchor (A2-on 2-ep flat) + 3 (A2-off early-stop) + 3 (E.2 + A2-off early-stop) = 10 cells. Budget used: ~1 hour of ~12 hour Phase S budget.
+- Winning config (locked under E.2): **E.2 + A2-off** (Component-0-only head, no walks-supervision).
+- Test MRR: **0.7079 ± 0.0005** (3 seeds; std lowest of all cells due to dedup-via-compute-graph effect).
+- Δ over anchor (0.7070 ± 0.0016): **+0.0009**, smaller than anchor std — locked via simpler-wins-ties per v2.2 §4.4.
+- A2-off alone (E.1): 0.7089 ± 0.0012 (kept for reference; +0.0019 over anchor, just above anchor std).
+- **Group A3 SUPERSEDED by §4.7 loss-family search** — see below.
+
+---
+
+## Phase S §4.7 — Loss family search (v2.3, on wiki E.1)
+
+**Status:** in implementation as of 2026-05-19. Pre-registration committed.
+
+**Win condition (per v2.3 §2 + §4.7.2):** *eliminate the over-training cliff*, NOT lift wiki peak. Wiki is recurrence-saturated (`is_cold_start_uv` carries the EdgeBank-tw signal natively at the head); no loss-family change is expected to lift peak meaningfully. The diagnostic-load-bearing finding is the 5×-column-norm-growth → −0.28 test MRR cliff over 50 epochs under alignment+uniformity. A loss whose gradient is structurally bounded eliminates the cliff.
+
+**Roll-back to E.1 head:** §4.7 runs under E.1 (cross-table) because under the wiki-Phase-S-winning E.2 the embeddings are unread at scoring and the loss-family search dedup-collapses (v2.2 §4.6). If §4.7 lifts the number under E.1, production architecture becomes E.1 + §4.7 winner. Otherwise fall back to E.2 + A2-off.
+
+### Pre-registered ranking (analytical, not yet measured)
+
+| Criterion | InfoNCE (A3.1) | **Triplet (A3.2)** | SGNS (A3.3) |
+|---|---|---|---|
+| Cliff elimination | weak (NPC coupling) | **literal ∇=0 once margin clears** | sigmoid saturation (soft) |
+| Theoretical stop guarantee | none | **strongest (mathematical)** | shifted-PMI plateau |
+| Cosine/raw-dot scale stability | raw-dot scale issue | **cosine bounded [-1,1]** | sigmoid bounded |
+| Predicted wiki peak | 0.700 ± 0.020 | 0.690 ± 0.020 | 0.695 ± 0.020 |
+| Predicted cliff (50-ep − peak) | −0.05 to −0.10 | **±0.01** | −0.05 |
+| Predicted cross-dataset uplift | +0.03–0.08 | +0.02–0.05 | **+0.04–0.07** |
+| Implementation cost | ~30 LOC | **~20 LOC** | ~50 LOC |
+
+### Pre-registered cell predictions
+
+| Cell | Config | Predicted test MRR | Predicted cliff | Confidence |
+|---|---|---|---|---|
+| 1 | InfoNCE alone | 0.70 ± 0.02 | −0.05 | medium |
+| 2 | **Triplet alone** | **0.69 ± 0.02** | **±0.01** | **high (theory)** |
+| 3 | SGNS alone | 0.695 ± 0.02 | −0.05 | medium |
+| 4 | InfoNCE + normbrake | 0.70 ± 0.02 | ±0.02 | medium |
+| 5 | **Triplet + normbrake** | **0.69 ± 0.02** | ±0.01 (normbrake dormant) | **high** |
+| 6 | SGNS + normbrake | 0.695 ± 0.02 | ±0.02 | medium |
+
+**Prior winner candidate (pending data): Cell 5 (Triplet + normbrake), or Cell 2 (Triplet alone) if normbrake is dormant.** Updated to a different cell only if data show > 0.005 advantage over Cell 2 on multi-seed reproduction.
+
+**Reasoning for Cell 5 as prior:**
+1. Cliff is the load-bearing diagnostic (5× column-norm growth → −0.28 test MRR over 50 ep).
+2. Triplet's gradient is structurally bounded — `∇L = 0` once positives clear the margin. This is mathematically guaranteed, not heuristic. Direct fix for the diagnosed cause.
+3. Cosine normalization caps magnitude scale at [-1, 1] — `m = 0.5` is dataset-independent.
+4. Semi-hard mining empirically beats hard mining on bipartite graphs.
+5. Simplest implementation (~20 lines, smallest bug surface area).
+6. Normbrake paired with triplet is the cleanest theoretical test: if triplet self-limits, normbrake should be *dormant* (`L_normbrake ≈ 0` throughout). Positive evidence the threshold is calibrated correctly even though normbrake does nothing.
+
+### Cells (to be filled in run-by-run)
+
+| Cell | Config | Seed | Best ep | Best val | Best test | Cliff (50-ep − peak) | Max col-norm |
+|---|---|---|---|---|---|---|---|
+| 1 | InfoNCE                |  |  |  |  |  |  |
+| 2 | Triplet                |  |  |  |  |  |  |
+| 3 | SGNS                   |  |  |  |  |  |  |
+| 4 | InfoNCE + normbrake    |  |  |  |  |  |  |
+| 5 | Triplet + normbrake    |  |  |  |  |  |  |
+| 6 | SGNS    + normbrake    |  |  |  |  |  |  |
+
+### §4.7 exit decision
+
+To be filled in post-run. Decision rules per v2.3 §4.7.6 (criteria A–I) and §4.7.7 stop conditions.
 
 ---
 
