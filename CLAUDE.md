@@ -406,34 +406,68 @@ introducing a one-position skew between time and edge-feat at
 every walk position — fixed by right-padding (zero at the seed
 slot, which is masked out anyway).
 
+### Lesson 13 — Cross-pair attention with 4-channel link MLP regresses
+
+Replacing Phase 2's 12-block link MLP (8 cross-table + 4 walk-encoded)
+with a 4-channel head fed by cross-pair-attended W cost ~0.05 test MRR
+on wiki. The hand-crafted Hadamard/L1 cross-table interactions are
+doing more work than cross-pair attention adds on a 110K-edge dataset.
+Keep the 12-block design; if cross-pair is added back, layer it as
+PAIR-CONDITIONED W INSIDE the 12-block structure, not as a replacement.
+
+### Lesson 14 — Direct (u, v) recurrence is the biggest unpulled lever
+
+On tgbl-wiki, EdgeBank's pure (u, v)-pair-recurrence lookup reaches
+0.571 test MRR. Our co-occurrence feature captures SHARED-NEIGHBOR
+recurrence (second-order), NOT direct (u, v) recurrence (first-order).
+Adding an explicit "is v in u's recent K-history?" feature with
+recency-aware decay gave +0.0506 test MRR (Phase 5 0.4396 → Phase 6
+0.4902) — the largest single architectural gain of the session. The
+recurrence signal is the dominant signal on this dataset; the walk
+encoder, DyG transformer, memory, and co-occurrence all approximate
+it indirectly and inefficiently.
+
+### Lesson 15 — Capacity scaling hurts on wiki
+
+d_emb 128 → 192 with the full Phase 5 stack regressed test MRR by
+0.03 (0.4396 → 0.4093). The architecture is already at the right
+capacity for 110K-edge / 9.2k-node wiki. More params just makes the
+model overfit faster (BCE 0.027 → ~0.025 with no eval improvement).
+Capacity scaling is a tool for bigger datasets, not for squeezing
+more out of small ones.
+
+### Lesson 16 — Memory module adds marginal value when recurrence is already captured elsewhere
+
+TGN-style raw-message-store memory (with proper one-step BPTT) added
+only +0.003 test MRR on top of Phase 4 (DyG + co). The memory's main
+contribution — "summary of u's history" — overlaps with what the DyG
+transformer already extracts. Memory is more useful on datasets where
+the recurrence horizon is much longer than K_history (e.g., monthly
+patterns vs daily wiki edits). On wiki, K_history=32 already covers
+~the same time window as memory's running state.
+
 ---
 
-## Baseline result (v3, strict-causal, walks-supervise-embeddings only)
+## Results (tgbl-wiki, 50 epochs, B=200, K=5, L=20, d=128 unless noted)
 
-**tgbl-wiki, 50 epochs, hist_neg_ratio=0.5, d=128.** All numbers go
-through `tgb.linkproppred.evaluate.Evaluator.eval(...)`.
+All MRR through `tgb.linkproppred.evaluate.Evaluator.eval(...)`.
 
-| Run | B | K | L | Val MRR | Test MRR |
-|---|---|---|---|---|---|
-| v3, additive node-feat residual + edge-feat alignment | 200 | 5 | 20 | 0.3725 | 0.2884 |
-| v3, init-only node-feat + edge-feat alignment | 200 | 5 | 20 | 0.3629 | 0.2942 |
-| **v3 + cross-table link MLP + union seeding + ef-pad fix (current best)** | **200** | **5** | **20** | **0.4015** | **0.3313** |
-| v3 directed (sanity — TGB negatives don't respect direction) | 200 | 5 | 20 | 0.3553 | 0.2735 |
-| v3 + larger batch + longer walks (regressed, see Lesson on batch size) | 1000 | 5 | 50 | 0.3503 | 0.2690 |
-| v3 + larger batch + longer walks + `time_scale` fix (Lesson 11) | 1000 | 5 | 50 | 0.3574 | 0.2704 |
+| Run | Val MRR | Test MRR | Notes |
+|---|---|---|---|
+| v3, additive node-feat residual | 0.3725 | 0.2884 | early v3 baseline |
+| v3 + init-only node-feat | 0.3629 | 0.2942 | |
+| **v3 + cross-table link MLP + union seeding + ef-pad fix (Phase 0)** | **0.4015** | **0.3313** | the 8-block + walk-context baseline that everything stacks on |
+| v3 directed (sanity) | 0.3553 | 0.2735 | TGB negs don't respect direction; undirected is right for wiki |
+| Phase 2 — Phase 0 + walk encoder (GRU over walk) | 0.5128 | 0.4289 | walk encoder produces seed-pooled W; 12-block link MLP (8 cross-table + 4 walk-encoded) |
+| Phase 3 — Phase 2 + cross-pair attention + 4-channel link MLP | 0.4424 | 0.3829 | REGRESSED — Hadamard/L1 cross-table blocks were doing more work than cross-pair attn added |
+| Phase 4 — Phase 2 + DyG node encoder + co-occurrence + 12-block MLP | 0.5118 | 0.4362 | Marginal; cross-pair dropped |
+| Phase 4 @ 15 epochs (early stop) | 0.4847 | 0.3906 | Worse — model still learning past ep 15 |
+| Phase 5 — Phase 4 + raw-message-store memory | 0.5198 | 0.4396 | Memory adds +0.003 test (marginal) |
+| Phase 5 + d_emb=192 (capacity sweep) | 0.5066 | 0.4093 | REGRESSED — capacity hurts on this dataset |
+| **Phase 6 — Phase 5 + EdgeBank-style direct recurrence feature** | **0.5264** | **0.4902** | **+0.0506 test from EdgeBank's direct (u,v)-in-history signal — biggest single jump of the session** |
 
-Training under the current best: 50 epochs × ~15s = ~13 min total.
-Tempest on CPU, model on RTX 2000 Ada. Link BCE 0.27 → 0.11 over 50
-epochs; alignment plateaus at ~0.87 by epoch 5; uniformity stable
-around −3.93.
-
-The B=1000, L=50 rows show that bumping batch size 5× regresses test
-MRR by ~0.06 on wiki even after fixing the `time_scale` derivation
-that L=50 exposed. The regression is the **batch size** itself — wiki
-is small (110K train edges) and dilutes per-positive gradient at
-larger batches, the exact failure mode our operating notes warn
-about. The `time_scale` fix (Lesson 11) is still a correctness win
-and should stay in the codebase.
+Training cost (Phase 6): 50 epochs × ~77 s = ~64 min + ~6 min eval.
+Tempest on CPU, model on RTX 2000 Ada (8 GB VRAM).
 
 Leaderboard reference (note: most carry the TGN memory leak):
 
@@ -448,8 +482,24 @@ Leaderboard reference (note: most carry the TGN memory leak):
 | DyGFormer | 0.798 |
 | TPNet | 0.827 |
 
-The current honest walks-supervise-embeddings number is 0.331 on
-wiki. Closing the gap to EdgeBank (0.495) is the next milestone; the
+The current honest walks-supervise-embeddings number is **0.490 test
+MRR** on wiki (Phase 6, all channels stacked). Closing the remaining gap
+to EdgeBank-tw (0.571) and beyond would require:
+- Larger K_history window (eb-feat saturates at K=32 since we only see
+  32 most-recent events per node — wiki has dense interactions)
+- True time-windowed history (vs slot-windowed) — EdgeBank-tw uses a
+  time window, not a count window
+- Per-token co-occurrence features (DyGFormer's full version, not the
+  scalar summary we have)
+
+The historical assertion that "0.331 is the next milestone" is now
+superseded — 0.490 puts us between EdgeBank-inf (0.495) and EdgeBank-tw
+(0.571). Memorisation-via-recurrence is the now-dominant signal; the
+DyG transformer + memory module add small marginal value on top.
+
+(legacy text retained below for context)
+
+Closing the gap to EdgeBank (0.495) was the original milestone; the
 levers we haven't pulled yet (walks-at-scoring, raw-message-store
 memory, longer walks at small batch) are exactly what the leaderboard
 methods rely on.
