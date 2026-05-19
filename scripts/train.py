@@ -96,6 +96,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-debug", action="store_true",
                    help="Verbose per-epoch logging: grad norms, link-MLP "
                         "col-norm, full per-epoch test MRR trajectory.")
+    # Sampled-eval for cheap per-epoch monitoring on large datasets (review).
+    # When < 1.0, each per-epoch val/test eval subsamples positives by this
+    # fraction. Final report eval (post weight-restore) is always full
+    # precision regardless. Use ~0.05 on tgbl-review to cut per-epoch
+    # eval cost from ~15 min to ~1 min.
+    p.add_argument("--monitor-sample-pct", type=float, default=1.0,
+                   help="Fraction of val/test positives to score per epoch "
+                        "during training-time monitoring. <1.0 = sampled "
+                        "estimate (cheap on big datasets); final report eval "
+                        "is always full precision.")
 
     # Optimization
     p.add_argument("--num-neg-per-pos", type=int, default=10)
@@ -265,6 +275,7 @@ def main() -> None:
             ),
             early_stop_patience=args.early_stop_patience,
             log_debug=args.log_debug,
+            monitor_sample_pct=args.monitor_sample_pct,
         )
         print(f"\n=== Summary (best epoch {summary['best_epoch']}) ===")
         print(f"  stopped_at_epoch    : {summary['stopped_at_epoch']}")

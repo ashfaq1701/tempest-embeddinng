@@ -497,6 +497,7 @@ class Trainer:
         test_batches_factory: Optional[Callable[[], Iterable[Batch]]] = None,
         early_stop_patience: Optional[int] = None,
         log_debug: bool = False,
+        monitor_sample_pct: float = 1.0,
     ) -> Dict[str, Any]:
         """Train up to `config.num_epochs`.
 
@@ -644,13 +645,17 @@ class Trainer:
             eval_dt = 0.0
             if do_val:
                 t1 = time.perf_counter()
-                val_mrr = self.evaluate(val_batches_factory(), val_evaluator)
+                # Per-epoch monitoring eval — uses `monitor_sample_pct` for
+                # cheap evals on big datasets. Final report eval (after
+                # weight-restore, see post-loop block) is always full-precision.
+                val_mrr = self.evaluate(
+                    val_batches_factory(), val_evaluator, sample_pct=monitor_sample_pct,
+                )
                 per_epoch_val.append(float(val_mrr))
-                # log_debug: ALSO run test eval every epoch (not just on
-                # improvement), so the full val/test trajectory is captured
-                # for cliff/plateau localization.
                 if log_debug and do_test:
-                    test_all = self.evaluate(test_batches_factory(), test_evaluator)
+                    test_all = self.evaluate(
+                        test_batches_factory(), test_evaluator, sample_pct=monitor_sample_pct,
+                    )
                     per_epoch_test_all.append(float(test_all))
                 improved = val_mrr > best_val_mrr
                 if improved:
@@ -658,19 +663,16 @@ class Trainer:
                     best_epoch = epoch + 1
                     best_state = self._model_state_snapshot()
                     epochs_no_improve = 0
-                    # Pin test_mrr to the same epoch as best val.
                     if do_test:
                         if log_debug:
-                            # Reuse the test eval just computed (it would be
-                            # the same value if we ran it twice — the state
-                            # carries from val eval, no new mutations between
-                            # them aside from val ingest, which a re-eval also
-                            # double-counts; we skip the duplicate).
                             test_mrr = test_all
                             best_test_mrr = float(test_mrr)
                             per_epoch_test.append(float(test_mrr))
                         else:
-                            test_mrr = self.evaluate(test_batches_factory(), test_evaluator)
+                            test_mrr = self.evaluate(
+                                test_batches_factory(), test_evaluator,
+                                sample_pct=monitor_sample_pct,
+                            )
                             best_test_mrr = float(test_mrr)
                             per_epoch_test.append(float(test_mrr))
                 else:
@@ -709,16 +711,55 @@ class Trainer:
             self._load_model_state(best_state)
             print(
                 f"  restored best weights from epoch {best_epoch} "
-                f"(val {best_val_mrr:.4f}"
-                + (f", test {best_test_mrr:.4f}" if best_test_mrr is not None else "")
+                f"(monitor val {best_val_mrr:.4f}"
+                + (f", monitor test {best_test_mrr:.4f}" if best_test_mrr is not None else "")
                 + ")",
+                flush=True,
+            )
+
+        # ── Final FULL eval (always sample_pct=1.0) on the restored weights ──
+        # Per-epoch numbers above are sampled if monitor_sample_pct < 1; this
+        # gives the paper-defensible report value. Tempest/time_state were
+        # mutated by per-epoch evals on val+test data; we re-walk from a
+        # fresh state to compute the canonical metric:
+        #   reset walk_gen / time_state / neg_sampler
+        #   re-ingest training edges (NO walks, NO scoring — just state)
+        #   run full val + test eval
+        final_val_full: Optional[float] = None
+        final_test_full: Optional[float] = None
+        if best_state is not None and monitor_sample_pct < 1.0 and val_evaluator is not None:
+            print(f"  final full eval (sample_pct=1.0) on restored weights …", flush=True)
+            self.walk_gen.reset()
+            if isinstance(self.neg_sampler_train, HistoricalNegativeSampler):
+                self.neg_sampler_train.reset()
+            if self.time_state is not None:
+                self.time_state.reset()
+            # Re-ingest training batches' edges (cheap; no model forward).
+            for b in batches:
+                self.walk_gen.add_edges(b.src, b.tgt, b.ts, b.edge_feat)
+                if self.time_state is not None:
+                    self.time_state.update(b.src, b.tgt, b.ts)
+            t_final = time.perf_counter()
+            final_val_full = self.evaluate(val_batches_factory(), val_evaluator, sample_pct=1.0)
+            if do_test and test_evaluator is not None:
+                final_test_full = self.evaluate(test_batches_factory(), test_evaluator, sample_pct=1.0)
+            print(
+                f"  FINAL full val {final_val_full:.4f}"
+                + (f"  test {final_test_full:.4f}" if final_test_full is not None else "")
+                + f"  ({time.perf_counter() - t_final:.1f}s)",
                 flush=True,
             )
 
         return {
             "best_epoch": best_epoch,
-            "best_val_mrr": float(best_val_mrr) if do_val else None,
-            "best_test_mrr": best_test_mrr,
+            # If we ran a final full eval, report THAT as best_*_mrr (the
+            # paper-defensible number); else fall back to the monitor value.
+            "best_val_mrr": (final_val_full if final_val_full is not None
+                             else (float(best_val_mrr) if do_val else None)),
+            "best_test_mrr": (final_test_full if final_test_full is not None
+                              else best_test_mrr),
+            "monitor_best_val_mrr": float(best_val_mrr) if do_val else None,
+            "monitor_best_test_mrr": best_test_mrr,
             "stopped_at_epoch": stopped_at_epoch,
             "per_epoch_val_mrr": per_epoch_val,
             "per_epoch_test_mrr": per_epoch_test,
@@ -732,8 +773,15 @@ class Trainer:
         }
 
     @torch.no_grad()
-    def evaluate(self, batches: Iterable[Batch], evaluator: Evaluator) -> float:
-        """Streaming evaluation. Returns dataset-level metric (TGB official)."""
+    def evaluate(self, batches: Iterable[Batch], evaluator: Evaluator,
+                 sample_pct: float = 1.0) -> float:
+        """Streaming evaluation. Returns dataset-level metric (TGB official).
+
+        `sample_pct < 1.0` enables sub-sampling positives per batch for
+        cheap per-epoch monitoring on large datasets (tgbl-review-v2). State
+        ingest (walk_gen / time_state) happens on the FULL batch regardless,
+        so state evolution stays exact — only the scoring path subsamples.
+        """
         self.embedding_store.eval()
         self.link_predictor.eval()
         if self.time_encoder is not None:
@@ -742,7 +790,7 @@ class Trainer:
         n = 0
         for batch in batches:
             # 1-3. Score the batch FIRST (pre-ingest, strictly causal).
-            m, b = evaluator.evaluate_batch(batch)
+            m, b = evaluator.evaluate_batch(batch, sample_pct=sample_pct)
             total += m
             n += b
             # 4. Ingest LAST. Eval-time embedding adaptation is intentionally

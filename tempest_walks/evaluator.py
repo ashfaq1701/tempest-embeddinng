@@ -73,13 +73,42 @@ class Evaluator:
                 )
 
     @torch.no_grad()
-    def evaluate_batch(self, batch: Batch) -> Tuple[float, int]:
-        """Returns (sum_of_metric_over_batch, num_positives)."""
-        neg_src, neg_tgt = self.neg_sampler.sample(batch)
-        B = len(batch.src)
+    def evaluate_batch(self, batch: Batch, sample_pct: float = 1.0) -> Tuple[float, int]:
+        """Returns (sum_of_metric_over_batch, num_positives_scored).
 
-        all_u, all_v, counts = self._interleave(batch, neg_src, neg_tgt, B)
-        scores = self._score_chunked(all_u, all_v, counts, t_query=int(batch.t_max))
+        When `sample_pct < 1.0`, the positive set in this batch is randomly
+        subsampled BEFORE scoring — used for cheap per-epoch monitoring on
+        large datasets (e.g. tgbl-review-v2's 730k val positives, where
+        full eval costs ~15 min per pass). The full-eval path (sample_pct=1)
+        is bit-identical to the original behaviour.
+
+        Important: the caller (Trainer.evaluate) still ingests the FULL
+        batch into walk_gen/time_state regardless of sampling — only the
+        scoring step is subsampled. State evolution stays exact.
+        """
+        B = len(batch.src)
+        if 0.0 < sample_pct < 1.0:
+            n_keep = max(1, int(B * sample_pct))
+            keep_idx = np.random.choice(B, size=n_keep, replace=False)
+            sub_batch = Batch(
+                src=batch.src[keep_idx],
+                tgt=batch.tgt[keep_idx],
+                ts=batch.ts[keep_idx],
+                edge_feat=(
+                    batch.edge_feat[keep_idx] if batch.edge_feat is not None else None
+                ),
+                t_max=int(batch.ts[keep_idx].max()) if len(keep_idx) > 0 else batch.t_max,
+            )
+            score_batch = sub_batch
+            B_scored = n_keep
+        else:
+            score_batch = batch
+            B_scored = B
+
+        neg_src, neg_tgt = self.neg_sampler.sample(score_batch)
+
+        all_u, all_v, counts = self._interleave(score_batch, neg_src, neg_tgt, B_scored)
+        scores = self._score_chunked(all_u, all_v, counts, t_query=int(score_batch.t_max))
 
         scores_np = scores.cpu().numpy()
         total = 0.0
@@ -94,7 +123,7 @@ class Evaluator:
             })
             total += float(res[self.eval_metric])
             cursor += 1 + K
-        return total, B
+        return total, B_scored
 
     def _time_features_for_chunk(
         self,
