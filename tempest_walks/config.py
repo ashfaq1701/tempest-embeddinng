@@ -37,6 +37,13 @@ class Config:
     #   "C" = uniform α=1 (sampler does everything)
     align_weighting: str = "A"
 
+    # Phase S Group A2 — alignment on/off (v2.2 §4.1).
+    # 1.0 = standard walks-supervision (the anchor configuration).
+    # 0.0 = alignment loss is computed but contributes zero gradient;
+    #       cross-table embeddings only see uniformity. Phase S's first
+    #       test of "does walks-supervision help on this dataset?"
+    lambda_align: float = 1.0
+
     # Uniformity loss
     eta_uniform: float = 1.0
     uniformity_temperature: float = 2.0

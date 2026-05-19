@@ -162,7 +162,13 @@ class Trainer:
             temperature=self.config.uniformity_temperature,
             cap=self.config.uniformity_cap,
         )
-        l_total = l_align + self.config.eta_uniform * l_uniform
+        # Phase S Group A2: lambda_align scales the alignment-loss
+        # gradient (0.0 = walks-supervision off, embeddings receive
+        # only uniformity gradient; 1.0 = anchor configuration).
+        l_total = (
+            self.config.lambda_align * l_align
+            + self.config.eta_uniform * l_uniform
+        )
 
         self.emb_optimizer.zero_grad(set_to_none=True)
         l_total.backward()

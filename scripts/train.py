@@ -43,6 +43,11 @@ def parse_args() -> argparse.Namespace:
     # Phase 1 ablation: alignment-loss weighting variant
     p.add_argument("--align-weighting", choices=["A", "B", "C"], default="A",
                    help="A=1/K·(1+Δt/τ)^(-β) [control]; B=1/K only; C=uniform α=1")
+    # Phase S Group A2 (v2.2 §4.1): scalar on the alignment loss.
+    # 1.0 = anchor (alignment on). 0.0 = walks-supervision OFF.
+    p.add_argument("--lambda-align", type=float, default=1.0,
+                   help="Scalar on alignment loss. 0 turns walks-supervision off "
+                        "(Phase S Group A2). Anchor uses 1.0.")
 
     # Optimization
     p.add_argument("--num-neg-per-pos", type=int, default=10)
@@ -102,6 +107,7 @@ def main() -> None:
         eta_uniform=args.eta_uniform,
         uniformity_temperature=args.uniformity_temperature,
         align_weighting=args.align_weighting,
+        lambda_align=args.lambda_align,
         num_neg_per_pos=args.num_neg_per_pos,
         hist_neg_ratio=args.hist_neg_ratio,
         reservoir_size=args.reservoir_size,
