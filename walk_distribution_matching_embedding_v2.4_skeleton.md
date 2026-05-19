@@ -106,7 +106,36 @@ To be filled in.
 
 ## 7. Cross-dataset (review) sweep results
 
-To be filled in.
+### 7.1 tgbl-review-v2 dataset profile (probed 2026-05-19 ~00:00)
+
+| | tgbl-wiki | tgbl-review-v2 | Ratio |
+|---|---|---|---|
+| N nodes | 9,227 | 352,637 | 38× |
+| Train edges | 110,232 | 3,413,837 | 31× |
+| Val edges | 23,621 | 730,784 | 31× |
+| Test edges | 23,621 | 728,919 | 31× |
+| Edge feat dim | 172 | 1 | — |
+| Time span | 21 days | 6,199 days | 295× |
+| is_directed | False | False | — |
+| eval_metric | mrr | mrr | — |
+| Best leaderboard | 0.827 (TPNet) | 0.521 (GraphMixer) | review is much harder |
+
+Eval cost on review is ~15–20 min per val pass (vs ~50s on wiki); train ~9 min/epoch vs ~17s on wiki. A 50-epoch run is ~10–15 hours per cell.
+
+### 7.2 Reduced review sweep (user-rule compliant)
+
+Run only the 2 cells the user's decision rule requires:
+1. **Cell A: alignment+uniformity** (anchor baseline; v2.2 spec).
+2. **Cell T: Triplet** (wiki §4.7 winner; chosen as best-of-3 because it won on wiki and is the most stable training-dynamics candidate).
+
+Each at 10 epochs max, `--early-stop-patience 3`. Wall ~3 hours per cell.
+
+Skip the full 8-cell sweep because:
+- InfoNCE was definitively rejected on wiki under joint training (test fell from 0.6984 → 0.6536 as λ_link rose). The InfoNCE failure is fundamental.
+- SGNS+nb wiki cross-seed cliff (seed-7) makes it a stability risk; we're not selecting it from wiki.
+- Per user rule we only need anchor + winner.
+
+Results: TBD.
 
 ## 8. §4.8.3 long-training plateau analysis
 
