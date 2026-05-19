@@ -51,6 +51,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--xpair-dropout", type=float, default=0.1)
     p.add_argument("--link-dropout", type=float, default=0.0)
 
+    # DyGFormer-style dynamic node encoder + per-node history buffer
+    p.add_argument("--use-node-encoder", default=True,
+                   action=argparse.BooleanOptionalAction)
+    p.add_argument("--k-history", type=int, default=32)
+    p.add_argument("--node-enc-n-heads", type=int, default=4)
+    p.add_argument("--node-enc-n-layers", type=int, default=1)
+    p.add_argument("--node-enc-dropout", type=float, default=0.1)
+    p.add_argument("--node-enc-ff-dim", type=int, default=256)
+
     # Losses
     p.add_argument("--temporal-decay-exp", type=float, default=0.5)
     p.add_argument("--alignment-time-scale", type=float, default=-1.0)
@@ -108,6 +117,12 @@ def main() -> None:
         xpair_n_heads=args.xpair_n_heads,
         xpair_dropout=args.xpair_dropout,
         link_dropout=args.link_dropout,
+        use_node_encoder=args.use_node_encoder,
+        k_history=args.k_history,
+        node_enc_n_heads=args.node_enc_n_heads,
+        node_enc_n_layers=args.node_enc_n_layers,
+        node_enc_dropout=args.node_enc_dropout,
+        node_enc_ff_dim=args.node_enc_ff_dim,
         temporal_decay_exp=args.temporal_decay_exp,
         alignment_time_scale=args.alignment_time_scale,
         eta_uniform=args.eta_uniform,
@@ -185,6 +200,8 @@ def main() -> None:
         walk_gen=trainer.walk_gen,
         walk_encoder=trainer.walk_encoder,
         cross_pair_attn=trainer.cross_pair_attn,
+        node_history=trainer.node_history,
+        node_encoder=trainer.node_encoder,
         time_scale=trainer._time_scale,
     )
     eval_test = Evaluator(
@@ -197,6 +214,8 @@ def main() -> None:
         walk_gen=trainer.walk_gen,
         walk_encoder=trainer.walk_encoder,
         cross_pair_attn=trainer.cross_pair_attn,
+        node_history=trainer.node_history,
+        node_encoder=trainer.node_encoder,
         time_scale=trainer._time_scale,
     )
 

@@ -27,10 +27,12 @@ from .config import Config
 from .data import Batch
 from .evaluator import Evaluator
 from .losses import alignment_loss, link_bce, uniformity_loss
+from .history import NodeHistory
 from .model import (
     CrossPairAttention,
     EmbeddingStore,
     LinkPredictor,
+    NodeEncoder,
     WalkEncoder,
     masked_mean_pool,
 )
@@ -83,6 +85,28 @@ class Trainer:
                 n_heads=config.xpair_n_heads,
                 dropout=config.xpair_dropout,
             ).to(self.device)
+
+        # DyGFormer-style dynamic node encoder + history buffer.
+        # History writes happen in the post-scoring block (LAST), reads
+        # happen at the start of _step / evaluate_batch (BEFORE scoring).
+        self.node_history: Optional[NodeHistory] = None
+        self.node_encoder: Optional[NodeEncoder] = None
+        if config.use_node_encoder:
+            self.node_history = NodeHistory(
+                n_nodes=config.max_node_count,
+                K=config.k_history,
+                edge_feat_dim=edge_feat_dim,
+            )
+            self.node_encoder = NodeEncoder(
+                embedding_store=self.embedding_store,
+                d_model=config.d_emb,
+                n_heads=config.node_enc_n_heads,
+                n_layers=config.node_enc_n_layers,
+                d_time=config.d_time,
+                d_role=config.d_role,
+                dropout=config.node_enc_dropout,
+                ff_dim=config.node_enc_ff_dim,
+            ).to(self.device)
         # Walk encoder (Phase 1): GRU over per-position walk inputs.
         # d_gru is fixed to d_emb so its output can be directly cosine-
         # compared against target(seed) in the alignment loss. The encoder
@@ -130,6 +154,8 @@ class Trainer:
         link_params = list(self.link_predictor.parameters())
         if self.cross_pair_attn is not None:
             link_params += list(self.cross_pair_attn.parameters())
+        if self.node_encoder is not None:
+            link_params += list(self.node_encoder.parameters())
         self.link_optimizer = torch.optim.Adam(link_params, lr=config.link_lr)
         self._time_scale = config.alignment_time_scale  # overridden after dataset load
 
@@ -294,10 +320,47 @@ class Trainer:
 
         u_t = torch.from_numpy(all_u).long().to(self.device)
         v_t = torch.from_numpy(all_v).long().to(self.device)
-        e_u = self.embedding_store.target(u_t)     # [P, d]
-        e_v = self.embedding_store.target(v_t)     # [P, d]
+        e_u_static = self.embedding_store.target(u_t)     # [P, d]
+        e_v_static = self.embedding_store.target(v_t)
 
-        logits = self.link_predictor(e_u, e_v, w_u, w_v)
+        # Dynamic node embedding via DyGFormer-style encoder.
+        # STRICT-CAUSAL READ: history reflects events ≤ batch B−1; this
+        # batch's events have NOT been written yet (the post-scoring block
+        # at the end of train()'s per-batch loop is the only writer).
+        e_u_dyn = e_u_static                               # default = static fallback
+        e_v_dyn = e_v_static
+        if self.node_encoder is not None and self.node_history is not None:
+            # Read the history slice for every node we need to score
+            # (deduplicated through seeds_np to amortise the lookup).
+            nb, hts, ef_hist, ro, vc = self.node_history.read_windows_for_nodes(seeds_np)
+            nb_t = torch.from_numpy(nb).long().to(self.device)
+            hts_t = torch.from_numpy(hts).long().to(self.device)
+            ef_hist_t = (
+                torch.from_numpy(ef_hist).float().to(self.device)
+                if ef_hist is not None else None
+            )
+            ro_t = torch.from_numpy(ro).long().to(self.device)
+            vc_t = torch.from_numpy(vc).long().to(self.device)
+            tq_hist = torch.full(
+                (seeds_tensor.shape[0],), int(batch.t_max),
+                dtype=torch.long, device=self.device,
+            )
+            node_h, _has_hist = self.node_encoder(
+                neighbors=nb_t,
+                timestamps=hts_t,
+                edge_feats=ef_hist_t,
+                roles=ro_t,
+                valid_cnt=vc_t,
+                t_query=tq_hist,
+                time_scale=self._time_scale,
+            )                                              # [N_unique, d]
+            # Gather node_h for u and v of each pair; add as residual on top
+            # of the static identity. Cold-start rows have node_h=0 → fall
+            # back to e_u_static / e_v_static naturally.
+            e_u_dyn = e_u_static + node_h[u_idx_t]
+            e_v_dyn = e_v_static + node_h[v_idx_t]
+
+        logits = self.link_predictor(e_u_dyn, e_v_dyn, w_u, w_v)
         labels = torch.cat([
             torch.ones(B, device=self.device),
             torch.zeros(B * K_neg, device=self.device),
@@ -331,12 +394,16 @@ class Trainer:
             self.walk_gen.reset()
             if isinstance(self.neg_sampler_train, HistoricalNegativeSampler):
                 self.neg_sampler_train.reset()
+            if self.node_history is not None:
+                self.node_history.reset()
             self.embedding_store.train()
             self.link_predictor.train()
             if self.walk_encoder is not None:
                 self.walk_encoder.train()
             if self.cross_pair_attn is not None:
                 self.cross_pair_attn.train()
+            if self.node_encoder is not None:
+                self.node_encoder.train()
             t0 = time.perf_counter()
             sum_align = sum_uniform = sum_link = 0.0
             n = 0
@@ -349,6 +416,16 @@ class Trainer:
                 if isinstance(self.neg_sampler_train, HistoricalNegativeSampler):
                     self.neg_sampler_train.observe(batch.src, batch.tgt)
                 self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
+                if self.node_history is not None:
+                    # LAST write of the post-scoring block. After this line,
+                    # the history reflects events ≤ batch B. Batch B+1's
+                    # read at the start of its _step will see this.
+                    self.node_history.write_events(
+                        src=batch.src,
+                        tgt=batch.tgt,
+                        ts=batch.ts,
+                        edge_feat=batch.edge_feat,
+                    )
                 sum_align += l_align
                 sum_uniform += l_uniform
                 sum_link += l_link
@@ -370,6 +447,8 @@ class Trainer:
             self.walk_encoder.eval()
         if self.cross_pair_attn is not None:
             self.cross_pair_attn.eval()
+        if self.node_encoder is not None:
+            self.node_encoder.eval()
         total = 0.0
         n = 0
         for batch in batches:
@@ -384,6 +463,15 @@ class Trainer:
             # conventional: "previously observed test edges can be accessed
             # by the model but back-propagation [...] is not permitted").
             self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
+            if self.node_history is not None:
+                # Same protocol as training: history write is the LAST line.
+                # Batch B+1's evaluator.evaluate_batch will see events ≤ B.
+                self.node_history.write_events(
+                    src=batch.src,
+                    tgt=batch.tgt,
+                    ts=batch.ts,
+                    edge_feat=batch.edge_feat,
+                )
         return total / max(n, 1)
 
     # ------------------------------------------------------------------ #

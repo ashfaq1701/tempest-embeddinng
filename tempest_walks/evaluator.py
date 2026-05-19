@@ -18,10 +18,12 @@ import numpy as np
 import torch
 
 from .data import Batch
+from .history import NodeHistory
 from .model import (
     CrossPairAttention,
     EmbeddingStore,
     LinkPredictor,
+    NodeEncoder,
     WalkEncoder,
     masked_mean_pool,
 )
@@ -59,6 +61,8 @@ class Evaluator:
         walk_gen: Optional[WalkGenerator] = None,
         walk_encoder: Optional[WalkEncoder] = None,
         cross_pair_attn: Optional[CrossPairAttention] = None,
+        node_history: Optional[NodeHistory] = None,
+        node_encoder: Optional[NodeEncoder] = None,
         time_scale: Optional[float] = None,
     ):
         # Lazy import so this module loads without py-tgb installed.
@@ -77,15 +81,23 @@ class Evaluator:
         self.walk_gen = walk_gen
         self.walk_encoder = walk_encoder
         self.cross_pair_attn = cross_pair_attn
+        self.node_history = node_history
+        self.node_encoder = node_encoder
         self.time_scale = time_scale
-        # Consistency check: with the walk encoder + cross-pair attn, all
-        # three components must be wired together.
+        # Consistency checks: each augmentation needs its full support set.
         if walk_encoder is not None and (
             walk_gen is None or cross_pair_attn is None or time_scale is None
         ):
             raise ValueError(
                 "Evaluator with walk_encoder requires walk_gen, "
                 "cross_pair_attn, and time_scale to all be provided.",
+            )
+        if node_encoder is not None and (
+            node_history is None or time_scale is None
+        ):
+            raise ValueError(
+                "Evaluator with node_encoder requires node_history and "
+                "time_scale to be provided.",
             )
 
     @torch.no_grad()
@@ -96,14 +108,27 @@ class Evaluator:
 
         all_u, all_v, counts = self._interleave(batch, neg_src, neg_tgt, B)
 
-        # Phase 3: walk-encode all unique nodes in this batch once, build the
-        # per-seed sequence (avg over K walks per position) + valid mask.
-        # Per-pair cross-attention happens inside the chunk loop.
+        # Compute the unique seed set ONCE, share between walk encoder
+        # and node encoder.
+        all_u_np = all_u.cpu().numpy().astype(np.int64)
+        all_v_np = all_v.cpu().numpy().astype(np.int64)
+        seeds_np = np.unique(np.concatenate([all_u_np, all_v_np]))
+
+        # Phase 3: walk-encode all unique nodes; build per-seed sequence
+        # (avg over K walks per position) + valid mask.
         seed_seq_lookup: Optional[Tuple[np.ndarray, torch.Tensor, torch.Tensor]] = None
         if self.walk_encoder is not None:
-            seed_seq_lookup = self._encode_walks_for_batch(all_u, all_v, batch.t_max)
+            seed_seq_lookup = self._encode_walks_for_batch(seeds_np, batch.t_max)
 
-        scores = self._score_chunked(all_u, all_v, counts, seed_seq_lookup)
+        # Phase 4: read each unique node's history and run the node encoder,
+        # producing a per-seed dynamic node embedding.
+        node_h_lookup: Optional[Tuple[np.ndarray, torch.Tensor]] = None
+        if self.node_encoder is not None:
+            node_h_lookup = self._encode_history_for_batch(seeds_np, batch.t_max)
+
+        scores = self._score_chunked(
+            all_u, all_v, counts, seed_seq_lookup, node_h_lookup,
+        )
 
         scores_np = scores.cpu().numpy()
         total = 0.0
@@ -122,8 +147,7 @@ class Evaluator:
 
     def _encode_walks_for_batch(
         self,
-        all_u: torch.Tensor,
-        all_v: torch.Tensor,
+        seeds_np: np.ndarray,
         t_max: int,
     ) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor]:
         """Sample walks for every unique node in this batch, run the encoder
@@ -139,9 +163,6 @@ class Evaluator:
         ingests AFTER calling evaluate_batch). Same protocol as training.
         """
         assert self.walk_gen is not None and self.walk_encoder is not None
-        all_u_np = all_u.cpu().numpy().astype(np.int64)
-        all_v_np = all_v.cpu().numpy().astype(np.int64)
-        seeds_np = np.unique(np.concatenate([all_u_np, all_v_np]))
 
         walks = self.walk_gen.walks_for_nodes(seeds_np)
         nodes = walks.nodes.to(self.device).long().clamp_min(0)
@@ -191,12 +212,58 @@ class Evaluator:
 
         return seeds_np, seed_seq, seq_mask
 
+    def _encode_history_for_batch(
+        self,
+        seeds_np: np.ndarray,
+        t_max: int,
+    ) -> Tuple[np.ndarray, torch.Tensor]:
+        """Read per-node interaction history for every unique seed,
+        run the DyGFormer-style node encoder, return per-seed node_h.
+
+        Returns:
+            seeds_np : np.ndarray  sorted unique seed ids (same as input)
+            node_h   : [N, d_emb]  per-seed dynamic embedding; zero rows
+                                   are the cold-start fallback (caller
+                                   adds them to target(u) as residual,
+                                   so zero → static fallback).
+
+        Strict-causal: history reflects events ≤ batch B−1 because the
+        trainer's evaluate() writes events AFTER calling evaluate_batch.
+        """
+        assert self.node_encoder is not None and self.node_history is not None
+        assert self.time_scale is not None
+
+        nb, hts, ef_hist, ro, vc = self.node_history.read_windows_for_nodes(seeds_np)
+        nb_t = torch.from_numpy(nb).long().to(self.device)
+        hts_t = torch.from_numpy(hts).long().to(self.device)
+        ef_hist_t = (
+            torch.from_numpy(ef_hist).float().to(self.device)
+            if ef_hist is not None else None
+        )
+        ro_t = torch.from_numpy(ro).long().to(self.device)
+        vc_t = torch.from_numpy(vc).long().to(self.device)
+        tq = torch.full(
+            (seeds_np.shape[0],), int(t_max),
+            dtype=torch.long, device=self.device,
+        )
+        node_h, _has_hist = self.node_encoder(
+            neighbors=nb_t,
+            timestamps=hts_t,
+            edge_feats=ef_hist_t,
+            roles=ro_t,
+            valid_cnt=vc_t,
+            t_query=tq,
+            time_scale=self.time_scale,
+        )
+        return seeds_np, node_h
+
     def _score_chunked(
         self,
         all_u: torch.Tensor,
         all_v: torch.Tensor,
         counts: List[int],
         seed_seq_lookup: Optional[Tuple[np.ndarray, torch.Tensor, torch.Tensor]] = None,
+        node_h_lookup: Optional[Tuple[np.ndarray, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Score [P] rows through the link predictor in row_budget-sized chunks.
 
@@ -242,6 +309,18 @@ class Evaluator:
             np.searchsorted(seeds_np, all_v_np),
         ).long().to(self.device)
 
+        # Optional node-encoder lookup (matches the trainer's residual add).
+        node_h_tensor: Optional[torch.Tensor] = None
+        if node_h_lookup is not None:
+            # node_h_lookup seeds are the same seeds_np we used for walks
+            # (computed once in evaluate_batch and shared) — but assert it
+            # in case future callers diverge.
+            assert np.array_equal(node_h_lookup[0], seeds_np), (
+                "node_h_lookup seed array must match the walk-encoder's "
+                "seed array — they're sampled from the same union."
+            )
+            node_h_tensor = node_h_lookup[1]                  # [N_unique, d]
+
         for start, end in rows:
             u = all_u[start:end]
             v = all_v[start:end]
@@ -261,6 +340,9 @@ class Evaluator:
 
             e_u = self.embedding_store.target(u)
             e_v = self.embedding_store.target(v)
+            if node_h_tensor is not None:
+                e_u = e_u + node_h_tensor[u_idx]
+                e_v = e_v + node_h_tensor[v_idx]
             out[start:end] = self.link_predictor(e_u, e_v, w_u, w_v)
 
         return out

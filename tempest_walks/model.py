@@ -49,7 +49,7 @@ optimizer; nothing is mutated in-place during the forward pass.
 Streaming feature updates: overwrite the buffer with `update_node_feat`.
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -355,6 +355,165 @@ def masked_mean_pool(
     summed = (h_seq * mask_f).sum(dim=1)                  # [P, d]
     counts = mask_f.sum(dim=1).clamp_min(1e-6)            # [P, 1]
     return summed / counts
+
+
+class NodeEncoder(nn.Module):
+    """DyGFormer-style dynamic node encoder.
+
+    For each (node u, query time t), construct K_history tokens from u's
+    most-recent interactions, run them through a small transformer encoder,
+    and pool to a single d-dim node representation.
+
+    Per-token features (concat → projection → d_model):
+        neighbor identity  : E_target[neighbor_i]                 d_emb
+        recency embedding  : time_embed(t_query − timestamp_i)    d_time
+        edge feature       : proj_e(edge_feat_i)                  d_emb  (if ef)
+        role               : role_embed(0 if u was src else 1)    d_role
+
+    Cold-start handling: nodes with valid_cnt == 0 produce all-padding
+    tokens; the transformer's key_padding_mask is all-True (mask out
+    everything), which would NaN softmax → caller should detect cold
+    rows and substitute a fallback (e.g. target(u)) before passing to
+    the link MLP. The encoder itself just returns whatever PyTorch
+    produces on the cold rows (typically zeros after our 0-out-cold
+    safety post-step).
+
+    `d_model` must equal `embedding_store.d_emb` so the encoder's output
+    is in the same space as the rest of the system (link MLP, alignment).
+
+    Shares `embedding_store.edge_feat_proj` (the same Linear used by the
+    walk encoder + context_walk) — no duplicated parameter for edge feats.
+    """
+
+    def __init__(
+        self,
+        embedding_store: "EmbeddingStore",
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 1,
+        d_time: int = 16,
+        d_role: int = 8,
+        dropout: float = 0.1,
+        ff_dim: int = 256,
+    ):
+        super().__init__()
+        d_emb = embedding_store.d_emb
+        if d_model != d_emb:
+            raise ValueError(
+                f"NodeEncoder d_model ({d_model}) must equal d_emb ({d_emb}); "
+                f"the link MLP / alignment / cross-pair all live in d_emb space."
+            )
+        # Don't register embedding_store as a submodule — avoids double-
+        # counting in .parameters() (same trick as WalkEncoder).
+        object.__setattr__(self, "embedding_store", embedding_store)
+        self.d_emb = d_emb
+        self.d_model = d_model
+        self.has_edge_feat = embedding_store.has_edge_feat
+
+        # Per-token feature heads.
+        self.role_embed = nn.Embedding(2, d_role)
+        self.mlp_time = nn.Sequential(
+            nn.Linear(2, d_time),
+            nn.GELU(),
+            nn.Linear(d_time, d_time),
+        )
+        # Token concat width → d_model projection
+        token_dim = d_emb + d_time + d_role + (d_emb if self.has_edge_feat else 0)
+        self.token_proj = nn.Linear(token_dim, d_model)
+
+        # Transformer encoder
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,  # Pre-LN: more stable for short sequences
+        )
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        neighbors: torch.Tensor,       # [P, K] long, padding=-1 (clamp before lookup)
+        timestamps: torch.Tensor,      # [P, K] long, padding=-1
+        edge_feats: Optional[torch.Tensor],  # [P, K, d_e] float or None
+        roles: torch.Tensor,           # [P, K] long {0, 1}, padding=-1
+        valid_cnt: torch.Tensor,       # [P] long, in [0, K]
+        t_query: torch.Tensor,         # [P] long — query times per row
+        time_scale: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (node_h, has_history):
+            node_h:      [P, d_model] — encoded representation
+            has_history: [P] bool     — True if the row had at least one
+                                        real history entry (caller substitutes
+                                        a fallback for the False ones)
+        """
+        device = neighbors.device
+        P, K = neighbors.shape
+
+        # Build valid mask from valid_cnt: position p of row i is valid iff p < vc[i].
+        # Convention matches NodeHistory: right-padded, valid at [0, vc-1].
+        positions = torch.arange(K, device=device).unsqueeze(0)        # [1, K]
+        valid_mask = positions < valid_cnt.unsqueeze(1)                 # [P, K]
+        has_history = valid_mask.any(dim=1)                             # [P]
+
+        # Safe lookup tensors: clamp padding indices to 0 so embedding lookups
+        # don't blow up. The mask zeros out their contribution anyway.
+        nb_safe = neighbors.clamp_min(0)
+        ro_safe = roles.clamp_min(0)
+
+        # Neighbor identity via E_target (the persistent identity table —
+        # NOT target() through target_final, because we want the raw lookup
+        # for tokens; the per-feature-fusion is handled inside this encoder
+        # via the token_proj).
+        nb_emb = self.embedding_store.E_target(nb_safe)                 # [P, K, d_emb]
+
+        # Recency embedding. t_query − timestamps[i]; clamp_min(0) defensively.
+        # Replace padding -1 timestamps with t_query (Δt = 0) so they don't
+        # blow up the time MLP — they're masked out downstream anyway.
+        t_q = t_query.unsqueeze(1)                                       # [P, 1]
+        ts_safe = torch.where(valid_mask, timestamps, t_q)
+        dt = (t_q - ts_safe).clamp_min(0).float()
+        dt_norm = dt / max(time_scale, 1e-6)
+        time_in = torch.stack([dt_norm, torch.log1p(dt_norm)], dim=-1)
+        time_h = self.mlp_time(time_in)                                  # [P, K, d_time]
+
+        # Role embedding
+        role_h = self.role_embed(ro_safe)                                # [P, K, d_role]
+
+        parts = [nb_emb, time_h, role_h]
+        if self.has_edge_feat and edge_feats is not None:
+            ef_proj = self.embedding_store.edge_feat_proj(edge_feats.float())
+            # Zero out padding slots' edge feats (mask out their contribution
+            # since the model shouldn't see anything from padding rows).
+            ef_proj = ef_proj * valid_mask.unsqueeze(-1).float()
+            parts.append(ef_proj)
+
+        tokens = torch.cat(parts, dim=-1)                                # [P, K, token_dim]
+        tokens = self.token_proj(tokens)                                  # [P, K, d_model]
+
+        # Transformer expects key_padding_mask: True = MASK (ignore).
+        kpm = ~valid_mask                                                 # [P, K] True at padding
+
+        # Cold-start rows (all padding): nn.TransformerEncoder NaNs on a
+        # fully-masked sequence. Force one slot to be unmasked so softmax
+        # has a valid key; we'll override the OUTPUT for those rows.
+        all_padding = kpm.all(dim=1)                                     # [P]
+        kpm_safe = kpm.clone()
+        kpm_safe[all_padding, 0] = False
+
+        enc_out = self.transformer(tokens, src_key_padding_mask=kpm_safe)
+        enc_out = self.out_norm(enc_out)                                 # [P, K, d_model]
+
+        # Pool: masked mean over the truly-valid positions
+        node_h = masked_mean_pool(enc_out, valid_mask)                   # [P, d_model]
+
+        # Zero out the cold rows (caller will substitute fallback)
+        node_h = node_h * has_history.float().unsqueeze(-1)
+
+        return node_h, has_history
 
 
 class WalkEncoder(nn.Module):

@@ -33,6 +33,17 @@ class Config:
     xpair_dropout: float = 0.1
     link_dropout: float = 0.0
 
+    # DyGFormer-style dynamic node encoder. Per-node history buffer +
+    # transformer over recent interactions. node_h(u, t) is added to
+    # target(u) at the link MLP input (additive residual; cold-start
+    # rows get zero from the encoder and fall back to target(u) alone).
+    use_node_encoder: bool = True
+    k_history: int = 32                   # per-node history window size
+    node_enc_n_heads: int = 4
+    node_enc_n_layers: int = 1
+    node_enc_dropout: float = 0.1
+    node_enc_ff_dim: int = 256
+
     # Alignment loss
     temporal_decay_exp: float = 0.5      # β in (1 + Δt/time_scale)^(-β)
     alignment_time_scale: float = -1.0   # ≤ 0 ⇒ derive from training time range
