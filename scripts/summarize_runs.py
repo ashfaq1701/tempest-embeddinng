@@ -100,6 +100,18 @@ def parse_log(path: str) -> Optional[Dict]:
         peak = max(out["per_ep_val"])
         last_quarter_min = min(out["per_ep_val"][-max(3, len(out["per_ep_val"])//4):])
         out["cliff_drop"] = peak - last_quarter_min
+        # Smoothness scores — the user's goal is smooth loss decrease + smooth
+        # val MRR increase. Quantify with:
+        #   val_monotonicity: fraction of consecutive epoch-pairs where val_mrr
+        #                     does NOT drop by > 0.005 (anti-noise threshold).
+        #   peak_position:    epoch / total_epochs where val_mrr peaked.
+        #                     <0.3 = peaks early (bad — under-trained-look);
+        #                     >0.7 = peaks late (good — still climbing).
+        v = out["per_ep_val"]
+        n_pairs = max(len(v) - 1, 1)
+        n_smooth = sum(1 for i in range(len(v) - 1) if v[i+1] >= v[i] - 0.005)
+        out["val_smoothness"] = n_smooth / n_pairs
+        out["peak_position"] = (v.index(peak) + 1) / len(v) if v else 0.0
     return out
 
 
@@ -116,10 +128,12 @@ def format_row(r: Dict) -> str:
     val = f"{r.get('best_val', float('nan')):.4f}"
     test = f"{r.get('best_test', float('nan')):.4f}"
     cliff = f"{r.get('cliff_drop', 0.0):.3f}"
+    smooth = f"{r.get('val_smoothness', 0.0):.2f}"
+    peak_pos = f"{r.get('peak_position', 0.0):.2f}"
     return (
         f"  {primary:<7}  nb={nb}  λL={jl}  nL={nl}  drL={ldr}  drE={edr}  "
         f"seed={seed}  best ep {best_ep:>2}/stop {stopped:>2}  "
-        f"val {val}  test {test}  cliff {cliff}"
+        f"val {val}  test {test}  cliff {cliff}  smooth {smooth}  peak@{peak_pos}"
     )
 
 
