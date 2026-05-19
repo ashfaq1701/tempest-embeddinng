@@ -63,6 +63,9 @@ def parse_args() -> argparse.Namespace:
     # Co-occurrence feature (recurrence signal from per-pair history overlap)
     p.add_argument("--use-co-feat", default=True,
                    action=argparse.BooleanOptionalAction)
+    # Memory module (TGN-style raw-message-store)
+    p.add_argument("--use-memory", default=True,
+                   action=argparse.BooleanOptionalAction)
 
     # Losses
     p.add_argument("--temporal-decay-exp", type=float, default=0.5)
@@ -128,6 +131,7 @@ def main() -> None:
         node_enc_dropout=args.node_enc_dropout,
         node_enc_ff_dim=args.node_enc_ff_dim,
         use_co_feat=args.use_co_feat,
+        use_memory=args.use_memory,
         temporal_decay_exp=args.temporal_decay_exp,
         alignment_time_scale=args.alignment_time_scale,
         eta_uniform=args.eta_uniform,
@@ -208,6 +212,7 @@ def main() -> None:
         node_history=trainer.node_history,
         node_encoder=trainer.node_encoder,
         co_encoder=trainer.co_encoder,
+        memory=trainer.memory,
         time_scale=trainer._time_scale,
     )
     eval_test = Evaluator(
@@ -223,6 +228,7 @@ def main() -> None:
         node_history=trainer.node_history,
         node_encoder=trainer.node_encoder,
         co_encoder=trainer.co_encoder,
+        memory=trainer.memory,
         time_scale=trainer._time_scale,
     )
 

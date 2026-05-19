@@ -50,6 +50,11 @@ class Config:
     # Requires use_node_encoder=True (uses the same history buffer).
     use_co_feat: bool = True
 
+    # TGN-style per-node memory with raw-message store. State[u] is updated
+    # via GRU each batch from raw messages stashed in the prior batch. Added
+    # as residual to target(u) (alongside DyG node_h) at the link MLP input.
+    use_memory: bool = True
+
     # Alignment loss
     temporal_decay_exp: float = 0.5      # β in (1 + Δt/time_scale)^(-β)
     alignment_time_scale: float = -1.0   # ≤ 0 ⇒ derive from training time range

@@ -19,6 +19,7 @@ import torch
 
 from .data import Batch
 from .history import NodeHistory
+from .memory import NodeMemory
 from .model import (
     CoOccurrenceEncoder,
     CrossPairAttention,
@@ -65,6 +66,7 @@ class Evaluator:
         node_history: Optional[NodeHistory] = None,
         node_encoder: Optional[NodeEncoder] = None,
         co_encoder: Optional[CoOccurrenceEncoder] = None,
+        memory: Optional[NodeMemory] = None,
         time_scale: Optional[float] = None,
     ):
         # Lazy import so this module loads without py-tgb installed.
@@ -89,6 +91,7 @@ class Evaluator:
         self.node_history = node_history
         self.node_encoder = node_encoder
         self.co_encoder = co_encoder
+        self.memory = memory
         self.time_scale = time_scale
         # Consistency checks: each augmentation needs its full support set.
         if walk_encoder is not None and (
@@ -119,6 +122,13 @@ class Evaluator:
         all_u_np = all_u.cpu().numpy().astype(np.int64)
         all_v_np = all_v.cpu().numpy().astype(np.int64)
         seeds_np = np.unique(np.concatenate([all_u_np, all_v_np]))
+
+        # Apply memory's pending raw messages from prior batch BEFORE scoring.
+        # No-grad here (we're inside @torch.no_grad). State after this reflects
+        # events ≤ prior eval/training batch.
+        if self.memory is not None:
+            seeds_t = torch.from_numpy(seeds_np).long().to(self.device)
+            self.memory.apply_pending(seeds_t)
 
         # Walk-encode all unique nodes; produce per-seed W (seed-pooled).
         seed_w_lookup: Optional[Tuple[np.ndarray, torch.Tensor]] = None
@@ -336,6 +346,11 @@ class Evaluator:
             if node_h_tensor is not None:
                 e_t_u = e_t_u + node_h_tensor[u_idx]
                 e_t_v = e_t_v + node_h_tensor[v_idx]
+            if self.memory is not None:
+                # Memory state is read here (in eval no_grad). State was
+                # advanced via apply_pending at the start of evaluate_batch.
+                e_t_u = e_t_u + self.memory.read(u)
+                e_t_v = e_t_v + self.memory.read(v)
 
             co_feat: Optional[torch.Tensor] = None
             if (

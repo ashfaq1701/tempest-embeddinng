@@ -28,6 +28,7 @@ from .data import Batch
 from .evaluator import Evaluator
 from .losses import alignment_loss, link_bce, uniformity_loss
 from .history import NodeHistory
+from .memory import NodeMemory
 from .model import (
     CoOccurrenceEncoder,
     CrossPairAttention,
@@ -98,6 +99,14 @@ class Trainer:
         # happen at the start of _step / evaluate_batch (BEFORE scoring).
         self.node_history: Optional[NodeHistory] = None
         self.node_encoder: Optional[NodeEncoder] = None
+        self.memory: Optional[NodeMemory] = None
+        if config.use_memory:
+            self.memory = NodeMemory(
+                n_nodes=config.max_node_count,
+                d_emb=config.d_emb,
+                d_time=config.d_time,
+                edge_feat_dim=edge_feat_dim,
+            ).to(self.device)
         if config.use_node_encoder:
             self.node_history = NodeHistory(
                 n_nodes=config.max_node_count,
@@ -165,6 +174,8 @@ class Trainer:
             link_params += list(self.node_encoder.parameters())
         if self.co_encoder is not None:
             link_params += list(self.co_encoder.parameters())
+        if self.memory is not None:
+            link_params += list(self.memory.parameters())
         self.link_optimizer = torch.optim.Adam(link_params, lr=config.link_lr)
         self._time_scale = config.alignment_time_scale  # overridden after dataset load
 
@@ -251,6 +262,14 @@ class Trainer:
             neg_src.reshape(-1).astype(np.int64),
             neg_tgt.reshape(-1).astype(np.int64),
         ]))
+
+        # ── (3a) Memory: apply pending raw messages from batch B−1 to s[u]
+        # BEFORE scoring. After this, s[u] reflects events ≤ B−1. Done IN
+        # AUTOGRAD GRAPH so GRU + msg_proj weights can learn from this
+        # batch's link BCE.
+        if self.memory is not None:
+            seeds_for_mem = torch.from_numpy(seeds_np).long().to(self.device)
+            self.memory.apply_pending(seeds_for_mem)
 
         # ── (3) Walks from the pre-ingest Tempest ─────────────────────────────
         walks = self.walk_gen.walks_for_nodes(seeds_np)
@@ -383,6 +402,12 @@ class Trainer:
             e_t_u = e_t_u + node_h[u_idx_t]
             e_t_v = e_t_v + node_h[v_idx_t]
 
+        # Memory residual — s[u] reflects events ≤ B−1 because apply_pending
+        # ran at the start of this batch.
+        if self.memory is not None:
+            e_t_u = e_t_u + self.memory.read(u_t)
+            e_t_v = e_t_v + self.memory.read(v_t)
+
         # Optional co-occurrence feature from per-pair history overlap.
         co_feat: Optional[torch.Tensor] = None
         if self.co_encoder is not None and self.node_history is not None:
@@ -417,6 +442,12 @@ class Trainer:
         l_total.backward()
         self.emb_optimizer.step()
         self.link_optimizer.step()
+
+        # After backward + step, detach memory state so next batch's
+        # apply_pending starts from a leaf tensor (no BPTT through the
+        # entire epoch).
+        if self.memory is not None:
+            self.memory.detach_state()
         return float(l_align.detach()), float(l_uniform.detach()), float(l_link.detach())
 
     # ------------------------------------------------------------------ #
@@ -431,6 +462,8 @@ class Trainer:
                 self.neg_sampler_train.reset()
             if self.node_history is not None:
                 self.node_history.reset()
+            if self.memory is not None:
+                self.memory.reset()
             self.embedding_store.train()
             self.link_predictor.train()
             if self.walk_encoder is not None:
@@ -441,6 +474,8 @@ class Trainer:
                 self.node_encoder.train()
             if self.co_encoder is not None:
                 self.co_encoder.train()
+            if self.memory is not None:
+                self.memory.train()
             t0 = time.perf_counter()
             sum_align = sum_uniform = sum_link = 0.0
             n = 0
@@ -462,6 +497,26 @@ class Trainer:
                         tgt=batch.tgt,
                         ts=batch.ts,
                         edge_feat=batch.edge_feat,
+                    )
+                if self.memory is not None:
+                    # Build raw messages for batch B's events; stash for
+                    # batch B+1's apply_pending. Uses state (already in-graph
+                    # from this batch's apply_pending) but we're outside
+                    # the autograd backward by now, so this is a pure
+                    # forward op that records pending. The detach_state
+                    # call inside _step already broke the autograd graph
+                    # for state, so this write doesn't propagate gradients.
+                    ef_proj_for_mem = None
+                    if batch.edge_feat is not None and self.embedding_store.has_edge_feat:
+                        with torch.no_grad():
+                            ef_t = torch.from_numpy(batch.edge_feat).float().to(self.device)
+                            ef_proj_for_mem = self.embedding_store.edge_feat_proj(ef_t)
+                    self.memory.update_pending(
+                        src=batch.src,
+                        tgt=batch.tgt,
+                        ts=batch.ts,
+                        edge_feat_proj=ef_proj_for_mem,
+                        time_scale=self._time_scale,
                     )
                 sum_align += l_align
                 sum_uniform += l_uniform
@@ -488,6 +543,8 @@ class Trainer:
             self.node_encoder.eval()
         if self.co_encoder is not None:
             self.co_encoder.eval()
+        if self.memory is not None:
+            self.memory.eval()
         total = 0.0
         n = 0
         for batch in batches:
@@ -510,6 +567,18 @@ class Trainer:
                     tgt=batch.tgt,
                     ts=batch.ts,
                     edge_feat=batch.edge_feat,
+                )
+            if self.memory is not None:
+                ef_proj_for_mem = None
+                if batch.edge_feat is not None and self.embedding_store.has_edge_feat:
+                    ef_t = torch.from_numpy(batch.edge_feat).float().to(self.device)
+                    ef_proj_for_mem = self.embedding_store.edge_feat_proj(ef_t)
+                self.memory.update_pending(
+                    src=batch.src,
+                    tgt=batch.tgt,
+                    ts=batch.ts,
+                    edge_feat_proj=ef_proj_for_mem,
+                    time_scale=self._time_scale,
                 )
         return total / max(n, 1)
 
