@@ -209,21 +209,41 @@ MRR becomes the **Phase 0.5 baseline** for all downstream comparisons.
 Every Phase S configuration is judged against this number, not against
 0.71.
 
-**Sanity checks before launch:**
-- [ ] Trainer respects `--num-epochs 2` and stops cleanly.
-- [ ] NodeTimeState resets between seeds (no cross-seed leakage).
-- [ ] TGB Evaluator state is independent per seed.
-- [ ] Logged outputs distinguish seeds (filename / stdout tag).
+**Sanity checks before launch (all passed; see commit `3727f63`):**
+- [x] Trainer respects `--num-epochs 2` and stops cleanly (`trainer.py:268`).
+- [x] NodeTimeState resets between seeds (fresh Trainer per seed → fresh
+  `NodeTimeState`; `.reset()` at epoch start).
+- [x] TGB Evaluator state is independent per seed (load_val_ns/test_ns
+  once before loop, idempotent; fresh `TGBNegativeSampler` per seed).
+- [x] Logged outputs distinguish seeds (per-seed stdout tag +
+  `runs/anchor_validation_<ts>.json`).
+- [x] WalkGenerator + Tempest fresh per seed (`walks.py:48` constructs
+  new `TemporalRandomWalk` per `Trainer.__init__`).
+- [x] Per-seed RNG: `np.random.seed`, `torch.manual_seed`,
+  `cuda.manual_seed_all` before `Trainer.__init__`;
+  `HistoricalNegativeSampler` takes `seed=config.seed`.
 
-**Results:**
-| Seed | Val MRR | Test MRR | Walltime |
-|---|---|---|---|
-| 42 |   |   |   |
-| 7  |   |   |   |
-| 13 |   |   |   |
-| mean ± std |   |   | — |
+**Results (run `20260519_173221`, ~4.2 min wall, RTX 2000 Ada + Tempest CPU):**
 
-**Decision:**
+| Seed | Val MRR | Test MRR | Train s | Eval s |
+|---|---|---|---|---|
+| 42         | 0.7447  | 0.7088  | 37.2 | 50.0 |
+| 7          | 0.7427  | 0.7060  | 33.6 | 49.4 |
+| 13         | 0.7420  | 0.7062  | 33.4 | 49.8 |
+| **mean ± std** | **0.7431 ± 0.0014** | **0.7070 ± 0.0016** | — | — |
+
+**Decision: CONFIRMED** (v2.2 §3.2 gate). Test mean 0.7070 ≥ 0.70 ✓,
+std 0.0016 ≤ 0.02 (massively under) ✓. The 0.71 smoke reproduces
+tightly across {42, 7, 13}. Per-epoch align/uniform/link numbers are
+identical within 0.001 across seeds, meaning Tempest's unsealed walk
+RNG is producing effectively deterministic walks for this protocol
+(input timestamps and seed sets fully determine the trajectory). The
+~0.01–0.02 noise concern from the pre-launch audit was overcautious.
+
+**Phase 0.5 baseline locked at test MRR = 0.7070** (mean across the
+three anchor seeds). Phase S configurations are judged against this
+floor; gains must be > 0.0016 (anchor std) to count as a real "win"
+per v2.2 §4.4.
 
 ---
 
