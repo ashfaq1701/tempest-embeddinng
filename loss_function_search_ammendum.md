@@ -145,22 +145,25 @@ L_A3.1 = mean over walks
 
 ### 4.2 A3.2 — Triplet/margin loss with semi-hard mining
 
-**Description.** For each walk W, sample triplets (anchor `target(seed)`, positive `context(walk-internal position sampled with weight w(i))`, negative `context(uniform random)`). Margin loss on the difference of cosine similarities. This is the only candidate with literal self-limiting gradient — the textbook fix for the over-training cliff.
+**Description.** For each walk W, sample triplets (anchor `target(seed)`, positive `context(walk-internal position sampled UNIFORMLY)`, negative `context(uniform random destination)`). Compute the cosine-margin hinge **and multiply it by the positional/temporal weight `w(p)`** at the sampled position. This makes Δt enter the loss as a multiplicative weight on the per-triplet hinge — identical to how InfoNCE and SGNS use `w_pos` — so the three primaries are mutually consistent in their timestamp use. (Earlier draft used Categorical(w(i)) sampling with an unweighted hinge; the audit in §4.7 of v2.3 showed that throws away Δt after the multinomial. The current spec is the fix.) This is the only candidate with literal self-limiting gradient — the textbook fix for the over-training cliff.
 
 **Formula:**
 
 ```
 For each walk W = (n_0, n_1, ..., n_{L-1}) with seed u = n_{L-1}:
-  Sample position p ~ Categorical({n_0, ..., n_{L-2}}, weights={w(0), ..., w(L-2)})
+  Sample position p ~ Uniform({i : 0 ≤ i ≤ lens − 2 ∧ position i is valid})
   Sample negative q ~ uniform from training-destination pool
-  
+
+  w_p     = (1 / depth(p)) · (1 + Δt(p) / time_scale)^(-β)   # same w(i) family used by A1 / A3.1 / A3.3
   pos_sim = cosine(target(u), context(p))
   neg_sim = cosine(target(u), context(q))
-  
-  L_triplet = max(0, m - pos_sim + neg_sim)
 
-L_A3.2 = mean over walks
+  L_triplet_walk = w_p · max(0, m − pos_sim + neg_sim)         # hinge weighted by Δt-decay
+
+L_A3.2 = Σ_walks (keep · L_triplet_walk) / Σ_walks (keep · w_p)   # mean over kept triplets, weight-normalised
 ```
+
+where `keep` is the semi-hard mining mask defined below.
 
 **Semi-hard mining (mandatory):** within each batch, after computing all triplets, restrict gradient backprop to triplets where `pos_sim - neg_sim < m` (negative is inside the margin band) AND `neg_sim < pos_sim` (negative not closer than positive). This keeps the loss focused on the boundary triplets and avoids the collapse mode of hard mining.
 
@@ -169,7 +172,7 @@ L_A3.2 = mean over walks
 1. **Use cosine similarity** with `margin = 0.5`, not raw dot product. Raw dot product on 128-d Xavier-init embeddings has unbounded magnitude scale, making margin selection brittle across training. Cosine normalizes to [-1, 1] and `m = 0.5` is the literature default.
 2. **Delete `L_uniform` entirely.** Margin loss provides no uniformity pressure; rely on weight decay for L2 norm control.
 3. **Add weight decay** `1e-4` on `E_target, E_context` (this is also a Group D hyperparameter; pick the same value if D has been tuned).
-4. **Sample positive `p` by walk position with weights `w(i)`** — same positional weighting as A1/A3.1, just used as sampling probability instead of loss weight.
+4. **Sample positive `p` UNIFORMLY from valid walk positions; weight the hinge by `w(p)`.** Δt enters the loss the same way as InfoNCE / SGNS — as a per-pair loss-weight multiplier, NOT as a categorical sampling probability. This avoids the "Δt discarded after multinomial" failure mode of the earlier draft and keeps the three primaries directly comparable.
 5. **Sample negative `q` uniformly from training destinations** (same pool as link BCE negative sampler).
 
 **Hyperparameters:**
@@ -498,4 +501,4 @@ The amendment becomes archival once v2.3 lands. It exists to preserve the *reaso
 
 ---
 
-*Document version: 1.2, post Phase S Group A2 single-seed result. Companion to walk_distribution_matched_design_v2.2.md. Will be archived into v2.3 once a primary + (optional) normbrake auxiliary is locked. Changes from v1.1: removed EdgeBank-as-teacher distillation (A3.x_distill) entirely from the amendment; updated §1 to honestly note its removal and the contribution-dilution rationale; updated §2 goal-shaping to reframe wiki expectations honestly (tie anchor expected, lift unlikely without heuristic supervision); reduced execution plan from 10 to 6 cells; renumbered sections §5 onward (formerly §6 onward); updated §8 to list distillation as deferred-not-in-scope rather than as an active auxiliary. Changes from v1.0 → v1.1 (preserved): added §4.4 A3.x_normbrake as custom diagnostic-derived regularizer; added decision criteria for normbrake outcomes; updated §7 deduplication for normbrake-under-E.2. Sources: NeurTWs (Jin et al., NeurIPS 2022), Wang & Isola (ICML 2020), Levy & Goldberg (NIPS 2014), Yeh et al. (ECCV 2022 DCL), Zeng (arXiv:2510.02161v2 triplet vs contrastive), Mikolov et al. (NIPS 2013), Zuo et al. (KDD 2018 HTNE), Tan et al. (ICLR 2024 Kernel-InfoNCE), and the TGB leaderboard (January 2026 snapshot). The §4.4 norm-brake regularizer is not from a published source; it is derived directly from Phase 0.5 diagnostic data in this project.*
+*Document version: 1.3, post v2.3 audit. Companion to walk_distribution_matching_embedding_v2.md (v2.3). ARCHIVAL — load-bearing spec lives in v2.3 §4.7; this file preserves the full per-loss reasoning trail. Changes from v1.2: §4.2 (A3.2 Triplet) — fixed the Δt-discard hole. Earlier draft sampled positive `p ~ Categorical(w(i))` and used an unweighted hinge, which means Δt only biased WHICH position got sampled and was discarded from the loss after the multinomial. v1.3 switches to UNIFORM sampling of `p` and multiplies the per-walk hinge by `w(p)` — so Δt enters the triplet loss the same way it does in InfoNCE / SGNS (multiplicative weight on the per-pair loss term), making the three primaries directly comparable in the comparison matrix. Description, formula block, critical-implementation item 4 all updated. No other primary changes. Changes from v1.1 → v1.2 (preserved): removed EdgeBank-as-teacher distillation; reduced execution plan from 10 to 6 cells; renumbered sections; updated §8 to list distillation as deferred-not-in-scope. Changes from v1.0 → v1.1 (preserved): added §4.4 A3.x_normbrake as custom diagnostic-derived regularizer; added decision criteria for normbrake outcomes; updated §7 deduplication for normbrake-under-E.2. Sources: NeurTWs (Jin et al., NeurIPS 2022), Wang & Isola (ICML 2020), Levy & Goldberg (NIPS 2014), Yeh et al. (ECCV 2022 DCL), Zeng (arXiv:2510.02161v2 triplet vs contrastive), Mikolov et al. (NIPS 2013), Zuo et al. (KDD 2018 HTNE), Tan et al. (ICLR 2024 Kernel-InfoNCE), and the TGB leaderboard (January 2026 snapshot). The §4.4 norm-brake regularizer is not from a published source; it is derived directly from Phase 0.5 diagnostic data in this project.*
