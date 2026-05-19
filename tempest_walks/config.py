@@ -44,6 +44,12 @@ class Config:
     node_enc_dropout: float = 0.1
     node_enc_ff_dim: int = 256
 
+    # Co-occurrence feature: |neighbors(u) ∩ neighbors(v)| in their recent
+    # K_history slices, projected to d_emb, added as 5th channel to the
+    # link MLP. The recurrence signal EdgeBank exploits, made learnable.
+    # Requires use_node_encoder=True (uses the same history buffer).
+    use_co_feat: bool = True
+
     # Alignment loss
     temporal_decay_exp: float = 0.5      # β in (1 + Δt/time_scale)^(-β)
     alignment_time_scale: float = -1.0   # ≤ 0 ⇒ derive from training time range

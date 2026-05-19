@@ -152,7 +152,8 @@ class EmbeddingStore(nn.Module):
 
 
 class LinkPredictor(nn.Module):
-    """4-channel MLP head: [E(u) ‖ E(v) ‖ W(u) ‖ W(v)].
+    """4-channel MLP head: [E(u) ‖ E(v) ‖ W(u) ‖ W(v)], with an OPTIONAL
+    5th co-occurrence channel.
 
     Simpler than the prior 12-block design — relies on CrossPairAttention
     (a separate module) to do all the interaction work *before* the head
@@ -166,6 +167,10 @@ class LinkPredictor(nn.Module):
                      each side has already attended to the other's walk,
                      so co-occurrence / shared-history signal is folded
                      into W before the MLP sees it.
+      - C(u, v) (opt): explicit recurrence feature — count of distinct
+                       neighbors shared between u's and v's recent history,
+                       projected to d_emb. EdgeBank-style memorisation
+                       made differentiable. Controlled by use_co_feat.
 
     Why 4 raw channels instead of 12 hand-crafted interactions: the
     cross-pair attention is a learned interaction. Stacking it under
@@ -175,9 +180,16 @@ class LinkPredictor(nn.Module):
     consistent with a positive link?" classifier.
     """
 
-    def __init__(self, d_emb: int, hidden: int = 128, dropout: float = 0.0):
+    def __init__(
+        self,
+        d_emb: int,
+        hidden: int = 128,
+        dropout: float = 0.0,
+        use_co_feat: bool = False,
+    ):
         super().__init__()
-        in_d = 4 * d_emb
+        self.use_co_feat = use_co_feat
+        in_d = (5 if use_co_feat else 4) * d_emb
         self.norm = nn.LayerNorm(in_d)
         self.net = nn.Sequential(
             nn.Linear(in_d, hidden),
@@ -195,8 +207,17 @@ class LinkPredictor(nn.Module):
         e_v: torch.Tensor,
         w_u: torch.Tensor,
         w_v: torch.Tensor,
+        co_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        x = torch.cat([e_u, e_v, w_u, w_v], dim=-1)
+        parts = [e_u, e_v, w_u, w_v]
+        if self.use_co_feat:
+            if co_feat is None:
+                raise ValueError(
+                    "LinkPredictor was built with use_co_feat=True but "
+                    "co_feat was not passed to forward()."
+                )
+            parts.append(co_feat)
+        x = torch.cat(parts, dim=-1)
         return self.net(self.norm(x)).squeeze(-1)
 
 
@@ -284,6 +305,73 @@ class CrossPairAttention(nn.Module):
         v_attended = v_attended * (~u_all_masked).float().unsqueeze(-1)
 
         return h_u_seq + u_attended, h_v_seq + v_attended
+
+
+class CoOccurrenceEncoder(nn.Module):
+    """Per-pair co-occurrence feature from per-node interaction histories.
+
+    For each (u, v) pair, count how many distinct neighbours are shared
+    between u's and v's K-most-recent-interaction sets. This is the
+    recurrence signal EdgeBank scores with a hash table, made into a
+    differentiable input feature for the link MLP.
+
+    Three statistics computed and projected to d_emb together:
+        1. raw overlap count             — |neighbors(u) ∩ neighbors(v)|
+        2. overlap / min(vc_u, vc_v)     — normalized by the smaller history
+        3. overlap / sqrt(vc_u · vc_v)   — Jaccard-ish geometric normalization
+
+    All three are scalars; a 3 → d_emb projection lifts them to the link
+    MLP's expected width. Doing all three is cheap (~20 FLOPs per pair)
+    and lets the model choose which scale matters per dataset.
+    """
+
+    def __init__(self, d_emb: int):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(3, d_emb),
+            nn.GELU(),
+            nn.Linear(d_emb, d_emb),
+        )
+
+    @staticmethod
+    def compute_overlap(
+        nb_u: torch.Tensor,      # [P, K] long — u's history neighbors
+        nb_v: torch.Tensor,      # [P, K] long — v's history neighbors
+        vc_u: torch.Tensor,      # [P] long — u's valid count
+        vc_v: torch.Tensor,      # [P] long — v's valid count
+    ) -> torch.Tensor:
+        """Returns [P, 3]: raw overlap, /min(vc_u,vc_v), /sqrt(vc_u·vc_v)."""
+        device = nb_u.device
+        K = nb_u.shape[1]
+        positions = torch.arange(K, device=device).unsqueeze(0)
+        mask_u = positions < vc_u.unsqueeze(1)                    # [P, K]
+        mask_v = positions < vc_v.unsqueeze(1)
+        # Pairwise compare every u-slot with every v-slot
+        match = (nb_u.unsqueeze(2) == nb_v.unsqueeze(1))          # [P, K_u, K_v]
+        match = match & mask_u.unsqueeze(2) & mask_v.unsqueeze(1)
+        # Count u-slots that have ≥1 v-match (approximation to |set ∩ set|;
+        # equal to it when u-history has unique neighbors). This avoids the
+        # cost of explicit set deduplication.
+        overlap = match.any(dim=2).float().sum(dim=1)             # [P]
+        vc_u_f = vc_u.float().clamp_min(1.0)
+        vc_v_f = vc_v.float().clamp_min(1.0)
+        denom_min = torch.minimum(vc_u_f, vc_v_f)
+        denom_geo = torch.sqrt(vc_u_f * vc_v_f)
+        return torch.stack([
+            overlap,
+            overlap / denom_min,
+            overlap / denom_geo,
+        ], dim=-1)                                                # [P, 3]
+
+    def forward(
+        self,
+        nb_u: torch.Tensor,
+        nb_v: torch.Tensor,
+        vc_u: torch.Tensor,
+        vc_v: torch.Tensor,
+    ) -> torch.Tensor:
+        feats = self.compute_overlap(nb_u, nb_v, vc_u, vc_v)      # [P, 3]
+        return self.proj(feats)                                    # [P, d_emb]
 
 
 def masked_mean_pool(

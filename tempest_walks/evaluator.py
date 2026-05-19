@@ -20,6 +20,7 @@ import torch
 from .data import Batch
 from .history import NodeHistory
 from .model import (
+    CoOccurrenceEncoder,
     CrossPairAttention,
     EmbeddingStore,
     LinkPredictor,
@@ -63,6 +64,7 @@ class Evaluator:
         cross_pair_attn: Optional[CrossPairAttention] = None,
         node_history: Optional[NodeHistory] = None,
         node_encoder: Optional[NodeEncoder] = None,
+        co_encoder: Optional[CoOccurrenceEncoder] = None,
         time_scale: Optional[float] = None,
     ):
         # Lazy import so this module loads without py-tgb installed.
@@ -83,6 +85,7 @@ class Evaluator:
         self.cross_pair_attn = cross_pair_attn
         self.node_history = node_history
         self.node_encoder = node_encoder
+        self.co_encoder = co_encoder
         self.time_scale = time_scale
         # Consistency checks: each augmentation needs its full support set.
         if walk_encoder is not None and (
@@ -121,8 +124,9 @@ class Evaluator:
             seed_seq_lookup = self._encode_walks_for_batch(seeds_np, batch.t_max)
 
         # Phase 4: read each unique node's history and run the node encoder,
-        # producing a per-seed dynamic node embedding.
-        node_h_lookup: Optional[Tuple[np.ndarray, torch.Tensor]] = None
+        # producing a per-seed dynamic node embedding. Also cache nb_t/vc_t
+        # for the co-occurrence encoder to reuse without re-reading.
+        node_h_lookup: Optional[Tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor]] = None
         if self.node_encoder is not None:
             node_h_lookup = self._encode_history_for_batch(seeds_np, batch.t_max)
 
@@ -216,16 +220,17 @@ class Evaluator:
         self,
         seeds_np: np.ndarray,
         t_max: int,
-    ) -> Tuple[np.ndarray, torch.Tensor]:
+    ) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Read per-node interaction history for every unique seed,
-        run the DyGFormer-style node encoder, return per-seed node_h.
+        run the DyGFormer-style node encoder, AND cache the neighbor /
+        valid-count tensors so the co-occurrence encoder can reuse them.
 
         Returns:
             seeds_np : np.ndarray  sorted unique seed ids (same as input)
             node_h   : [N, d_emb]  per-seed dynamic embedding; zero rows
-                                   are the cold-start fallback (caller
-                                   adds them to target(u) as residual,
-                                   so zero → static fallback).
+                                   are cold-start fallbacks.
+            nb_t     : [N, K] long — gathered neighbor IDs (for co-occur)
+            vc_t     : [N]    long — valid counts (for co-occur)
 
         Strict-causal: history reflects events ≤ batch B−1 because the
         trainer's evaluate() writes events AFTER calling evaluate_batch.
@@ -255,7 +260,7 @@ class Evaluator:
             t_query=tq,
             time_scale=self.time_scale,
         )
-        return seeds_np, node_h
+        return seeds_np, node_h, nb_t, vc_t
 
     def _score_chunked(
         self,
@@ -263,7 +268,7 @@ class Evaluator:
         all_v: torch.Tensor,
         counts: List[int],
         seed_seq_lookup: Optional[Tuple[np.ndarray, torch.Tensor, torch.Tensor]] = None,
-        node_h_lookup: Optional[Tuple[np.ndarray, torch.Tensor]] = None,
+        node_h_lookup: Optional[Tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Score [P] rows through the link predictor in row_budget-sized chunks.
 
@@ -309,8 +314,10 @@ class Evaluator:
             np.searchsorted(seeds_np, all_v_np),
         ).long().to(self.device)
 
-        # Optional node-encoder lookup (matches the trainer's residual add).
+        # Optional node-encoder + co-occurrence lookups.
         node_h_tensor: Optional[torch.Tensor] = None
+        hist_nb_tensor: Optional[torch.Tensor] = None
+        hist_vc_tensor: Optional[torch.Tensor] = None
         if node_h_lookup is not None:
             # node_h_lookup seeds are the same seeds_np we used for walks
             # (computed once in evaluate_batch and shared) — but assert it
@@ -320,6 +327,8 @@ class Evaluator:
                 "seed array — they're sampled from the same union."
             )
             node_h_tensor = node_h_lookup[1]                  # [N_unique, d]
+            hist_nb_tensor = node_h_lookup[2]                 # [N_unique, K]
+            hist_vc_tensor = node_h_lookup[3]                 # [N_unique]
 
         for start, end in rows:
             u = all_u[start:end]
@@ -343,7 +352,21 @@ class Evaluator:
             if node_h_tensor is not None:
                 e_u = e_u + node_h_tensor[u_idx]
                 e_v = e_v + node_h_tensor[v_idx]
-            out[start:end] = self.link_predictor(e_u, e_v, w_u, w_v)
+
+            # Optional co-occurrence feature using the cached history slices.
+            co_feat: Optional[torch.Tensor] = None
+            if (
+                self.co_encoder is not None
+                and hist_nb_tensor is not None
+                and hist_vc_tensor is not None
+            ):
+                nb_u = hist_nb_tensor[u_idx]
+                nb_v = hist_nb_tensor[v_idx]
+                vc_u = hist_vc_tensor[u_idx]
+                vc_v = hist_vc_tensor[v_idx]
+                co_feat = self.co_encoder(nb_u, nb_v, vc_u, vc_v)
+
+            out[start:end] = self.link_predictor(e_u, e_v, w_u, w_v, co_feat)
 
         return out
 

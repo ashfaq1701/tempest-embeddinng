@@ -29,6 +29,7 @@ from .evaluator import Evaluator
 from .losses import alignment_loss, link_bce, uniformity_loss
 from .history import NodeHistory
 from .model import (
+    CoOccurrenceEncoder,
     CrossPairAttention,
     EmbeddingStore,
     LinkPredictor,
@@ -70,11 +71,17 @@ class Trainer:
         # Phase 3: 4-channel link MLP [E(u) ‖ E(v) ‖ W(u) ‖ W(v)] —
         # cross-pair attention does the interaction work BEFORE the MLP
         # sees its inputs, so we don't need Hadamard/L1/cross-table blocks.
+        # Optional 5th channel: co-occurrence projection (requires node_history).
+        co_feat_enabled = config.use_co_feat and config.use_node_encoder
         self.link_predictor = LinkPredictor(
             config.d_emb,
             config.d_hidden_link,
             dropout=config.link_dropout,
+            use_co_feat=co_feat_enabled,
         ).to(self.device)
+        self.co_encoder: Optional[CoOccurrenceEncoder] = None
+        if co_feat_enabled:
+            self.co_encoder = CoOccurrenceEncoder(d_emb=config.d_emb).to(self.device)
         # Cross-pair attention head — pair-conditioned walk summary.
         # Lives with the link side: parameters are scoring-specific
         # (the alignment loss doesn't touch them).
@@ -156,6 +163,8 @@ class Trainer:
             link_params += list(self.cross_pair_attn.parameters())
         if self.node_encoder is not None:
             link_params += list(self.node_encoder.parameters())
+        if self.co_encoder is not None:
+            link_params += list(self.co_encoder.parameters())
         self.link_optimizer = torch.optim.Adam(link_params, lr=config.link_lr)
         self._time_scale = config.alignment_time_scale  # overridden after dataset load
 
@@ -360,7 +369,19 @@ class Trainer:
             e_u_dyn = e_u_static + node_h[u_idx_t]
             e_v_dyn = e_v_static + node_h[v_idx_t]
 
-        logits = self.link_predictor(e_u_dyn, e_v_dyn, w_u, w_v)
+        # Optional co-occurrence feature from per-pair history overlap.
+        co_feat: Optional[torch.Tensor] = None
+        if self.co_encoder is not None and self.node_history is not None:
+            # nb_t, vc_t already gathered above when node_encoder ran.
+            # If node_encoder is off but co_encoder is on (not currently a
+            # supported config), would need a separate read here.
+            nb_u = nb_t[u_idx_t]                                            # [P, K]
+            nb_v = nb_t[v_idx_t]
+            vc_u_p = vc_t[u_idx_t]                                          # [P]
+            vc_v_p = vc_t[v_idx_t]
+            co_feat = self.co_encoder(nb_u, nb_v, vc_u_p, vc_v_p)           # [P, d_emb]
+
+        logits = self.link_predictor(e_u_dyn, e_v_dyn, w_u, w_v, co_feat)
         labels = torch.cat([
             torch.ones(B, device=self.device),
             torch.zeros(B * K_neg, device=self.device),
@@ -404,6 +425,8 @@ class Trainer:
                 self.cross_pair_attn.train()
             if self.node_encoder is not None:
                 self.node_encoder.train()
+            if self.co_encoder is not None:
+                self.co_encoder.train()
             t0 = time.perf_counter()
             sum_align = sum_uniform = sum_link = 0.0
             n = 0
@@ -449,6 +472,8 @@ class Trainer:
             self.cross_pair_attn.eval()
         if self.node_encoder is not None:
             self.node_encoder.eval()
+        if self.co_encoder is not None:
+            self.co_encoder.eval()
         total = 0.0
         n = 0
         for batch in batches:
