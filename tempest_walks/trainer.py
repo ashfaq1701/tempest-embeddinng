@@ -304,10 +304,12 @@ class Trainer:
             cap=self.config.uniformity_cap,
         )
 
-        # ── (6c) Link prediction: 4-channel MLP [E(u), E(v), W(u), W(v)] ──
-        # W(u), W(v) are PAIR-CONDITIONED — they come from cross-pair attention
-        # between u's walk sequence and v's walk sequence. Gather per-pair
-        # sequences, run cross-attention, pool, then score.
+        # ── (6c) Link prediction: 12-block (or 13 with co-feat) link MLP
+        # restoring Phase 2's empirically-best cross-table interaction
+        # structure. Cross-pair attention was tried in Phase 3 with a
+        # collapsed 4-channel head and regressed test MRR by ~0.05 — the
+        # Hadamard/L1 cross-table blocks were doing more work than
+        # cross-pair attention added, so we drop cross-pair entirely.
         all_u = np.concatenate([batch.src, neg_src.reshape(-1).astype(np.int64)])
         all_v = np.concatenate([batch.tgt, neg_tgt.reshape(-1).astype(np.int64)])
         u_idx_in_seeds = np.searchsorted(seeds_np, all_u)
@@ -315,29 +317,41 @@ class Trainer:
         u_idx_t = torch.from_numpy(u_idx_in_seeds).long().to(self.device)
         v_idx_t = torch.from_numpy(v_idx_in_seeds).long().to(self.device)
 
-        h_u_seq = seed_seq[u_idx_t]            # [P, L, d]
-        h_v_seq = seed_seq[v_idx_t]
-        u_mask = seq_mask[u_idx_t]             # [P, L]
-        v_mask = seq_mask[v_idx_t]
+        # Seed-pooled walk summary (Phase 2 style) — mean over the K walks
+        # of each seed at the seed position, with target() fallback for
+        # cold-start nodes. Cheaper than cross-pair attention and avoids
+        # Phase 3's regression.
+        K = walks.K
+        arange_w = torch.arange(h_walks.shape[0], device=self.device)
+        seed_pos = (walk_lens - 1).clamp_min(0)
+        h_at_seed = h_walks[arange_w, seed_pos, :]                      # [N*K, d]
+        has_walk = (walk_lens > 0).float().unsqueeze(-1)
+        h_at_seed = h_at_seed.reshape(seeds_tensor.shape[0], K, -1)
+        has_walk = has_walk.reshape(seeds_tensor.shape[0], K, 1)
+        seed_h_sum = (h_at_seed * has_walk).sum(dim=1)
+        seed_h_cnt = has_walk.sum(dim=1).clamp_min(1.0)
+        seed_h = seed_h_sum / seed_h_cnt                                # [N_unique, d]
+        no_walk = (has_walk.sum(dim=1) == 0).float()
+        target_seeds_fallback = self.embedding_store.target(seeds_tensor)
+        seed_h = seed_h * (1.0 - no_walk) + target_seeds_fallback * no_walk
 
-        # Cross-pair attention: both sides attend to the other's walk
-        h_u_attn, h_v_attn = self.cross_pair_attn(h_u_seq, h_v_seq, u_mask, v_mask)
-
-        # Masked mean pool → pair-conditioned walk summaries
-        w_u = masked_mean_pool(h_u_attn, u_mask)   # [P, d]
-        w_v = masked_mean_pool(h_v_attn, v_mask)   # [P, d]
+        w_u = seed_h[u_idx_t]
+        w_v = seed_h[v_idx_t]
 
         u_t = torch.from_numpy(all_u).long().to(self.device)
         v_t = torch.from_numpy(all_v).long().to(self.device)
-        e_u_static = self.embedding_store.target(u_t)     # [P, d]
-        e_v_static = self.embedding_store.target(v_t)
+        e_t_u = self.embedding_store.target(u_t)
+        e_t_v = self.embedding_store.target(v_t)
+        e_c_u = self.embedding_store.context(u_t)
+        e_c_v = self.embedding_store.context(v_t)
 
         # Dynamic node embedding via DyGFormer-style encoder.
         # STRICT-CAUSAL READ: history reflects events ≤ batch B−1; this
         # batch's events have NOT been written yet (the post-scoring block
         # at the end of train()'s per-batch loop is the only writer).
-        e_u_dyn = e_u_static                               # default = static fallback
-        e_v_dyn = e_v_static
+        # The DyG output is added as a RESIDUAL to target(u) before the
+        # cross-table blocks of the link MLP see it. Cold-start rows have
+        # node_h=0 → fall back to the static lookup naturally.
         if self.node_encoder is not None and self.node_history is not None:
             # Read the history slice for every node we need to score
             # (deduplicated through seeds_np to amortise the lookup).
@@ -365,9 +379,9 @@ class Trainer:
             )                                              # [N_unique, d]
             # Gather node_h for u and v of each pair; add as residual on top
             # of the static identity. Cold-start rows have node_h=0 → fall
-            # back to e_u_static / e_v_static naturally.
-            e_u_dyn = e_u_static + node_h[u_idx_t]
-            e_v_dyn = e_v_static + node_h[v_idx_t]
+            # back to e_t_u / e_t_v naturally.
+            e_t_u = e_t_u + node_h[u_idx_t]
+            e_t_v = e_t_v + node_h[v_idx_t]
 
         # Optional co-occurrence feature from per-pair history overlap.
         co_feat: Optional[torch.Tensor] = None
@@ -381,7 +395,7 @@ class Trainer:
             vc_v_p = vc_t[v_idx_t]
             co_feat = self.co_encoder(nb_u, nb_v, vc_u_p, vc_v_p)           # [P, d_emb]
 
-        logits = self.link_predictor(e_u_dyn, e_v_dyn, w_u, w_v, co_feat)
+        logits = self.link_predictor(e_t_u, e_t_v, e_c_u, e_c_v, w_u, w_v, co_feat)
         labels = torch.cat([
             torch.ones(B, device=self.device),
             torch.zeros(B * K_neg, device=self.device),

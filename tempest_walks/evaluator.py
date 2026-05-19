@@ -76,9 +76,12 @@ class Evaluator:
         self.device = device
         self.eval_metric = eval_metric
         self.tgb_eval = TGBEvaluator(name=tgb_dataset_name)
+        # Cross-pair attention is dropped on this branch — row budget can
+        # stay at the higher 500K-rows ceiling (the only per-row cost in
+        # eval is the link MLP forward at d_emb width).
         self.row_budget = _row_budget_for_d_emb(
             embedding_store.d_emb,
-            with_cross_pair=cross_pair_attn is not None,
+            with_cross_pair=False,
         )
         self.walk_gen = walk_gen
         self.walk_encoder = walk_encoder
@@ -117,11 +120,10 @@ class Evaluator:
         all_v_np = all_v.cpu().numpy().astype(np.int64)
         seeds_np = np.unique(np.concatenate([all_u_np, all_v_np]))
 
-        # Phase 3: walk-encode all unique nodes; build per-seed sequence
-        # (avg over K walks per position) + valid mask.
-        seed_seq_lookup: Optional[Tuple[np.ndarray, torch.Tensor, torch.Tensor]] = None
+        # Walk-encode all unique nodes; produce per-seed W (seed-pooled).
+        seed_w_lookup: Optional[Tuple[np.ndarray, torch.Tensor]] = None
         if self.walk_encoder is not None:
-            seed_seq_lookup = self._encode_walks_for_batch(seeds_np, batch.t_max)
+            seed_w_lookup = self._encode_walks_for_batch(seeds_np, batch.t_max)
 
         # Phase 4: read each unique node's history and run the node encoder,
         # producing a per-seed dynamic node embedding. Also cache nb_t/vc_t
@@ -131,7 +133,7 @@ class Evaluator:
             node_h_lookup = self._encode_history_for_batch(seeds_np, batch.t_max)
 
         scores = self._score_chunked(
-            all_u, all_v, counts, seed_seq_lookup, node_h_lookup,
+            all_u, all_v, counts, seed_w_lookup, node_h_lookup,
         )
 
         scores_np = scores.cpu().numpy()
@@ -153,15 +155,15 @@ class Evaluator:
         self,
         seeds_np: np.ndarray,
         t_max: int,
-    ) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor]:
-        """Sample walks for every unique node in this batch, run the encoder
-        once, return per-seed walk SEQUENCES + valid masks for cross-pair
-        attention to consume per pair.
+    ) -> Tuple[np.ndarray, torch.Tensor]:
+        """Sample walks for every unique node in this batch, run the encoder,
+        seed-pool (mean of h_walks[w, lens_w-1, :] over the K walks per seed,
+        target() fallback for cold-start), return per-seed W.
 
         Returns:
-            seeds_np  : np.ndarray   sorted unique seed ids
-            seed_seq  : [N, L, d_emb] per-position mean over K walks
-            seq_mask  : [N, L] bool  True at valid (real-walk) positions
+            seeds_np : np.ndarray  sorted unique seed ids
+            seed_w   : [N, d_emb]  seed-pooled walk-summary (same recipe as
+                                   the trainer's seed-pool path).
 
         Strict-causal: walks come from the CURRENT Tempest state (the trainer
         ingests AFTER calling evaluate_batch). Same protocol as training.
@@ -177,7 +179,6 @@ class Evaluator:
         )
         seeds_tensor = walks.seeds.to(self.device).long()
         K = walks.K
-        L = nodes.shape[1]
         t_query_per_walk = torch.full(
             (seeds_tensor.shape[0] * K,), int(t_max),
             dtype=torch.long, device=self.device,
@@ -191,30 +192,23 @@ class Evaluator:
             time_scale=self.time_scale,
         )                                                                          # [N*K, L, d]
 
-        # Per-position avg over K walks (same logic as Trainer._compute_seed_seq).
+        # Seed-pool (matches trainer's recipe): pick h at the per-walk seed
+        # position (lens-1), average over K walks per seed, target() fallback
+        # for all-cold-start seeds.
+        arange_w = torch.arange(h_walks.shape[0], device=self.device)
+        seed_pos = (walk_lens - 1).clamp_min(0)
+        h_at_seed = h_walks[arange_w, seed_pos, :]                                 # [N*K, d]
+        has_walk = (walk_lens > 0).float().unsqueeze(-1)                           # [N*K, 1]
         N = seeds_tensor.shape[0]
-        d = h_walks.shape[2]
-        positions = torch.arange(L, device=self.device).unsqueeze(0)
-        per_walk_valid = positions < walk_lens.unsqueeze(1)                        # [N*K, L]
-        h_walks_re = h_walks.reshape(N, K, L, d)
-        valid_re = per_walk_valid.reshape(N, K, L)
-        valid_f = valid_re.float().unsqueeze(-1)
-        h_sum = (h_walks_re * valid_f).sum(dim=1)
-        h_cnt = valid_f.sum(dim=1).clamp_min(1.0)
-        seed_seq = h_sum / h_cnt                                                   # [N, L, d]
-        seq_mask = valid_re.any(dim=1)                                             # [N, L]
-
-        # Cold-start fallback: nodes with every walk lens=0 — inject
-        # target(seed) at position 0 so cross-pair attention has a key/value.
-        no_walk_any = ~seq_mask.any(dim=1)
-        if no_walk_any.any():
-            target_seeds = self.embedding_store.target(seeds_tensor)
-            seed_seq = seed_seq.clone()
-            seq_mask = seq_mask.clone()
-            seed_seq[no_walk_any, 0, :] = target_seeds[no_walk_any]
-            seq_mask[no_walk_any, 0] = True
-
-        return seeds_np, seed_seq, seq_mask
+        h_at_seed = h_at_seed.reshape(N, K, -1)
+        has_walk = has_walk.reshape(N, K, 1)
+        h_sum = (h_at_seed * has_walk).sum(dim=1)                                  # [N, d]
+        h_cnt = has_walk.sum(dim=1).clamp_min(1.0)
+        seed_w = h_sum / h_cnt
+        no_walk = (has_walk.sum(dim=1) == 0).float()
+        target_seeds_fb = self.embedding_store.target(seeds_tensor)
+        seed_w = seed_w * (1.0 - no_walk) + target_seeds_fb * no_walk              # [N, d]
+        return seeds_np, seed_w
 
     def _encode_history_for_batch(
         self,
@@ -267,7 +261,7 @@ class Evaluator:
         all_u: torch.Tensor,
         all_v: torch.Tensor,
         counts: List[int],
-        seed_seq_lookup: Optional[Tuple[np.ndarray, torch.Tensor, torch.Tensor]] = None,
+        seed_w_lookup: Optional[Tuple[np.ndarray, torch.Tensor]] = None,
         node_h_lookup: Optional[Tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Score [P] rows through the link predictor in row_budget-sized chunks.
@@ -297,14 +291,13 @@ class Evaluator:
         out = torch.empty(int(all_u.shape[0]), dtype=torch.float32, device=self.device)
 
         # Walk-encoded path requires the lookup AND the cross-pair attention.
-        if seed_seq_lookup is None or self.cross_pair_attn is None:
+        if seed_w_lookup is None:
             raise RuntimeError(
-                "Evaluator was constructed without walk_encoder/cross_pair_attn "
-                "but the current LinkPredictor is the 4-channel variant that "
-                "requires walk-encoded W(u), W(v). Wire those in.",
+                "Evaluator was constructed without walk_encoder; the current "
+                "LinkPredictor requires walk-encoded W(u), W(v). Wire those in.",
             )
 
-        seeds_np, seed_seq, seq_mask = seed_seq_lookup
+        seeds_np, seed_w_pooled = seed_w_lookup                          # [N_unique, d]
         all_u_np = all_u.cpu().numpy().astype(np.int64)
         all_v_np = all_v.cpu().numpy().astype(np.int64)
         u_idx_full = torch.from_numpy(
@@ -319,9 +312,6 @@ class Evaluator:
         hist_nb_tensor: Optional[torch.Tensor] = None
         hist_vc_tensor: Optional[torch.Tensor] = None
         if node_h_lookup is not None:
-            # node_h_lookup seeds are the same seeds_np we used for walks
-            # (computed once in evaluate_batch and shared) — but assert it
-            # in case future callers diverge.
             assert np.array_equal(node_h_lookup[0], seeds_np), (
                 "node_h_lookup seed array must match the walk-encoder's "
                 "seed array — they're sampled from the same union."
@@ -336,24 +326,17 @@ class Evaluator:
             u_idx = u_idx_full[start:end]
             v_idx = v_idx_full[start:end]
 
-            h_u_seq = seed_seq[u_idx]                       # [P_chunk, L, d]
-            h_v_seq = seed_seq[v_idx]
-            u_mask = seq_mask[u_idx]                        # [P_chunk, L]
-            v_mask = seq_mask[v_idx]
+            w_u = seed_w_pooled[u_idx]                                  # [P_chunk, d]
+            w_v = seed_w_pooled[v_idx]
 
-            h_u_attn, h_v_attn = self.cross_pair_attn(
-                h_u_seq, h_v_seq, u_mask, v_mask,
-            )
-            w_u = masked_mean_pool(h_u_attn, u_mask)         # [P_chunk, d]
-            w_v = masked_mean_pool(h_v_attn, v_mask)
-
-            e_u = self.embedding_store.target(u)
-            e_v = self.embedding_store.target(v)
+            e_t_u = self.embedding_store.target(u)
+            e_t_v = self.embedding_store.target(v)
+            e_c_u = self.embedding_store.context(u)
+            e_c_v = self.embedding_store.context(v)
             if node_h_tensor is not None:
-                e_u = e_u + node_h_tensor[u_idx]
-                e_v = e_v + node_h_tensor[v_idx]
+                e_t_u = e_t_u + node_h_tensor[u_idx]
+                e_t_v = e_t_v + node_h_tensor[v_idx]
 
-            # Optional co-occurrence feature using the cached history slices.
             co_feat: Optional[torch.Tensor] = None
             if (
                 self.co_encoder is not None
@@ -366,7 +349,9 @@ class Evaluator:
                 vc_v = hist_vc_tensor[v_idx]
                 co_feat = self.co_encoder(nb_u, nb_v, vc_u, vc_v)
 
-            out[start:end] = self.link_predictor(e_u, e_v, w_u, w_v, co_feat)
+            out[start:end] = self.link_predictor(
+                e_t_u, e_t_v, e_c_u, e_c_v, w_u, w_v, co_feat,
+            )
 
         return out
 

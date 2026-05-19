@@ -152,32 +152,26 @@ class EmbeddingStore(nn.Module):
 
 
 class LinkPredictor(nn.Module):
-    """4-channel MLP head: [E(u) ‖ E(v) ‖ W(u) ‖ W(v)], with an OPTIONAL
-    5th co-occurrence channel.
+    """12-block link MLP (Phase 2's empirically-best structure) plus an
+    OPTIONAL co-occurrence channel:
 
-    Simpler than the prior 12-block design — relies on CrossPairAttention
-    (a separate module) to do all the interaction work *before* the head
-    sees its inputs. The MLP itself is just a non-linear scorer on the
-    concatenated raw inputs; no Hadamard / L1 / cross-table blocks.
+      Group A (8 cross-table interaction blocks):
+        target(u), context(v), target(u)⊙context(v), |target(u)−context(v)|,
+        target(v), context(u), target(v)⊙context(u), |target(v)−context(u)|
+      Group B (4 walk-encoded blocks):
+        W(u), W(v), W(u)⊙W(v), |W(u)−W(v)|
+      Group C (1 optional co-occurrence block):
+        co_feat   (projection of per-pair history overlap statistics)
 
-    Per-channel contract:
-      - E(u), E(v):  identity-table node embeddings (typically target()).
-                     Stable per-node, independent of (u, v) pairing.
-      - W(u), W(v):  walk-summary embeddings AFTER cross-pair attention —
-                     each side has already attended to the other's walk,
-                     so co-occurrence / shared-history signal is folded
-                     into W before the MLP sees it.
-      - C(u, v) (opt): explicit recurrence feature — count of distinct
-                       neighbors shared between u's and v's recent history,
-                       projected to d_emb. EdgeBank-style memorisation
-                       made differentiable. Controlled by use_co_feat.
+    target(u) here may include the DyGFormer-style node-encoder residual
+    (caller decides whether `target_in` is the raw lookup or the lookup
+    plus node_h). Same for context.
 
-    Why 4 raw channels instead of 12 hand-crafted interactions: the
-    cross-pair attention is a learned interaction. Stacking it under
-    Hadamard / L1 blocks would just give the MLP two stages of feature
-    cross — wasteful and harder to train. The MLP becomes a clean
-    "is this combination of identity + walk-context-aware-summaries
-    consistent with a positive link?" classifier.
+    History note: Phase 3 tried collapsing this to 4 channels with cross-
+    pair attention doing all the interaction work — that REGRESSED test
+    MRR by ~0.05 on tgbl-wiki. The Hadamard/L1 cross-table interactions
+    were doing more work than cross-pair attention added. Keeping the
+    12-block structure is the empirically-validated choice.
     """
 
     def __init__(
@@ -189,7 +183,9 @@ class LinkPredictor(nn.Module):
     ):
         super().__init__()
         self.use_co_feat = use_co_feat
-        in_d = (5 if use_co_feat else 4) * d_emb
+        # 8 cross-table + 4 walk-encoded + (1 if co_feat) — all d_emb wide
+        n_blocks = 8 + 4 + (1 if use_co_feat else 0)
+        in_d = n_blocks * d_emb
         self.norm = nn.LayerNorm(in_d)
         self.net = nn.Sequential(
             nn.Linear(in_d, hidden),
@@ -203,13 +199,22 @@ class LinkPredictor(nn.Module):
 
     def forward(
         self,
-        e_u: torch.Tensor,
-        e_v: torch.Tensor,
+        e_t_u: torch.Tensor,
+        e_t_v: torch.Tensor,
+        e_c_u: torch.Tensor,
+        e_c_v: torch.Tensor,
         w_u: torch.Tensor,
         w_v: torch.Tensor,
         co_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        parts = [e_u, e_v, w_u, w_v]
+        parts = [
+            # u→v cross-table: target(u) interacts with context(v)
+            e_t_u, e_c_v, e_t_u * e_c_v, (e_t_u - e_c_v).abs(),
+            # v→u cross-table: target(v) interacts with context(u)
+            e_t_v, e_c_u, e_t_v * e_c_u, (e_t_v - e_c_u).abs(),
+            # walk-encoded interaction
+            w_u, w_v, w_u * w_v, (w_u - w_v).abs(),
+        ]
         if self.use_co_feat:
             if co_feat is None:
                 raise ValueError(
