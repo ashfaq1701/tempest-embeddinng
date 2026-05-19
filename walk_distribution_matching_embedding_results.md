@@ -402,16 +402,59 @@ by > anchor std.
 5. Simplest implementation (~20 lines, smallest bug surface area).
 6. Normbrake paired with triplet is the cleanest theoretical test: if triplet self-limits, normbrake should be *dormant* (`L_normbrake ≈ 0` throughout). Positive evidence the threshold is calibrated correctly even though normbrake does nothing.
 
-### Cells (to be filled in run-by-run)
+### Cells run on wiki seed 42 (full sweep)
 
-| Cell | Config | Seed | Best ep | Best val | Best test | Cliff (50-ep − peak) | Max col-norm |
-|---|---|---|---|---|---|---|---|
-| 1 | InfoNCE                |  |  |  |  |  |  |
-| 2 | Triplet                |  |  |  |  |  |  |
-| 3 | SGNS                   |  |  |  |  |  |  |
-| 4 | InfoNCE + normbrake    |  |  |  |  |  |  |
-| 5 | Triplet + normbrake    |  |  |  |  |  |  |
-| 6 | SGNS    + normbrake    |  |  |  |  |  |  |
+Three bugs were found and fixed during this sweep — see chronological log below for the fix trail. The numbers below are from the post-fix run (`lossmining_v2_seed42_*`), keeping Cell 3 (SGNS alone) from the pre-fix run since it was unaffected by all bugs.
+
+| Cell | Config                | Best ep | Best val | Best test | Stopped at | Cliff shape |
+|---|---|---|---|---|---|---|
+| 1 | InfoNCE                | 1  | 0.7312 | 0.6959 | 6  | strong cliff; peaks ep1, val 0.7077 by ep6 (−0.024) |
+| 2 | Triplet                | 7  | 0.7446 | **0.7112** | 12 | none — val plateaus 0.7418–0.7446 |
+| 3 | SGNS                   | 5  | 0.6567 | 0.6149 | 10 | mild — saturates fast (sigmoids close), peaks low |
+| 4 | InfoNCE + normbrake    | 1  | 0.7398 | 0.7011 | 6  | strong cliff (nb fires only weakly: L_nb ≤ 0.005) |
+| 5 | Triplet + normbrake    | 7  | 0.7447 | 0.7105 | 12 | none; **normbrake DORMANT** (L_nb = 0.0 throughout) — confirms criterion F |
+| 6 | SGNS + normbrake       | 13 | 0.7451 | **0.7113** | 18 | none — **normbrake actively brakes** (L_nb 24.7 → 2.0 monotonic; col 6.93 → 4.87) |
+
+Per the v2.2 §3.2 anchor std of 0.0016, Cells 6 and 2 are statistically tied. Both clear A2-off floor (0.7092) by > anchor std.
+
+### Multi-seed validation (seeds 7 + 13) on top-2
+
+| Cell | Config | Seed 42 | Seed 7 | Seed 13 | Mean ± std | Cliff observed? |
+|---|---|---|---|---|---|---|
+| 2 | Triplet | 0.7112 | 0.7116 | 0.7088 | **0.7105 ± 0.0014** | none across all 3 seeds |
+| 6 | SGNS + normbrake | 0.7113 | 0.7073 | (running, ep 14, val climbing) | TBD | **seed 7 shows cliff** (peak 0.7394 ep8 → 0.7104 ep13, Δ −0.029) |
+
+**Interim winner: Cell 2 (Triplet).** Tighter cross-seed variance and *no cliff observed on any seed*. Cell 6 has higher seed-42 peak but cross-seed unstable. Final pick deferred until Cell 6 seed 13 completes.
+
+### Three bugs found and fixed during this sweep (chronological)
+
+1. **InfoNCE NaN from epoch 1.** Original implementation used `exp(score)/(exp(score)+Σexp(neg))` which overflows at τ=0.1 once scores exceed ~30. Fixed via `torch.logsumexp` — numerically stable log-softmax. Cells 1+4 NaN'd in the broken run (reported MRR 1.0 because TGB Evaluator falls through to "all tied" → trivial perfect ranking on NaN logits).
+
+2. **Normbrake threshold off by ~7×.** Default `0.54` came from the Phase 0.5 diagnostic's measurement of *link-MLP first-Linear column norms* (input dim 1123). But `normbrake_loss` penalizes `E_target` / `E_context` column norms (each over n_nodes=9227 entries, scale ~1.4 at Xavier init). Recalibrated empirically by running a 2-ep anchor and reading `per_epoch_col_norm = 2.58`: locked at `1.5 × 2.58 = 3.87`. The broken default crushed embeddings to threshold during the buggy run.
+
+3. **Triplet's mandatory weight_decay = 1e-4 was silently 0.0.** Config defaulted `weight_decay_emb` to 0.0 with an aspirational comment "set to 1e-4 when primary_loss=triplet"; the trainer dutifully read 0.0. Per amendment v1.3 §4.2 this is the norm-control mechanism replacing uniformity loss when alignment is dropped. Fixed by changing Config default to `1e-4`.
+
+All three bugs were caught **before** any results were published in v2.3 docs — only this results.md reflects the corrected numbers.
+
+### Mechanism analysis of the InfoNCE cliff
+
+Cell 1 evolution:
+- Val: 0.7312 → 0.7304 → 0.7307 → 0.7306 → 0.7114 → 0.7077  (peak ep1, monotone decline after ep4)
+- Col norm: 2.52 → 3.05 → 3.44 → 3.80 → 4.13 → 4.43  (1.76× growth in 6 epochs)
+- InfoNCE loss: 5.51 → 5.17  (slow decrease)
+
+**Why InfoNCE breaks down so fast on wiki:** at epoch 1 the embeddings are near random init and the link MLP latches onto the `is_cold_start_uv` bit (Component-0-only signal ≈ 0.71 single-seed). As InfoNCE trains, embeddings drift into the contrastive geometry and the link MLP's cross-table reads change semantically faster than the link MLP can re-fit — there's no capacity in the head to handle the dynamic. The cliff is **not** col-norm-only; it's an **embedding/link-MLP coupling failure**. Normbrake (Cell 4) damps col-norm growth but doesn't fix the coupling problem — it fires only weakly here because col norms (2.5–3.3) sit just at the threshold (3.87).
+
+**Implication for the v2.3 architecture:** the current "embeddings see ONLY the primary loss, link MLP sees ONLY BCE" decoupling is the structural cause of the cliff. **Group C (`λ_link` > 0)** — letting BCE backprop into embeddings — couples the two paths and is a natural candidate fix. Also implemented: deeper link MLP and more dropout (deferred to the deep-analysis phase). See §4.7 deep-analysis section below for the fix sweep.
+
+### §4.7 deep-analysis plan (post-multi-seed)
+
+For the 1-2 winning losses across wiki + tgbl-review-v2:
+
+1. **Long-training plateau analysis** — train 100 epochs with `--early-stop-patience` disabled; track per-epoch val + test + col-norm + grad-norms with `--log-debug`. Identifies whether the val plateau is genuinely converged or under-trained.
+2. **Joint training fix** — sweep `λ_link ∈ {0, 0.1, 0.3, 1.0}` on the cliff-prone configurations (InfoNCE alone, InfoNCE+nb, SGNS+nb seed 7). Hypothesis: BCE-into-embeddings stabilises by coupling the loss paths.
+3. **Architectural fixes** — deeper link MLP (3 → 5 layers), higher dropout (0 → 0.1 → 0.3), embedding dropout. The user explicitly authorised overriding the v2.3 spec where the data warrants.
+4. **Cross-dataset sensitivity** — run the picked architecture on tgbl-review-v2 with the same fixes.
 
 ### §4.7 exit decision
 

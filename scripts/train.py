@@ -48,6 +48,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda-align", type=float, default=1.0,
                    help="Scalar on alignment loss. 0 turns walks-supervision off "
                         "(Phase S Group A2). Anchor uses 1.0.")
+    # Phase S Group C — joint training scalar on link BCE -> embeddings.
+    # 0 (default) keeps decoupled training. > 0 lets BCE update embeddings,
+    # scaled by this value. Candidate fix for InfoNCE/SGNS rapid breakdown.
+    p.add_argument("--lambda-link", type=float, default=0.0,
+                   help="Scalar on link BCE's gradient into embedding tables "
+                        "(Phase S Group C). 0=decoupled, 1.0=full joint "
+                        "training. Only meaningful under head_mode=cross_table.")
     # Phase S Group E (v2.2 §4.1 / §6.4): link MLP head structure.
     p.add_argument("--head-mode", choices=["cross_table", "component_0_only"],
                    default="cross_table",
@@ -57,6 +64,38 @@ def parse_args() -> argparse.Namespace:
                    help="E.3: dropout on the 8·d cross-table block before "
                         "concatenation with Component 0. Only used when "
                         "--head-mode=cross_table.")
+    # §4.8.2 architectural fixes for cliff remediation.
+    p.add_argument("--link-mlp-n-layers", type=int, default=3,
+                   help="Link MLP depth (number of Linear layers). Default 3 "
+                        "matches v2.3 spec. Increase to 5 for §4.8.2 ablation.")
+    p.add_argument("--link-mlp-dropout", type=float, default=0.0,
+                   help="Dropout between hidden layers of the link MLP.")
+    p.add_argument("--embedding-dropout", type=float, default=0.0,
+                   help="Dropout applied to embedding lookups AT the link MLP "
+                        "read site (training only). Regulariser without "
+                        "touching the embedding-side loss.")
+
+    # Phase S §4.7 — loss-family search. Selects the primary embedding-side
+    # loss and an optional norm-brake auxiliary. All hyperparameters under
+    # each primary are literature-default; no per-dataset tuning (§4.7.0).
+    p.add_argument("--primary-loss", choices=["alignment", "triplet", "infonce", "sgns"],
+                   default="alignment",
+                   help="Embedding-side loss family. 'alignment'=v2.2 default; "
+                        "'triplet'/'infonce'/'sgns'=§4.7 candidates.")
+    # Norm-brake auxiliary
+    p.add_argument("--lambda-normbrake", type=float, default=0.0,
+                   help="Weight on §4.4 norm-brake regularizer. 0=off.")
+    p.add_argument("--normbrake-threshold", type=float, default=0.54,
+                   help="Per-column L2 threshold for norm-brake. Default 0.54 "
+                        "= 1.5 × wiki anchor mean col-norm. Recalibrate per "
+                        "dataset (see v2.3 §4.7.4).")
+    # Debug instrumentation for deep-analysis runs. When set, logs per-epoch
+    # gradient norms (E_target, E_context), link MLP first-Linear cross-table
+    # col-norm, AND runs full test eval every epoch (not just on val improvement).
+    # Adds ~50% eval cost per epoch; only enable for cliff/plateau analysis.
+    p.add_argument("--log-debug", action="store_true",
+                   help="Verbose per-epoch logging: grad norms, link-MLP "
+                        "col-norm, full per-epoch test MRR trajectory.")
 
     # Optimization
     p.add_argument("--num-neg-per-pos", type=int, default=10)
@@ -119,6 +158,13 @@ def main() -> None:
         lambda_align=args.lambda_align,
         head_mode=args.head_mode,
         cross_table_dropout=args.cross_table_dropout,
+        link_mlp_n_layers=args.link_mlp_n_layers,
+        link_mlp_dropout=args.link_mlp_dropout,
+        embedding_dropout=args.embedding_dropout,
+        primary_loss=args.primary_loss,
+        lambda_normbrake=args.lambda_normbrake,
+        normbrake_threshold=args.normbrake_threshold,
+        lambda_link=args.lambda_link,
         num_neg_per_pos=args.num_neg_per_pos,
         hist_neg_ratio=args.hist_neg_ratio,
         reservoir_size=args.reservoir_size,
@@ -147,6 +193,9 @@ def main() -> None:
         train_dst_pool=train_dst_pool,
         node_feat=loaded.node_feat,
         edge_feat_dim=edge_feat_dim,
+        # SGNS unigram^0.75 needs raw (non-unique) destination counts; pass
+        # them through unconditionally — they're a numpy view, ~free.
+        train_destinations_full=loaded.train.destinations,
     )
 
     # Derive alignment time-scale: (training time span) / L_REF, where
@@ -215,6 +264,7 @@ def main() -> None:
                 loaded.test, config.target_batch_size,
             ),
             early_stop_patience=args.early_stop_patience,
+            log_debug=args.log_debug,
         )
         print(f"\n=== Summary (best epoch {summary['best_epoch']}) ===")
         print(f"  stopped_at_epoch    : {summary['stopped_at_epoch']}")
@@ -223,6 +273,25 @@ def main() -> None:
             print(f"  best_test_{loaded.eval_metric:<13}: {summary['best_test_mrr']:.4f}")
         print(f"  per_epoch_val_{loaded.eval_metric:<8}: "
               + ", ".join(f"{v:.4f}" for v in summary["per_epoch_val_mrr"]))
+        if summary.get("per_epoch_col_norm"):
+            print("  per_epoch_col_norm    : "
+                  + ", ".join(f"{v:.4f}" for v in summary["per_epoch_col_norm"]))
+        if summary.get("per_epoch_normbrake"):
+            print("  per_epoch_L_normbrake : "
+                  + ", ".join(f"{v:.4f}" for v in summary["per_epoch_normbrake"]))
+        # Debug-instrumentation outputs (only populated when --log-debug)
+        if summary.get("per_epoch_test_mrr_all"):
+            print(f"  per_epoch_test_{loaded.eval_metric:<8}: "
+                  + ", ".join(f"{v:.4f}" for v in summary["per_epoch_test_mrr_all"]))
+        if summary.get("per_epoch_grad_target"):
+            print("  per_epoch_grad_E_targ : "
+                  + ", ".join(f"{v:.4f}" for v in summary["per_epoch_grad_target"]))
+        if summary.get("per_epoch_grad_context"):
+            print("  per_epoch_grad_E_ctx  : "
+                  + ", ".join(f"{v:.4f}" for v in summary["per_epoch_grad_context"]))
+        if summary.get("per_epoch_link_w_norm"):
+            print("  per_epoch_link_w_norm : "
+                  + ", ".join(f"{v:.4f}" for v in summary["per_epoch_link_w_norm"]))
     else:
         print("=== Training ===")
         trainer.train(create_batches(loaded.train, config.target_batch_size))

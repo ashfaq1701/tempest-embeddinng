@@ -296,6 +296,89 @@ The archival `loss_function_search_ammendum.md` (in repo root) preserves the ful
 
 ---
 
+## 4.8 Deep-analysis sweep — cliff and plateau remediation
+
+**Status: ADDED post-§4.7 (data-driven).**
+
+§4.7's seed-42 sweep on wiki showed two distinct failure shapes:
+
+1. **InfoNCE rapid cliff (Cell 1):** peaks at epoch 1 (val 0.7312), declines monotonically. Col norms grow 2.52 → 4.43 (1.76× in 6 epochs); InfoNCE loss decreases slowly (5.51 → 5.17). The link MLP latches onto Component 0 at epoch 1 and the embedding-side primary loss drags the cross-table reads into a different geometry faster than the link MLP can re-fit.
+2. **SGNS+nb stability sensitive to seed (Cell 6):** seed 42 train smoothly to 18 epochs (val 0.7451), but seed 7 cliffs (peak 0.7394 ep8 → 0.7104 ep13, Δ −0.029). Normbrake damps col-norm growth but doesn't prevent the embedding/link-MLP coupling drift on every seed.
+
+Triplet (Cell 2) is stable across all 3 seeds (no cliff observed), confirming the hinge's self-limiting gradient. But it stops improving around epoch 7 — is that *convergence* or *under-training*?
+
+§4.8 introduces a deep-analysis sweep to (a) localise the cliff cause and (b) test candidate fixes. Authorised by user direction (2026-05-19): "use your data driven reasoning ... identify the spot of breakdowns by weight/gradient tracing ... you can override [original v2.3 spec] if needed."
+
+### 4.8.0 New instrumentation (`--log-debug`)
+
+Added to `Trainer.train()`:
+
+- **Per-epoch grad norm of `E_target.weight` and `E_context.weight`** — captures how aggressively the primary loss is pulling embeddings each epoch.
+- **Per-epoch col norm of link MLP first-Linear** (cross-table portion, mean) — the original Phase 0.5 diagnostic signal. Lets us split "embedding geometry drift" from "link MLP over-fit".
+- **Per-epoch test MRR at EVERY epoch (not just on val improvement)** — full cliff trajectory. Adds ~50% eval cost; only enabled with `--log-debug`.
+
+These let us trace WHERE the cliff happens (embedding side vs link MLP side) and HOW FAST (per-batch grad magnitude).
+
+### 4.8.1 Group C (joint training `λ_link`) — sweep added back to scope
+
+The original v2.3 Group C (`λ_link ∈ {0, 0.1, 0.3, 1.0}`) was deferred when E.2 won on wiki (made it moot under "embeddings unread"). §4.7 rolled back to E.1, so joint training is meaningful again — and is the cleanest candidate fix for the InfoNCE cliff.
+
+**Mechanism.** Currently embedding tables see ONLY the primary loss; link MLP sees ONLY BCE. The two paths can drift apart — exactly the InfoNCE failure mode. Joint training has BCE backprop into embeddings too (scaled by `λ_link`), coupling the two paths so the embedding geometry stays linked to what the link MLP NEEDS.
+
+**Cells (run on cliff-prone configurations from §4.7):**
+
+| Cell | Config | `λ_link` |
+|---|---|---|
+| C-jl0   | InfoNCE alone                    | 0 (control = §4.7 Cell 1) |
+| C-jl0.1 | InfoNCE alone                    | 0.1 |
+| C-jl0.3 | InfoNCE alone                    | 0.3 |
+| C-jl1.0 | InfoNCE alone                    | 1.0 |
+| C-jlT   | Triplet alone                    | sweep {0, 0.3, 1.0} — does joint training help even on the stable winner? |
+| C-jlS   | SGNS+normbrake                   | sweep {0, 0.3, 1.0} — does joint training fix the seed-7 cliff? |
+
+**Hypothesis:** joint training helps InfoNCE most (cliff IS coupling-drift); helps SGNS+nb moderately (stabilises cross-seed); helps Triplet least (already self-limits).
+
+### 4.8.2 Architectural fixes — deeper link MLP + dropout
+
+If joint training alone doesn't stabilise InfoNCE/SGNS, the user-authorised fallback is architectural: deeper link MLP, embedding dropout, link dropout. The hypothesis: the head can absorb the embedding-geometry shift if it has more capacity / regularisation.
+
+**New Config fields (added under `--log-debug`-style auxiliary):**
+
+- `link_mlp_n_layers`: default 3 (= current). Sweep 3 → 5.
+- `link_mlp_dropout`: default 0.0. Sweep 0.0 → 0.1 → 0.3.
+- `embedding_dropout`: default 0.0. Sweep 0.0 → 0.1 → 0.3.
+
+**Cells:**
+
+| Cell | Config |
+|---|---|
+| A-d5    | §4.8.1 winner + link_mlp_n_layers=5 |
+| A-dr0.1 | §4.8.1 winner + link_mlp_dropout=0.1 |
+| A-dr0.3 | §4.8.1 winner + link_mlp_dropout=0.3 |
+| A-ed0.1 | §4.8.1 winner + embedding_dropout=0.1 |
+
+### 4.8.3 Long-training plateau check
+
+After §4.8.1 + §4.8.2 land a stable architecture, run it 100 epochs (no early stop) on wiki + tgbl-review-v2 with `--log-debug`. Identifies whether val MRR truly plateaus or continues climbing slowly. Same diagnostic shape as the original §4.7 cliff investigation, just longer-horizon.
+
+### 4.8.4 Execution order (12-hour budget)
+
+| Slot | Step | Wall budget |
+|---|---|---|
+| 1 | Wiki Cell-6 seed 13 completes (in flight) | ~10 min |
+| 2 | Review probe completes; check size | ~5 min |
+| 3 | Review sweep (8 cells × ~15-20 min) | ~2.5 hrs |
+| 4 | Cross-dataset winner selected | — |
+| 5 | §4.8.1 λ_link sweep on cliff-prone configs (~8 cells) | ~1.5 hrs |
+| 6 | §4.8.2 architectural sweep on §4.8.1 winner (~5 cells) | ~1 hr |
+| 7 | §4.8.3 long-training validation on the locked architecture (2 datasets) | ~3 hrs |
+| 8 | Multi-seed validation of final architecture (3 seeds × 2 datasets = 6 runs) | ~1.5 hrs |
+| 9 | Write up findings; update v2.3 → v2.4 | ~1 hr |
+
+Total: ~10–11 hours. Within the 12h 37m budget.
+
+---
+
 ## 5. Refinement phases (after Phase S)
 
 These run on top of the Phase S winner ("the base"). Each is one overnight session.

@@ -291,6 +291,7 @@ class LinkPredictor(nn.Module):
         d_time: int = 32,
         head_mode: str = "cross_table",
         cross_table_dropout: float = 0.0,
+        n_layers: int = 3,
     ):
         super().__init__()
         if head_mode not in ("cross_table", "component_0_only"):
@@ -302,10 +303,13 @@ class LinkPredictor(nn.Module):
                 "head_mode='component_0_only' requires use_time_encoding=True "
                 "(otherwise the head has no inputs)."
             )
+        if n_layers < 2:
+            raise ValueError(f"n_layers must be ≥ 2 (input projection + output), got {n_layers}")
         self.use_time_encoding = use_time_encoding
         self.d_time = d_time
         self.head_mode = head_mode
         self.cross_table_dropout = nn.Dropout(cross_table_dropout) if cross_table_dropout > 0 else None
+        self.n_layers = n_layers
 
         in_d = 0
         if head_mode == "cross_table":
@@ -313,15 +317,15 @@ class LinkPredictor(nn.Module):
         if use_time_encoding:
             in_d += 3 * d_time + 3
         self.norm = nn.LayerNorm(in_d)
-        self.net = nn.Sequential(
-            nn.Linear(in_d, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 1),
-        )
+        # Build an n_layer MLP head: input projection (Linear in_d -> hidden) +
+        # (n_layers - 2) GELU+Dropout+Linear(hidden,hidden) blocks + final
+        # Linear(hidden, 1). Default n_layers=3 reproduces the original 3-layer
+        # head (input proj + 1 hidden block + output). Sweep to 5 for §4.8.2.
+        layers: list = [nn.Linear(in_d, hidden), nn.GELU(), nn.Dropout(dropout)]
+        for _ in range(n_layers - 2):
+            layers += [nn.Linear(hidden, hidden), nn.GELU(), nn.Dropout(dropout)]
+        layers.append(nn.Linear(hidden, 1))
+        self.net = nn.Sequential(*layers)
 
     def forward(
         self,
