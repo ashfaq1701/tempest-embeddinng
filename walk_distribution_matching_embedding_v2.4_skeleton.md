@@ -73,7 +73,32 @@ vs anchor (alignment+uniformity) 0.7070 ± 0.0016 across 3 seeds.
 
 ## 5. §4.8.1 λ_link sweep results
 
-To be filled in.
+### 5.1 InfoNCE — joint training MONOTONICALLY HURTS
+
+| λ_link | best val | best test | cliff drop | smoothness | val trajectory |
+|---|---|---|---|---|---|
+| 0.0 (control) | 0.7372 | 0.6984 | 0.025 | 0.60 | 0.7372, 0.7359, 0.7347, 0.7247, 0.7120, 0.7232 |
+| 0.1 | 0.7316 | 0.6898 | 0.068 | 0.00 | 0.7316, 0.7218, 0.7016, 0.6947, 0.6689, 0.6633 |
+| 0.3 | 0.7213 | 0.6767 | 0.141 | 0.40 | 0.7213, 0.6426, 0.6126, 0.6501, 0.5802, 0.5901 |
+| 1.0 | (running) | | | | |
+
+**Hypothesis falsified.** Joint training was *predicted* to stabilise InfoNCE by coupling the embedding-side and link-side paths. The data shows the opposite: link BCE backprop **amplifies** InfoNCE's pull on embeddings (col norms grow faster: 4.44 → 5.71 → 5.56 → ?), and val MRR collapses harder (cliff drop 0.025 → 0.068 → 0.141).
+
+**Mechanism revision.** InfoNCE and link BCE both push embeddings AWAY from random init toward "useful for prediction" geometry, but in different directions. At low λ_link, BCE's gradient (small) adds to InfoNCE's; at higher λ_link, BCE dominates and the embeddings are pulled into a BCE-optimal geometry — but the link MLP isn't trained at the SAME rate as the embeddings move, so the MLP keeps over-fitting the *previous* embedding geometry. The mismatch is what cliffs val MRR.
+
+**Implication.** InfoNCE on wiki is fundamentally the wrong loss family. Joint training is not a fix; it accelerates the failure. Drop InfoNCE from further consideration on wiki.
+
+### 5.2 Triplet — joint training results
+
+To be filled in. (Prediction: smaller effect than InfoNCE because Triplet's hinge bounds gradient magnitude.)
+
+### 5.3 SGNS + normbrake — joint training results
+
+To be filled in. (Prediction: small effect; SGNS+nb is already mostly stable on most seeds, only seed-7 cliffs.)
+
+### 5.4 Alignment + uniformity — joint training results
+
+To be filled in. (Important — this is the anchor baseline. Does joint training extend the anchor's clean plateau past 50 epochs? Or does the same cliff appear?)
 
 ## 6. §4.8.2 architectural sweep results
 
