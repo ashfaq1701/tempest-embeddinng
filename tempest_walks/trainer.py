@@ -149,6 +149,7 @@ class Trainer:
             t_query=t_query,
             beta=self.config.temporal_decay_exp,
             time_scale=self._time_scale,
+            weighting=self.config.align_weighting,
         )
 
         # Uniformity is on the unique nodes touched by the batch (src + tgt) —

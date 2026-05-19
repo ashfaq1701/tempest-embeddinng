@@ -40,6 +40,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alignment-time-scale", type=float, default=-1.0)
     p.add_argument("--eta-uniform", type=float, default=1.0)
     p.add_argument("--uniformity-temperature", type=float, default=2.0)
+    # Phase 1 ablation: alignment-loss weighting variant
+    p.add_argument("--align-weighting", choices=["A", "B", "C"], default="A",
+                   help="A=1/K·(1+Δt/τ)^(-β) [control]; B=1/K only; C=uniform α=1")
 
     # Optimization
     p.add_argument("--num-neg-per-pos", type=int, default=10)
@@ -89,6 +92,7 @@ def main() -> None:
         alignment_time_scale=args.alignment_time_scale,
         eta_uniform=args.eta_uniform,
         uniformity_temperature=args.uniformity_temperature,
+        align_weighting=args.align_weighting,
         num_neg_per_pos=args.num_neg_per_pos,
         hist_neg_ratio=args.hist_neg_ratio,
         reservoir_size=args.reservoir_size,

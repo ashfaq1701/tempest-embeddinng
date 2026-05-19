@@ -31,6 +31,11 @@ class Config:
     # Alignment loss
     temporal_decay_exp: float = 0.5      # β in (1 + Δt/time_scale)^(-β)
     alignment_time_scale: float = -1.0   # ≤ 0 ⇒ derive from training time range
+    # Phase 1 ablation: per-position weighting variant in alignment_loss.
+    #   "A" = current 1/K · (1+Δt/τ)^(-β) [control]
+    #   "B" = 1/K only (sampler does temporal decay)
+    #   "C" = uniform α=1 (sampler does everything)
+    align_weighting: str = "A"
 
     # Uniformity loss
     eta_uniform: float = 1.0

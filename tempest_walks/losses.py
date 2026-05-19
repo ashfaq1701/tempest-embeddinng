@@ -13,18 +13,33 @@ def alignment_loss(
     t_query: torch.Tensor,          # [N] int64 — query timestamp per seed (= batch t_max)
     beta: float,
     time_scale: float,
+    weighting: str = "A",            # Phase 1 ablation: "A" | "B" | "C"
 ) -> torch.Tensor:
-    """Pull E_target[seed] toward E_context[walk-neighbours], position- and
-    time-weighted. Seed and padding positions are masked OUT.
+    """Pull E_target[seed] toward E_context[walk-neighbours]. Three loss-weighting
+    variants for the Phase 1 ablation:
+
+      Variant A (control, default):
+          α(c) = (1 / depth(c)) · (1 + Δt(c) / time_scale)^(−β)
+          — both positional decay AND temporal decay applied.
+
+      Variant B (distance only — drop time decay; sampler does it):
+          α(c) = 1 / depth(c)
+
+      Variant C (uniform over valid positions — sampler does everything):
+          α(c) = 1
+
+    All three share the same valid mask (excludes padding and the seed
+    position itself) and the same masked-mean reduction.
 
     Per (walk w, context position c):
-        w(c) = (1 / depth(c)) · (1 + Δt(c) / time_scale)^(−β)
-        where depth(c) = lens_w − 1 − c     (steps from c to the seed)
-              Δt(c)    = t_query − timestamps[w, c]
-        loss contribution = w(c) · (1 − cos(E_target[seed_w], E_context[walk_w, c]))
+        depth(c) = lens_w − 1 − c     (steps from c to the seed)
+        Δt(c)    = t_query − timestamps[w, c]
+        loss contribution = α(c) · (1 − cos(E_target[seed_w], E_context[walk_w, c]))
 
     Vectorised: one cosine per (w, c) cell, masked-mean reduced.
     """
+    if weighting not in ("A", "B", "C"):
+        raise ValueError(f"weighting must be 'A', 'B', or 'C', got {weighting!r}")
     device = e_target_seed.device
     K = walks.K
     NK, L, _ = e_context_all.shape
@@ -47,18 +62,23 @@ def alignment_loss(
 
     cos = F.cosine_similarity(e_target_bc, e_context_all, dim=-1)  # [N*K, L]
 
-    # Positional weight: 1 / depth(c), depth(c) = lens − 1 − c (number of
-    # walk steps from context c to the seed). depth 1 (last context before
-    # seed) gets weight 1; deepest past gets weight 1/(lens-1).
-    depth = (lens.unsqueeze(1) - 1 - positions).clamp_min(1).float()  # [N*K, L]
-    pos_w = 1.0 / depth
+    # Build α(c) per the weighting variant.
+    if weighting == "A":
+        # Positional × temporal — the original alignment loss.
+        depth = (lens.unsqueeze(1) - 1 - positions).clamp_min(1).float()
+        pos_w = 1.0 / depth
+        t_query_per_walk = t_query.repeat_interleave(K).unsqueeze(1)
+        dt = (t_query_per_walk - ts).clamp_min(0).float()
+        time_w = (1.0 + dt / max(time_scale, 1e-6)) ** (-beta)
+        w = pos_w * time_w
+    elif weighting == "B":
+        # Positional only — drop time decay (sampler bias already encodes recency).
+        depth = (lens.unsqueeze(1) - 1 - positions).clamp_min(1).float()
+        w = 1.0 / depth
+    else:  # weighting == "C"
+        # Uniform — sampler handles both positional and temporal weighting.
+        w = torch.ones_like(cos)
 
-    # Temporal weight: (1 + Δt / time_scale)^(−β). Δt = t_query − timestamps.
-    t_query_per_walk = t_query.repeat_interleave(K).unsqueeze(1)  # [N*K, 1]
-    dt = (t_query_per_walk - ts).clamp_min(0).float()             # [N*K, L]
-    time_w = (1.0 + dt / max(time_scale, 1e-6)) ** (-beta)
-
-    w = pos_w * time_w
     use_f = use.float()
     contrib = use_f * w * (1.0 - cos)
     denom = (use_f * w).sum().clamp_min(1e-6)
