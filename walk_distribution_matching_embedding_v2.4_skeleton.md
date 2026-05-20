@@ -137,11 +137,13 @@ Tightened config to fit ~8-hr budget on review (which is 30× wiki size):
 | Cell | Config | Best val (sampled) | Best test (sampled) | Cliff observed? |
 |---|---|---|---|---|
 | A | alignment | 0.3093 (ep2) | 0.2956 | **YES** — val 0.3093 → 0.2877 (drop 0.022) by ep 4 |
-| A_nb | alignment + normbrake (thr 31.3) | (running) | — | TBD |
+| A_nb | alignment + normbrake (thr 31.3) | 0.3139 (ep3, in progress) | 0.2963 (ep3) | TBD — L_nb dormant so far (col_norm 16→24 < 31.3 threshold) |
 | T | Triplet | TBD | — | — |
 | T_nb | Triplet + normbrake | TBD | — | — |
 | S | SGNS | TBD | — | — |
 | S_nb | SGNS + normbrake | TBD | — | — |
+
+**Note on seed-42 trajectories across A vs A_nb:** they differ from epoch 1 (val 0.2843 vs 0.2664). Same seed but review's larger graph triggers more CUDA non-determinism in the matrix multiplies; not a bug. Both are valid training runs. The init-divergence check on wiki showed bit-tight reproduction; review is noisier.
 
 ### 7.4 Cross-dataset cliff diagnosis
 
