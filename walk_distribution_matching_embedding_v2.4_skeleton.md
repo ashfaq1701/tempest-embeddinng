@@ -137,13 +137,42 @@ Tightened config to fit ~8-hr budget on review (which is 30× wiki size):
 | Cell | Config | Best val (sampled) | Best test (sampled) | Cliff observed? |
 |---|---|---|---|---|
 | A | alignment | 0.3093 (ep2) | 0.2956 | **YES** — val 0.3093 → 0.2877 (drop 0.022) by ep 4 |
-| A_nb | alignment + normbrake (thr 31.3) | 0.3139 (ep3, in progress) | 0.2963 (ep3) | TBD — L_nb dormant so far (col_norm 16→24 < 31.3 threshold) |
-| T | Triplet | TBD | — | — |
-| T_nb | Triplet + normbrake | TBD | — | — |
-| S | SGNS | TBD | — | — |
-| S_nb | SGNS + normbrake | TBD | — | — |
+| A_nb | alignment + normbrake (thr 31.3) | 0.3271 (ep4) | **0.3135** | partial — val plateaus, no sharp cliff in 6 epochs |
+| T | Triplet (killed at ep 3) | 0.1596 (ep3) | 0.1534 (ep3) | n/a — far below alignment, killed for budget |
+| T_nb | Triplet + normbrake | skipped (Triplet decisively lost) | — | — |
+| S | SGNS | skipped | — | — |
+| S_nb | SGNS + normbrake | skipped | — | — |
 
 **Note on seed-42 trajectories across A vs A_nb:** they differ from epoch 1 (val 0.2843 vs 0.2664). Same seed but review's larger graph triggers more CUDA non-determinism in the matrix multiplies; not a bug. Both are valid training runs. The init-divergence check on wiki showed bit-tight reproduction; review is noisier.
+
+### 7.5 Cross-dataset winner: ALIGNMENT+UNIFORMITY
+
+Per user's decision rule (gap < 0.01 ⇒ prefer alignment+uniformity, the paper-defensible anchor):
+
+| | Wiki (mean across 3 seeds) | Review (seed 42, sampled) |
+|---|---|---|
+| Alignment+uniformity | 0.7070 ± 0.0016 | 0.2956 (A) / 0.3135 (A_nb) |
+| Triplet (best of 3 new) | 0.7105 ± 0.0014 | ~0.20 (projected from ep-3 = 0.1534) |
+| Δ (Triplet − alignment) | **+0.0035** (within anchor std; < 0.01 threshold) | **−0.12** (Triplet decisively loses) |
+
+**Decision: alignment+uniformity is the LOCKED winner across both datasets.** On wiki it's within noise of Triplet (per rule, prefer alignment). On review it dominates Triplet by ~0.15 MRR. The deep-analysis target is now making **alignment+uniformity smooth over 50 epochs** — the wiki cliff fix.
+
+Killed remaining review cells (T_nb, S, S_nb) to free GPU for Stage 2 alignment-fix sweep.
+
+## 8. §4.8.3 Stage 2 — alignment long-training fixes (in progress)
+
+Launched 2026-05-20 07:05. 6 cells, 50 epochs each, no early-stop, --log-debug:
+
+| Cell | normbrake | n_layers | link_dropout | emb_dropout |
+|---|---|---|---|---|
+| A_long_baseline | 0 | 3 | 0.0 | 0.0 |
+| A_long_nb | 0.1 | 3 | 0.0 | 0.0 |
+| A_long_dr0.3 | 0 | 3 | 0.3 | 0.0 |
+| A_long_ed0.3 | 0 | 3 | 0.0 | 0.3 |
+| A_long_d5 | 0 | 5 | 0.0 | 0.0 |
+| A_long_full | 0.1 | 5 | 0.3 | 0.3 (kitchen sink) |
+
+ETA ~13:30. Goal: identify configuration that prevents the 50-epoch cliff (val MRR drop from ~0.71 to ~0.43).
 
 ### 7.4 Cross-dataset cliff diagnosis
 
