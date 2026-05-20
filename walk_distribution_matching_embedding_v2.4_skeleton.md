@@ -334,7 +334,51 @@ To be filled in.
 
 ## 9. Recommendation for locked architecture
 
-To be filled in.
+**Loss family: alignment + uniformity (LOCKED 2026-05-20).**
+
+User decision: gains from Triplet (wiki 0.7105 ± 0.0014) over
+alignment+uniformity (wiki Phase S anchor 0.7079 ± 0.0005) are
+**marginal (~0.003) and within the user's ±0.01 decision threshold**.
+Triplet **decisively lost on review** (val 0.16 vs alignment 0.31), so
+alignment is the cross-dataset-robust paper-defensible choice. SGNS
+tied on wiki but also lost on review. InfoNCE rejected for the
+historical-negative destructive-interference mechanism (Lesson 19).
+
+Locked production config (subject to Stage 4 confirmation for λ_link
+and hist_neg_ratio):
+
+| Component | Locked value | Source |
+|---|---|---|
+| Primary loss | alignment + uniformity | user 2026-05-20, this section |
+| Normbrake λ | 0.1 | Stage 2 A_long_nb (only fix that meaningfully helps) |
+| Normbrake threshold | 1.5 × col_norm at ep 1–2 (3.87 on wiki, 31.32 on review) | Phase 0.5 diagnostic calibration |
+| η_uniform | 1.0 | Phase S anchor |
+| Head mode | cross_table (E.1) | Lesson 9 + Phase S |
+| Component 0 (time encoding + cold-start bits) | ENABLED | Phase 0.5 diagnostic |
+| Walks-supervise-embeddings | YES | Lesson 2 |
+| Strict-causal protocol | NON-NEGOTIABLE | Lesson 3 + project rule |
+| λ_link (joint training) | **0 (DECISIVELY FALSIFIED)** | Stage 3 + §4.8.1 |
+| hist_neg_ratio | 0.5 (default), pending Stage 4 | TGB eval-distribution match |
+| weight_decay_link | TBD, pending Stage 3 WD cells | residual cliff hypothesis |
+
+**Paper-ablation paths kept behind PORT-FLAG in master (per post_lock_transition_plan):**
+
+- Triplet loss + semi-hard mining (`--primary-loss triplet`)
+- SGNS + unigram^0.75 cache (`--primary-loss sgns`)
+- InfoNCE (`--primary-loss infonce`) — kept for completeness even though rejected
+- E.2 head variant (Component-0-only, `--head-mode component_0_only`)
+- Component 0 disable (`--no-use-time-encoding`)
+- A2-off (no alignment, `--lambda-align 0`)
+- normbrake-off (`--lambda-normbrake 0`)
+- hist_neg_ratio variants (`--hist-neg-ratio`)
+- λ_link variants (`--lambda-link`)
+- weight_decay_link variants (`--weight-decay-link`)
+
+**What still needs to land before locking is final:**
+
+1. Stage 3 completion (4 of 6 cells done; WD1e-4 and WD1e-3 pending) — confirms whether `weight_decay_link` closes the residual cliff or not.
+2. Stage 4 completion (8 cells) — confirms `hist_neg_ratio=0` doesn't save joint training AND tests whether the default `hist_neg_ratio=0.5` is the right decoupled-training default.
+3. Multi-seed validation on the final winning cell across seeds {42, 7, 13}.
 
 ## 10. Open issues + future work
 
