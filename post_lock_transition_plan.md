@@ -261,11 +261,43 @@ commits. NOT one massive merge. Each commit:
 - 2-epoch smoke test confirming end-to-end training works
 - For PORT-FLAG commits: smoke test in the non-default flag setting
 
-### Final verification (after all commits land)
+### Final verification — TWO GATES (Gate A + Gate B)
 
-Run anchor validation (3 seeds, 2 epochs) on new master. Result MUST
-match original anchor (test MRR **0.7070 ± 0.0016**) within anchor std.
-If it doesn't, the port has a bug.
+**Gate A — Anchor reproduction (cheap, 2-epoch x 3 seeds, ~10 min):**
+
+```bash
+cd tempest-walk-embedding-new
+python -m scripts.anchor_validation --seeds 42,7,13 --num-epochs 2
+```
+
+Expected: mean test MRR **0.7070 ± 0.0016**. If outside anchor std,
+the port has a bug — diff against intermediate module-by-module to
+find the regression. Do NOT proceed to Gate B with a failing Gate A.
+
+**Gate B — Locked-config wiki reproduction (expensive, 50-epoch x 1 seed, ~1 hr):**
+
+```bash
+cd tempest-walk-embedding-new
+python -m scripts.train --tgb-name tgbl-wiki --seed 42 \
+  --num-epochs 50 --early-stop-patience 999 --log-debug \
+  [all locked-config flags from config_locked_v1.yaml]
+```
+
+Expected: matches the corresponding Stage 4/5 winning cell within
+CUDA tolerance (±0.030 val MRR drift acceptable per Stage 3 L0
+finding).
+
+**Why two gates:** Gate A only runs 2 epochs from random init — it
+catches gross plumbing bugs but misses subtle long-training bugs in
+normbrake/WD/uniformity-cap code paths. Gate B exercises the full
+50-epoch code path including all cliff-fix interactions.
+
+**Commit Gate B output as `master_locked_verification.md`** — the
+receipt for the port. Without this artifact, the port is not
+verified.
+
+Do NOT proceed to the single-table ablation (Step 6 below) until
+BOTH gates pass.
 
 ---
 
@@ -288,17 +320,73 @@ ablations finalized, the directory can be removed but the tar stays.
 
 ---
 
+## Step 6 — Single-table architectural ablation (gated by Gates A + B)
+
+After Steps 1–5 complete AND both verification gates pass, create:
+
+```bash
+cd tempest-walk-embedding-new
+git checkout master
+git checkout -b experiment/embedding-table-variations
+```
+
+Full ablation spec is in **v2.4 §13** ([walk_distribution_matching_embedding_v2.4_skeleton.md](walk_distribution_matching_embedding_v2.4_skeleton.md#13-488-single-table-ablation-planned-gated-by-step-1-3)).
+
+One cell only: `1T_asym` (single `E` table + `P_src` + `P_tgt`
+projections). Locked-config flags. Recalibrate normbrake threshold via
+2-epoch warmup before launching the full 50-epoch run.
+
+**Decision rule (summary):**
+- Ties or wins → lock single-table, dual-table → PORT-FLAG.
+- Loses < 0.005 → lock single-table (simpler-wins-ties).
+- Loses > 0.005 → dual-table stays locked; single-table → PORT-FLAG.
+
+**Cliff-shape bonus:** smoother long-training trajectory can justify
+locking single-table even on a tie.
+
+After resolution: merge winning branch to master OR leave branch in
+place. Update `config_locked_v1.yaml` accordingly.
+
+---
+
+## Step 7 — Walk encoder branch (gated by Step 6 resolution)
+
+Only after Step 6 completes and master's embedding-table architecture
+is final, create:
+
+```bash
+cd tempest-walk-embedding-new
+git checkout master   # whichever architecture is locked
+git checkout -b feature/walk-embedding-integration
+```
+
+The walk encoder produces `walk_repr_u` from walks seeded on the
+source node `u`. Full spec is in **v2.4 §14** (deferred to a follow-up
+doc).
+
+**Why this ordering:** the walk encoder builds on the locked-table
+architecture. Settling Step 6 first ensures the walk encoder doesn't
+have to be retested against two embedding-table variants.
+
+---
+
 ## Deliverables of this Step-1-through-5 process
 
 1. `tempest-walk-embedding-intermediate/` — frozen experimental record
 2. `tempest-walk-embedding-new/` at master with:
    - Locked production config as defaults
    - All paper-ablation paths behind CLI flags
-   - Reproduces anchor result (0.7070 ± 0.0016) on 3-seed validation
+   - Reproduces anchor result (0.7070 ± 0.0016) on 3-seed validation (Gate A)
+   - Reproduces locked-config result on wiki 50-epoch within ±0.030 (Gate B)
    - `port_plan.md` committed
    - `config_locked_v1.yaml` committed
+   - `master_locked_verification.md` committed (Gate B receipt)
    - Codebase audit reviewable from git log
 3. `tempest-walk-embedding-intermediate-archive-YYYYMMDD.tar.gz`
+4. `experiment/embedding-table-variations` branch with 1T_asym result documented (Step 6)
+5. v2.4 §13 populated; v2.4 §1 + §9 updated with final architecture; status DRAFT → FINAL.
+
+After deliverables 1–5: Step 7 (walk encoder) can begin.
 
 ---
 
@@ -313,9 +401,11 @@ is minutes-to-low-hours.
 | Step 1 — clone | 10 min | ~30 sec (cp -a + git verify) |
 | Step 2 — master reset | 10 min | ~30 sec (checkout + verify) |
 | Step 3 — port plan | 4–6 hr | ~15–30 min (read intermediate file-by-file + classify) |
-| Step 4 — execute port | 1–2 days | ~1–2 hr (small commits + tests + anchor) |
+| Step 4 — execute port + Gates A+B | 1–2 days | ~1–2 hr + ~1 hr GPU (50-ep wiki run) |
 | Step 5 — archive | 30 min | ~30 sec (tar) |
-| **Total** | **2–3 days focused work** | **~2–3 hours** |
+| Step 6 — single-table ablation | ~1 day (review) | ~1 hr GPU (50-ep + maybe multi-seed +2 hr) |
+| Step 7 — walk encoder | ~2 weeks | TBD (deferred) |
+| **Steps 1–6 total** | **3–5 days focused work** | **~4–7 hours** |
 
 Critically, the anchor-validation step (50-ep × 3 seeds = ~3 hr GPU
 time) is the binding constraint either way — not the tooling work.

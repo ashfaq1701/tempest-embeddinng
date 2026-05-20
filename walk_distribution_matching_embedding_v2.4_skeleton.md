@@ -539,4 +539,152 @@ Instead execute the 5-step transition in
 4. Execute port as small reviewable commits; verify anchor reproduces 0.7070 ± 0.0016.
 5. Archive intermediate.
 
-**Gate to architecture-sweep work:** anchor validation on new master passes within ±0.005.
+**Two-gate verification after port:**
+
+- **Gate A (anchor reproduction):** `python -m scripts.anchor_validation --seeds 42,7,13 --num-epochs 2` must give 0.7070 ± 0.0016 within anchor std on new master.
+- **Gate B (locked-config wiki run):** `python -m scripts.train --tgb-name tgbl-wiki --seed 42 --num-epochs 50 --early-stop-patience 999 --log-debug [locked flags]` must reproduce the corresponding Stage 4/5 winning cell within CUDA tolerance (±0.030). Commit the run as `master_locked_verification.md`.
+
+**Gate B catches port bugs Gate A misses** — Gate A only runs 2 epochs from random init; Gate B runs 50 epochs with the full locked-config code path including normbrake, weight_decay_link, and any winning hist_neg_ratio/uniformity knobs.
+
+## 13. §4.8.8 Single-table ablation (planned, gated by Step 1–3)
+
+**Status:** planned. Branch `experiment/embedding-table-variations` off
+master AFTER Steps 1–3 (port + Gates A and B pass).
+
+### Motivation
+
+Stage 2 mechanism analysis identified universal **E_context gradient
+collapse** (0.005 → 0.0001 by ep 7) across every fix as a contributor
+to the residual cliff. A single-table architecture removes E_context as
+a separate parameter set entirely — there is no distinct context table
+to collapse.
+
+**Parameter reduction:** 2 × N × d → 1 × N × d + 2 × d × d. At d=128:
+- Wiki (N=9,227): 2.36M → 1.18M + 32K = 1.21M (~half)
+- Review (N=352,637): 90.3M → 45.2M + 32K = 45.2M (~half)
+
+If single-table matches dual-table on wiki, master locks the simpler
+architecture. The paper claim becomes: *"single embedding table with
+asymmetric projections at the link MLP, half the parameters of dual-
+table at matched performance."*
+
+### Architecture spec — `1T_asym`
+
+Replace `E_target` and `E_context` (both `[N, d]`) with a single `E[node]`
+of size `[N, d]`. Add two small linear projections at the link MLP read
+site:
+
+```
+P_src : Linear(d, d)
+P_tgt : Linear(d, d)
+
+Scoring (cross-table block, same 8-block structure as v3 E.1):
+  Score = link_mlp(P_src(E[u]),
+                   P_tgt(E[v]),
+                   P_src(E[u]) ⊙ P_tgt(E[v]),
+                   |P_src(E[u]) − P_tgt(E[v])|,
+                   ... reverse direction ...,
+                   Component_0)
+
+Alignment loss:
+  Pulls E[seed] toward E[walk_node] (no target/context distinction).
+  L_align = mean over walks of weighted (1 − cos(E[seed], E[walk_node]))
+
+Uniformity loss:
+  Pushes E[u] away from E[v_neg] for random negative pairs
+  (operates on the single table E).
+
+Normbrake:
+  Applied to the single E table. THRESHOLD MUST BE RECALIBRATED — see
+  pre-launch step below.
+```
+
+**SKIP `1T_sym`** (symmetric scoring without P_src/P_tgt). Theory predicts
+loss on directional eval; the cell isn't worth burning.
+
+### Pre-launch verification (REQUIRED before the 50-epoch cell)
+
+The single E table now serves both target and context roles. Its
+column-norm distribution may differ from dual-table E_target's.
+
+1. Run a 2-epoch warmup with `--lambda-normbrake 0` (normbrake off).
+2. Read per-column L2 norm of the single E table at end of ep 2.
+3. Set `normbrake_threshold = 1.5 × measured_col_norm`.
+4. Document the new threshold in this section BEFORE launching the
+   full 50-epoch cell.
+
+**If the new threshold differs from the dual-table threshold (3.87 on
+wiki) by more than 20%, that itself is a finding** — note it
+prominently. It would indicate the single-E table operates at a
+different magnitude regime than dual-table did.
+
+### Cell — one cell only
+
+| Cell | E tables | Projections | Locked-config flags |
+|---|---|---|---|
+| 1T_asym | 1 (`E[N, d]`) | P_src, P_tgt (d→d each) | Stage 4/5 winners + normbrake (recalibrated threshold) + WD_link=1e-4 |
+
+50 epochs, seed 42, no early-stop, `--log-debug`.
+
+### Decision rules
+
+**A** — 1T_asym **ties or wins** 2T_locked on test MRR (within anchor std 0.0016, or higher): lock single-table. Multi-seed validate (7, 13). If multi-seed mean is within anchor std of 2T mean, lock single-table.
+
+**B** — 1T_asym loses by **< 0.005** (tie within CUDA noise): per "simpler wins ties," lock single-table. Multi-seed validate.
+
+**C** — 1T_asym loses by **> 0.005**: dual-table stays as locked production. Document outcome in this section and in `port_plan.md` as "tested, rejected." Keep single-table code as PORT-FLAG for paper-ablation completeness.
+
+**Cliff-shape bonus:** if 1T_asym matches 2T on peak BUT has a cleaner cliff (smaller drop, no E_context-style gradient collapse since there is no E_context), that's a bigger finding than peak parity. Lockable even on a tie because long-training stability is better.
+
+### Pre-registered prediction (2026-05-20, before Stage 4 lands)
+
+Best-guess outcome based on Stage 2/3 mechanism analysis and Lesson 9
+("cross-table > within-table"):
+
+- **40% Scenario B** (1T_asym loses by < 0.005, tie within noise): the cross-table link MLP can recover most of the dual-table flexibility through P_src/P_tgt projections. Simpler-wins-ties → lock single-table.
+- **30% Scenario C-mild** (loses by 0.005–0.015): the dual-table asymmetry buys ~0.005–0.01 test MRR that linear projections can't recover. Dual-table stays locked; single-table → PORT-FLAG.
+- **20% Scenario C-clear** (loses > 0.015): the dual-table inductive bias is critical (E_target and E_context learn different distributions; one table can't be optimal at both simultaneously). Dual-table locked clearly.
+- **10% Scenario A** (1T_asym wins): unlikely but possible if E_context's gradient collapse is more damaging than I estimated.
+
+**Most-likely outcome:** B or C-mild. Cliff shape will probably help single-table even if peak loses slightly — fewer parameters + no E_context collapse mechanism.
+
+### Lock procedure
+
+After 1T_asym ablation + multi-seed lands:
+
+1. Update v2.4 §1 with architecture decision and reasoning.
+2. **Winner:** merge `experiment/embedding-table-variations` to master. Update `config_locked_v1.yaml`. Losing variant → PORT-FLAG for paper ablation.
+3. **Loser stays:** leave branch in place for paper reproducibility; master keeps dual-table as locked.
+
+## 14. §4.8.9 Walk encoder branch (gated by Step 4 outcome)
+
+**Status:** PLANNED. Branch `feature/walk-embedding-integration` off
+master AFTER Step 4 (single-table ablation) resolves and master's
+embedding-table architecture is final.
+
+**Why this ordering:**
+
+1. **Walk encoder replaces source-side embedding** with `walk_repr_u`. Destination side still uses `E` (or `E_context` if dual-table). Settling destination architecture first means walk encoder doesn't have to be retested against both options.
+2. **Single-table is cheap** (1 cell + multi-seed if needed). Walk encoder is expensive (~2 weeks). Settle the easy question first.
+3. **Master's locked architecture is the production baseline** the walk encoder builds on. If master drifts mid-implementation, comparison is unreliable.
+
+**Implementation:** walk encoder produces `walk_repr_u` from walks
+seeded on the source node `u`. At training time, walks are filtered
+from alignment walks (seeded on `union(src, tgt)`) to the `src`-subset
+for encoder input. At scoring time, a separate Tempest call seeded on
+`u` only, with caching by `(u, t_bucket)`.
+
+**Full spec deferred** to a follow-up doc after Step 4 resolves.
+
+## 15. Deliverables of Steps 1–4 (final lock + verified master)
+
+1. **tempest-walk-embedding-intermediate/** — frozen experimental record.
+2. **tempest-walk-embedding-new/** on master with the FINAL locked architecture (single-table or dual-table per §13 outcome).
+3. **master_locked_verification.md** — wiki 50-epoch reproduction of the locked-config result on new master, attached as the Gate B receipt.
+4. **experiment/embedding-table-variations** branch with the architectural ablation result recorded.
+5. **v2.4 §13** populated with the single-table outcome + decision.
+6. **v2.4 status: DRAFT → FINAL.**
+7. **config_locked_v1.yaml** reflecting the final architecture.
+8. **port_plan.md** committed on master with full PORT-DEFAULT/FLAG/SKIP table (per [post_lock_transition_plan.md](post_lock_transition_plan.md)).
+
+Then — AND ONLY THEN — Step 5 (walk encoder) begins.
