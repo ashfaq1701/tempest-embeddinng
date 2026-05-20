@@ -28,6 +28,15 @@ class Config:
     uniformity_temperature: float = 2.0
     uniformity_cap: int = 20_000
 
+    # Normbrake — per-column L2 hinge that caps embedding magnitudes above
+    # `normbrake_threshold` (CLAUDE.md Lesson 18). Halves the 50-epoch
+    # over-training cliff observed in alignment+uniformity. Default OFF
+    # (lambda_normbrake=0); enable with CLI flags. Threshold needs
+    # per-dataset calibration at 1.5× measured col_norm at ep 1–2.
+    # Reference values: wiki 3.87, review 31.32.
+    lambda_normbrake: float = 0.0
+    normbrake_threshold: float = 0.0
+
     # Link prediction
     num_neg_per_pos: int = 10            # K negatives per positive
     # Mixture of TGB-style negatives at TRAINING time. hist_neg_ratio=0.5

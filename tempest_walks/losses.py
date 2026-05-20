@@ -91,3 +91,30 @@ def uniformity_loss(
 def link_bce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """BCE-with-logits on positives (label=1) + negatives (label=0)."""
     return F.binary_cross_entropy_with_logits(logits, labels)
+
+
+def normbrake_loss(
+    E_target: torch.Tensor,         # [N, d]
+    E_context: torch.Tensor,        # [N, d]
+    threshold: float,
+) -> torch.Tensor:
+    """Per-column L2 hinge — saturates embedding magnitudes above `threshold`.
+
+    L = mean_j (max(0, ||E[:, j]||_2 - threshold))^2 summed over both tables.
+
+    Self-limiting: zero gradient below threshold, quadratic above. Composes
+    with alignment+uniformity (or any primary loss) by addition.
+
+    Motivation (Lesson 18): alignment+uniformity has a 50-epoch over-training
+    cliff driven by col_norm runaway (wiki: 2.08 → 10.76 over 50 epochs).
+    Normbrake clamps col_norm at `threshold` and HALVES the cliff drop
+    (-0.28 → -0.11 val MRR by ep 50 on wiki). Peak val MRR is unchanged.
+
+    Threshold calibration: 1.5 × measured col_norm at ep 1–2. Wiki: 3.87.
+    Review: ~31.32 (scales with N).
+    """
+    col_norms_t = E_target.norm(dim=0)        # [d]
+    col_norms_c = E_context.norm(dim=0)       # [d]
+    excess_t = F.relu(col_norms_t - threshold)
+    excess_c = F.relu(col_norms_c - threshold)
+    return excess_t.pow(2).mean() + excess_c.pow(2).mean()

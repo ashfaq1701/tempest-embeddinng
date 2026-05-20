@@ -26,7 +26,7 @@ import torch
 from .config import Config
 from .data import Batch
 from .evaluator import Evaluator
-from .losses import alignment_loss, link_bce, uniformity_loss
+from .losses import alignment_loss, link_bce, normbrake_loss, uniformity_loss
 from .model import EmbeddingStore, LinkPredictor
 from .negatives import (
     HistoricalNegativeSampler,
@@ -142,6 +142,18 @@ class Trainer:
             cap=self.config.uniformity_cap,
         )
         l_total = l_align + self.config.eta_uniform * l_uniform
+
+        # Normbrake auxiliary (CLAUDE.md Lesson 18). Composes with the
+        # primary loss by addition. Operates on the underlying embedding
+        # tables, not on the per-walk lookups — so it can constrain
+        # magnitudes even when a given batch only touches a subset of nodes.
+        if self.config.lambda_normbrake > 0:
+            l_nb = normbrake_loss(
+                E_target=self.embedding_store.E_target.weight,
+                E_context=self.embedding_store.E_context.weight,
+                threshold=self.config.normbrake_threshold,
+            )
+            l_total = l_total + self.config.lambda_normbrake * l_nb
 
         self.emb_optimizer.zero_grad(set_to_none=True)
         l_total.backward()

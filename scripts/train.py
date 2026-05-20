@@ -40,6 +40,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alignment-time-scale", type=float, default=-1.0)
     p.add_argument("--eta-uniform", type=float, default=1.0)
     p.add_argument("--uniformity-temperature", type=float, default=2.0)
+    # Normbrake — per-column L2 hinge on embeddings (CLAUDE.md Lesson 18).
+    # Default OFF (lambda=0). Calibrate threshold to 1.5× col_norm at ep 1-2:
+    # tgbl-wiki → 3.87, tgbl-review-v2 → 31.32.
+    p.add_argument("--lambda-normbrake", type=float, default=0.0,
+                   help="Coefficient for per-column L2 hinge on the "
+                        "embedding tables. 0 disables (default). "
+                        "Recommended production value: 0.1.")
+    p.add_argument("--normbrake-threshold", type=float, default=0.0,
+                   help="L2 column-norm threshold above which normbrake "
+                        "activates. Calibrate per dataset to 1.5× col_norm "
+                        "at ep 1-2 (wiki: 3.87, review: 31.32).")
 
     # Optimization
     p.add_argument("--num-neg-per-pos", type=int, default=10)
@@ -89,6 +100,8 @@ def main() -> None:
         alignment_time_scale=args.alignment_time_scale,
         eta_uniform=args.eta_uniform,
         uniformity_temperature=args.uniformity_temperature,
+        lambda_normbrake=args.lambda_normbrake,
+        normbrake_threshold=args.normbrake_threshold,
         num_neg_per_pos=args.num_neg_per_pos,
         hist_neg_ratio=args.hist_neg_ratio,
         reservoir_size=args.reservoir_size,
