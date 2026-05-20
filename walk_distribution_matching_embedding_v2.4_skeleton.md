@@ -361,9 +361,22 @@ and hist_neg_ratio):
 | hist_neg_ratio | 0.5 (default), pending Stage 4 | TGB eval-distribution match |
 | **weight_decay_link** | **1e-4 (NEARLY ELIMINATES THE CLIFF)** | Stage 3 WD1e-4 — drop -0.014 vs nb-only -0.110 |
 
-### Stage 3 BREAKTHROUGH: WD1e-4 closes the cliff
+### Stage 3 BREAKTHROUGH: WD closes the cliff (both 1e-4 and 1e-3 work)
 
-WD1e-4 final trajectory shows a NEARLY FLAT val MRR curve through 50 epochs:
+Full Stage 3 results (after WD1e-3 completion):
+
+| Cell | Best val | ep 50 val | Drop | link_w 50ep | Verdict |
+|---|---|---|---|---|---|
+| L0 (control, no WD) | 0.7446 | 0.6064 | -0.138 | 1.85 | normbrake-only baseline |
+| L0.1 (joint λ=0.1) | 0.6710 | 0.3741 | collapsed | — | joint training catastrophic |
+| L0.3 (joint λ=0.3) | 0.5977 | 0.3606 | collapsed | — | worse |
+| L1.0 (joint λ=1.0) | 0.5584 | 0.3773 | collapsed | — | worst |
+| **WD1e-4 (nb + WD)** | **0.7452** | **0.7313** | **-0.014** | **0.169** | LOCKED (production safe) |
+| WD1e-3 (nb + heavy WD) | 0.7446 | **0.7437** | **-0.0009** | 0.0068 | slightly flatter; over-suppresses link MLP |
+
+**WD1e-4 locked as production default.** WD1e-3 is technically slightly flatter (-0.0009 vs -0.014) but link_w_norm drops to 0.0068 — the link MLP weights are pushed below typical Adam init magnitudes, which is over-regularization. WD1e-4 keeps link_w_norm at a healthy 0.169 while still nearly eliminating the cliff. Safer for cross-dataset transfer (review may need higher link capacity).
+
+WD1e-4 final trajectory:
 
 | Epoch | val MRR | Δ from peak |
 |---|---|---|
@@ -403,11 +416,122 @@ This is **the smooth val MRR curve the user asked for** (2026-05-20: "We will tr
 
 To be filled in.
 
-## 11. Post-lock transition (gated by Stage 4 + multi-seed validation)
+## 11. §4.8.7 Stage 5 — uniformity hyperparameter sweep (planned, gated by Stage 4)
 
-Once Stage 4 + multi-seed lands and the final architecture is locked,
-**do NOT start architecture-sweep work directly on this branch.** Instead
-execute the 5-step transition in [post_lock_transition_plan.md](post_lock_transition_plan.md):
+**Status:** planned. Cells launch ONLY after Stage 4 + multi-seed lands
+and the winning hist_neg_ratio + λ_link are confirmed.
+
+### Motivation — two hypotheses
+
+**H1: `eta_uniform` too high.** Uniformity's negative pull dominates
+alignment's positive pull, inflating column norms before normbrake
+catches them. Reducing `eta_uniform` lets alignment dominate, producing
+more semantically coherent embedding geometry within the clamped
+magnitude regime.
+
+**H2: Effective uniformity negative count is too high.** All-pairs
+uniformity over the entire batch produces low-variance, consistent push
+direction. Combined with Adam momentum, this could be why E_context
+drifts even when per-batch grads vanish (the 0.005 → 0.0001 collapse
+seen in every Stage 2 cell). Fewer pairs (lower variance) = less
+consistent push = E_context might settle.
+
+### Current defaults (verified by grep)
+
+The code does NOT have an `n_uniform_neg` parameter. The actual
+uniformity hyperparameters (`tempest_walks/config.py:117-120`) are:
+
+| Field | Default | Role |
+|---|---|---|
+| `eta_uniform` | 1.0 | scalar on uniformity in total loss (H1 target) |
+| `uniformity_temperature` | 2.0 | exponent in `exp(-t · sq_dist)` |
+| `uniformity_cap` | 20_000 | max nodes used in all-pairs (H2 target) |
+
+**Important:** `uniformity_cap=20_000` NEVER fires at default. With
+B=200 batches and union(src, tgt) seeding, the unique batch node count
+is typically 200–400. The cap only triggers when unique batch nodes
+exceed it. To meaningfully test H2, the cap must be set BELOW the
+typical batch unique-node count (~300).
+
+The loss math: `uniformity_loss` does all-pairs `cdist` over the unique
+batch nodes (capped). For B=200 with ~300 unique nodes, that's ~45,000
+pairs per batch — effectively all-pairs.
+
+### Pre-registered prediction (2026-05-20 18:40)
+
+Best-guess outcome based on Stage 2/3 mechanism diagnosis:
+
+- **60% Scenario A** (U_base wins or all cells tie within anchor std 0.0016): uniformity hyperparams are non-critical because normbrake + WD_link supersede upstream loss tuning. Magnitudes are clamped regardless of uniformity strength.
+- **30% Scenario B** (U_lo / U_lower wins): H1 partially holds — reducing eta_uniform helps alignment dominate, but the cliff is already controlled by Stage 3 fixes so the gain is marginal (< 0.005).
+- **10% Scenario C** (N_half / N_quarter wins): H2 holds — fewer effective uniformity negatives lets E_context settle past ep 7 and improves long-training plateau quality.
+
+If Scenario B or C produces cliff-shape improvement (val drop < -0.005 from current -0.014), uniformity IS part of the cliff mechanism, not just upstream of normbrake. Document prominently in v2.4.
+
+### Cell design (6 cells, seed 42, 50 ep, no early-stop)
+
+Base config: alignment + normbrake (λ=0.1, threshold=3.87) +
+weight_decay_link=1e-4 + Stage 4 winning hist_neg_ratio + Stage 4
+winning λ_link. (Filled in after Stage 4 lands; default placeholder
+hist=0.5 λ_link=0.)
+
+| Cell | eta_uniform | uniformity_cap | Tests |
+|---|---|---|---|
+| U_base | 1.0 (control) | 20_000 (eff. all pairs) | reproduces locked baseline |
+| U_lo | 0.3 | 20_000 | H1: mild reduction |
+| U_lower | 0.1 | 20_000 | H1: strong reduction |
+| N_half | 1.0 | 200 (~half typical batch unique nodes) | H2: higher gradient variance |
+| N_quarter | 1.0 | 100 (~quarter typical) | H2: much higher variance |
+| Both_lo | 0.3 | 200 | combined H1 + H2 |
+
+Wall time: 6 cells × ~55 min = ~5.5 hr.
+
+### Decision rules
+
+**A** — U_base wins or all cells tie within anchor std (0.0016): lock
+current defaults (eta_uniform=1.0, uniformity_cap=20_000). Most likely
+outcome per prediction.
+
+**B** — One of U_lo / U_lower / Both_lo wins by > anchor std: H1
+confirmed. Reduce eta_uniform to the winning value. Multi-seed validate
+on seeds 7, 13 before locking.
+
+**C** — N_half or N_quarter wins by > anchor std: H2 confirmed. Reduce
+uniformity_cap. Multi-seed validate before locking.
+
+**Cliff-improvement bonus**: if any winning cell produces val drop
+< -0.005 (vs current -0.014 from WD1e-4), uniformity is mechanistically
+part of the cliff — flag for paper writeup.
+
+### Multi-seed discipline
+
+If any cell other than U_base wins, multi-seed validate (seeds 7, 13)
+on the winning cell before locking. CUDA noise from Stage 3 (~0.030
+drift) means small single-seed effects need confirmation.
+
+### Lock procedure (gates the port)
+
+After Stage 5 + multi-seed lands:
+
+1. Update v2.4 §1 "Final locked architecture" with COMPLETE spec
+   including eta_uniform and uniformity_cap values.
+2. Update v2.4 §9 with reasoning for each hyperparameter.
+3. Mark v2.4 status DRAFT → FINAL.
+4. Then proceed to clone-then-port-to-master per
+   [post_lock_transition_plan.md](post_lock_transition_plan.md).
+
+In `port_plan.md`: classify `eta_uniform` and `uniformity_cap` as
+PORT-FLAG regardless of Stage 5 outcome — CLI knobs exposed, defaults
+set per winner. Appendix ablations need to rerun this sweep later.
+
+**DO NOT START PORTING** until Stage 5 + multi-seed lands AND v2.4 §1
+documents the complete locked config including these two values.
+
+## 12. Post-lock transition (gated by Stage 4 + Stage 5 + multi-seed validation)
+
+Once Stage 4 + Stage 5 + multi-seed lands and the final architecture is
+locked, **do NOT start architecture-sweep work directly on this branch.**
+Instead execute the 5-step transition in
+[post_lock_transition_plan.md](post_lock_transition_plan.md):
 
 1. Clone `tempest-walk-embedding-new` → `tempest-walk-embedding-intermediate` (frozen experimental record).
 2. Reset `tempest-walk-embedding-new` to master (clean v3 baseline).

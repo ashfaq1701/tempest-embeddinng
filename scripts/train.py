@@ -40,6 +40,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alignment-time-scale", type=float, default=-1.0)
     p.add_argument("--eta-uniform", type=float, default=1.0)
     p.add_argument("--uniformity-temperature", type=float, default=2.0)
+    # Max nodes used in all-pairs uniformity per batch. With B=200 union
+    # seeding, typical unique-batch-nodes ~300; the default 20000 never
+    # fires. Drop below 300 to actually subsample (Stage 5 §11).
+    p.add_argument("--uniformity-cap", type=int, default=20_000)
     # Phase 1 ablation: alignment-loss weighting variant
     p.add_argument("--align-weighting", choices=["A", "B", "C"], default="A",
                    help="A=1/K·(1+Δt/τ)^(-β) [control]; B=1/K only; C=uniform α=1")
@@ -173,6 +177,7 @@ def main() -> None:
         alignment_time_scale=args.alignment_time_scale,
         eta_uniform=args.eta_uniform,
         uniformity_temperature=args.uniformity_temperature,
+        uniformity_cap=args.uniformity_cap,
         align_weighting=args.align_weighting,
         lambda_align=args.lambda_align,
         head_mode=args.head_mode,
