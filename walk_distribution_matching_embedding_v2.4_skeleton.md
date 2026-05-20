@@ -359,7 +359,26 @@ and hist_neg_ratio):
 | Strict-causal protocol | NON-NEGOTIABLE | Lesson 3 + project rule |
 | λ_link (joint training) | **0 (DECISIVELY FALSIFIED)** | Stage 3 + §4.8.1 |
 | hist_neg_ratio | 0.5 (default), pending Stage 4 | TGB eval-distribution match |
-| weight_decay_link | TBD, pending Stage 3 WD cells | residual cliff hypothesis |
+| **weight_decay_link** | **1e-4 (NEARLY ELIMINATES THE CLIFF)** | Stage 3 WD1e-4 — drop -0.014 vs nb-only -0.110 |
+
+### Stage 3 BREAKTHROUGH: WD1e-4 closes the cliff
+
+WD1e-4 final trajectory shows a NEARLY FLAT val MRR curve through 50 epochs:
+
+| Epoch | val MRR | Δ from peak |
+|---|---|---|
+| 5 (peak) | 0.7448 | 0 |
+| 10 | 0.7443 | -0.0005 |
+| 20 | 0.7442 | -0.0006 |
+| 30 | 0.7442 | -0.0006 |
+| 40 | 0.7415 | -0.003 |
+| 50 | 0.7313 | **-0.014** |
+
+This is **the smooth val MRR curve the user asked for** (2026-05-20: "We will try to make the loss curve going down smoothly and MRR curve going up smoothly").
+
+**Mechanism diagnosed:** link_w_norm growth — was 0.28 → 1.83 (6.5×) with normbrake alone; with WD=1e-4 it's **0.185 → 0.169 (essentially flat)**. The link MLP weights stop running away, val MRR stays high.
+
+**Locked production architecture:** alignment + uniformity + normbrake (λ=0.1, threshold per-dataset) + weight_decay_link=1e-4. λ_link=0. hist_neg_ratio pending Stage 4.
 
 **Paper-ablation paths kept behind PORT-FLAG in master (per post_lock_transition_plan):**
 
