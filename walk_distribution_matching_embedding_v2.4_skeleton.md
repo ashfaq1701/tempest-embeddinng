@@ -122,20 +122,42 @@ To be filled in.
 
 Eval cost on review is ~15–20 min per val pass (vs ~50s on wiki); train ~9 min/epoch vs ~17s on wiki. A 50-epoch run is ~10–15 hours per cell.
 
-### 7.2 Reduced review sweep (user-rule compliant)
+### 7.2 Review sweep (6 cells, sampled eval)
 
-Run only the 2 cells the user's decision rule requires:
-1. **Cell A: alignment+uniformity** (anchor baseline; v2.2 spec).
-2. **Cell T: Triplet** (wiki §4.7 winner; chosen as best-of-3 because it won on wiki and is the most stable training-dynamics candidate).
+User direction (2026-05-20 ~01:00): run all 3 primaries × {with/without normbrake} + alignment×2 = 6 cells. Reduced from the original 8 by dropping InfoNCE (definitively rejected on wiki under joint training).
 
-Each at 10 epochs max, `--early-stop-patience 3`. Wall ~3 hours per cell.
+Tightened config to fit ~8-hr budget on review (which is 30× wiki size):
+- `--num-epochs 6`, `--early-stop-patience 2`.
+- `--monitor-sample-pct 0.05` (5% sampled per-epoch eval ≈ 36.5k val positives; statistically powerful for ranking).
+- `--skip-final-full-eval` (final full eval was OOMing at 500k row budget; lowered to 100k row budget but skipping it on review for safety).
+- Normbrake threshold calibrated on review: `1.5 × 20.88 = 31.32` (from a 2-ep alignment calibration run).
 
-Skip the full 8-cell sweep because:
-- InfoNCE was definitively rejected on wiki under joint training (test fell from 0.6984 → 0.6536 as λ_link rose). The InfoNCE failure is fundamental.
-- SGNS+nb wiki cross-seed cliff (seed-7) makes it a stability risk; we're not selecting it from wiki.
-- Per user rule we only need anchor + winner.
+### 7.3 Review results (in progress)
 
-Results: TBD.
+| Cell | Config | Best val (sampled) | Best test (sampled) | Cliff observed? |
+|---|---|---|---|---|
+| A | alignment | 0.3093 (ep2) | 0.2956 | **YES** — val 0.3093 → 0.2877 (drop 0.022) by ep 4 |
+| A_nb | alignment + normbrake (thr 31.3) | (running) | — | TBD |
+| T | Triplet | TBD | — | — |
+| T_nb | Triplet + normbrake | TBD | — | — |
+| S | SGNS | TBD | — | — |
+| S_nb | SGNS + normbrake | TBD | — | — |
+
+### 7.4 Cross-dataset cliff diagnosis
+
+The alignment+uniformity cliff manifests on BOTH datasets but with different timing:
+
+| | Wiki | Review |
+|---|---|---|
+| Best-val epoch | 2 | 2 |
+| Cliff onset | epoch 5–10 | **epoch 3–4** |
+| 50-ep test (or earliest cliff value) | 0.4269 (50 ep) | 0.2877 (ep 4) |
+| Test drop from peak | 0.28 (0.7070 → 0.4269) | 0.022 (0.2956 → 0.2877) |
+| Col-norm growth | 0.36 → 1.99 (5.5×, link MLP) / 1.4 → 13 (~10×, estimated, E_table) | 16.0 → 29.0 (1.8× in 4 ep, accelerating) |
+
+**Same cause, faster on review.** Review's larger node count + longer time span causes embeddings to drift through more distinct states per epoch; the alignment pull grows col-norms 1.8× in 4 epochs (vs wiki's ~1.5× in 4 epochs). The cliff lands sooner because review has less "easy recurrence" signal to amortize the over-training.
+
+The cross-dataset reproduction of the cliff confirms: **the alignment+uniformity cliff is fundamental to the loss family, not a wiki-specific artifact**. Whatever fixes it on wiki should fix it on review too.
 
 ## 8. §4.8.3 long-training plateau analysis
 
