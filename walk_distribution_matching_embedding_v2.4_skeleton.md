@@ -672,12 +672,46 @@ come from the source-side representation interacting differently with
 each destination representation.**
 
 Currently the source-side input is `P_src(E[u])` — a static
-embedding (or with Component 0's Δt). A walk encoder gives the source
-a time-aware, history-aware representation: `walk_repr[u]` summarizes
-u's recent neighborhood and edge features.
+embedding (or with Component 0's Δt scalars). A walk encoder gives
+the source a **time-aware, history-aware, neighborhood-aware**
+representation: `walk_repr[u]` summarizes u's recent neighborhood
+structure and edge-feature trajectory.
 
 Destination-side walks are deferred (1000× more walk samples per row,
 tests a different question).
+
+### Gradient flow — why this eliminates the cliff BY CONSTRUCTION
+
+PyTorch autograd handles the full chain:
+
+```
+∂L_link / ∂score
+    ↓ through link_mlp
+∂L_link / ∂(walk_repr_u via P_src) and ∂L_link / ∂(E[v] via P_tgt)
+    ↓ through walk_encoder forward
+∂L_link / ∂walk_encoder.parameters     ← GRU + projections trained by BCE
+    ↓ through per-step embedding lookups
+∂L_link / ∂E[walk_node_i]              ← E table ALSO trained by BCE
+```
+
+This is fundamentally different from locked-v2:
+
+- **locked-v2:** E trained by alignment+uniformity, link MLP trained by BCE, two paths **decoupled**. Embedding table drifts independently of what link MLP needs. The -0.28 baseline cliff (Lesson 17) is the consequence.
+
+- **walk encoder:** E (via per-step lookups) AND walk_encoder AND link_mlp are **all in the same BCE compute graph**. The encoder cannot drift away from what link MLP needs because they share the loss.
+
+**Option α (DEFAULT for initial cells):** Keep alignment + uniformity
++ normbrake on the embedding table. Walk encoder adds joint BCE
+supervision. Alignment provides structural regularization; BCE provides
+task-specific shaping. Safer — supervision fallback if encoder
+underperforms.
+
+**Option β (ablation after initial cells, conditional):** Drop
+alignment + uniformity + normbrake. Walk encoder is pure end-to-end
+trained: BCE only. Cliff truly doesn't exist by construction because
+nothing is decoupled. Cleaner — but no fallback.
+
+Start with Option α. Test Option β as an ablation if Option α works.
 
 ### Architecture
 
@@ -688,31 +722,120 @@ d_hidden = d_emb (matches embedding dimension; default 128)
 num_layers = 1
 bidirectional = False  (walks are chronological; bidirectional has
                        no inductive-bias justification)
+```
 
-Per-step input:
-  [E[walk_node_i],  Φ(t_seed - t_i),  edge_features_for_step]
+### Per-step input — depends on Step 5 outcome
 
-Where:
-  E[walk_node_i]        — locked embedding table (single E or
-                          E_target if dual-table per §13)
-  Φ(t_seed - t_i)       — Component 0's existing time encoder
-                          applied to Δt between seed and step i
-  edge_features_for_step — concatenated when dataset provides
-                          (wiki d=172, review d=1)
+**IF master locks single-table (Step 5 → Outcome A or B):**
 
-walk_repr[u] = mean_pool over K walks of GRU(per_step_input).last_h
+```
+step_input_i = concat([
+  E[walk_node_ids[i]],
+  Φ(t_seed - t_i),
+  edge_features[i]   # zeros for i == 0 (no incoming edge)
+])
+```
+
+Per-step lookup is unambiguous: every step reads `E[n_i]` regardless
+of position. Role asymmetry lives in `P_src` / `P_tgt` projections at
+the link MLP, not in the per-step lookup.
+
+**IF master locks dual-table (Step 5 → Outcome C):**
+
+```
+step_input_i = concat([
+  E_target[walk_node_ids[i]] if i == L-1 else E_context[walk_node_ids[i]],
+  Φ(t_seed - t_i),
+  edge_features[i]   # zeros for i == 0
+])
+```
+
+Per-step lookup is role-aware: the seed (i == L-1) reads `E_target`
+because the encoder output feeds the source-side slot of the link
+MLP. Walk-internal nodes (i < L-1) read `E_context` because they are
+destinations the seed historically connected to, and alignment loss
+has trained `E_context` to encode "destination role relative to a
+walker." Using `E_context` for walk-internal nodes leverages the
+semantics alignment already learned.
+
+### Per-step input components
+
+1. **`E[walk_node_i]`** — node embedding. Shared with locked-v2
+   architecture (no separate encoder embedding table). Sharing means
+   the encoder benefits from per-node semantics that alignment has
+   trained.
+
+2. **`Φ(t_seed - t_i)`** — time-delta encoding. Reuse Component 0's
+   existing time encoder applied to elapsed time since walk step. A
+   step 1 minute ago and a step 1 month ago produce different
+   representations even if they pass through the same node.
+   **Use `t_seed - t_i` (recency relative to seed)**, NOT
+   `t_i - t_{i-1}` (inter-step delta). The GRU implicitly learns
+   inter-step pacing from the sequence of Φ values.
+
+3. **`edge_features[i]`** — edge features for the step (if dataset
+   provides). Wiki d=172, review d=1. For `i == 0` there is no
+   incoming edge — pad with zeros. If dataset has no edge features,
+   omit this term entirely.
+
+### Chronological order
+
+Tempest returns walks in chronological order: oldest first, seed last.
+Seed at position `L-1`.
+
+```
+walk_node_ids   = [n_0, n_1, ..., n_{L-1}]    # n_{L-1} is the seed
+walk_timestamps = [t_0, t_1, ..., t_{L-1}]    # t_{L-1} == t_seed
+```
+
+The GRU processes left-to-right (oldest to newest). The last hidden
+state corresponds to position `L-1` and has "seen" the entire walk
+from the seed's perspective.
+
+### Walk representation
+
+```
+h_walk = GRU(per_step_inputs).last_hidden_state    # [d_hidden]
+
+For K walks per seed, mean-pool across walks:
+walk_repr[u] = mean_k(h_walk_k)
+```
 
 K defaults to 5 (matches alignment loss's num_walks_per_node).
+
+### Short-walk handling
+
+Tempest sometimes returns walks shorter than `max_walk_len` (early
+epochs, cold-start nodes, isolated seeds). Pad with zeros, **mask the
+padded positions** in the GRU forward pass via standard PyTorch
+sequence-packing — they don't contribute to the hidden state evolution.
+
+If a seed has zero historical neighbors (only itself in the walk),
+the GRU sees a single step and produces a representation based on
+`[E[seed], Φ(0), zeros]` alone. **Graceful fallback to locked-v2
+behavior** for cold-start nodes.
+
+### Link MLP input restructuring
+
+**Source-side input changes** from `P_src(E[u])` → `P_src(walk_repr[u])`.
+
+**Destination side unchanged:** `P_tgt(E[v])` (whichever locked table).
+
+**Component 0 unchanged:** `component_0(u, v, t)`.
+
+### Unit test for dual-table per-step lookup (REQUIRED if dual-table locked)
+
+```
+Construct a test walk with node_ids = [n_a, n_b, n_c] (seed = n_c).
+Verify the encoder reads:
+  - E_context[n_a]    (position 0, walk-internal)
+  - E_context[n_b]    (position 1, walk-internal)
+  - E_target[n_c]     (position 2, seed)
+In that order.
 ```
 
-**Link MLP source-side input changes:**
-
-```
-Before:  P_src(E[u])
-After:   P_src(walk_repr[u])
-```
-
-Destination side and Component 0 unchanged.
+This catches the most likely implementation bug (off-by-one on which
+position is the seed). Run **before** any training.
 
 ### Pipeline — training time
 
@@ -720,17 +843,14 @@ Destination side and Component 0 unchanged.
 for each batch:
   # Existing alignment walks (unchanged from locked-v2):
   walks = tempest.sample(seeds=unique(src ∪ tgt), K=5)
-  L_align, L_uniform = alignment_loss(walks)
-  L_normbrake = normbrake_loss(E)
+  L_align, L_uniform = alignment_loss(walks)        # if Option α
+  L_normbrake = normbrake_loss(E)                   # if Option α
 
   # NEW: filter walks to src-seeded subset for encoder input.
-  # On undirected graphs (wiki, review) the filter is valid since
-  # alignment seeds union(src, tgt); the link MLP only reads
-  # walk_repr in the source-side input, so only src walks needed.
   src_walks = walks_for_seeds(walks, unique(src))
   walk_repr_src = walk_encoder(src_walks)
 
-  # Link MLP forward:
+  # Link MLP forward — DIRECTIONAL, matches eval distribution:
   for each row (A, B, t):
     score_pos = link_mlp(P_src(walk_repr_src[A]),
                          P_tgt(E[B]),
@@ -744,13 +864,9 @@ for each batch:
   L_total = L_align + L_uniform + L_normbrake + λ_link · L_link
 ```
 
-Note: **the walk encoder is trained ONLY by BCE backprop** (the
-λ_link path). The alignment loss does NOT supervise the encoder
-directly — alignment supervises the embedding tables E, which the
-encoder reads as inputs. This is decoupled supervision for the
-encoder vs jointly-trained-with-BCE — different regime from the §4.8.1
-λ_link experiment (which couples alignment ↔ BCE via embedding
-tables).
+**NO bidirectional BCE** — only `score(A, B)` per batch row, never
+`score(B, A)`. The link MLP is structurally directional and matches
+eval.
 
 ### Pipeline — scoring time
 
@@ -767,90 +883,114 @@ for each scoring row (u, candidates, t):
 
 ### Walk caching at scoring time
 
-Cache `walks_u` keyed by `(u, t_bucket)` to amortize across same-u
-test rows. Wiki test averages ~2.5 positives per node; review ~2.
-Caching halves scoring-time walk-sampling cost.
+Cache `walks_u` keyed by `(u, t_bucket)`. Wiki test averages ~2.5
+positives per node; review ~2. Caching halves scoring-time walk cost.
 
-`t_bucket` granularity:
-- Too coarse (1 day) → state at different t's within bucket differs,
-  breaks strict-causal.
-- Too fine (1 sec) → no hits, defeats purpose.
-
-**Initial:** `t_bucket = t` (exact match). Verify hit-rate counter.
-If < 5%, increase to nearest 100-second window AND re-verify strict-
-causal (walks within a bucket must use only edges with timestamp <
-bucket_start).
+- **Initial:** `t_bucket = t` (exact match). Verify hit-rate counter.
+- **If hit-rate < 5%:** increase to nearest 100-second window. **Re-verify strict-causal:** walks within a bucket must use only edges with timestamp < bucket_start.
 
 ### Directed-graph guard
 
 ```
 if config.is_directed:
   alignment_walks = tempest.sample(seeds=unique(src), K=5)
-  src_walks = alignment_walks  # no filter needed (already src-only)
+  src_walks = alignment_walks  # already src-only
 else:
   alignment_walks = tempest.sample(seeds=unique(src ∪ tgt), K=5)
   src_walks = walks_for_seeds(alignment_walks, unique(src))
 ```
 
+### Gradient-health verification
+
+Add to `--log-debug` per-epoch output:
+
+```
+grad_walk_encoder_gru      = ||walk_encoder.gru.weight_ih_l0.grad||
+grad_walk_encoder_proj_src = ||P_src.weight.grad||
+grad_embedding_E           = ||E.weight.grad||
+```
+
+Healthy training shows ALL THREE non-trivial (>1e-4) throughout. If
+`grad_walk_encoder_gru` is near zero, BCE isn't reaching the encoder.
+Likely cause: a `.detach()` call somewhere in the encoder forward
+breaking the autograd graph. Debug before declaring the encoder
+broken.
+
 ### Initial experiment cells
 
 Three cells on wiki, seed 42, 50 epochs, no early-stop, `--log-debug`.
 
-| Cell | Walk encoder | K | Purpose |
-|---|---|---|---|
-| W_off | disabled | — | control = locked-v2 baseline reproduction |
-| W_gru | enabled, d_hidden=128 | 5 | does source walk encoder lift MRR? |
-| W_gru_k1 | enabled, d_hidden=128 | 1 | does K=1 suffice (halves scoring cost)? |
+| Cell | Walk encoder | K | Loss family | Purpose |
+|---|---|---|---|---|
+| `W_off` | disabled | — | locked-v2 (Option α) | control = locked-v2 baseline reproduction |
+| `W_gru` | enabled, d=128 | 5 | Option α (align+uniform+nb on) | does source walk encoder lift MRR? |
+| `W_gru_k1` | enabled, d=128 | 1 | Option α | does K=1 suffice (halves scoring cost)? |
 
-Wall time: ~1 hr each on wiki.
+`W_off` must reproduce locked-v2's corresponding cell within CUDA
+noise — **if not, branch has an integration bug; fix BEFORE launching
+W_gru**.
+
+Wall time: ~1 hr each on wiki at K=5 (encoder adds modest training
+cost; scoring time grows from ~50s → ~5–10 min per pass due to
+per-source walk sampling at eval).
 
 ### Pre-registered prediction (2026-05-20, before Stage 4 lands)
 
-Best-guess outcome based on Lessons 2 (walks-only baseline plateaued
-0.011), 14 (direct recurrence is biggest unpulled lever, +0.05 test
-MRR), and 16 (memory module margin small once recurrence captured):
+Best-guess outcome based on Lessons 2 (walks-only plateaued 0.011),
+14 (direct recurrence is biggest unpulled lever, +0.05 test MRR),
+16 (memory module margin small once recurrence captured):
 
 - **50% Scenario B** (W_gru ties W_off within anchor std): Component 0 + alignment + normbrake + WD already capture most temporal signal on wiki. Walks add marginal value.
-- **30% Scenario A** (W_gru wins by > 0.005): walk encoder provides new signal — pooled neighborhood + edge-feature trajectory beats static E[u]. Plausible because Component 0 only sees u/v's Δt scalars; walks see the actual neighborhood structure.
-- **15% Scenario C** (W_gru loses by > 0.005): training instability or encoder bug. Run 100-ep smoke check before declaring broken.
-- **5% Scenario D** (W_gru_k1 matches W_gru): K=1 suffices. Lock K=1 for scoring efficiency.
+- **30% Scenario A** (W_gru wins by > 0.005): walk encoder provides new signal — pooled neighborhood + edge-feature trajectory beats static E[u]. Plausible because Component 0 only sees u/v Δt scalars; walks see actual neighborhood structure.
+- **15% Scenario C** (W_gru loses by > 0.005): training instability or encoder bug. Investigate.
+- **5% Scenario D** (W_gru_k1 matches W_gru): K=1 suffices.
 
-**Bigger-picture prediction:** the wiki gap to leaderboard
-(0.7105 honest vs 0.798 DyGFormer) is partly leak-inflated and partly
-real-signal. Walk encoder might recover ~0.02–0.05 of the honest gap.
-Review's leaderboard gap (0.31 honest vs 0.52 GraphMixer) is wider,
-so walk encoder likely helps MORE on review.
+**Bigger picture:** wiki gap to leaderboard (0.7105 honest vs 0.798 DyGFormer) is partly leak-inflated and partly real signal. Walk encoder might recover ~0.02–0.05 of the honest gap. Review's gap (0.31 honest vs 0.52 GraphMixer) is wider — walk encoder likely helps MORE on review.
 
 ### Decision rules
 
-**A** — W_gru beats W_off by > 0.005: source walk encoder works. Multi-seed validate (7, 13). If multi-seed mean > anchor std above W_off, lock walk-encoder-on as production.
+**A** — W_gru beats W_off by > 0.005: works. Multi-seed validate (7, 13). If multi-seed mean > anchor std above W_off, lock walk-encoder-on. Run Option β ablation next.
 
-**B** — W_gru ties W_off within anchor std: walk encoder doesn't help on wiki. Either Component 0 carries the signal already, or wiki's recurrence-saturated structure means walks add nothing. Test on review before final verdict.
+**B** — W_gru ties W_off within anchor std: doesn't help wiki. Either Component 0 carries the signal, or wiki's recurrence saturation makes walks redundant. Test on review before final verdict.
 
-**C** — W_gru loses by > 0.005: investigate. Likely cause: encoder GRU not converged in 50 epochs, or per-step input has a bug. Run 100 epochs as smoke check before declaring broken.
+**C** — W_gru loses by > 0.005: investigate. **Three causes to rule out before declaring broken:**
+1. Encoder GRU not converged in 50 epochs (run 100-ep smoke).
+2. Per-step input construction has a bug (verify with unit test).
+3. Gradient not reaching encoder (verify grad-health logging).
 
-**D** — W_gru_k1 matches W_gru: K=1 suffices. Lock K=1.
+**D** — W_gru_k1 matches W_gru: K=1 suffices. Lock K=1 for scoring efficiency.
 
 ### Cliff-shape comparison
 
-The walk encoder is jointly trained with link BCE. It should NOT
-exhibit the alignment-loss cliff (decoupled supervision was that
-cliff's cause).
+The walk encoder is jointly trained with link BCE. **Expectation: NO cliff** (decoupled supervision was the cliff's cause; encoder eliminates that decoupling).
 
-- If W_gru cliffs anyway → deeper cause than locked-v2 diagnosed. Document prominently.
-- If W_gru is cliff-free AND beats W_off → paper claim becomes "walk encoder joint training eliminates cliff by construction AND lifts ceiling."
+- If W_gru cliffs anyway → cliff has a deeper cause than locked-v2 diagnosed. **Substantial finding** — would change the paper's central claim.
+- If W_gru is cliff-free AND beats W_off → paper claim becomes "walk encoder joint training eliminates the cliff BY CONSTRUCTION AND lifts the ceiling."
+
+### Option β ablation (CONDITIONAL on W_gru winning)
+
+If W_gru beats W_off in initial cells, run one more cell:
+
+| Cell | Walk encoder | K | Loss family |
+|---|---|---|---|
+| `W_gru_beta` | enabled, d=128 | 5 | Option β (align+uniform+nb OFF; λ_link=1.0; BCE only) |
+
+Outcomes:
+- **β matches α** → drop alignment+uniformity from production, cleaner architecture. Paper claim: "Joint BCE-through-encoder training eliminates the need for separate embedding supervision."
+- **β loses to α** → alignment-as-regularization composes usefully with walk encoder. Production keeps Option α.
+- **β beats α** → drop alignment+uniformity, cleaner AND better. Best outcome.
 
 ### Cross-dataset follow-up
 
-If W_gru beats W_off on wiki, run the same cell on review (single
-seed, abbreviated 6-ep sampled-eval per Stage 4 review config).
+If W_gru beats W_off on wiki, run on review (single seed, abbreviated
+6-ep sampled-eval per Stage 4 review config).
 
-- If review shows >0.05 improvement: destination-side walks become worth revisiting.
-- If review shows marginal improvement: source-walks-only is sufficient; defer destination-side.
+- **> 0.05 improvement** → destination-side walks (symmetric 1a) becomes worth revisiting.
+- **Marginal** → source-walks-only sufficient; defer destination side.
 
 ### Lock procedure
 
-After W_gru cells + multi-seed + cross-dataset validation:
+After W_gru cells + multi-seed + Option β ablation + cross-dataset validation:
 
 1. Update v2.4 §14 (or v2.5 §1) with final decision + reasoning.
 2. **Winner:** merge `experiment/add-source-walk-embedding` to master after full verification (Gates A + B re-run).

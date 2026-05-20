@@ -398,33 +398,83 @@ git checkout locked-v2
 git checkout -b experiment/add-source-walk-embedding
 ```
 
-Full architecture, pipeline (training + scoring), caching strategy,
-directed-graph guard, experiment cells, decision rules, cliff-shape
-comparison, cross-dataset follow-up, and pre-registered prediction
-are in **v2.4 §14** ([walk_distribution_matching_embedding_v2.4_skeleton.md](walk_distribution_matching_embedding_v2.4_skeleton.md)).
+Full spec is in **v2.4 §14**
+([walk_distribution_matching_embedding_v2.4_skeleton.md](walk_distribution_matching_embedding_v2.4_skeleton.md)).
+Summary below.
 
-**Cells (3, on wiki, seed 42, 50 ep, no early-stop, --log-debug):**
-- `W_off` — control (locked-v2 baseline reproduction)
-- `W_gru` — encoder enabled, K=5 (main hypothesis test)
-- `W_gru_k1` — encoder enabled, K=1 (sensitivity test)
+### Gradient flow — eliminates cliff BY CONSTRUCTION
 
-**Decision summary:**
-- A — W_gru beats W_off > 0.005 → multi-seed; if confirmed, lock walk encoder on.
-- B — W_gru ties W_off → encoder doesn't help wiki; test on review.
-- C — W_gru loses > 0.005 → investigate; run 100-ep smoke before declaring broken.
-- D — W_gru_k1 matches W_gru → lock K=1 for scoring efficiency.
+PyTorch autograd connects link MLP → walk encoder → embedding table
+via the BCE compute graph. The encoder cannot drift away from what
+the link MLP needs because they share the loss. Compare to locked-v2:
+E trained by alignment+uniformity, link MLP trained by BCE — two
+**decoupled** paths, hence the -0.28 baseline cliff (Lesson 17).
 
-**Cliff-shape bonus:** walk encoder is BCE-trained, not contrastive-
-trained — it should NOT cliff. If it does, deeper failure mode.
+### Option α (default) vs Option β
 
-**Cross-dataset follow-up:** if W_gru wins on wiki, run on review.
-- > 0.05 improvement → destination-side walks become worth revisiting.
-- Marginal → source-walks-only is sufficient; defer destination side.
+- **Option α** (initial cells): keep alignment + uniformity + normbrake on E. Walk encoder adds joint BCE supervision. Two gradient sources on E (structural + task). Supervision fallback if encoder fails.
+- **Option β** (conditional ablation): drop alignment + uniformity + normbrake. Walk encoder is pure end-to-end-trained on BCE. Cliff truly doesn't exist by construction.
 
-**Lock procedure (Step 7.5):** if walk encoder wins, merge to master,
-re-run Gates A + B, update `config_locked_v1.yaml`, tag
-`git tag locked-v3 -m "source walk encoder locked"`. If loses/ties,
-leave branch in place; master stays at `locked-v2`.
+Start with α. Test β if α works.
+
+### Per-step input — depends on Step 5 outcome
+
+- **If single-table locked (Step 5 → A/B):** every step reads `E[n_i]`. Asymmetry in P_src/P_tgt only.
+- **If dual-table locked (Step 5 → C):** seed (i==L-1) reads `E_target`; walk-internal (i<L-1) reads `E_context`. **Unit-test the lookup BEFORE training** — off-by-one is the most likely bug.
+
+### Cells (3 initial + 1 conditional)
+
+| Cell | Walk encoder | K | Loss family | Purpose |
+|---|---|---|---|---|
+| `W_off` | disabled | — | locked-v2 | control reproduction |
+| `W_gru` | enabled | 5 | Option α | main hypothesis |
+| `W_gru_k1` | enabled | 1 | Option α | sensitivity (K=1 halves scoring cost) |
+| `W_gru_beta` | enabled | 5 | Option β | CONDITIONAL on W_gru winning |
+
+`W_off` must reproduce locked-v2 within CUDA noise. If not, branch
+has integration bug — fix BEFORE W_gru.
+
+### Decision summary
+
+- **A** W_gru beats W_off > 0.005 → multi-seed; lock walk-encoder-on; run W_gru_beta.
+- **B** W_gru ties → test on review before final verdict.
+- **C** W_gru loses > 0.005 → investigate. **Rule out 3 causes first:** (1) GRU not converged (run 100 ep), (2) per-step input bug (run unit test), (3) gradient not reaching encoder (check `grad_walk_encoder_gru` in --log-debug).
+- **D** W_gru_k1 matches W_gru → lock K=1.
+
+### Gradient-health checks in --log-debug
+
+```
+grad_walk_encoder_gru, grad_walk_encoder_proj_src, grad_embedding_E
+```
+
+All three must be non-trivial (>1e-4) throughout training. Near-zero
+encoder grad = `.detach()` bug in encoder forward.
+
+### Cliff-shape expectation
+
+Walk encoder is BCE-trained, not contrastive-decoupled. Expectation:
+NO cliff. If it cliffs, deeper failure mode — substantial finding,
+would change paper's central claim.
+
+### Cross-dataset follow-up
+
+If W_gru wins on wiki, run on review.
+- > 0.05 improvement → destination-side walks (1a symmetric) worth revisiting.
+- Marginal → source-walks-only sufficient.
+
+### Step 7.5 — Lock procedure
+
+If walk encoder wins (W_gru + multi-seed + Option β + cross-dataset
+all support it):
+
+1. Update v2.4 §14 (or v2.5 §1) with final decision.
+2. Merge `experiment/add-source-walk-embedding` to master.
+3. Re-run Gates A + B (anchor + locked-config wiki).
+4. Update `config_locked_v1.yaml`.
+5. **Tag:** `git tag locked-v3 -m "source walk encoder locked"`.
+
+If loses/ties: leave branch as paper-reproducibility artifact. Master
+stays at `locked-v2`.
 
 **DO NOT proceed to further architecture work** (destination-side
 walks, memory module, Hawkes head) until source walk encoder
