@@ -446,6 +446,138 @@ the recurrence horizon is much longer than K_history (e.g., monthly
 patterns vs daily wiki edits). On wiki, K_history=32 already covers
 ~the same time window as memory's running state.
 
+### Lesson 17 — Alignment+uniformity has a 50-epoch over-training cliff
+
+Run alignment+uniformity for 50 epochs on wiki and val MRR drops
+**0.7448 → 0.4625** (peak at ep 2, declining monotonically thereafter).
+The mechanism is diagnosed precisely:
+
+- `col_norm(E_target)` grows 2.08 → 10.76 (5.2× in 50 epochs) — monotonic
+  embedding-magnitude runaway under the alignment pull.
+- `grad_E_context` collapses 0.005 → 0.0001 by ep 7 — alignment loss
+  saturates on the context side almost immediately. Adam's accumulated
+  momentum keeps moving E_context anyway via stale state.
+- Link MLP weights grow 0.28 → 2.02 (7×) tracking the embedding
+  growth — the link decoder rescales itself to fit the drifting
+  geometry.
+- The link MLP then "locks onto" a geometry that doesn't generalize,
+  hence the cliff.
+
+The cliff is fundamental to the loss family, not a wiki artifact: review
+shows the same cliff with faster onset (ep 3–4 vs ep 5–10 on wiki) and
+faster col-norm growth. Whatever fixes it on wiki should fix it on
+review too.
+
+### Lesson 18 — Normbrake (per-column L2 hinge) halves the cliff
+
+A per-column L2 hinge above a calibrated threshold —
+`L_normbrake = λ · Σ_c relu(||col_c||₂ - threshold)²` — directly addresses
+the col-norm runaway. With λ=0.1 and threshold=3.87 (calibrated to
+1.5× early-epoch col_norm), the cliff drops from -0.28 → **-0.11** val
+MRR by ep 50.
+
+The clamp is clean: col_norm freezes at the threshold (3.91 actual vs
+3.87 target) from ~ep 12 onward, and `grad_E_target` stays HEALTHY
+(0.092 vs baseline 0.012, 8× better). Peak val MRR is unchanged
+(0.7448 → 0.7464).
+
+But normbrake does NOT close the cliff — residual -0.11 drop remains.
+Diagnosed cause: link_w_norm continues to grow (0.28 → 1.83) even with
+embeddings clamped. The link MLP "outflanks" the embedding clamp by
+absorbing the magnitude growth itself. The secondary fix
+(`weight_decay_link`) is being tested in Stage 3 of v2.4.
+
+Calibration rule: threshold = 1.5× measured col_norm at ep 1–2 (after
+the first non-trivial pass). Wiki: 3.87. Review: ~31.32 (16× larger
+embedding range due to larger N).
+
+### Lesson 19 — Joint training (λ_link > 0) collapses contrastive walk-supervision
+
+Letting link BCE backprop into the embedding tables (joint training,
+λ_link > 0) **immediately collapses val MRR** across all contrastive
+loss families tested: InfoNCE, alignment+uniformity. At λ_link=0.1 on
+wiki, val MRR drops 0.7432 → 0.5109 by ep 2 (drop of 0.23 in one
+epoch).
+
+**Mechanism:** historical negatives in BCE fight alignment supervision
+directly. Alignment pulls `target(u) ↔ context(v)` together for every
+`v` in u's walk history (= the reservoir of past destinations). BCE on
+the same hist-negative pair `(u, v_hist)` pushes them apart. The two
+gradients act on the **same embedding pairs in opposite directions**.
+
+This is loss-family-universal: InfoNCE λ_link sweep showed the same
+collapse pattern, as did alignment. The Stage 4 hist_neg_ratio × λ_link
+sweep tests the hypothesis directly: if joint training with
+`hist_neg_ratio=0` (pure random negs) doesn't collapse, the destructive
+interference is exactly that. If it still collapses, there's a deeper
+incompatibility (v2.5 follow-up).
+
+**Default for v2.4 production:** λ_link=0 (decoupled training) unless
+Stage 4 reveals a recoverable joint-training regime.
+
+### Lesson 20 — Triplet wins wiki, loses review (cross-dataset robustness)
+
+Wiki §4.7 loss sweep: Triplet at multi-seed (42, 7, 13) gives
+**0.7105 ± 0.0014 test MRR** with no cliff — best single-dataset
+performer. SGNS+normbrake ties at 0.7113. Alignment+uniformity (anchor)
+sits at 0.7079 ± 0.0005.
+
+Cross-dataset review sweep: Triplet **decisively loses** (val ~0.16 vs
+alignment ~0.31). Same hyperparams that worked on wiki produce a 2×
+gap. SGNS also lost on review.
+
+**Conclusion:** alignment+uniformity is the cross-dataset-robust choice.
+The user-imposed decision rule (within ±0.01 wiki, prefer the
+cross-dataset winner) makes alignment the locked production loss. Triplet
+and SGNS stay in the codebase as PORT-FLAG paper-ablation paths.
+
+### Lesson 21 — Architectural fixes (dropout, depth) don't fix the cliff
+
+Stage 2 ran 6 cells × 50 ep on wiki testing dropout/depth combinations
+against alignment+uniformity's cliff. Final ranking (smaller val drop
+is better):
+
+| Cell | Val drop (peak → ep 50) |
+|---|---|
+| normbrake λ=0.1 | **-0.11** |
+| nb + n=5 + link_dr=0.3 + emb_dr=0.3 (kitchen sink) | -0.12 |
+| link MLP dropout 0.3 | -0.19 |
+| deeper MLP (n_layers=5) | -0.23 |
+| embedding dropout 0.3 | -0.27 |
+| baseline (no fix) | -0.28 |
+
+**Findings:**
+- Normbrake is the only fix that meaningfully helps.
+- Link MLP dropout barely helps (regularizes head but not embedding
+  magnitude — the upstream cause).
+- Embedding dropout HURTS (noise on inputs makes the cliff sharper).
+- Deeper MLP HURTS (more capacity → faster overfit to drifting
+  embeddings). Reaffirms Lesson 15.
+- Kitchen sink DILUTES — adds noise without improving over nb alone.
+
+The cliff is a regularization problem (constrain magnitudes), not a
+capacity problem (more/fewer layers, dropout).
+
+### Lesson 22 — Adam constructor changes induce CUDA non-determinism drift
+
+Stage 3 L0 vs Stage 2 A_long_nb were intended to be bit-identical
+controls (same seed, same hyperparams, same code path). The only
+intentional difference was a `weight_decay=0.0` argument added to the
+`Adam(link_params, ...)` constructor (preparation for the
+`weight_decay_link` knob). Result: mechanism preserved bit-tight
+(col_norm, L_normbrake, gradients all match within 0.001 per epoch),
+but val MRR drifted **-0.030 by ep 50**.
+
+Likely cause: passing `weight_decay=0` triggers different internal CUDA
+kernel selection in `torch.optim.Adam` than the default-omitted case,
+which has different floating-point ordering and accumulates drift via
+non-deterministic atomic adds in the link MLP forward.
+
+**Implication for the port:** "no-op-looking" constructor changes can
+move 50-epoch val MRR by 0.03. The anchor validation gate uses
+±0.005 — well below this drift level. Be SUSPICIOUS of drift > 0.005;
+"that's CUDA noise" is not always true.
+
 ---
 
 ## Results (tgbl-wiki, 50 epochs, B=200, K=5, L=20, d=128 unless noted)

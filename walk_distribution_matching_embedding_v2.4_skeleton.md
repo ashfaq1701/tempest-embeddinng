@@ -174,6 +174,144 @@ Launched 2026-05-20 07:05. 6 cells, 50 epochs each, no early-stop, --log-debug:
 
 ETA ~13:30. Goal: identify configuration that prevents the 50-epoch cliff (val MRR drop from ~0.71 to ~0.43).
 
+### Stage 2 results (as cells complete)
+
+**Cell A_long_baseline DONE (ep 50 reached):**
+
+| Epoch | val MRR | test MRR | col_norm | link_w_norm | grad_E_target | grad_E_context |
+|---|---|---|---|---|---|---|
+| 1 | 0.7434 | 0.7062 | 2.08 | 0.28 | 0.279 | 0.0050 |
+| 2 (peak) | **0.7448** | **0.7071** | 2.58 | 0.36 | 0.260 | 0.0018 |
+| 10 | 0.7033 | 0.6696 | 4.47 | 0.79 | 0.061 | 0.0004 |
+| 20 | 0.5952 | 0.5349 | 6.51 | 1.13 | 0.028 | 0.0002 |
+| 30 | 0.5419 | 0.4847 | 8.21 | 1.43 | 0.019 | 0.0001 |
+| 50 | **0.4625** | **0.4055** | **10.76** | **2.02** | 0.012 | 0.0001 |
+
+Cliff reproduces exactly. Drop 0.28 val / 0.30 test from peak.
+
+**Cell A_long_nb DONE (ep 50 reached):**
+
+| Epoch | val MRR | test MRR | col_norm | link_w_norm | grad_E_target | grad_E_context | L_normbrake |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.7450 | 0.7082 | 2.08 | 0.28 | 0.278 | 0.0051 | 0.000 |
+| 2 (peak) | **0.7464** | **0.7102** | 2.58 | 0.35 | 0.260 | 0.0019 | 0.000 |
+| 7 (nb active) | 0.7299 | 0.6936 | 3.60 | 0.65 | 0.071 | 0.0007 | 0.0003 |
+| 12 (nb saturates) | 0.7062 | 0.6598 | **3.90 (clamped)** | 0.85 | 0.093 | 0.0003 | 0.0046 |
+| 20 | 0.6509 | 0.6005 | 3.91 | 1.13 | 0.091 | 0.0002 | 0.0050 |
+| 30 | 0.6138 | 0.5687 | 3.91 | 1.41 | 0.092 | 0.0001 | 0.0053 |
+| 50 | **0.6368** | **0.5943** | **3.91 (frozen)** | **1.83** | 0.092 | 0.0000 | 0.0054 |
+
+**Normbrake works EXACTLY as designed:** col_norm clamps at 3.91 (target 3.87) from ep 12 onward; E_target gradient stays HEALTHY (0.092 vs baseline 0.012 — 8× better); cliff drop halved (-0.11 val vs -0.28 baseline).
+
+**But residual cliff still present.** link_w_norm continues runaway (0.28 → 1.83, 6.5×) since no regularizer on link MLP. E_context gradient collapses identically to baseline (0.005 → 0.0001 by ep 8). Val MRR plateaus at ~0.62 instead of recovering.
+
+**Stage 2 ranking (all 6 cells done):**
+
+| Cell | Peak val | Final val (ep 50) | Val drop | col_norm 50ep | link_w_norm 50ep | Verdict |
+|---|---|---|---|---|---|---|
+| **A_long_nb** (normbrake λ=0.1) | **0.7464** | **0.6368** | **-0.110** | **3.91 (clamped)** | 1.83 | **CLEAN WINNER** |
+| A_long_full (nb + n=5 + dr=0.3 + ed=0.3) | 0.7451 | 0.6262 | -0.119 | 3.91 (clamped) | 1.66 | dilutes (extra knobs add noise) |
+| A_long_dr0.3 (link MLP dropout 0.3) | 0.7451 | 0.5582 | -0.187 | 10.75 | 1.86 | marginal |
+| A_long_d5 (n_layers=5) | 0.7446 | 0.5165 | -0.228 | 10.76 | 2.03 | hurts (capacity scaling) |
+| A_long_ed0.3 (embedding dropout 0.3) | 0.7449 | 0.4718 | -0.273 | 10.76 | 1.96 | barely helps |
+| A_long_baseline | 0.7448 | 0.4625 | -0.282 | 10.76 | 2.02 | the cliff |
+
+### Mechanism summary
+
+1. **Embedding magnitude runaway is the PRIMARY cliff driver.** Normbrake (which directly addresses this) halves the drop. Nothing else comes close.
+2. **Link MLP weight runaway is the SECONDARY driver.** Even with col_norm clamped to 3.91 by normbrake, link_w_norm grows 6.5× (0.28 → 1.83), driving the residual -0.11 drop.
+3. **E_context gradient collapses universally** (0.005 → 0.0001 by ep 7) across ALL fixes. Adam's accumulated momentum keeps moving E_context, even with vanishing per-batch gradients.
+4. **Deeper MLP and embedding dropout HURT.** More capacity (n=5) or more noise on inputs (ed=0.3) accelerates overfit to drifting embeddings.
+5. **Link MLP dropout barely helps** (-0.19 vs -0.28 baseline). Dropout on activations is too weak to constrain the underlying weight runaway.
+
+### Next experiment (post-Stage 2)
+
+To close the residual -0.11 cliff, two candidates:
+
+1. **Joint training (λ_link > 0):** alignment+normbrake's E_context gradient collapses 0.005 → 0.0001 by ep 7 even though Adam keeps moving it via momentum. Joint training gives E_context a SECOND gradient source from link BCE that doesn't saturate the same way alignment does. InfoNCE+λ_link failed (§4.8.1) but alignment's gradient geometry is more compatible with BCE (both pull target·context up for related pairs), so the hypothesis is loss-specific not universal.
+2. **Link MLP weight_decay:** the SECONDARY runaway. link_w_norm grows 0.28 → 1.83 (6.5×) even with embeddings clamped. Adding `weight_decay` to `link_optimizer` directly constrains this. Complementary to (1), not redundant — (1) targets E_context grad collapse; (2) targets link MLP runaway.
+
+## 9. §4.8.4 Stage 3 — λ_link + weight_decay_link sweep (in progress)
+
+Launched 2026-05-20 12:47. 6 cells × ~55 min = ~5.5 hr; ETA ~18:15.
+
+All cells: alignment + normbrake (λ=0.1, threshold=3.87), 50 ep, patience=999, --log-debug, seed 42.
+
+| Cell | λ_link | wd_link | Hypothesis |
+|---|---|---|---|
+| L0 | 0.0 | 0 | control (must reproduce A_long_nb) |
+| L0.1 | 0.1 | 0 | gentle joint training |
+| L0.3 | 0.3 | 0 | stronger joint training |
+| L1.0 | 1.0 | 0 | full joint training |
+| WD1e-4 | 0 | 1e-4 | gentle L2 on link MLP |
+| WD1e-3 | 0 | 1e-3 | stronger L2 on link MLP |
+
+Decision rule (per user 2026-05-20):
+- If any cell holds val MRR within 0.05 of peak through ep 50 with drop < 0.05 → lock as production architecture, multi-seed validate.
+- If all λ_link > 0 cells worsen → "joint training universally hurts contrastive walks-supervision" is the negative result. Lock λ_link=0.
+- If λ_link helps E_context grad (>0.0005 past ep 7) but doesn't close cliff → deeper failure mode; flag for v2.5.
+- Mixed results: pick by cleanest val MRR plateau quality.
+
+### Stage 3 partial results (Cell L0 + L0.1 ep 1-4 only)
+
+**L0 (control, λ_link=0, wd=0) FINAL:**
+- best val 0.7446 (ep 4), final val 0.6064 (ep 50)
+- Reproduces A_long_nb's MECHANISM bit-tight (col_norm, L_normbrake, gradients all match within 0.001), but val MRR drifts -0.030 by ep 50 due to CUDA non-determinism after the Adam constructor change. Cliff shape preserved.
+
+**L0.1 (joint training, λ_link=0.1) EARLY EPOCHS (ep 1-4):**
+
+| Epoch | L0 (control) val | L0.1 val | Δ |
+|---|---|---|---|
+| 1 | 0.7425 | **0.6710** | **-0.072** |
+| 2 | 0.7432 | **0.5109** | **-0.232** |
+| 3 | 0.7429 | 0.5576 | -0.185 |
+| 4 | 0.7446 | 0.5649 | -0.180 |
+
+**Immediate collapse.** Joint training drops val MRR by 0.23 at ep 2. Worse than InfoNCE+λ_link did. The user's prediction (alignment+BCE composes better than InfoNCE+BCE) is **falsified by the data**.
+
+### §4.8.5 Mechanism diagnosis — destructive interference from historical negatives
+
+**Hypothesis:** Joint training (λ_link > 0) directly contradicts walk-supervision because of historical negatives in BCE:
+- Alignment loss pulls `target(u) ↔ context(v)` together for every `v` in u's walk history.
+- The training reservoir holds u's past destinations (TGB-style historical negs, hist_neg_ratio=0.5 default).
+- BCE on historical negative `(u, v_hist)` pushes `target(u)` AWAY from `context(v_hist)` — but `v_hist` IS in u's walk history (it's a past destination).
+- The two gradient signals fight each other directly at the same embedding pairs.
+
+This explains why ALL contrastive walk-supervision losses (InfoNCE, alignment, expected SGNS) fail under joint training: the universal destructive interference is mediated by historical negatives, not by loss-family geometry.
+
+**Testable prediction:** With `hist_neg_ratio = 0` (pure random training negatives), joint training should NOT collapse — random negatives are unlikely to be in u's walk history, so no destructive interference.
+
+This motivates the Stage 4 sweep below.
+
+## 10. §4.8.6 Stage 4 — hist_neg_ratio sweep (planned)
+
+**Will launch:** after Stage 3 completes (~18:15).
+
+**Design:** 2×4 grid testing interaction between joint training and historical negative ratio.
+
+| Cell | λ_link | hist_neg_ratio | Hypothesis |
+|---|---|---|---|
+| D_hnr0 | 0 | 0.00 | decoupled + pure random negs (training distribution mismatch test) |
+| D_hnr0.25 | 0 | 0.25 | decoupled + light hist mix |
+| D_hnr0.5 | 0 | 0.50 | decoupled + default mix (= A_long_nb / L0 reference) |
+| D_hnr0.75 | 0 | 0.75 | decoupled + heavy hist mix |
+| J_hnr0 | 0.1 | 0.00 | **critical test:** joint training with NO destructive interference |
+| J_hnr0.25 | 0.1 | 0.25 | mild interference |
+| J_hnr0.5 | 0.1 | 0.50 | full interference (= L0.1 reference) |
+| J_hnr0.75 | 0.1 | 0.75 | maximum interference |
+
+All cells: alignment + normbrake (λ=0.1, threshold=3.87), 50 ep, patience=999, seed 42, --log-debug.
+
+Wall time: 8 cells × ~55 min = ~7.5 hr. Overnight-feasible.
+
+**Decision rules:**
+1. **Hypothesis confirmed** (J_hnr0 holds val MRR within 0.05 of peak through ep 50, J_hnr>0 collapses progressively): the architecture spec changes substantially.
+   - Lock alignment + normbrake + λ_link=0.1 + hist_neg_ratio=0 if J_hnr0 also closes the residual cliff.
+   - If J_hnr0 doesn't close cliff but doesn't collapse either, the question becomes which is better: D_hnr0.5 (decoupled, eval-aligned distribution) or J_hnr0 (joint, distribution-mismatched).
+2. **Hypothesis falsified** (J_hnr0 also collapses): destructive interference is NOT from historical negatives — it's from BCE on positive edges fighting alignment in some other way. Deeper failure mode; v2.5 follow-up.
+3. **Decoupled column shows minimum at hnr=0.5** (the current default): confirms TGB eval distribution match is the right default and no further tuning needed on that axis.
+4. **Decoupled column shows hnr=0 or hnr=0.75 wins**: revise the hist_neg_ratio default. This is the secondary finding regardless of joint training.
+
 ### 7.4 Cross-dataset cliff diagnosis
 
 The alignment+uniformity cliff manifests on BOTH datasets but with different timing:
@@ -201,3 +339,17 @@ To be filled in.
 ## 10. Open issues + future work
 
 To be filled in.
+
+## 11. Post-lock transition (gated by Stage 4 + multi-seed validation)
+
+Once Stage 4 + multi-seed lands and the final architecture is locked,
+**do NOT start architecture-sweep work directly on this branch.** Instead
+execute the 5-step transition in [post_lock_transition_plan.md](post_lock_transition_plan.md):
+
+1. Clone `tempest-walk-embedding-new` → `tempest-walk-embedding-intermediate` (frozen experimental record).
+2. Reset `tempest-walk-embedding-new` to master (clean v3 baseline).
+3. Write `port_plan.md` classifying every file as PORT-DEFAULT / PORT-FLAG / SKIP. **Pause for review before porting.**
+4. Execute port as small reviewable commits; verify anchor reproduces 0.7070 ± 0.0016.
+5. Archive intermediate.
+
+**Gate to architecture-sweep work:** anchor validation on new master passes within ±0.005.
