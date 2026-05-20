@@ -15,8 +15,10 @@
 # Also samples the decoupled column to check the existing hist_neg_ratio=0.5
 # default isn't accidentally suboptimal.
 #
-# All cells: alignment + normbrake (λ=0.1, threshold=3.87), 50 ep,
-# patience=999, --log-debug, seed 42.
+# All cells: alignment + normbrake (λ=0.1, threshold=3.87) +
+# weight_decay_link=1e-4 (Stage 3 BREAKTHROUGH — closes residual cliff;
+# val drop -0.014 vs nb-only -0.11). This is the locked production base.
+# 50 ep, patience=999, --log-debug, seed 42.
 set -e
 TS=$(date +%Y%m%d_%H%M%S)
 mkdir -p runs
@@ -24,7 +26,7 @@ mkdir -p runs
 summary="runs/stage4_${TS}_SUMMARY.log"
 {
 echo "=== Stage 4 hist_neg_ratio × λ_link sweep — ts=${TS} ==="
-echo "  base: alignment + normbrake λ=0.1 threshold=3.87"
+echo "  base: alignment + normbrake λ=0.1 threshold=3.87 + WD_link=1e-4"
 echo "  num_epochs=50  early-stop disabled  --log-debug  seed=42"
 
 # 8 cells: 2×4 grid (λ_link ∈ {0, 0.1}) × (hist_neg_ratio ∈ {0, 0.25, 0.5, 0.75})
@@ -46,6 +48,7 @@ for spec in \
     --num-epochs 50 --early-stop-patience 999 --seed 42 \
     --primary-loss alignment \
     --lambda-normbrake 0.1 --normbrake-threshold 3.87 \
+    --weight-decay-link 1e-4 \
     --lambda-link "${ll}" \
     --hist-neg-ratio "${hnr}" \
     --head-mode cross_table \
