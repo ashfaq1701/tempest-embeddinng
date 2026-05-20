@@ -90,7 +90,9 @@ class Trainer:
             self.embedding_store.parameters(), lr=config.emb_lr,
         )
         self.link_optimizer = torch.optim.Adam(
-            self.link_predictor.parameters(), lr=config.link_lr,
+            self.link_predictor.parameters(),
+            lr=config.link_lr,
+            weight_decay=config.weight_decay_link,
         )
         self._time_scale = config.alignment_time_scale  # overridden after dataset load
 

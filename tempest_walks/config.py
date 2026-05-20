@@ -37,6 +37,14 @@ class Config:
     lambda_normbrake: float = 0.0
     normbrake_threshold: float = 0.0
 
+    # weight_decay on the link MLP optimizer (Stage 3 §8 cliff fix). With
+    # normbrake clamping embedding col_norms, the residual cliff is driven
+    # by link_w_norm runaway (0.28 → 1.83 over 50 ep). weight_decay_link=
+    # 1e-4 holds link_w_norm flat (0.19 → 0.17) and shrinks the 50-ep
+    # cliff drop from -0.11 to -0.014 on wiki. Default OFF for backward
+    # compatibility; pair with normbrake for the production cliff fix.
+    weight_decay_link: float = 0.0
+
     # Link prediction
     num_neg_per_pos: int = 10            # K negatives per positive
     # Mixture of TGB-style negatives at TRAINING time. hist_neg_ratio=0.5

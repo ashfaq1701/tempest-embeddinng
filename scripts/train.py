@@ -51,6 +51,13 @@ def parse_args() -> argparse.Namespace:
                    help="L2 column-norm threshold above which normbrake "
                         "activates. Calibrate per dataset to 1.5× col_norm "
                         "at ep 1-2 (wiki: 3.87, review: 31.32).")
+    # weight_decay on the link MLP optimizer (Stage 3 cliff fix). Holds
+    # link_w_norm flat over 50 ep training and nearly eliminates the
+    # residual cliff (drop -0.014 vs nb-only -0.11 on wiki).
+    p.add_argument("--weight-decay-link", type=float, default=0.0,
+                   help="Adam weight_decay on the link MLP. 1e-4 is the "
+                        "Stage 3 winning value; pair with normbrake for "
+                        "the full cliff fix.")
 
     # Optimization
     p.add_argument("--num-neg-per-pos", type=int, default=10)
@@ -102,6 +109,7 @@ def main() -> None:
         uniformity_temperature=args.uniformity_temperature,
         lambda_normbrake=args.lambda_normbrake,
         normbrake_threshold=args.normbrake_threshold,
+        weight_decay_link=args.weight_decay_link,
         num_neg_per_pos=args.num_neg_per_pos,
         hist_neg_ratio=args.hist_neg_ratio,
         reservoir_size=args.reservoir_size,
