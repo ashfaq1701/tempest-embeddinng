@@ -498,6 +498,7 @@ class Trainer:
         early_stop_patience: Optional[int] = None,
         log_debug: bool = False,
         monitor_sample_pct: float = 1.0,
+        skip_final_full_eval: bool = False,
     ) -> Dict[str, Any]:
         """Train up to `config.num_epochs`.
 
@@ -719,15 +720,13 @@ class Trainer:
 
         # ── Final FULL eval (always sample_pct=1.0) on the restored weights ──
         # Per-epoch numbers above are sampled if monitor_sample_pct < 1; this
-        # gives the paper-defensible report value. Tempest/time_state were
-        # mutated by per-epoch evals on val+test data; we re-walk from a
-        # fresh state to compute the canonical metric:
-        #   reset walk_gen / time_state / neg_sampler
-        #   re-ingest training edges (NO walks, NO scoring — just state)
-        #   run full val + test eval
+        # gives the paper-defensible report value. Skippable on memory-tight
+        # datasets (review): pass skip_final_full_eval=True to fall back to
+        # the monitor (sampled) values as the reported result.
         final_val_full: Optional[float] = None
         final_test_full: Optional[float] = None
-        if best_state is not None and monitor_sample_pct < 1.0 and val_evaluator is not None:
+        if (best_state is not None and monitor_sample_pct < 1.0
+                and val_evaluator is not None and not skip_final_full_eval):
             print(f"  final full eval (sample_pct=1.0) on restored weights …", flush=True)
             self.walk_gen.reset()
             if isinstance(self.neg_sampler_train, HistoricalNegativeSampler):

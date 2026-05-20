@@ -26,7 +26,8 @@ echo "=== Step 1: review anchor calibration (2 ep, alignment, sampled=${SAMPLE})
 .venv/bin/python -u -m scripts.train --tgb-name tgbl-review --use-gpu \
   --num-epochs 2 --early-stop-patience 5 --seed "${SEED}" \
   --primary-loss alignment \
-  --monitor-sample-pct "${SAMPLE}" > "${cal_log}" 2>&1
+  --monitor-sample-pct "${SAMPLE}" \
+  --skip-final-full-eval > "${cal_log}" 2>&1
 echo "exit=$?  log=${cal_log}"
 tail -25 "${cal_log}"
 
@@ -59,7 +60,8 @@ summary="runs/sweep_tgbl-review_seed${SEED}_${TS}_SUMMARY.log"
       --primary-loss "${loss}" --lambda-normbrake "${nb}" \
       --normbrake-threshold "${NB_THR}" \
       --head-mode cross_table \
-      --monitor-sample-pct "${SAMPLE}" > "${log}" 2>&1
+      --monitor-sample-pct "${SAMPLE}" \
+      --skip-final-full-eval > "${log}" 2>&1
     rc=$?
     echo "Cell ${cellid} exit=${rc}  log=${log}"
     tail -10 "${log}"

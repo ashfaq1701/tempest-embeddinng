@@ -106,6 +106,10 @@ def parse_args() -> argparse.Namespace:
                         "during training-time monitoring. <1.0 = sampled "
                         "estimate (cheap on big datasets); final report eval "
                         "is always full precision.")
+    p.add_argument("--skip-final-full-eval", action="store_true",
+                   help="Skip the final full-precision eval (used when "
+                        "monitor_sample_pct<1). Falls back to monitor values "
+                        "as the reported result. Use on memory-tight datasets.")
 
     # Optimization
     p.add_argument("--num-neg-per-pos", type=int, default=10)
@@ -276,6 +280,7 @@ def main() -> None:
             early_stop_patience=args.early_stop_patience,
             log_debug=args.log_debug,
             monitor_sample_pct=args.monitor_sample_pct,
+            skip_final_full_eval=args.skip_final_full_eval,
         )
         print(f"\n=== Summary (best epoch {summary['best_epoch']}) ===")
         print(f"  stopped_at_epoch    : {summary['stopped_at_epoch']}")

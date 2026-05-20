@@ -23,11 +23,16 @@ from .negatives import NegativeSampler
 from .timestate import NodeTimeState
 
 
-_ROW_BUDGET_AT_D128 = 500_000
+_ROW_BUDGET_AT_D128 = 100_000
 
 
 def _row_budget_for_d_emb(d_emb: int) -> int:
-    return max(50_000, _ROW_BUDGET_AT_D128 * 128 // d_emb)
+    # Lowered from 500k → 100k after a CUDA OOM on tgbl-review's full-precision
+    # eval (730k positives × ~999 negs per pass). Review has 352k nodes →
+    # embedding tables alone occupy ~1.4 GB with Adam state, leaving little
+    # headroom for the link MLP forward at 500k rows × 1123-dim input.
+    # 100k rows × 1123 = ~450 MB input, fits comfortably under 8 GB VRAM.
+    return max(20_000, _ROW_BUDGET_AT_D128 * 128 // d_emb)
 
 
 class Evaluator:
