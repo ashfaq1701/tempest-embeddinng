@@ -89,6 +89,11 @@ class Config:
     # control that uniformity used to provide. Only APPLIED when
     # primary_loss="triplet"; ignored for alignment / infonce / sgns paths.
     weight_decay_emb: float = 1e-4
+    # v2.4 §8 cliff-fix: L2 on the link MLP weights. Stage 2 showed
+    # link_w_norm runs away 0.28 → 1.83 (6.5×) even with normbrake clamping
+    # the embedding magnitude — this is the residual cliff driver.
+    # Always-applied (no loss gating).
+    weight_decay_link: float = 0.0
     # A3.1 InfoNCE hyperparameters — literature defaults.
     infonce_tau: float = 0.1
     infonce_num_neg_in_batch: int = 256

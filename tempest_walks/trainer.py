@@ -181,7 +181,11 @@ class Trainer:
         link_params = list(self.link_predictor.parameters())
         if self.time_encoder is not None:
             link_params += list(self.time_encoder.parameters())
-        self.link_optimizer = torch.optim.Adam(link_params, lr=config.link_lr)
+        self.link_optimizer = torch.optim.Adam(
+            link_params,
+            lr=config.link_lr,
+            weight_decay=config.weight_decay_link,
+        )
         self._time_scale = config.alignment_time_scale  # overridden after dataset load
         # Side-channel for per-epoch logging of the optional normbrake aux.
         # _embedding_step writes this each batch; train() aggregates per epoch.

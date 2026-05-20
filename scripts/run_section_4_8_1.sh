@@ -27,7 +27,9 @@ summary="runs/sec481_${TGB}_seed${SEED}_${TS}_SUMMARY.log"
     "T_jl1.0:triplet:0:1.0" \
     "S_jl0.0:sgns:0.1:0.0" \
     "S_jl0.3:sgns:0.1:0.3" \
-    "S_jl1.0:sgns:0.1:1.0"; do
+    "S_jl1.0:sgns:0.1:1.0" \
+    "A_jl0.3:alignment:0:0.3" \
+    "A_jl1.0:alignment:0:1.0"; do
     IFS=':' read tag loss nb jl <<< "$spec"
     log="runs/sec481_${TGB}_${tag}_seed${SEED}_${TS}.log"
     echo "--- ${tag} (loss=${loss} nb=${nb} λ_link=${jl}) → ${log} ---"

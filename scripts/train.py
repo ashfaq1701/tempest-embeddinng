@@ -55,6 +55,11 @@ def parse_args() -> argparse.Namespace:
                    help="Scalar on link BCE's gradient into embedding tables "
                         "(Phase S Group C). 0=decoupled, 1.0=full joint "
                         "training. Only meaningful under head_mode=cross_table.")
+    # v2.4 §8 cliff-fix: L2 on the link MLP weights (Adam weight_decay).
+    p.add_argument("--weight-decay-link", type=float, default=0.0,
+                   help="weight_decay applied to link_optimizer. Stage 2 "
+                        "showed link_w_norm runs away 6.5× over 50 ep even "
+                        "with normbrake; this is the residual cliff knob.")
     # Phase S Group E (v2.2 §4.1 / §6.4): link MLP head structure.
     p.add_argument("--head-mode", choices=["cross_table", "component_0_only"],
                    default="cross_table",
@@ -179,6 +184,7 @@ def main() -> None:
         lambda_normbrake=args.lambda_normbrake,
         normbrake_threshold=args.normbrake_threshold,
         lambda_link=args.lambda_link,
+        weight_decay_link=args.weight_decay_link,
         num_neg_per_pos=args.num_neg_per_pos,
         hist_neg_ratio=args.hist_neg_ratio,
         reservoir_size=args.reservoir_size,
