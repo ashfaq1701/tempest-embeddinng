@@ -349,24 +349,86 @@ place. Update `config_locked_v1.yaml` accordingly.
 
 ---
 
-## Step 7 — Walk encoder branch (gated by Step 6 resolution)
+## Step 6.5 — Lock procedure after single-table ablation (always-run)
 
-Only after Step 6 completes and master's embedding-table architecture
-is final, create:
+After Step 6 lands and the single-table cell + multi-seed (if needed)
+resolve, execute the conditional merge-or-confirm:
+
+### Outcome A or B (single-table wins or ties dual-table within anchor std)
 
 ```bash
 cd tempest-walk-embedding-new
-git checkout master   # whichever architecture is locked
-git checkout -b feature/walk-embedding-integration
+git checkout master
+git merge experiment/embedding-table-variations
 ```
 
-The walk encoder produces `walk_repr_u` from walks seeded on the
-source node `u`. Full spec is in **v2.4 §14** (deferred to a follow-up
-doc).
+Verify the merge:
+1. **Re-run Gate A** (anchor validation) — must reproduce 0.7070 ± 0.0016.
+2. **Re-run Gate B** (50-epoch locked-config wiki seed 42) — must match the single-table cell result from Step 6.
+3. Commit `master_locked_verification_post_single_table.md` with both outputs saved.
 
-**Why this ordering:** the walk encoder builds on the locked-table
-architecture. Settling Step 6 first ensures the walk encoder doesn't
-have to be retested against two embedding-table variants.
+Update v2.4 §1 with single-table as the final locked architecture.
+Update `config_locked_v1.yaml` to reflect single-table.
+
+**Tag:** `git tag locked-v2 -m "single-table architecture locked"`.
+
+### Outcome C (single-table loses by > 0.005)
+
+Do NOT merge. Master keeps dual-table as locked. Leave
+`experiment/embedding-table-variations` branch in place for paper
+ablation reproducibility.
+
+**Tag:** `git tag locked-v2 -m "dual-table architecture confirmed"`.
+
+### Either way
+
+Master is tagged `locked-v2` with the final locked production
+architecture. **All subsequent branches start from this tag**, not
+from `master` directly — keeps the locked baseline traceable.
+
+---
+
+## Step 7 — Source walk encoder branch (gated by `locked-v2` tag)
+
+After `locked-v2` exists, create the walk encoder branch:
+
+```bash
+cd tempest-walk-embedding-new
+git checkout locked-v2
+git checkout -b experiment/add-source-walk-embedding
+```
+
+Full architecture, pipeline (training + scoring), caching strategy,
+directed-graph guard, experiment cells, decision rules, cliff-shape
+comparison, cross-dataset follow-up, and pre-registered prediction
+are in **v2.4 §14** ([walk_distribution_matching_embedding_v2.4_skeleton.md](walk_distribution_matching_embedding_v2.4_skeleton.md)).
+
+**Cells (3, on wiki, seed 42, 50 ep, no early-stop, --log-debug):**
+- `W_off` — control (locked-v2 baseline reproduction)
+- `W_gru` — encoder enabled, K=5 (main hypothesis test)
+- `W_gru_k1` — encoder enabled, K=1 (sensitivity test)
+
+**Decision summary:**
+- A — W_gru beats W_off > 0.005 → multi-seed; if confirmed, lock walk encoder on.
+- B — W_gru ties W_off → encoder doesn't help wiki; test on review.
+- C — W_gru loses > 0.005 → investigate; run 100-ep smoke before declaring broken.
+- D — W_gru_k1 matches W_gru → lock K=1 for scoring efficiency.
+
+**Cliff-shape bonus:** walk encoder is BCE-trained, not contrastive-
+trained — it should NOT cliff. If it does, deeper failure mode.
+
+**Cross-dataset follow-up:** if W_gru wins on wiki, run on review.
+- > 0.05 improvement → destination-side walks become worth revisiting.
+- Marginal → source-walks-only is sufficient; defer destination side.
+
+**Lock procedure (Step 7.5):** if walk encoder wins, merge to master,
+re-run Gates A + B, update `config_locked_v1.yaml`, tag
+`git tag locked-v3 -m "source walk encoder locked"`. If loses/ties,
+leave branch in place; master stays at `locked-v2`.
+
+**DO NOT proceed to further architecture work** (destination-side
+walks, memory module, Hawkes head) until source walk encoder
+decision is finalized.
 
 ---
 
