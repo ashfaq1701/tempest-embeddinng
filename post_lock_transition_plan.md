@@ -107,39 +107,124 @@ Each PORT-DEFAULT and PORT-FLAG entry must include:
 - Justification (1 sentence: why this is needed)
 - Test plan (how to verify functional correctness)
 
-### Minimum PORT-FLAG list (these MUST be kept behind flags for paper ablations)
+### Definitive classification (agent decision, 2026-05-20)
 
-- A2-off code path (no alignment loss)
-- normbrake-off code path (`--lambda-normbrake=0`)
-- Triplet loss implementation + semi-hard mining
-- InfoNCE loss implementation
-- SGNS loss implementation + unigram^0.75 cache
-- E.2 head variant (Component-0-only head)
-- Component 0 disable flag (`--use-time-encoding=False`)
-- Different hist_neg_ratio values (CLI knob already exists; verify plumbing)
-
-### PORT-DEFAULT list (subject to Stage 4 outcome — fill in after locking)
-
-- Component 0 (`timestate.py` + TimeEncoder + cold-start bits)
-- Alignment + uniformity loss (current v3 implementation)
-- Normbrake regularizer at locked threshold per dataset
-- λ_link joint training [IF Scenario 1 from Stage 4]
-- hist_neg_ratio=0 default [IF Scenario 1 from Stage 4]
-- Strict-causal protocol wiring (pre-scoring read, post-scoring write)
+Master already has these from b246b87 + recent ports — don't re-port:
+- alignment + uniformity loss (default loss family)
+- two-table embedding store with cross-table E.1 head
+- strict-causal protocol wiring
 - TGB Evaluator integration
-- anchor validation script (`scripts/anchor_validation.py`)
-- Diagnostic scripts (Phase 0.5 diag, init_divergence_check)
+- TGB negatives, training reservoir, historical/random mix
+- `lambda_normbrake`, `normbrake_threshold` (b062674)
+- `weight_decay_link` (de70b73)
+- All md docs (02041aa)
+
+### PORT-DEFAULT (must port; goes into locked production defaults)
+
+| Item | Source | Justification |
+|---|---|---|
+| `timestate.py` (NodeTimeState) | feature/`tempest_walks/timestate.py` | Phase 0.5 anchor; Component 0 is the reason wiki anchor hit 0.7079 |
+| `TimeEncoder` class | feature/`tempest_walks/model.py` | Component 0 functional time encoding |
+| `LinkPredictor` Component 0 input path | feature/`tempest_walks/model.py` | wires Φ(Δt) + cold-start bits into the link MLP |
+| `use_time_encoding`, `time_enc_k`, `cold_start_dt_clamp_factor` config fields | feature/`tempest_walks/config.py` | Component 0 plumbing; all default-ON |
+| Early stopping + patience | feature/`tempest_walks/trainer.py` | training infrastructure; needed for anchor validation gate |
+| Best-weight snapshot/restore | feature/`tempest_walks/trainer.py` | needed for `best_val_mrr` reporting |
+| `monitor_sample_pct`, `skip_final_full_eval` | feature/`scripts/train.py` + trainer | review-scale eval infrastructure (review is 30× wiki) |
+| `--log-debug` per-epoch instrumentation | feature/`tempest_walks/trainer.py` | needed to diagnose future cliffs |
+| `scripts/anchor_validation.py` (3-seed driver) | feature/scripts/ | the gate for porting correctness |
+| Phase 0.5 diagnostic scripts | feature/scripts/ | cold-start coverage check; reproducible |
+
+### PORT-FLAG (paper-ablation paths; CLI flag, default OFF/locked)
+
+| Item | CLI flag | Default | Reason needed for paper |
+|---|---|---|---|
+| Alternative loss families | `--primary-loss {triplet,infonce,sgns}` | `alignment` | Table 4.7 wiki sweep + Table 4.3 review sweep both show alignment wins/ties |
+| Triplet hyperparameters | `--triplet-margin`, `--weight-decay-emb` | 0.5, 1e-4 | inert unless `--primary-loss=triplet` |
+| InfoNCE hyperparameters | `--infonce-tau`, `--infonce-num-neg-{in-batch,unif}` | 0.1, 256, 256 | inert unless `--primary-loss=infonce` |
+| SGNS hyperparameters | `--sgns-k-neg`, `--sgns-subsample-t`, `--sgns-lr-*` | Mikolov defaults | inert unless `--primary-loss=sgns` |
+| E.2 head variant | `--head-mode component_0_only` | `cross_table` (E.1) | Phase S settled E.1 wins; paper shows the comparison |
+| A2-off (no alignment) | `--lambda-align 0` | 1.0 | Phase S settled A2-on wins; paper shows the comparison |
+| `hist_neg_ratio` variants | `--hist-neg-ratio` | (Stage 4 winner — likely 0.5) | TGB-distribution match; paper-defensible ablation |
+| `eta_uniform`, `uniformity_cap` | `--eta-uniform`, `--uniformity-cap` | (Stage 5 winners) | uniformity sweep is an open ablation |
+| `lambda_normbrake`, `normbrake_threshold` (off) | already ported | locked ON (0.1, dataset threshold) | run-with-no-cliff-fix ablation |
+
+### SKIP (do not port — config or code that's been demonstrated to hurt or has no paper value)
+
+User directive 2026-05-20: "don't port configs that don't matter." Even
+though "PORT-FLAG when unsure" is the general rule, configs that ALWAYS
+LOSE in the sweeps should be SKIPPED — they're clutter, not
+paper-defensibility.
+
+| Item | Why SKIP |
+|---|---|
+| `align_weighting` (B / C variants) | Phase 1 ablation completed; A won unambiguously. Keep ONLY the A behavior, drop the variants. |
+| `cross_table_dropout` | Stage 2 hurt the cliff; never useful. |
+| `link_mlp_n_layers` (n=5 variant) | Stage 2 HURT; reaffirms Lesson 15 ("capacity hurts on wiki"). Keep n=3 hard-coded. |
+| `link_mlp_dropout` | Stage 2 marginal-to-hurt; doesn't address embedding-side cliff. |
+| `embedding_dropout` | Stage 2 hurt; makes cliff sharper. |
+| `lambda_link` (joint training) | Stage 3 DECISIVELY FALSIFIED (Lesson 19). No paper question needs this knob — the paper documents the falsification in narrative. SKIP CLI entirely. |
+| Per-walk dispatch helpers (if any) | leftover from walks-encoder branch; verify usage = 0 before deleting |
+| InfoNCE NaN-debug instrumentation | bug fixed, prints removed |
+| Stage 2/3/4/5 sweep wrapper scripts | one-off experiment drivers; reproducible from doc + the underlying train.py |
+| Loss-search amendment doc archive | superseded by v2.4 §9 + Lesson 17–22 |
+| EdgeBank-distillation code (if started) | removed in amendment v1.2 |
+| tempest_walks/walks-encoder variants | different branch; do not bring over |
+
+### Rule of thumb (codified)
+
+The PORT-FLAG vs SKIP test:
+1. **PORT-FLAG** ⟺ the paper needs to SHOW the result (e.g., "Triplet on review", "E.2 head"). The flag enables reproducing the ablation.
+2. **SKIP** ⟺ the knob is demonstrably-bad AND no paper-defensible question needs the flag (e.g., "λ_link collapses immediately" — paper narrates, doesn't need CLI to reproduce).
+
+When in doubt: a single CI run + a sentence in the paper > a CLI flag that no one will use again.
 
 ### SKIP list (no production use, no paper-ablation value)
 
-- Stage 2 architectural variants that lost (deeper MLP, embedding dropout
-  — these are hyperparameters, not code)
-- InfoNCE NaN-debug instrumentation (bug fixed, debug printouts gone)
+User directive 2026-05-20: **don't port configs that don't matter.**
+Even though the general rule is "default to PORT-FLAG when unsure,"
+configs and code paths that are DEMONSTRATED to hurt should be SKIPPED
+entirely — they don't need to live on master even as flags.
+
+**Config fields to SKIP** (demonstrated not useful, not paper-defensible):
+
+- `align_weighting` (A/B/C variant in alignment_loss) — A won and is the
+  current default; B and C never helped. SKIP the variant code.
+- `cross_table_dropout` — Stage 2 hurt (E.3 ablation). SKIP.
+- `link_mlp_n_layers` — Stage 2 hurt (deeper = worse on wiki, Lesson 15
+  reaffirmed). SKIP.
+- `link_mlp_dropout` — Stage 2 marginal-to-hurt. SKIP.
+- `embedding_dropout` — Stage 2 hurt. SKIP.
+- `lambda_link` — Stage 3 DECISIVELY FALSIFIED (val MRR collapses
+  immediately at any λ_link > 0). The mechanism is documented in Lesson
+  19. No paper ablation needs this — it's a known-bad knob. SKIP from
+  master entirely.
+- `weight_decay_emb` — only ever fired under `primary_loss=triplet`;
+  default-disabled. If Triplet ports as PORT-FLAG, this comes with it;
+  otherwise SKIP.
+
+**Code paths to SKIP**:
+
+- Stage 2 architectural variants (deeper MLP, embedding dropout — these
+  are hyperparameters that didn't help; no code path needs to live).
+- InfoNCE NaN-debug instrumentation (bug fixed, debug printouts gone).
 - One-off scripts from intermediate stages that aren't anchor or
-  diagnostic
-- EdgeBank distillation code if ever started (removed in amendment v1.2)
+  diagnostic.
+- EdgeBank distillation code if ever started (removed in amendment v1.2).
 - tempest_walks variants from the walks-encoder overnight session
-  (different branch)
+  (different branch).
+- Per-walk dispatch kernel + helpers if all walk-encoder bypasses are
+  removed (verify usage before porting).
+
+**Rule for ambiguous configs**: if the config has a default that ALWAYS
+WINS in Stage 2/3/Stage S sweeps, port ONLY the default behavior (not
+the knob). Adding a CLI flag for "the value that always loses" is
+clutter, not paper-defensibility.
+
+**The PORT-FLAG vs SKIP test**: a PORT-FLAG is justified when the paper
+needs to SHOW the result (e.g., "Triplet vs alignment on review — we
+ran both"). A SKIP is justified when the knob is demonstrably-bad and
+no paper-defensible question needs the flag (e.g., "we proved λ_link
+collapses, no reason to keep the CLI flag").
 
 **Commit `port_plan.md` to tempest-walk-embedding-new master and pause
 for review before porting any code. Do not start Step 4 until plan is
