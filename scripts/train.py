@@ -40,24 +40,85 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alignment-time-scale", type=float, default=-1.0)
     p.add_argument("--eta-uniform", type=float, default=1.0)
     p.add_argument("--uniformity-temperature", type=float, default=2.0)
-    # Normbrake — per-column L2 hinge on embeddings (CLAUDE.md Lesson 18).
-    # Default OFF (lambda=0). Calibrate threshold to 1.5× col_norm at ep 1-2:
-    # tgbl-wiki → 3.87, tgbl-review-v2 → 31.32.
-    p.add_argument("--lambda-normbrake", type=float, default=0.0,
-                   help="Coefficient for per-column L2 hinge on the "
-                        "embedding tables. 0 disables (default). "
-                        "Recommended production value: 0.1.")
-    p.add_argument("--normbrake-threshold", type=float, default=0.0,
-                   help="L2 column-norm threshold above which normbrake "
-                        "activates. Calibrate per dataset to 1.5× col_norm "
-                        "at ep 1-2 (wiki: 3.87, review: 31.32).")
-    # weight_decay on the link MLP optimizer (Stage 3 cliff fix). Holds
-    # link_w_norm flat over 50 ep training and nearly eliminates the
-    # residual cliff (drop -0.014 vs nb-only -0.11 on wiki).
+    # Max nodes used in all-pairs uniformity per batch. With B=200 union
+    # seeding, typical unique-batch-nodes ~300; the default 20000 never
+    # fires. Drop below 300 to actually subsample (Stage 5 §11).
+    p.add_argument("--uniformity-cap", type=int, default=20_000)
+    # Phase 1 ablation: alignment-loss weighting variant
+    p.add_argument("--align-weighting", choices=["A", "B", "C"], default="A",
+                   help="A=1/K·(1+Δt/τ)^(-β) [control]; B=1/K only; C=uniform α=1")
+    # Phase S Group A2 (v2.2 §4.1): scalar on the alignment loss.
+    # 1.0 = anchor (alignment on). 0.0 = walks-supervision OFF.
+    p.add_argument("--lambda-align", type=float, default=1.0,
+                   help="Scalar on alignment loss. 0 turns walks-supervision off "
+                        "(Phase S Group A2). Anchor uses 1.0.")
+    # Phase S Group C — joint training scalar on link BCE -> embeddings.
+    # 0 (default) keeps decoupled training. > 0 lets BCE update embeddings,
+    # scaled by this value. Candidate fix for InfoNCE/SGNS rapid breakdown.
+    p.add_argument("--lambda-link", type=float, default=0.0,
+                   help="Scalar on link BCE's gradient into embedding tables "
+                        "(Phase S Group C). 0=decoupled, 1.0=full joint "
+                        "training. Only meaningful under head_mode=cross_table.")
+    # v2.4 §8 cliff-fix: L2 on the link MLP weights (Adam weight_decay).
     p.add_argument("--weight-decay-link", type=float, default=0.0,
-                   help="Adam weight_decay on the link MLP. 1e-4 is the "
-                        "Stage 3 winning value; pair with normbrake for "
-                        "the full cliff fix.")
+                   help="weight_decay applied to link_optimizer. Stage 2 "
+                        "showed link_w_norm runs away 6.5× over 50 ep even "
+                        "with normbrake; this is the residual cliff knob.")
+    # Phase S Group E (v2.2 §4.1 / §6.4): link MLP head structure.
+    p.add_argument("--head-mode", choices=["cross_table", "component_0_only"],
+                   default="cross_table",
+                   help="E.1 cross_table (anchor) vs E.2 component_0_only "
+                        "(drops cross-table reads entirely).")
+    p.add_argument("--cross-table-dropout", type=float, default=0.0,
+                   help="E.3: dropout on the 8·d cross-table block before "
+                        "concatenation with Component 0. Only used when "
+                        "--head-mode=cross_table.")
+    # §4.8.2 architectural fixes for cliff remediation.
+    p.add_argument("--link-mlp-n-layers", type=int, default=3,
+                   help="Link MLP depth (number of Linear layers). Default 3 "
+                        "matches v2.3 spec. Increase to 5 for §4.8.2 ablation.")
+    p.add_argument("--link-mlp-dropout", type=float, default=0.0,
+                   help="Dropout between hidden layers of the link MLP.")
+    p.add_argument("--embedding-dropout", type=float, default=0.0,
+                   help="Dropout applied to embedding lookups AT the link MLP "
+                        "read site (training only). Regulariser without "
+                        "touching the embedding-side loss.")
+
+    # Phase S §4.7 — loss-family search. Selects the primary embedding-side
+    # loss and an optional norm-brake auxiliary. All hyperparameters under
+    # each primary are literature-default; no per-dataset tuning (§4.7.0).
+    p.add_argument("--primary-loss", choices=["alignment", "triplet", "infonce", "sgns"],
+                   default="alignment",
+                   help="Embedding-side loss family. 'alignment'=v2.2 default; "
+                        "'triplet'/'infonce'/'sgns'=§4.7 candidates.")
+    # Norm-brake auxiliary
+    p.add_argument("--lambda-normbrake", type=float, default=0.0,
+                   help="Weight on §4.4 norm-brake regularizer. 0=off.")
+    p.add_argument("--normbrake-threshold", type=float, default=0.54,
+                   help="Per-column L2 threshold for norm-brake. Default 0.54 "
+                        "= 1.5 × wiki anchor mean col-norm. Recalibrate per "
+                        "dataset (see v2.3 §4.7.4).")
+    # Debug instrumentation for deep-analysis runs. When set, logs per-epoch
+    # gradient norms (E_target, E_context), link MLP first-Linear cross-table
+    # col-norm, AND runs full test eval every epoch (not just on val improvement).
+    # Adds ~50% eval cost per epoch; only enable for cliff/plateau analysis.
+    p.add_argument("--log-debug", action="store_true",
+                   help="Verbose per-epoch logging: grad norms, link-MLP "
+                        "col-norm, full per-epoch test MRR trajectory.")
+    # Sampled-eval for cheap per-epoch monitoring on large datasets (review).
+    # When < 1.0, each per-epoch val/test eval subsamples positives by this
+    # fraction. Final report eval (post weight-restore) is always full
+    # precision regardless. Use ~0.05 on tgbl-review to cut per-epoch
+    # eval cost from ~15 min to ~1 min.
+    p.add_argument("--monitor-sample-pct", type=float, default=1.0,
+                   help="Fraction of val/test positives to score per epoch "
+                        "during training-time monitoring. <1.0 = sampled "
+                        "estimate (cheap on big datasets); final report eval "
+                        "is always full precision.")
+    p.add_argument("--skip-final-full-eval", action="store_true",
+                   help="Skip the final full-precision eval (used when "
+                        "monitor_sample_pct<1). Falls back to monitor values "
+                        "as the reported result. Use on memory-tight datasets.")
 
     # Optimization
     p.add_argument("--num-neg-per-pos", type=int, default=10)
@@ -72,6 +133,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-batch-size", type=int, default=200)
     p.add_argument("--num-epochs", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
+    # Early stopping. When > 0, per-epoch val eval runs after each
+    # training epoch; trainer keeps the best-val checkpoint and breaks
+    # after this many epochs of no improvement. test_mrr is pinned to
+    # the same epoch as best_val_mrr (same model snapshot).
+    # When 0 (default), behaves like before: trains num_epochs flat,
+    # then val + test eval once.
+    p.add_argument("--early-stop-patience", type=int, default=0,
+                   help="Patience (in epochs) for early stopping on val "
+                        "MRR. 0 = disabled (legacy behaviour).")
 
     return p.parse_args()
 
@@ -107,8 +177,18 @@ def main() -> None:
         alignment_time_scale=args.alignment_time_scale,
         eta_uniform=args.eta_uniform,
         uniformity_temperature=args.uniformity_temperature,
+        uniformity_cap=args.uniformity_cap,
+        align_weighting=args.align_weighting,
+        lambda_align=args.lambda_align,
+        head_mode=args.head_mode,
+        cross_table_dropout=args.cross_table_dropout,
+        link_mlp_n_layers=args.link_mlp_n_layers,
+        link_mlp_dropout=args.link_mlp_dropout,
+        embedding_dropout=args.embedding_dropout,
+        primary_loss=args.primary_loss,
         lambda_normbrake=args.lambda_normbrake,
         normbrake_threshold=args.normbrake_threshold,
+        lambda_link=args.lambda_link,
         weight_decay_link=args.weight_decay_link,
         num_neg_per_pos=args.num_neg_per_pos,
         hist_neg_ratio=args.hist_neg_ratio,
@@ -138,6 +218,9 @@ def main() -> None:
         train_dst_pool=train_dst_pool,
         node_feat=loaded.node_feat,
         edge_feat_dim=edge_feat_dim,
+        # SGNS unigram^0.75 needs raw (non-unique) destination counts; pass
+        # them through unconditionally — they're a numpy view, ~free.
+        train_destinations_full=loaded.train.destinations,
     )
 
     # Derive alignment time-scale: (training time span) / L_REF, where
@@ -168,34 +251,89 @@ def main() -> None:
     loaded.dataset.load_val_ns()
     loaded.dataset.load_test_ns()
 
-    eval_val = Evaluator(
+    _eval_kwargs = dict(
         embedding_store=trainer.embedding_store,
         link_predictor=trainer.link_predictor,
-        neg_sampler=TGBNegativeSampler(loaded.dataset, split_mode="val"),
         device=trainer.device,
         tgb_dataset_name=loaded.name,
         eval_metric=loaded.eval_metric,
+        time_encoder=trainer.time_encoder,
+        time_state=trainer.time_state,
+        time_scale=trainer._time_scale,
+        cold_start_dt_clamp_factor=config.cold_start_dt_clamp_factor,
+    )
+    eval_val = Evaluator(
+        neg_sampler=TGBNegativeSampler(loaded.dataset, split_mode="val"),
+        **_eval_kwargs,
     )
     eval_test = Evaluator(
-        embedding_store=trainer.embedding_store,
-        link_predictor=trainer.link_predictor,
         neg_sampler=TGBNegativeSampler(loaded.dataset, split_mode="test"),
-        device=trainer.device,
-        tgb_dataset_name=loaded.name,
-        eval_metric=loaded.eval_metric,
+        **_eval_kwargs,
     )
 
     print(f"Model device: {trainer.device}    Tempest device: cpu")
-    print("=== Training ===")
-    trainer.train(create_batches(loaded.train, config.target_batch_size))
+    if args.early_stop_patience and args.early_stop_patience > 0:
+        # Early-stopping path: per-epoch val (+ test on new-best) eval
+        # happens inside trainer.train(); the test number is pinned to
+        # the same epoch as best val, so we report directly from the
+        # summary dict — no second outer eval pass.
+        print(f"=== Training (early stop patience={args.early_stop_patience}) ===")
+        summary = trainer.train(
+            create_batches(loaded.train, config.target_batch_size),
+            val_evaluator=eval_val,
+            val_batches_factory=lambda: create_batches(
+                loaded.val, config.target_batch_size,
+            ),
+            test_evaluator=eval_test,
+            test_batches_factory=lambda: create_batches(
+                loaded.test, config.target_batch_size,
+            ),
+            early_stop_patience=args.early_stop_patience,
+            log_debug=args.log_debug,
+            monitor_sample_pct=args.monitor_sample_pct,
+            skip_final_full_eval=args.skip_final_full_eval,
+        )
+        print(f"\n=== Summary (best epoch {summary['best_epoch']}) ===")
+        print(f"  stopped_at_epoch    : {summary['stopped_at_epoch']}")
+        print(f"  best_val_{loaded.eval_metric:<14}: {summary['best_val_mrr']:.4f}")
+        if summary["best_test_mrr"] is not None:
+            print(f"  best_test_{loaded.eval_metric:<13}: {summary['best_test_mrr']:.4f}")
+        print(f"  per_epoch_val_{loaded.eval_metric:<8}: "
+              + ", ".join(f"{v:.4f}" for v in summary["per_epoch_val_mrr"]))
+        if summary.get("per_epoch_col_norm"):
+            print("  per_epoch_col_norm    : "
+                  + ", ".join(f"{v:.4f}" for v in summary["per_epoch_col_norm"]))
+        if summary.get("per_epoch_normbrake"):
+            print("  per_epoch_L_normbrake : "
+                  + ", ".join(f"{v:.4f}" for v in summary["per_epoch_normbrake"]))
+        # Debug-instrumentation outputs (only populated when --log-debug)
+        if summary.get("per_epoch_test_mrr_all"):
+            print(f"  per_epoch_test_{loaded.eval_metric:<8}: "
+                  + ", ".join(f"{v:.4f}" for v in summary["per_epoch_test_mrr_all"]))
+        if summary.get("per_epoch_grad_target"):
+            print("  per_epoch_grad_E_targ : "
+                  + ", ".join(f"{v:.4f}" for v in summary["per_epoch_grad_target"]))
+        if summary.get("per_epoch_grad_context"):
+            print("  per_epoch_grad_E_ctx  : "
+                  + ", ".join(f"{v:.4f}" for v in summary["per_epoch_grad_context"]))
+        if summary.get("per_epoch_link_w_norm"):
+            print("  per_epoch_link_w_norm : "
+                  + ", ".join(f"{v:.4f}" for v in summary["per_epoch_link_w_norm"]))
+    else:
+        print("=== Training ===")
+        trainer.train(create_batches(loaded.train, config.target_batch_size))
 
-    print("=== Validation ===")
-    val_metric = trainer.evaluate(create_batches(loaded.val, config.target_batch_size), eval_val)
-    print(f"Val {loaded.eval_metric}: {val_metric:.4f}")
+        print("=== Validation ===")
+        val_metric = trainer.evaluate(
+            create_batches(loaded.val, config.target_batch_size), eval_val,
+        )
+        print(f"Val {loaded.eval_metric}: {val_metric:.4f}")
 
-    print("=== Test ===")
-    test_metric = trainer.evaluate(create_batches(loaded.test, config.target_batch_size), eval_test)
-    print(f"Test {loaded.eval_metric}: {test_metric:.4f}")
+        print("=== Test ===")
+        test_metric = trainer.evaluate(
+            create_batches(loaded.test, config.target_batch_size), eval_test,
+        )
+        print(f"Test {loaded.eval_metric}: {test_metric:.4f}")
 
 
 if __name__ == "__main__":
