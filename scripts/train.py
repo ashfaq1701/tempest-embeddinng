@@ -45,6 +45,17 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--log-debug", action="store_true",
                    help="Verbose per-epoch logging (reserved).")
+
+    # Lesson 28 Step-3 ablation toggles. Stripped after Step 5 decides.
+    p.add_argument("--use-walk-encoder", default=None,
+                   action=argparse.BooleanOptionalAction,
+                   help="True (default; locked) = source-side GRU walk_repr; "
+                        "False = static E_target[u] (W_off ablation).")
+    p.add_argument("--num-walks-per-node", type=int, default=None,
+                   help="K. Default 5 (locked); set to 1 for the W_gru_k1 / "
+                        "Sanity cells.")
+    p.add_argument("--freeze-tables", action="store_true",
+                   help="Freeze E_target and E_context (Sanity cell).")
     return p.parse_args()
 
 
@@ -65,7 +76,7 @@ def main() -> None:
         f"eval_metric={loaded.eval_metric}",
     )
 
-    config = Config(
+    config_kwargs = dict(
         tgb_name=loaded.name,
         max_node_count=loaded.max_node_count,
         is_directed=is_directed,
@@ -79,7 +90,13 @@ def main() -> None:
         log_debug=args.log_debug,
         tgb_root=args.tgb_root,
         use_gpu=args.use_gpu,
+        freeze_tables=args.freeze_tables,
     )
+    if args.use_walk_encoder is not None:
+        config_kwargs["use_walk_encoder"] = args.use_walk_encoder
+    if args.num_walks_per_node is not None:
+        config_kwargs["num_walks_per_node"] = args.num_walks_per_node
+    config = Config(**config_kwargs)
 
     train_dst_pool = np.unique(loaded.train.destinations)
     edge_feat_dim = (
@@ -112,7 +129,9 @@ def main() -> None:
     loaded.dataset.load_test_ns()
 
     # walk_repr_fn binding for the evaluator — sourced from the trainer.
-    walk_repr_fn = trainer._compute_walk_repr_for
+    # _e_t_u_for honors config.use_walk_encoder so W_off ablations work
+    # without a separate evaluator code path.
+    walk_repr_fn = trainer._e_t_u_for
 
     _eval_kwargs = dict(
         embedding_store=trainer.embedding_store,

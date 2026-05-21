@@ -63,7 +63,7 @@ def run_one(loaded, seed: int, use_gpu: bool) -> dict:
     derived = span / float(L_REF)
     trainer.set_time_scale(derived)
 
-    walk_repr_fn = trainer._compute_walk_repr_for
+    walk_repr_fn = trainer._e_t_u_for
     eval_kwargs = dict(
         embedding_store=trainer.embedding_store,
         link_predictor=trainer.link_predictor,
