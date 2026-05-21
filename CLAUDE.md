@@ -492,6 +492,138 @@ entirely; CAWN-style anonymous identity) would help on review
 (surprise index 0.987) without hurting wiki (surprise index 0.108).
 Walks-only is documented as future work below.
 
+### Lesson 28 — Tempest's `shuffle_walk_order` defaults to True; the walks-supervision pipeline was randomized at the seed-to-row mapping (2026-05-21)
+
+**This is the most consequential finding in the project's history.**
+Every walks-supervision diagnostic from Phase 2 onward (Lessons 17-26,
+the Stage 2-5 cliff analyses, the Step 6 single-table ablation, the
+Step 7 walk-encoder verification, and the Lesson 27 migration cell)
+was measured under randomized seed-to-row mapping. The historical
+empirical claims are provisional until re-collected.
+
+**Bug.** `temporal_random_walk.TemporalRandomWalk.__init__` accepts a
+`shuffle_walk_order` kwarg. Per the Tempest source
+(`temporal_random_walk/src/common/const.cuh`):
+
+```cpp
+constexpr bool DEFAULT_SHUFFLE_WALK_ORDER = true;
+```
+
+When True, Tempest randomly interleaves the [N·K, L] walk-output
+array across all seeds. The Python binding's docstring states this
+explicitly. `tempest_walks/walks.py:48-53` constructed
+`TemporalRandomWalk(...)` without passing `shuffle_walk_order`, so the
+True default silently activated. `grep -rn shuffle_walk *.py` returned
+zero hits across the codebase before the fix.
+
+**Where it broke the pipeline.** Three downstream paths assume the
+output is grouped as `[seed_0×K, seed_1×K, ..., seed_{N-1}×K]`:
+
+1. **`losses.py` alignment_loss**:
+   `e_target_seed.repeat_interleave(K, dim=0)` interleaves
+   `[E_target[s_0]×K, E_target[s_1]×K, ...]`. The cosine sim at
+   `losses.py:56` then pulls `E_target[s_i]` toward
+   `E_context[walk_row_i]` — but `walk_row_i` was sampled from a
+   randomly-different seed. Alignment is structurally randomized at
+   the (seed, context-walk) pairing.
+
+2. **`walk_encoder.py` reshape**:
+   `walk_repr_per_walk.view(N, K, d).mean(dim=1)` averages K rows
+   assuming they came from the same seed. With shuffled output,
+   `walk_repr[i]` is the mean of K rows from K randomly-mixed seeds.
+
+3. **`trainer.py::_compute_walk_repr_for`**: builds `idx_map` from
+   `walks.seeds`, the INPUT seed array (unshuffled), and looks up
+   rows for each batch.src entry — returning the wrong rows because
+   Tempest shuffled them but the input array didn't reflect that.
+
+`t_query` is `batch.t_max` broadcast across all seeds at the trainer
+level, so the `repeat_interleave(t_query)` at `losses.py:60` is
+shuffle-immune. Component 0 (Φ(Δt_u), Φ(Δt_v), Φ(Δt_uv) + 3 cold-start
+bits) goes through `NodeTimeState`, which never touches the walks
+pipeline; it is also shuffle-immune.
+
+**Predictive coherence with the historical record.** The bug's
+mechanism predicts the exact pattern we've been measuring:
+
+| Historical observation | Predicted under the bug |
+|---|---|
+| Sanity (Lesson 26): freeze E_target / E_context → test MRR Δ = +0.0005 ("tables are dead weight") | Tables never received coherent supervision; their training was effectively pulling toward random walks → behaved like random parameters → "frozen random = trained" is exactly what randomized supervision produces |
+| W_off (encoder OFF) = 0.7096, W_gru_k1 (encoder ON, K=1) = 0.7089, Δ ≈ 0 (Lesson 25) | Encoder's per-seed walk_repr was the mean of K randomly-mixed seeds — structurally noise — so the link MLP learned to ignore it |
+| Link-MLP cross-table weights collapsed 0.17 → 0.01 in sanity (Lesson 26) | Cross-table block reading meaningless inputs → WD_link drives weights to 0 |
+| 0.71 wiki ceiling across 25 architectural variants (Phases 2-7) | 0.71 IS Component 0's ceiling. Phase 0.5's zero-out diagnostic (Component 0 → 0 drops test MRR by -0.40) puts Component 0's contribution at ~0.40. Subtracting from 0.71 leaves ~0.31 — which is roughly the EdgeBank-tw / GraphMixer-style memorization floor reachable via NodeTimeState's Δt features. Walks-supervision was contributing ~0 |
+| Cliff dynamics (Lesson 17): E_context grad collapses to ~1e-4 by ep 7 | Alignment loss saturated against random context — no stable gradient signal |
+| Triplet wins wiki / loses review (Lesson 20) | Both losses operate on randomized walks; the cross-dataset difference reflects which loss-shape produces less bias under noise, NOT which captures walks structure better |
+
+The Sanity check is the cleanest evidence — *every* prediction the
+bug's mechanism makes lines up with what was observed.
+
+**Fix.** One kwarg in `tempest_walks/walks.py`:
+
+```python
+self.trw = TemporalRandomWalk(
+    is_directed=is_directed,
+    use_gpu=use_gpu,
+    enable_weight_computation=True,
+    timescale_bound=timescale_bound,
+    shuffle_walk_order=False,   # ← THE FIX
+)
+```
+
+**Cross-check verification.** `scripts/_shuffle_diagnostic.py` (5-node
+graph, K=3 walks per seed, deterministic timestamps):
+  - Pre-fix: **13 of 15** output rows had `nodes[lens-1] != seeds[row // K]`.
+  - Post-fix: **0 of 15** rows misaligned. Layout matches the
+    `[seed_0×K, seed_1×K, ...]` convention the codebase assumes.
+
+**Status of historical lessons.** Provisional pending re-anchor:
+
+  - Lesson 17 (cliff mechanism) — col_norm runaway is real but the
+    *cause* (alignment loss saturating early) may be artifact of
+    randomized supervision rather than a fundamental training-dynamics
+    issue.
+  - Lesson 18 (normbrake halves cliff) — may be regularizing a
+    parameter that already had no useful signal; effect under
+    coherent supervision unknown.
+  - Lesson 19 (λ_link > 0 collapses) — collapse mechanism may differ
+    under coherent supervision; possibly the BCE-into-embeddings
+    pressure was fighting *random alignment* rather than a real loss
+    surface.
+  - Lesson 22 (Adam-constructor drift) — likely still valid (CUDA
+    non-determinism is independent of supervision quality), but
+    sensitivity scale may change.
+  - Lesson 23 (WD_link breakthrough) — held link_w_norm flat while
+    the link MLP read meaningful inputs from walks? Or while it read
+    noise? Unknown until re-tested.
+  - Lesson 24 (single-table cliff-shape regression) — measured under
+    the bug; both architectures shuffled.
+  - Lesson 25 (walk encoder ties peak) — almost certainly artifact;
+    the encoder's `walk_repr[u]` was structurally noise.
+  - Lesson 26 (frozen tables sanity) — the cleanest case of the
+    bug's signature; explained entirely by the mechanism above.
+  - Lesson 27 (single-table migration) — pre-registered before the
+    bug was identified; deferred until anchor revalidates.
+
+Lessons 1-16 and the strict-causal protocol are independent of the
+walks pipeline (memory leak analysis, ingest order, evaluator,
+TimeEncoder, etc.) and stand as-is.
+
+**Re-verification protocol (in progress).**
+  - Step 1 ✓ commit walks.py fix (`905bfa4` on `fix/shuffle-walk-order`).
+  - Step 2: anchor validation under the fix on wiki (3 seeds × 2 ep).
+    Result: _TBD_.
+  - Step 3: 50-ep wiki cells under the fix — W_off / W_gru / Sanity.
+    Result: _TBD_.
+  - Step 4: review run under the fix (6-ep sampled-eval).
+    Result: _TBD_.
+  - Step 5: synthesize, decide which historical lessons re-collect.
+
+The diagnostic script `scripts/_shuffle_diagnostic.py` is retained
+in-tree for reproducibility of the pre-/post-fix witness; it is not
+part of the production pipeline.
+
+---
+
 ### Lesson 27 — Single-table + dual-projection migration (PRE-REGISTERED 2026-05-21, DEFERRED 2026-05-21)
 
 > **STATUS — DEFERRED pending Lesson 28's shuffle_walk_order bug fix.**
