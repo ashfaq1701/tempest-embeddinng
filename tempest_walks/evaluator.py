@@ -52,6 +52,12 @@ class Evaluator:
         time_state: Optional[NodeTimeState] = None,
         time_scale: Optional[float] = None,
         cold_start_dt_clamp_factor: float = 100.0,
+        # v2.4 §14 source walk encoder. If provided, e_t_u is replaced
+        # with walk_repr_u at scoring time (computed via a callable
+        # that takes a numpy array of node_ids + t_query and returns a
+        # [N, d_emb] tensor). The callable typically points at
+        # Trainer._compute_walk_repr_for.
+        walk_repr_fn: Optional[callable] = None,
     ):
         # Lazy import so this module loads without py-tgb installed.
         from tgb.linkproppred.evaluate import Evaluator as TGBEvaluator
@@ -67,6 +73,7 @@ class Evaluator:
         self.time_state = time_state
         self.time_scale = time_scale
         self.cold_start_dt_clamp_factor = cold_start_dt_clamp_factor
+        self.walk_repr_fn = walk_repr_fn
         # Wiring consistency: if the link predictor expects time inputs,
         # the encoder + state + scale must all be wired.
         if getattr(link_predictor, "use_time_encoding", False):
@@ -192,12 +199,19 @@ class Evaluator:
         for start, end in rows:
             u = all_u[start:end]
             v = all_v[start:end]
+            # v2.4 §14 source walk encoder: at eval, replace e_t_u with
+            # walk_repr_u via a Trainer-supplied callable.
+            if self.walk_repr_fn is not None:
+                u_np = u.cpu().numpy()
+                e_t_u = self.walk_repr_fn(u_np, t_query)
+            else:
+                e_t_u = self.embedding_store.target(u)
             if self.time_encoder is not None and self.time_state is not None:
                 phi_u, phi_v, phi_uv, cold_u, cold_v, cold_uv = self._time_features_for_chunk(
                     u, v, t_query,
                 )
                 out[start:end] = self.link_predictor(
-                    self.embedding_store.target(u),
+                    e_t_u,
                     self.embedding_store.target(v),
                     self.embedding_store.context(u),
                     self.embedding_store.context(v),
@@ -206,7 +220,7 @@ class Evaluator:
                 )
             else:
                 out[start:end] = self.link_predictor(
-                    self.embedding_store.target(u),
+                    e_t_u,
                     self.embedding_store.target(v),
                     self.embedding_store.context(u),
                     self.embedding_store.context(v),

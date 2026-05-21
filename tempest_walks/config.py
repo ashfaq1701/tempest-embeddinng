@@ -14,6 +14,13 @@ class Config:
     d_emb: int = 128
     d_hidden_link: int = 128
 
+    # v2.4 §14 source walk encoder. When True, replaces e_t_u (the
+    # source-side embedding lookup at the link MLP) with the GRU's
+    # output applied to walks seeded on u. Jointly trained with link
+    # BCE — gradient flows through encoder INTO E_target/E_context.
+    # Default False = locked-v2 baseline (no encoder).
+    use_walk_encoder: bool = False
+
     # Component 0: time encoding at the link MLP (Phase 0.5 of the
     # walk-distribution-matched design).
     # Inputs Δt_u, Δt_v, Δt_uv go through a learned functional time

@@ -37,6 +37,7 @@ from .losses import (
     uniformity_loss,
 )
 from .model import EmbeddingStore, LinkPredictor, TimeEncoder
+from .walk_encoder import WalkEncoder
 from .negatives import (
     HistoricalNegativeSampler,
     NegativeSampler,
@@ -94,6 +95,21 @@ class Trainer:
             # determines the ω_i geometric init scale.
             self.time_encoder = TimeEncoder(k=config.time_enc_k, time_scale=1.0).to(self.device)
             self.time_state = NodeTimeState(n_nodes=config.max_node_count)
+        # v2.4 §14 source walk encoder. Initialized only when enabled;
+        # adds to the link_optimizer param group so BCE backprops into
+        # the GRU AND into E_target/E_context via per-step lookups.
+        self.walk_encoder: Optional[WalkEncoder] = None
+        if config.use_walk_encoder:
+            if not config.use_time_encoding:
+                raise ValueError(
+                    "use_walk_encoder=True requires use_time_encoding=True "
+                    "(walk encoder per-step input needs Φ time-delta encoding)"
+                )
+            d_time = 2 * config.time_enc_k
+            has_edge = (edge_feat_dim > 0)
+            self.walk_encoder = WalkEncoder(
+                d_emb=config.d_emb, d_time=d_time, has_edge_feat=has_edge,
+            ).to(self.device)
         self.walk_gen = WalkGenerator(
             is_directed=config.is_directed,
             use_gpu=False,                  # Tempest CPU — preserves 8 GB VRAM
@@ -181,6 +197,10 @@ class Trainer:
         link_params = list(self.link_predictor.parameters())
         if self.time_encoder is not None:
             link_params += list(self.time_encoder.parameters())
+        # Walk encoder is link-side (BCE-trained); BCE backprop flows
+        # encoder → E_target/E_context via per-step lookups regardless.
+        if self.walk_encoder is not None:
+            link_params += list(self.walk_encoder.parameters())
         self.link_optimizer = torch.optim.Adam(
             link_params,
             lr=config.link_lr,
@@ -408,6 +428,57 @@ class Trainer:
         cold_uv = torch.from_numpy(is_cold_uv_np).to(self.device).unsqueeze(-1)
         return phi_u, phi_v, phi_uv, cold_u, cold_v, cold_uv
 
+    def _compute_walk_repr_for(self, node_ids: np.ndarray, t_query: int) -> torch.Tensor:
+        """Compute walk_repr[u] for the given node IDs at the query timestamp.
+
+        v2.4 §14 helper: a separate Tempest walks call seeded on
+        unique(node_ids) feeds the WalkEncoder GRU. Returns a tensor
+        with one walk_repr per input node, in the SAME order as
+        node_ids (handles repeats by lookup; same walk_repr returned
+        for repeated node IDs).
+        """
+        assert self.walk_encoder is not None
+        assert self.time_encoder is not None
+        unique_ids = np.unique(node_ids)
+        walks = self.walk_gen.walks_for_nodes(unique_ids)
+        wn = walks.nodes.to(self.device).long().clamp_min(0)
+        wt = walks.timestamps.to(self.device).long()
+        wl = walks.lens.to(self.device).long()
+        NK = wn.shape[0]
+        tq = torch.full((NK,), int(t_query), dtype=torch.long, device=self.device)
+        edge_feats_padded = None
+        if (
+            self.embedding_store.has_edge_feat
+            and walks.edge_feats is not None
+        ):
+            ef = walks.edge_feats.to(self.device)
+            ef_proj = self.embedding_store.edge_feat_proj(ef.float())  # [N*K, L-1, d_emb]
+            edge_feats_padded = torch.nn.functional.pad(ef_proj, (0, 0, 0, 1))
+        walk_repr_unique = self.walk_encoder(
+            walk_nodes=wn,
+            walk_timestamps=wt,
+            walk_lens=wl,
+            t_query=tq,
+            embedding_store=self.embedding_store,
+            time_encoder=self.time_encoder,
+            edge_feats_padded=edge_feats_padded,
+            K=walks.K,
+        )  # [N_unique, d_emb]
+        # Build O(1) lookup from node_id → row in walk_repr_unique.
+        seeds_np = (
+            walks.seeds.cpu().numpy()
+            if isinstance(walks.seeds, torch.Tensor)
+            else np.asarray(walks.seeds)
+        )
+        idx_map = {int(n): i for i, n in enumerate(seeds_np)}
+        row_idx = np.fromiter(
+            (idx_map[int(u)] for u in node_ids),
+            dtype=np.int64,
+            count=len(node_ids),
+        )
+        row_t = torch.from_numpy(row_idx).long().to(self.device)
+        return walk_repr_unique[row_t]
+
     def _link_step(self, batch: Batch) -> float:
         neg_src, neg_tgt = self.neg_sampler_train.sample(batch)
         B = len(batch.src)
@@ -424,7 +495,13 @@ class Trainer:
 
         # §4.8.2 embedding-side dropout at the link-MLP read site (training
         # mode only — torch.nn.Dropout is a no-op during eval()).
-        e_t_u = self.embedding_store.target(u_t)
+        # v2.4 §14 source walk encoder: when enabled, replace e_t_u
+        # (source-side embedding lookup) with walk-pooled GRU output.
+        # Negatives share batch.src, so unique(all_u) == unique(batch.src).
+        if self.walk_encoder is not None:
+            e_t_u = self._compute_walk_repr_for(all_u, int(batch.t_max))
+        else:
+            e_t_u = self.embedding_store.target(u_t)
         e_t_v = self.embedding_store.target(v_t)
         e_c_u = self.embedding_store.context(u_t)
         e_c_v = self.embedding_store.context(v_t)

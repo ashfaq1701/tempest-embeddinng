@@ -34,6 +34,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-walk-len", type=int, default=20)
     p.add_argument("--num-walks-per-node", type=int, default=5)
     p.add_argument("--walk-bias", default="ExponentialWeight")
+    # v2.4 §14 source walk encoder. Default OFF (locked-v2 baseline).
+    p.add_argument("--walk-encoder", action="store_true",
+                   help="Enable source-side GRU walk encoder (v2.4 §14). "
+                        "Replaces e_t_u with walk-pooled GRU output.")
 
     # Losses
     p.add_argument("--temporal-decay-exp", type=float, default=0.5)
@@ -173,6 +177,7 @@ def main() -> None:
         max_walk_len=args.max_walk_len,
         num_walks_per_node=args.num_walks_per_node,
         walk_bias=args.walk_bias,
+        use_walk_encoder=args.walk_encoder,
         temporal_decay_exp=args.temporal_decay_exp,
         alignment_time_scale=args.alignment_time_scale,
         eta_uniform=args.eta_uniform,
@@ -251,6 +256,11 @@ def main() -> None:
     loaded.dataset.load_val_ns()
     loaded.dataset.load_test_ns()
 
+    # v2.4 §14: when walk encoder is enabled, the Evaluator calls back into
+    # the trainer's helper to compute walk_repr_u at scoring time.
+    walk_repr_fn = (
+        trainer._compute_walk_repr_for if trainer.walk_encoder is not None else None
+    )
     _eval_kwargs = dict(
         embedding_store=trainer.embedding_store,
         link_predictor=trainer.link_predictor,
@@ -261,6 +271,7 @@ def main() -> None:
         time_state=trainer.time_state,
         time_scale=trainer._time_scale,
         cold_start_dt_clamp_factor=config.cold_start_dt_clamp_factor,
+        walk_repr_fn=walk_repr_fn,
     )
     eval_val = Evaluator(
         neg_sampler=TGBNegativeSampler(loaded.dataset, split_mode="val"),
