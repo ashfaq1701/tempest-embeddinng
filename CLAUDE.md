@@ -492,7 +492,7 @@ entirely; CAWN-style anonymous identity) would help on review
 (surprise index 0.987) without hurting wiki (surprise index 0.108).
 Walks-only is documented as future work below.
 
-### Lesson 28 — Tempest's `shuffle_walk_order` defaults to True; the walks-supervision pipeline was randomized at the seed-to-row mapping (2026-05-21)
+### Lesson 28 — Two coupled strict-causal bugs: `shuffle_walk_order=True` (walks) and reservoir leak (negatives) (2026-05-21)
 
 **This is the most consequential finding in the project's history.**
 Every walks-supervision diagnostic from Phase 2 onward (Lessons 17-26,
@@ -501,7 +501,16 @@ Step 7 walk-encoder verification, and the Lesson 27 migration cell)
 was measured under randomized seed-to-row mapping. The historical
 empirical claims are provisional until re-collected.
 
-**Bug.** `temporal_random_walk.TemporalRandomWalk.__init__` accepts a
+A second strict-causal bug — the historical-negative reservoir
+leaking across epochs — surfaced during the post-shuffle-fix code
+audit (Bug 2 below). Both are coupled in that the reservoir leak's
+effect was masked by the shuffle bug (alignment trained random
+signal regardless of negative choice). After both fixes the
+pipeline finally trains on coherent supervision.
+
+## Bug 1 — `shuffle_walk_order` defaults to True
+
+`temporal_random_walk.TemporalRandomWalk.__init__` accepts a
 `shuffle_walk_order` kwarg. Per the Tempest source
 (`temporal_random_walk/src/common/const.cuh`):
 
@@ -576,6 +585,67 @@ graph, K=3 walks per seed, deterministic timestamps):
   - Post-fix: **0 of 15** rows misaligned. Layout matches the
     `[seed_0×K, seed_1×K, ...]` convention the codebase assumes.
 
+## Bug 2 — HistoricalNegativeSampler reservoir leaks across epochs
+
+`Trainer.train()`'s docstring at trainer.py:333 says "Per epoch: reset
+Tempest + time_state + reservoir". The implementation reset only the
+first two — `walk_gen.reset()` and `time_state.reset()`. The
+`HistoricalNegativeSampler.reset()` method (negatives.py:102-104,
+zeros the reservoir + count) was never called outside `__init__`.
+
+**Failure mode.** Each training epoch iterates the chronological train
+set. By the END of epoch 1, every source's reservoir reflects the
+ENTIRE training timeline (reservoir_size=32 vs ~20-30 avg unique
+destinations per source on wiki — most sources saturate). At the
+START of epoch 2:
+
+  - walk_gen and time_state are empty (fresh chronological pass).
+  - But the reservoir still holds every destination each source ever
+    interacted with.
+  - Historical negatives for batch B in epoch 2 sample uniformly from
+    that full pool.
+  - Many of those destinations are the source's FUTURE positives
+    within epoch 2 (B' > B in the same chronological pass).
+  - The false-negative guard at negatives.py:135-137 only invalidates
+    `hist_neg == batch.tgt`; it does NOT know which (u, v) pairs are
+    upcoming positives.
+
+So the model is trained to score (u, v_future_positive) LOW for batch
+B, then trained to score the same pair HIGH at batch B' > B. The
+"historical" channel of the negatives is a structurally
+self-contradictory training signal from epoch 2 onward, on a real
+fraction of every batch.
+
+**Why this masked under Bug 1.** With shuffled walks, the embedding
+tables and walk encoder were never receiving coherent supervision —
+contradictions in negative sampling couldn't damage signal that
+didn't exist. The HistoricalNegativeSampler docstring already warned
+against using historical negatives on wiki for an *adjacent* reason
+(scoring eval-time historical positives LOW collapses MRR). The
+reservoir leak amplifies that risk by guaranteeing future-positive
+contamination.
+
+**Magnitude.** wiki has 9227 nodes / 110K train edges / reservoir_size
+32. Average source has ~20-30 unique destinations; most fit in the
+reservoir by end of epoch 1. By epoch 2 each source's reservoir
+approximates its full destination-history distribution. EdgeBank-tw's
+0.571 wiki score quantifies the underlying recurrence — a substantial
+fraction of historical negatives served at training time are pairs
+that genuinely should be classified positive at later batches in the
+same epoch.
+
+**Fix.** Two changes:
+
+1. `NegativeSampler` ABC gains a no-op default `.reset()`. Subclasses
+   that own state (`HistoricalNegativeSampler`) override; stateless
+   subclasses (`UniformNegativeSampler`, `TGBNegativeSampler`) inherit
+   the no-op.
+
+2. `Trainer.train()` calls `self.neg_sampler_train.reset()` at the top
+   of the per-epoch loop, immediately after `walk_gen.reset()` and
+   `time_state.reset()`. Unconditional — the ABC default makes it
+   safe across sampler choices.
+
 **Status of historical lessons.** Provisional pending re-anchor:
 
   - Lesson 17 (cliff mechanism) — col_norm runaway is real but the
@@ -604,17 +674,30 @@ graph, K=3 walks per seed, deterministic timestamps):
   - Lesson 27 (single-table migration) — pre-registered before the
     bug was identified; deferred until anchor revalidates.
 
-Lessons 1-16 and the strict-causal protocol are independent of the
-walks pipeline (memory leak analysis, ingest order, evaluator,
+Lesson 4 ("historical negatives are RIGHT under walks-supervise-
+embeddings") is provisional too: under the reservoir leak, training
+historical negatives were sampling from "destinations the source
+ever interacted with across all of train" rather than "destinations
+the source interacted with up to batch B-1". The lesson's strict-
+causal premise wasn't fully met. The mix of historical vs random
+training negatives still matters; only the *historicity* of the
+historical channel was broken.
+
+Lessons 1-3, 5-16 and the strict-causal protocol are independent of
+the walks pipeline (memory leak analysis, ingest order, evaluator,
 TimeEncoder, etc.) and stand as-is.
 
 **Re-verification protocol (in progress).**
-  - Step 1 ✓ commit walks.py fix (`905bfa4` on `fix/shuffle-walk-order`).
-  - Step 2: anchor validation under the fix on wiki (3 seeds × 2 ep).
+  - Step 1a ✓ commit walks.py shuffle fix (`905bfa4`).
+  - Step 1b ✓ commit reservoir-reset fix (same branch).
+  - Step 2: anchor validation under both fixes on wiki (3 seeds × 2 ep).
+    Result: _TBD (in progress; pre-fix anchor seed-42 was val 0.7441 /
+    test 0.7082; a partial post-Bug-1-only run completed seeds 42 and
+    7 at val 0.7430 / test 0.7076 and val 0.7440 / test 0.7087
+    respectively, but was halted before seed 13 when Bug 2 surfaced)._
+  - Step 3: 50-ep wiki cells under both fixes — W_off / W_gru / Sanity.
     Result: _TBD_.
-  - Step 3: 50-ep wiki cells under the fix — W_off / W_gru / Sanity.
-    Result: _TBD_.
-  - Step 4: review run under the fix (6-ep sampled-eval).
+  - Step 4: review run under both fixes (6-ep sampled-eval).
     Result: _TBD_.
   - Step 5: synthesize, decide which historical lessons re-collect.
 

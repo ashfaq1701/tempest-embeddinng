@@ -350,6 +350,13 @@ class Trainer:
         for ep in range(1, n_epochs + 1):
             self.walk_gen.reset()
             self.time_state.reset()
+            # Drop the historical-negative reservoir at epoch boundaries.
+            # Without this, epoch 1's full chronological pass leaves every
+            # source's reservoir reflecting the entire training set, so
+            # epoch 2's "historical negatives" can include destinations
+            # the source will positively interact with later in the same
+            # epoch. Strict-causal violation — see Lesson 28.
+            self.neg_sampler_train.reset()
             self.embedding_store.train()
             self.link_predictor.train()
             self.time_encoder.train()

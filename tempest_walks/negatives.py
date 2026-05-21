@@ -23,11 +23,23 @@ from .data import Batch
 
 
 class NegativeSampler(abc.ABC):
-    """All samplers expose `sample(batch) → (neg_src, neg_tgt)`."""
+    """All samplers expose `sample(batch) → (neg_src, neg_tgt)`.
+
+    `reset()` is called by the trainer at the start of every epoch.
+    Stateless samplers can rely on the no-op default; samplers that
+    accumulate per-source state (e.g., the historical reservoir)
+    MUST override to drop carry-over from the prior epoch — without
+    it, epoch-1's full chronological pass contaminates epoch-2's
+    historical negatives with future-batch positives (strict-causal
+    violation, see Lesson 28).
+    """
 
     @abc.abstractmethod
     def sample(self, batch: Batch):
         ...
+
+    def reset(self) -> None:
+        return None
 
 
 class UniformNegativeSampler(NegativeSampler):
