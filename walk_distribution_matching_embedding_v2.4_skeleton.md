@@ -1080,3 +1080,217 @@ If walk encoder loses or ties: leave branch as paper-reproducibility artifact. M
 8. **port_plan.md** committed on master with full PORT-DEFAULT/FLAG/SKIP table (per [post_lock_transition_plan.md](post_lock_transition_plan.md)).
 
 Then — AND ONLY THEN — Step 5 (walk encoder) begins.
+
+## 16. §6 Hybrid vs walks-only architectural ablation (planned, gated by Step 7 walk-encoder outcome)
+
+**Status:** PLANNED. Two parallel branches off `locked-v2`. Gated by
+Step 7 walk-encoder cells (W_off / W_gru / W_gru_k1) resolving and a
+pre-experiment sanity check.
+
+### Motivation — cross-domain literature review
+
+The static-table-feeds-encoder pattern (locked-v2 + Step 7 walk encoder
+as currently designed) has known failure modes:
+
+1. **Column-norm runaway tied to entity frequency** under contrastive
+   objectives (Wang & Isola 2020; Adap-τ 2023; SSL-norms 2025). Popular
+   nodes inflate, rare nodes stay near init. Stage 2 diagnostic on
+   locked-v2 confirmed this.
+2. **Decoupled-supervision drift**: table trained by alignment+uniformity,
+   encoder by link BCE — the encoder chases a moving input distribution.
+   See Query Drift Compensation (arXiv:2506.00037).
+3. **Inductive failure**: per-node tables hard-bind predictions to
+   training-time identity. tgbl-review-v2's surprise index 0.987 is
+   exactly the regime where this hurts most.
+
+**TGB v2 leaderboard pattern (January 2026 snapshot):** top-tier methods
+build source representations from temporal walks/neighbor sequences,
+NOT per-node identity:
+- TPNet 0.827 wiki
+- Heuristic-LocalGlobal 0.821
+- HyperEvent 0.810
+- DyGFormer 0.798
+
+Methods leaning hardest on per-node identity (TGN ~0.396, GraphMixer
+0.118 on wiki) sit at the bottom of wiki. On review the ranking
+inverts — GraphMixer #1 at 0.521 because review's high surprise index
+favors inductive methods that DON'T bind to ID.
+
+**CAWN Ab.5 ablation (Wang et al., ICLR 2021):** replacing anonymous
+walks with one-hot node identity made performance "significantly less
+effective" — the cleanest single datapoint.
+
+**Our pattern (0.71 wiki / 0.31 review) is the canonical signature of
+a table that overfits to transductive identity and breaks down
+inductively.**
+
+### Pre-experiment sanity check (1 cell, ~1.5 hr on Step 7 branch)
+
+**SANITY:** Freeze `E_target` and `E_context` (`requires_grad=False` on
+both tables, no gradient from any loss back into them). Retrain just
+the walk encoder + link MLP. Seed 42, 50 epochs, `--log-debug`.
+
+Interpretation:
+- **Matches Step 7** → encoder is already ignoring the table; walks-only (Exp B) is the productive direction.
+- **Drops > 0.01** → table IS carrying signal; Exp A (hybrid done properly) is worth the effort.
+- **Improves** → table is actively hurting via drift; walks-only strongly indicated.
+
+This is one cheap cell that disambiguates which experiment to prioritize.
+
+### Experiment A — Hybrid done properly
+
+Branch: `experiment/hybrid-table-encoder` from `locked-v2`.
+
+Three guardrails from the cross-domain literature, added to Step 7's
+walk-encoder design:
+
+1. **L2-normalize each table lookup** before feeding into the encoder
+   per-step input. Cancels column-norm runaway at the encoder interface.
+   Implementation: `F.normalize(E_target[node], dim=-1)` and
+   `F.normalize(E_context[node], dim=-1)` in WalkEncoder.forward.
+2. **Detach the table from link-MLP loss for the first N=10 epochs.**
+   Alignment + uniformity shape the table before the encoder starts
+   pulling on it via BCE-through-encoder. After epoch N, re-enable.
+   New config: `detach_table_epochs=10`.
+3. **Row-wise weight decay** on E_target and E_context (separate from
+   column-level normbrake). Adam `weight_decay_emb=1e-5`. Fights row-level
+   magnitude growth, complementary to normbrake.
+
+**Cells:**
+- `A_main` — seed 42, 50 ep, all three guardrails ON. Wiki then review.
+- Multi-seed if A_main beats locked-v2 by > 0.005 AND shows cleaner cliff.
+
+### Experiment B — Walks-only (no source-side table)
+
+Branch: `experiment/walks-only-source` from `locked-v2`.
+
+Remove `E_target` entirely from the source-side representation. The
+walk encoder builds source from:
+- **Anonymous-walk positional identity** per CAWN — hitting counts on
+  each walk (how many times each walk-position-index appears in the
+  K=5 walks for this source). This is the I_CAW identity from Wang
+  et al. ICLR 2021.
+- Edge features along the walk (existing).
+- Time-delta encoding (existing).
+- `E_context[walk_node]` for walk-internal nodes only (because
+  walk-internal nodes are destinations from the seed's perspective,
+  and E_context has alignment-trained semantics for that role).
+
+**Explicitly NOT included for the source side:**
+- `E_target[seed]` anywhere
+- `E_target` lookups in any per-step position
+- Any learned per-source-node identity
+
+**Destination side at the link MLP keeps `E_context[v]`** — asymmetric
+per CAWN's own design.
+
+```
+Per-step GRU input (walks-only):
+  step_input_i = concat([
+    one_hot_hitting_count(node_i across K=5 walks),     # CAWN I_CAW
+    E_context[walk_node_i] if i < L-1 else zeros,       # walk-internal only
+    Φ(t_seed - t_i),                                      # existing
+    edge_features_i                                       # existing
+  ])
+
+Walk pool: learned attention over K walks (one query token attending
+to K walk-summary vectors), per CAW-N-Attn.
+
+Source repr: source_repr = walk_encoder(walks_u)         # NO E_target anywhere
+Dest repr (unchanged): E_context[v]
+```
+
+**Cells:**
+- `B_main` — walks-only as specified, seed 42, 50 ep
+- `B_meanpool` — walks-only with mean-pool instead of attention pool (ablation: does attention matter?)
+- `B_no_hitcount` — walks-only WITHOUT hitting-count anonymous identity (ablation: is walk structure alone enough?)
+
+### Asymmetric decision rule
+
+The lit review identifies **tgbl-review-v2 (surprise index 0.987) as
+the discriminator**, not wiki (0.108). Evaluate both experiments on
+both datasets.
+
+**Lock walks-only (Experiment B) if BOTH:**
+- B test MRR on wiki ≥ A test MRR on wiki − **0.01**
+- B test MRR on review ≥ A test MRR on review + **0.02**
+
+The asymmetric thresholds reflect that the inductive dataset is the
+harder discriminator. A small wiki regression is acceptable in exchange
+for review improvement.
+
+**Lock hybrid (Experiment A) if BOTH:**
+- A test MRR on wiki ≥ B test MRR on wiki + **0.02**
+- A test MRR on review ≥ B test MRR on review − **0.01**
+
+Inverse asymmetry: hybrid must clearly win on wiki AND not lose review.
+
+**If neither rule triggers:** investigate further. Likely one
+architecture has a bug preventing its potential.
+
+### Pre-registered prediction (2026-05-21, before launches)
+
+Based on the cross-domain literature + our 0.71/0.31 pattern:
+
+- **50% Experiment B wins** (per CAWN, GraphMixer review-#1, and TGB top-tier all leaning walks/inductive). Walks-only ties wiki within 0.01 and beats review by ≥ 0.02. Lock walks-only.
+- **25% Experiment A wins** (hybrid done properly — L2-normalize + detach-warmup + row-WD stabilize the table contribution). Hybrid beats walks-only on wiki by ≥ 0.02 without losing review. Lock hybrid.
+- **20% Sanity check shows tables are dead weight** (frozen tables match Step 7 within noise). Strong signal for Experiment B.
+- **5% Neither rule triggers** — both experiments are competitive, both within asymmetric thresholds. Default to walks-only on simplicity grounds (CAWN-style) and run cross-dataset multi-seed on both.
+
+**Bigger-picture prediction:** walks-only on review likely yields
+**0.35–0.45** test MRR (vs locked-v2's 0.31). Wiki may drop 0.01–0.02
+(0.69–0.70). The trade-off is clearly favorable on a paper-defensibility
+basis if the asymmetric decision rule's review threshold is met.
+
+### Execution order
+
+1. **Sanity check** (1 cell, ~1.5 hr) on the Step 7 branch.
+2. **Document §16** (this section) with pre-registered predictions. ✓
+3. **Launch Experiment B first** (literature prior is stronger). B_main on wiki, seed 42.
+4. If B_main wins by > 0.005 wiki: run B_main on review.
+5. **Launch Experiment A second.** A_main on wiki, seed 42.
+6. If A_main competitive on wiki: run A_main on review.
+7. **Apply asymmetric decision rule.** Lock the winner.
+8. **Multi-seed validate** the winner.
+9. Optionally run `B_meanpool` and `B_no_hitcount` as paper follow-up ablations.
+
+### Lock procedure
+
+1. Update v2.4 §16 with both results and the decision.
+2. **Winner (B):** merge `experiment/walks-only-source` to master. Archive `experiment/hybrid-table-encoder` as paper-ablation reproducibility.
+3. **Winner (A):** merge `experiment/hybrid-table-encoder` to master. Archive walks-only branch as paper-ablation reproducibility.
+4. Update `config_locked_v1.yaml`.
+5. Tag master: `git tag locked-v3 -m "walks-only architecture locked"` OR `git tag locked-v3 -m "hybrid table+encoder architecture locked"`.
+
+**DO NOT proceed to any further architectural work until this decision
+is finalized.** Walks-only vs hybrid is the load-bearing architectural
+question after the in-flight walk encoder.
+
+### Caveats
+
+- Strict-causal protocol caps absolute MRR below leaderboard methods
+  that may carry within-batch leaks. Don't expect to hit TPNet's 0.827
+  on wiki even with optimal architecture. The gain from hybrid →
+  walks-only is more important than absolute number.
+- The destination-side lookup `E_context[v]` is kept in BOTH
+  experiments. Fully dropping all tables is a different (harder)
+  experiment that CAWN does not run.
+- GraphMixer's #1 on tgbl-review-v2 uses zero node features. Our
+  walks-only retains time/edge features and anonymous-walk identity,
+  so it's closer to CAWN than to GraphMixer in design.
+
+### Key literature references
+
+- Wang et al., "Causal Anonymous Walks," ICLR 2021 (snap.stanford.edu/caw)
+- Wang & Isola, "Alignment and Uniformity on the Hypersphere," ICML 2020
+- Liu et al., "Are ID Embeddings Necessary?" arXiv:2402.10602
+- Cong et al., "GraphMixer," ICLR 2023
+- Yu et al., "DyGFormer," arXiv:2303.13047
+- TGB v2 leaderboard, January 2026 snapshot (tgb.complexdatalab.com)
+
+### Final architecture decision (after ALL experiments resolve)
+
+After Step 7 + sanity check + Experiment A + Experiment B + multi-seed:
+the "best version" is selected per the asymmetric decision rule. The
+selected branch is merged to master as `locked-v3`. Document the final
+decision here with timestamped commit and tagging.
