@@ -447,13 +447,19 @@ class Trainer:
         NK = wn.shape[0]
         tq = torch.full((NK,), int(t_query), dtype=torch.long, device=self.device)
         edge_feats_padded = None
-        if (
-            self.embedding_store.has_edge_feat
-            and walks.edge_feats is not None
-        ):
-            ef = walks.edge_feats.to(self.device)
-            ef_proj = self.embedding_store.edge_feat_proj(ef.float())  # [N*K, L-1, d_emb]
-            edge_feats_padded = torch.nn.functional.pad(ef_proj, (0, 0, 0, 1))
+        if self.embedding_store.has_edge_feat:
+            L = wn.shape[1]
+            d_emb = self.embedding_store.d_emb
+            if walks.edge_feats is not None:
+                ef = walks.edge_feats.to(self.device)
+                ef_proj = self.embedding_store.edge_feat_proj(ef.float())  # [N*K, L-1, d_emb]
+                edge_feats_padded = torch.nn.functional.pad(ef_proj, (0, 0, 0, 1))
+            else:
+                # Cold-start (epoch-1 first batches): Tempest state empty, no
+                # edge feats. Encoder GRU still expects this slot — pad zeros.
+                edge_feats_padded = torch.zeros(
+                    (wn.shape[0], L, d_emb), dtype=torch.float32, device=self.device,
+                )
         walk_repr_unique = self.walk_encoder(
             walk_nodes=wn,
             walk_timestamps=wt,
