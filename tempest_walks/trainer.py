@@ -368,7 +368,12 @@ class Trainer:
             self._last_normbrake = 0.0
 
         self.emb_optimizer.zero_grad(set_to_none=True)
-        l_total.backward()
+        # v2.4 §16 Phase 1: when freeze_tables is True AND there are no
+        # other trainable params on the embedding side (e.g. wiki has no
+        # node_feat → target_final/context_final are None), l_total has
+        # no gradient path. Skip backward+step in that case.
+        if l_total.requires_grad:
+            l_total.backward()
         # Optional grad-norm logging (debug instrumentation for deep-analysis).
         # Captures the L2 norms of the embedding tables' gradients before the
         # optimizer step — the signal for "how aggressively is the loss
@@ -384,7 +389,9 @@ class Trainer:
                 float(g_c.norm().item()) if g_c is not None else 0.0
             )
             self._debug_grad_acc["n_batches"] += 1
-        self.emb_optimizer.step()
+        # Skip step when no gradient path (freeze_tables + no ancillary params).
+        if l_total.requires_grad:
+            self.emb_optimizer.step()
         return float(l_primary.detach()), l_uniform_val
 
     # ------------------------------------------------------------------ #
