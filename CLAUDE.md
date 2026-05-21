@@ -687,19 +687,96 @@ Lessons 1-3, 5-16 and the strict-causal protocol are independent of
 the walks pipeline (memory leak analysis, ingest order, evaluator,
 TimeEncoder, etc.) and stand as-is.
 
-**Re-verification protocol (in progress).**
+**Re-verification protocol.**
   - Step 1a ✓ commit walks.py shuffle fix (`905bfa4`).
-  - Step 1b ✓ commit reservoir-reset fix (same branch).
-  - Step 2: anchor validation under both fixes on wiki (3 seeds × 2 ep).
-    Result: _TBD (in progress; pre-fix anchor seed-42 was val 0.7441 /
-    test 0.7082; a partial post-Bug-1-only run completed seeds 42 and
-    7 at val 0.7430 / test 0.7076 and val 0.7440 / test 0.7087
-    respectively, but was halted before seed 13 when Bug 2 surfaced)._
-  - Step 3: 50-ep wiki cells under both fixes — W_off / W_gru / Sanity.
-    Result: _TBD_.
-  - Step 4: review run under both fixes (6-ep sampled-eval).
-    Result: _TBD_.
+  - Step 1b ✓ commit reservoir-reset fix (`50c7d32`).
+  - Step 2 ✓ anchor validation under both fixes on wiki (3 seeds × 2 ep):
+    val mean **0.7435 ± 0.0010** / test mean **0.7086 ± 0.0007**.
+    Verdict: CONFIRMED vs 0.7070 ± 0.0016 target. Delta vs pre-fix
+    anchor (test mean 0.7087): -0.0001 — **identical within noise**.
+    Outcome B: at 2-epoch scale on wiki, neither bug was load-bearing.
+    Component 0 dominates the 2-ep signal; walks-supervision adds
+    nothing measurable at this depth. The discriminators are deeper
+    training (Step 3) and review (Step 4).
+  - Step 3 — 50-ep wiki cells under both fixes (seed 42, --log-debug,
+    --early-stop-patience 999, --num-walks-per-node 1 where indicated):
+
+    | Cell | Best (ep, val/test) | Ep-50 val | Cliff drop | Pre-fix (Lesson 25/26) |
+    |---|---|---|---|---|
+    | W_off (no encoder, tables train, K=5) | ep 3: 0.7433 / **0.7081** | 0.6860 | **-0.057** | 0.7096 best, -0.019 cliff |
+    | W_gru_k1 (encoder ON, tables train, K=1) | ep 6: 0.7435 / **0.7075** | 0.6646 | **-0.079** | 0.7089 best, -0.002 cliff |
+    | Sanity (encoder ON, tables FROZEN, K=1) | _Sanity-rerun pending_ | | | 0.7094 best, -0.002 cliff |
+
+    Key observations:
+      - **Peak test MRR is unchanged within noise** vs pre-fix
+        (Δ ≈ -0.001 to -0.002). The walks-supervision pipeline is
+        coherent now, but Component 0 + memorization-via-time-features
+        still dominate the wiki ceiling at the 0.71 level.
+      - **Cliff is now SIGNIFICANTLY worse** under coherent walks:
+        W_off -0.057 vs -0.019 (3× deeper), W_gru_k1 -0.079 vs -0.002
+        (~40× deeper). The pre-fix observation of "encoder smooths the
+        cliff" (Lesson 25) **does not survive** under coherent
+        supervision. With real alignment signal, the embeddings drift
+        further over training even with the encoder.
+      - Link loss now CONVERGES MUCH FURTHER under coherent walks
+        (W_gru_k1 link loss 0.10 at ep 50 vs locked-v2's 0.15 at ep
+        50). The link MLP is fitting the now-meaningful cross-table
+        signal harder, which is the proximate cause of the deeper
+        cliff (overfit to overly-confident embeddings).
+      - Normbrake's contribution remains tiny: nb stuck around
+        0.0015-0.0018 across both cells, well below noise floor.
+        L_normbrake is essentially dormant under coherent walks too,
+        confirming the prior on Lesson 28b/Lesson 18 redundancy.
+        (Stripping pending architectural decision.)
+      - The encoder's "smoothing" property (Lesson 25) was an artifact
+        of the bug — under randomized walks, the encoder's noisy
+        output never trained anything coherent, so no overtraining-
+        induced cliff. Under coherent walks, the encoder doesn't help
+        smooth the cliff at all — it actually shifts the optimum
+        earlier (ep 6 vs W_off's ep 3 best, but bigger collapse after).
+  - Step 4: review run under both fixes (6-ep sampled-eval). _Deferred
+    (user instruction): re-evaluate after the architectural
+    simplification (single-table + possibly normbrake removal) lands._
   - Step 5: synthesize, decide which historical lessons re-collect.
+
+**Status of historical lessons (refined post-Step-3).**
+
+  - Lesson 17 (cliff mechanism, col_norm runaway) — **CONFIRMED real**.
+    The cliff is not an artifact of randomized supervision; under
+    coherent walks it is in fact DEEPER. Mechanism analysis (E grad
+    saturating early, Adam momentum runaway) still applies, but the
+    saturation is now on real signal rather than noise.
+  - Lesson 18 (normbrake halves cliff) — **provisional under coherent
+    supervision**. The pre-fix improvement was on a randomized-noise
+    cliff; whether it still helps the now-deeper cliff is untested.
+    nb is dormant (0.0017) in Step 3, suggesting it's not engaging
+    enough to matter — likely still strippable as Lesson 28-followup.
+  - Lesson 23 (WD_link breakthrough) — **provisional**. WD_link held
+    link_w_norm flat in Step 3 cells, but the cliff still appeared
+    via deeper link-loss convergence (different mechanism). Possibly
+    still load-bearing but in a different way.
+  - Lesson 25 (walk encoder ties peak, smooths cliff) — **FALSIFIED
+    under coherent walks for the cliff-smoothing claim**. Peak still
+    ties (W_off 0.7081 vs W_gru_k1 0.7075, within noise), but
+    encoder's cliff is WORSE (-0.079 vs W_off's -0.057). The
+    "smoothing" interpretation was a bug artifact.
+  - Lesson 26 (frozen tables sanity) — **rerun pending** (the cell
+    crashed mid-run and needs the trainer's no-grad guard before
+    re-launching).
+  - Lesson 27 (single-table migration) — re-evaluated after Step 3
+    lands (see Decision Path below).
+
+**Decision path after Step 3 (executed autonomously per user
+authority).** 
+  1. Merge the fix-branch to master, tag the result.
+  2. Re-run the single-table + dual-projection migration on the fixed
+     dual-table master. Acceptance: peak val within ~0.005 of fixed
+     dual-table baseline AND cliff not noticeably worse. If pass, the
+     dual-table architecture is gratuitous complexity → strip to
+     single-table.
+  3. With single-table locked, run a 50-ep `--lambda-normbrake 0`
+     ablation. If peak + cliff unchanged within noise, strip
+     normbrake entirely.
 
 The diagnostic script `scripts/_shuffle_diagnostic.py` is retained
 in-tree for reproducibility of the pre-/post-fix witness; it is not
