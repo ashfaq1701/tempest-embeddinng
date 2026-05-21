@@ -492,6 +492,83 @@ entirely; CAWN-style anonymous identity) would help on review
 (surprise index 0.987) without hurting wiki (surprise index 0.108).
 Walks-only is documented as future work below.
 
+### Lesson 27 — Single-table + dual-projection migration (PRE-REGISTERED 2026-05-21)
+
+This section is committed BEFORE the migration runs as a pre-registered
+prediction. Final empirical result is appended at the bottom of this
+lesson once Cell A + multi-seed verification complete.
+
+**Motivation.** Lesson 26 sanity-check froze E_target / E_context on wiki
+and the test MRR moved by Δ=+0.0005 — the dual tables contribute
+essentially nothing to wiki link prediction once the walk encoder is
+on. The asymmetry that the cross-table 8-block exploits lives at the
+LINK MLP HEAD (target(u) ↔ context(v) pairings), not in the embedding
+table identities. A single shared table E ∈ R^[N, d] with two linear
+projections P_src, P_tgt expresses exactly that asymmetry in fewer
+parameters:
+
+  - dual-table E_target + E_context on wiki: 9229 × 128 × 2 = 2.362M params.
+  - single-table E + P_src + P_tgt on wiki:  9229 × 128 + 2 × (128 × 128) = 1.214M params.
+
+The migration halves the embedding-side parameter count and makes the
+"the asymmetry is at the head" finding architecturally explicit.
+
+**Why this is NOT a re-run of Step 6 (Lesson 24).** Step 6 tested
+1T_asym BEFORE Stage 3's weight_decay_link=1e-4 landed and BEFORE the
+walk encoder shipped. The dual-table peak tied at the noise floor
+(Δ=-0.0006) but cliff shape regressed 3.2× (-0.011 → -0.035). Two of
+the three cliff-stabilizers we now ship (WD_link + walk encoder) hadn't
+yet been measured at that point. This migration retests the same
+architectural primitive under the present locked stack.
+
+**Pre-registered prediction (timestamped 2026-05-21).** On wiki:
+  - Peak test MRR ties locked-v2 within the anchor std (0.7070 ± 0.0016).
+    Confidence: high. The walk encoder is the load-bearing source-side
+    component; the static table contribution is verifiably ~0
+    (Lesson 26). Moving table identity into a projection should be
+    transparent to peak MRR.
+  - Cliff shape (peak val → ep-50 val drop) is the open question.
+    Possibility A: WD_link + walk encoder absorb the cliff-shape
+    regression Step 6 saw → drop matches locked-v2 (~-0.011).
+    Possibility B: single-table E magnitude dynamics differ enough that
+    even normbrake doesn't fully stabilize → drop somewhere between
+    -0.011 and Step 6's -0.035.
+  - Threshold-recalibration is mandatory. Dual-table threshold=3.87 was
+    calibrated against E_target.weight's per-column norm at ep 1-2; the
+    single-table E.weight absorbs gradients from BOTH the P_src side
+    (alignment + uniformity) AND the P_tgt side (alignment context-walk
+    + uniformity-of-target ub). Magnitude dynamics should differ. The
+    2-epoch calibration cell measures the new col_norm and sets
+    threshold = 1.5 × col_norm_at_ep2.
+
+On review (sampled 6-ep eval): peak ties or marginally improves vs
+locked-v2's 0.3135 (Lesson 26 predicts walks-only-style architectures
+should help on high-surprise-index datasets, and single-table is a
+small step in that direction by removing one of the two static
+identity tables).
+
+**Decision rule (locked before running).**
+This is a complexity-reduction migration, not an optimization. MERGE if
+ALL of the following hold:
+  - Wiki peak val MRR within ±0.005 of locked-v2 peak (≥ 0.7399, ≤ 0.7499
+    against the 0.7449 reference).
+  - Wiki cliff drop (peak → ep-50) within ±0.01 of locked-v2's -0.011
+    (i.e. drop ≤ -0.021, so ep-50 val ≥ 0.7235 against the 0.7335
+    reference).
+  - Multi-seed (42, 7, 13) mean within ±0.005 of locked-v2 mean. Single
+    seed is insufficient — Lesson 22 documents CUDA non-determinism
+    drift of ~±0.030 on identical seeds.
+
+DO NOT MERGE if any decision-rule check fails. The branch becomes a
+paper-ablation artifact; master stays at locked-v2.
+
+**Final empirical result.** _To be filled in after Cell A + multi-seed
+verification._
+  - Calibrated normbrake threshold (single-table E.weight, ep 2): _TBD_.
+  - Wiki seed 42: peak val _TBD_ / ep-50 val _TBD_ / drop _TBD_.
+  - Wiki seeds {7, 13}: _TBD_.
+  - Decision: _TBD_.
+
 ---
 
 ## Historical chronology (consolidated)
@@ -510,9 +587,10 @@ Walks-only is documented as future work below.
 | **Stage 3** — λ_link + WD_link sweep | WD_link=1e-4 BREAKTHROUGH | drop -0.014 |
 | **Stage 4** — hist_neg_ratio × λ_link (2×4 grid) | λ_link=0 confirmed; hist=0.5 default | — |
 | **Stage 5** — uniformity hyperparameter sweep | defaults win (Scenario A) | — |
-| **Step 6** — single-table 1T_asym ablation | dual-table wins on cliff shape | — |
+| **Step 6** — single-table 1T_asym ablation | dual-table wins on cliff shape (pre-WD_link, pre-encoder) | — |
 | **Step 7** — source walk encoder | ties locked-v2 on peak, smoother cliff | **0.7100** |
 | **(this codebase)** | minimal locked production | **0.7100 wiki** |
+| **Step 8** — single-table + dual-projection retest under locked-v2 stack | pre-registered 2026-05-21 (Lesson 27); result pending | — |
 
 Final wiki single-seed: val 0.7423 / **test 0.7100** at ep 1 with the
 minimal production architecture (smoke test 2026-05-21).
