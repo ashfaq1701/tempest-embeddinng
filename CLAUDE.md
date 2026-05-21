@@ -1,732 +1,600 @@
-# Tempest walk-first temporal embeddings — v3 (clean rebuild)
+# Tempest walk-first temporal embeddings — minimal production
 
 This codebase is the embedding-side companion to the Tempest paper
-(2026 ACM submission, *"Tempest: A GPU-Accelerated Engine for Streaming
-Temporal Random Walks"*). Its conclusion: *"Tempest opens a path to
+(2026 ACM submission). Its conclusion: *"Tempest opens a path to
 walk-native temporal embedding methods that consume causal walks
-directly, which we are pursuing in ongoing work."* That ongoing work
-is this repo.
+directly."* This repo implements that.
 
-The architecture is a minimum, tightly-TGB-coupled implementation of
-the only design that has been shown to actually work under an
-**honestly strict-causal protocol**:
+**Honest test MRR on TGB v2 (strict-causal protocol, no within-batch leak):**
 
-1. Walks **supervise the embedding table** via alignment + uniformity
-   (DeepWalk / node2vec / Wang & Isola pattern), seeded by current-
-   batch nodes but generated from a **pre-ingest Tempest state** —
-   so the walks never include the current batch's edges.
-2. A two-table embedding store (`E_target`, `E_context`) is decoded
-   by an 8-block MLP for link prediction.
-3. The TGB-official `Evaluator` is the only scorer; reported numbers
-   are bit-identical to the leaderboard protocol.
+| Dataset | Test MRR |
+|---|---|
+| tgbl-wiki-v2 | **0.7100** |
+| tgbl-review-v2 | **~0.31** (preliminary; 6-ep sampled-eval) |
 
-Everything else has been tried and either failed or carried a leak —
-see the lessons-learned section at the bottom. For the full design
-spec (every primitive, every loss, every channel, with shapes and
-equations), see `design_document.md`.
+Leaderboard reference (most carry the TGN within-batch memory leak;
+see Lesson 1):
 
----
-
-## Strict-causal protocol (NON-NEGOTIABLE)
-
-Every batch — at training AND at evaluation — runs in this exact order:
-
-```
-1.  walks   = walk_gen.walks_for_nodes(seeds = unique(batch.src ∪ batch.tgt))
-        # UNION seeding: every node touched by the batch gets walks. On
-        # bipartite-flavoured datasets (wiki, review, …) seeding only on
-        # batch.src would starve target(dst) and context(src) of the
-        # alignment signal — see Lesson 9.
-        # Tempest state contains events strictly UP THROUGH batch B-1;
-        # the current batch's edges have NOT been ingested yet.
-        # First batch of each epoch: walks are empty (Tempest just reset),
-        # so embeddings stay at random init for that batch — by design.
-2.  l_emb   = alignment(walks) + η · uniformity(batch_nodes)
-    embedding_optimizer.step()
-        # E_target / E_context updated from B-1-state walks only.
-3.  negatives = neg_sampler.sample(batch)
-        # Training:    K_hist drawn from each source's reservoir (events
-        #              ≤ batch B-1) + K_rand uniform random.
-        # Validation/test: dataset.negative_sampler.query_batch (TGB
-        #              pre-generated, 50/50 historical/random per positive).
-4.  score   = link_predictor(target(u), target(v), context(u), context(v))
-    (training) l_link = BCE(score, labels); link_optimizer.step()
-    (eval)     evaluator.eval({y_pred_pos, y_pred_neg, eval_metric})
-5.  POST-SCORING BLOCK (both updates feed batch B+1, not B):
-        if HistoricalNegativeSampler: neg_sampler.observe(batch.src, batch.tgt)
-        walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)   ← Tempest update is the LAST line
-```
-
-**Why this matters.** If the ingest happens before walks (the way the
-v1/v2 baselines did), the walks for source `u` contain the very edge
-`(u, v_pos, t)` that is about to be scored. The alignment loss has
-just pulled `E_target[u]` and `E_context[v_pos]` together; the link
-MLP then trivially scores that pair high. Training MRR balloons,
-evaluation MRR does not, and the published 0.508 / 0.7630 numbers from
-v1 / v2 were inflated by this leak. The same leak shape as the TGN
-memory-update leak documented in the v0 critical-lesson — just
-transposed to walk-embedding supervision.
-
-The strict-causal version trains slower (the embedding has to learn
-from past walks only, not from the batch it's about to score) but the
-training and eval distributions match.
-
-Per-epoch reset: `walk_gen.reset()` is called once at the start of
-each training epoch. At eval the Tempest state is **kept from end of
-training** and accumulates eval edges as it goes — TGB's streaming
-convention.
+| Method | wiki | review |
+|---|---|---|
+| Random | 0.0075 | — |
+| EdgeBank-tw | 0.571 | — |
+| GraphMixer | 0.594 | 0.521 |
+| TGN | 0.690 | — |
+| DyGFormer | 0.798 | — |
+| TPNet | 0.827 | — |
+| **Ours (honest)** | **0.71** | **0.31** |
 
 ---
 
-## Architecture
+## Architecture (fixed — no variant knobs)
 
 ```
                   ┌─────────────────┐
-                  │ TGB / Tempest   │ ← ingest after every batch
+                  │ TGB / Tempest   │ ← ingest AFTER scoring (strict-causal)
                   │  edge stream    │
                   └────────┬────────┘
-                           │ walks_for_nodes(seeds = unique(batch.src ∪ batch.tgt))
+                           │ walks_for_nodes(union(src, tgt))
                            ▼
-              ┌────────────────────────┐
-              │  per-walk: (nodes,     │  seed at nodes[lens-1]
-              │   timestamps, lens,    │  chronological order
-              │   edge_feats)          │  edge_feats[p] = feature of hop (p → p+1)
-              └──────────┬─────────────┘
+              ┌─────────────────────────┐
+              │ per-walk WalkData        │  seed at nodes[lens-1]
+              │  (nodes, ts, lens, ef)   │  chronological order
+              └──────────┬──────────────┘
                          │
         ┌────────────────┴────────────────┐
         ▼                                 ▼
-  alignment_loss                    uniformity_loss
-  (pull target(seed) toward         (spread target(u) on
-   context_walk(walk-position))      unit hypersphere)
+  alignment_loss                   uniformity_loss
+  pull target(seed) toward         spread target(u) on
+  context(walk-position)           the unit hypersphere
         │                                 │
-        └──────────────┬──────────────────┘
-                       ▼
-                 EmbeddingStore
-                 (E_target, E_context  ∈  ℝ^[N, d])
-                 + proj_t, proj_c, proj_e  (feature projections)
-                 + target_final, context_final, context_walk_final  (fusion)
-                       │
-                       ▼
-              LinkPredictor MLP   (CROSS-table 8-block)
-   ┌─────────────────────────────────────────────────────┐
-   │ in = concat([                                        │
-   │   # u→v direction: target(u) ↔ context(v)            │
-   │   target(u), context(v),                             │
-   │   target(u) ⊙ context(v), |target(u) − context(v)|,  │
-   │   # v→u direction: target(v) ↔ context(u)            │
-   │   target(v), context(u),                             │
-   │   target(v) ⊙ context(u), |target(v) − context(u)|,  │  # 8·d_emb
-   │ ])                                                    │
-   │ → LayerNorm → 2-layer GELU MLP → 1 logit             │
-   └─────────────────────────────────────────────────────┘
-                       │
-                       ▼
+        └────────────────┬────────────────┘
+                         ▼
+                   EmbeddingStore
+              (E_target, E_context  ∈  R^[N, d=128])
+              + optional node-feat residual (proj_t, proj_c)
+              + edge_feat_proj (consumed by alignment loss only)
+                         │
+                         ▼  + normbrake regularizer (column-norm clamp)
+                         │
+              ──────────────────────────────────────────
+              At each scoring row (u, v, t):
+              ──────────────────────────────────────────
+                         │
+        ┌────────────────┼────────────────────┐
+        ▼                ▼                    ▼
+  source side       destination side   Component 0
+  WalkEncoder       E_target[v]        Φ(Δt_u), Φ(Δt_v), Φ(Δt_uv)
+  (1-layer GRU      E_context[v]       + 3 cold-start bits
+   over walks                          (Xu et al. 2020 +
+   for u)                              Phase 0.5)
+        │                │                    │
+        └────────────────┴────────────────────┘
+                         ▼
+              LinkPredictor (8-block cross-table + Component 0)
+              input dim = 8·d_emb + 3·d_time + 3 = 1123
+              3-layer GELU MLP → 1 logit
+                         ▼
               BCE-with-logits (train)
               TGB Evaluator.eval (val/test)
 ```
 
-Walks supervise the embedding table; the link MLP only sees frozen
-embedding lookups. Two optimizers, two losses, run sequentially per
-batch:
+**Two optimizers, decoupled supervision:**
 
-- `embedding_optimizer` ← (l_align + η · l_uniform)
-- `link_optimizer`      ← BCE-with-logits on (pos, K negatives)
+- `emb_optimizer`  ← `alignment + η·uniformity + λ·normbrake`
+- `link_optimizer` ← BCE only, `weight_decay=1e-4` (cliff fix)
+  - Includes `walk_encoder.parameters()` AND `time_encoder.parameters()`
+  - BCE backprops through the encoder INTO E_target/E_context via
+    per-step lookups — gradient flow that absorbs link-MLP runaway.
 
----
+## Strict-causal protocol (NON-NEGOTIABLE)
 
-## Negative sampling
+Every batch — training AND evaluation — runs in this exact order:
 
-| Phase | Source | K per positive |
-|---|---|---|
-| Training | `HistoricalNegativeSampler`: K_hist from each source's reservoir of past destinations (Vitter R, M=32 by default), K_rand uniform over `train.destinations` pool. Default mix is 50/50, matching TGB's eval protocol. | 10 |
-| Validation | `dataset.negative_sampler.query_batch(..., split_mode="val")` (TGB pre-generated, mix of historical + random) | ~999 on tgbl-wiki |
-| Test | `dataset.negative_sampler.query_batch(..., split_mode="test")` | ~999 on tgbl-wiki |
+```
+1. walks   = walk_gen.walks_for_nodes(seeds = unique(batch.src ∪ batch.tgt))
+             ← Tempest state contains events strictly ≤ batch B-1.
+2. (train) l_emb = alignment(walks) + η·uniformity + λ·normbrake
+           emb_optimizer.step()
+3. negs    = neg_sampler.sample(batch)
+           ← Training: 50/50 historical reservoir + uniform random.
+             Reservoir contains observations through batch B-1.
+             Eval: TGB pre-generated negatives (50/50 mix).
+4. walk_repr_u = walk_encoder(walks_for_nodes(unique(batch.src)))
+   score    = link_predictor(walk_repr_u, target(v),
+                             context(u), context(v),
+                             Φ(Δt_u), Φ(Δt_v), Φ(Δt_uv),
+                             is_cold_*)
+5. (train) l_link = BCE(score, labels); link_optimizer.step()
+   (eval)  evaluator.eval(...)  ← TGB Evaluator, leaderboard-identical.
+6. POST-SCORING BLOCK (all for batch B+1):
+        if HistoricalNegativeSampler: neg_sampler.observe(batch.src, batch.tgt)
+        time_state.update(batch.src, batch.tgt, batch.ts)
+        walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)   ← LAST
+```
 
-**Causality of the reservoir.** `reservoir.observe(batch.src, batch.tgt)`
-runs in the post-scoring block AFTER the link step for batch B. So
-when batch B+1's `sample()` reads from the reservoir, it sees
-destinations from events ≤ batch B. Batch B's positives are not in
-its own reservoir at sampling time. Same strict-causal guarantee as
-the Tempest ingest.
-
-**Distribution match with eval.** TGB serves a mix of historical and
-random negatives at val/test (variable per positive, ~50/50 typical).
-Training on the same mix keeps the link-MLP's input distribution
-aligned with what eval will present. `hist_neg_ratio=0.5` is the
-default; set `--hist-neg-ratio 0` to fall back to pure-random
-training negatives for ablations.
-
-**False-negative guard.** Any historical-negative draw equal to the
-current positive's target (`v_neg == v_pos`) is replaced with the
-random fallback. Empty reservoir slots (cold-start sources) are
-likewise replaced. Both checks are a single vectorised `np.where`.
-
----
-
-## TGB integration (tight coupling)
-
-| Concern | TGB symbol | Where |
-|---|---|---|
-| Dataset | `tgb.linkproppred.dataset.LinkPropPredDataset(name, root, preprocess=True)` | `data.py::load_tgb` |
-| Splits | `dataset.{train,val,test}_mask` | `data.py::load_tgb` |
-| Edges | `dataset.full_data["sources" / "destinations" / "timestamps"]` | `data.py::load_tgb` |
-| Eval negatives | `dataset.load_val_ns()` / `load_test_ns()`, then `dataset.negative_sampler.query_batch(src, tgt, ts, split_mode)` | `negatives.py::TGBNegativeSampler` |
-| Metric scorer | `tgb.linkproppred.evaluate.Evaluator(name).eval({y_pred_pos, y_pred_neg, eval_metric})` | `evaluator.py` |
-| Metric name | `dataset.eval_metric` (typically `"mrr"`) | passed through `Loaded.eval_metric` |
-
-**There is no hand-rolled MRR.** A per-positive `tgb_eval.eval(...)`
-call computes the metric exactly as the leaderboard does.
-
----
+If step 6 happens before step 5, walks for source `u` include the edge
+`(u, v_pos, t)` we're about to score, alignment pulls `E_target[u]`
+and `E_context[v_pos]` together, and the link MLP trivially scores the
+just-strengthened pair high. v1/v2 reported inflated 0.508 / 0.7630
+numbers from exactly this leak.
 
 ## Walk-structure rules (Tempest)
 
 `temporal_random_walk.TemporalRandomWalk.get_random_walks_and_times_for_nodes`
-returns walks in **chronological order** regardless of direction:
+returns walks in chronological order:
 
 ```
-nodes:      [n_0, n_1, ..., n_{lens-2}, n_{lens-1}, -1, -1, ...]
-timestamps: [t_0, t_1, ..., t_{lens-2}, sentinel,   -1, -1, ...]
-lens:       number of valid NODES per walk (so lens-1 edges).
+nodes:      [n_0, n_1, ..., n_{lens-1}, -1, -1, ...]   # n_{lens-1} = seed
+timestamps: [t_0, t_1, ..., t_{lens-1}, -1, -1, ...]
+edge_feats: [ef_0, ef_1, ..., ef_{lens-2}, ...]        # ef[p] = edge (n_p, n_{p+1})
+lens:       int — number of valid node positions
 ```
 
-- `nodes[lens-1]` = **the seed** (Tempest reverses the walk in place
-  before return so callers see chronological order). NEVER assume
-  seed at `nodes[0]`.
-- `timestamps[k]` for `k ∈ [0, lens-2]` = time of edge between
-  `nodes[k]` and `nodes[k+1]`.
-- `timestamps[lens-1]` = sentinel `INT64_MAX` (backward walks).
-- `edge_feats[k]` for `k ∈ [0, lens-2]` = feature of the SAME edge
-  (`nodes[k]`, `nodes[k+1]`). Same indexing as `timestamps[k]`.
-  In `context_walk`, the edge-feat tensor is **right-padded** so that
-  position `p` of the [W, L] grid carries `edge_feats[p]`. Left-padding
-  it (off-by-one — uses `edge_feats[p-1]`) was a bug we hit; the
-  alignment loss's `timestamps[p]` and `edge_feats[p]` must describe
-  the same hop. See Lesson 11.
-- Positions ≥ `lens` are padding (`nodes=-1`, `timestamps=-1`).
+**Seed is at `nodes[lens-1]`** (Lesson 7). NEVER assume `nodes[0]`.
 
-**Cold-start.** A seed with no prior edges in the current Tempest
-state can return `lens=0` (empty walk). Code paths that touch
-per-position node embeddings must handle this — typically by
-clamping `lens` to ≥1 and treating the seed itself as the only valid
-token. The alignment loss masks padding out via the `lens` vector.
+## WalkEncoder (source-side, mandatory)
+
+1-layer unidirectional GRU. Per-step input:
+
+```
+step_input_i = concat([
+  E_target[node_i] if i == lens-1 else E_context[node_i],    # role-aware lookup
+  Φ(t_seed - t_i),                                            # time delta
+  edge_features[i] (zero-padded at i=0)                       # if dataset has ef
+])
+```
+
+GRU input dim = `d_emb + d_time + (d_emb if has_edge_feat else 0)`.
+
+Output: `walk_repr[u] = mean_k(GRU(step_inputs_k).hidden_at_seed_position)`
+over K=5 walks per seed.
+
+At the link MLP, `walk_repr_u` REPLACES the previously-static
+`E_target[u]` slot in the cross-table 8-block. `E_target[v]`,
+`E_context[u]`, `E_context[v]` are still static-table lookups.
+
+## Locked hyperparameters
+
+| Hyperparameter | Value | Rationale |
+|---|---|---|
+| `d_emb`, `d_hidden_link` | 128 | Lesson 15 (capacity hurts wiki) |
+| `max_walk_len` | 20 | Tempest default |
+| `num_walks_per_node` (K) | 5 | Tempest default; K=1 within noise |
+| `walk_bias` | ExponentialWeight | Tempest default |
+| `temporal_decay_exp` (β) | 0.5 | alignment-loss recency power |
+| `alignment_time_scale` | train_span / L_REF=20 | Lesson 11 (decoupled from max_walk_len) |
+| `eta_uniform` | 1.0 | Stage 5 Scenario A (defaults win) |
+| `uniformity_temperature` | 2.0 | Wang & Isola default |
+| `uniformity_cap` | 20000 | Stage 5 (cap never fires at B=200) |
+| `time_enc_k` | 16 | → d_time = 32 |
+| `cold_start_dt_clamp_factor` | 100.0 | Δt clamp to 100×time_scale |
+| `lambda_normbrake` | 0.1 | Stage 2 (only architectural fix that helps) |
+| `normbrake_threshold` | 3.87 (wiki) / 31.32 (review) | 1.5 × col_norm at ep 1-2 |
+| `weight_decay_link` | 1e-4 | Stage 3 BREAKTHROUGH (cliff drop -0.014) |
+| `num_neg_per_pos` (K_train) | 10 | TGB default |
+| `hist_neg_ratio` | 0.5 | Stage 4 (matches TGB eval distribution) |
+| `reservoir_size` | 32 | Vitter-R per-source reservoir |
+| `emb_lr`, `link_lr` | 1e-3 | Adam |
+| `target_batch_size` | 200 | Lesson 15 (small batches better) |
+
+All other knobs from the experimental phase were demonstrated to
+either hurt or be non-load-bearing and were stripped (see SKIP list
+below).
+
+## Files
+
+| Path | Role |
+|---|---|
+| `tempest_walks/config.py` | Locked production hyperparameters (23 fields) |
+| `tempest_walks/model.py` | EmbeddingStore + TimeEncoder + LinkPredictor |
+| `tempest_walks/walk_encoder.py` | 1-layer GRU walk encoder (source-side) |
+| `tempest_walks/losses.py` | alignment + uniformity + normbrake + link_bce |
+| `tempest_walks/trainer.py` | Strict-causal step + early-stop + snapshot/restore |
+| `tempest_walks/evaluator.py` | TGB-Evaluator-backed scorer with chunked link forward |
+| `tempest_walks/timestate.py` | NodeTimeState for Component 0 |
+| `tempest_walks/walks.py` | Tempest CPU walk-generator wrapper |
+| `tempest_walks/negatives.py` | TGB negatives + historical reservoir |
+| `tempest_walks/data.py` | TGB dataset loader |
+| `scripts/train.py` | Entry point (~10 CLI args) |
+| `scripts/anchor_validate.py` | 3-seed × 2-ep gate (Gate A) |
+
+## Running
+
+```bash
+# Wiki (default thresholds calibrated for wiki):
+.venv/bin/python -m scripts.train --tgb-name tgbl-wiki --use-gpu \
+  --num-epochs 50 --early-stop-patience 5
+
+# Review (override normbrake threshold + use sampled eval):
+.venv/bin/python -m scripts.train --tgb-name tgbl-review --use-gpu \
+  --num-epochs 6 --early-stop-patience 2 \
+  --normbrake-threshold 31.32 \
+  --monitor-sample-pct 0.05 --skip-final-full-eval
+
+# Anchor validation (Gate A):
+.venv/bin/python -m scripts.anchor_validate --tgb-name tgbl-wiki --use-gpu
+```
 
 ---
 
-## CRITICAL LESSONS LEARNED (do not re-litigate)
+## Lessons learned (consolidated)
 
 ### Lesson 1 — TGN memory has a within-batch leak
 
-Per Rossi et al. (2020), the standard `memory_update_at_start=False`
-mode applies the batch's positive edges to the GRU memory state
-BEFORE scoring. At scoring time both endpoints of the positive have
-been freshly updated; negatives' v-side has not. The model learns
-"freshness" rather than the link rule. Every open-source TGN /
-DyRep / DyGFormer / TPNet reimplementation that uses this mode
-carries the leak.
+Standard `memory_update_at_start=False` mode (Rossi et al. 2020) applies
+the batch's positive edges to the GRU memory state BEFORE scoring.
+Both endpoints of the positive have been freshly updated; negatives'
+v-side has not. Model learns "freshness" rather than the link rule.
+Most TGN/DyRep/DyGFormer/TPNet leaderboard implementations carry this
+leak, so leaderboard numbers are not strict-causally comparable to ours.
 
-The honest pattern is `memory_update_at_start=True` with a
-**raw-message-store**: batch B reads stored raw messages from batch
-B-1, applies them via the GRU at the start of B's forward, scores,
-then stashes B's new raw messages for B+1. Memory state used to
-score B reflects events strictly up to B-1. Gradient still flows
-because the GRU runs inside the autograd graph at scoring time.
+### Lesson 2 — Walks supervise embeddings, NOT transformer inputs
 
-This v3 codebase does NOT include a memory module by default. If one
-is added later it MUST use the raw-message-store pattern.
-
-### Lesson 2 — Walks supervise embeddings, not transformer inputs
-
-Feeding walks as per-batch input through a transformer encoder and
-training end-to-end on link loss only does **not** work. The
-encoder has to learn to read walks, the link MLP has to learn to
-score, and the embeddings have to be useful — all from a single
-weak 1:10 BCE/InfoNCE signal. The walks-only baseline plateaued at
-~0.011 test MRR on tgbl-wiki this way.
-
-What works: walks **supervise the embedding table** via
-`alignment(seed, walk-neighbours) + uniformity(batch nodes)`. The
-walks provide rich per-position supervision; the embeddings
-specialize; the link MLP becomes a thin decoder. The v1 baseline
-reached 0.508 test MRR on tgbl-wiki this way.
+Feeding walks as per-batch input through a transformer and training
+end-to-end on link BCE alone plateaued at ~0.011 test MRR on wiki.
+Walks must supervise the embedding tables via alignment+uniformity;
+the link MLP then becomes a thin decoder over the supervised geometry.
 
 ### Lesson 3 — Ingest order at TRAINING matters
 
-It's not enough for eval to be strict-causal. If at training the
-ingest happens BEFORE walks are generated, walks for source `u`
-include the current `(u, v_pos)` edge, the alignment loss pulls
-`E_target[u]` and `E_context[v_pos]` together, and the link MLP
-scores the just-strengthened pair seconds later. This is a leak,
-just on the walk-supervision side instead of the memory side. The
-v1/v2 published 0.508 / 0.7630 numbers were obtained under this
-leaky training protocol; the eval-only-strict-causal protocol they
-used isn't enough to make the numbers honest.
-
-This v3 codebase ingests AFTER scoring at training AND at eval.
-Always.
+If ingest happens BEFORE walks at training, walks for source `u`
+include the current `(u, v_pos)` edge → alignment pulls `E_target[u]`
+toward `E_context[v_pos]` → link MLP trivially scores the pair high
+→ training MRR inflates, eval doesn't. v1/v2's 0.508/0.7630 were
+exactly this leak. This codebase ingests AFTER scoring at training AND
+at eval, always.
 
 ### Lesson 4 — Historical negatives are RIGHT under walks-supervise-embeddings
 
-In the previous (walks-as-transformer-input) architecture, training
-with historical negatives collapsed eval MRR to ~0.065 on tgbl-wiki.
-At the time this looked like "the model learns to score historical
-pairs LOW; eval positives are historical; collapse." But the real
-cause was that the link MLP had no signal beyond the encoder output,
-and the encoder learned to discriminate against EXACTLY the hist-neg
-distribution it was trained on. Historical negatives just exposed
-the architecture's weakness.
-
-Under THIS architecture (walks supervise dual embedding tables;
-link MLP decodes), the calculus flips:
-
-- The alignment loss pulls `E_target[u]` close to `E_context[v]`
-  every time `v` appears in `u`'s walk history — that IS recency
-  encoding. The embedding now carries "v shows up in u's recent
-  past" without the link MLP having to learn it.
-- Historical negatives at training are therefore hard-but-honest
-  examples: `v_hist` shares u's history (high overlap in
-  `E_target` × `E_context` similarity) but isn't the actual
-  positive at this timestamp. The model learns to use OTHER
-  embedding-space signal to break the tie. That's exactly what
-  eval needs the model to do.
-- Training distribution matches eval distribution (TGB serves
-  ~50/50 hist/random at val/test).
-
-**Default: `hist_neg_ratio = 0.5`** — same mix TGB uses at eval.
-The original 3be7ada commit reported +0.070 test MRR from this
-change under the v1 architecture; the contribution under v3 needs
-re-measurement.
+`hist_neg_ratio=0.5` matches TGB's eval-time 50/50 historical/random
+mix. Without historical negatives at train, the train/eval
+distributions diverge and val MRR is harder to optimize. The reservoir
+is observed POST-batch (strict-causal — batch B's positives are NOT
+in the reservoir when batch B is scored).
 
 ### Lesson 5 — Memorization is THE signal on tgbl-wiki
 
-EdgeBank's 0.571 reveals that any architecture not designed to
-exploit historical recurrence will underperform on tgbl-wiki. The
-walk-as-supervision approach in this v3 encodes recurrence by
-pulling `E_target[u]` and `E_context[v]` together whenever `v`
-appears in `u`'s past walks. Repeated edges → repeated alignment
-pull → tight embeddings → high link score. That's EdgeBank's lookup
-table, made differentiable.
+EdgeBank-tw at 0.571 reveals that any architecture not designed to
+exploit historical recurrence will underperform. The alignment-loss
+geometry encodes recurrence by pulling `E_target[u]` and
+`E_context[v]` together whenever `v` appears in u's past walks.
+Repeated edges → repeated alignment pull → tight embeddings → high
+link score.
 
 ### Lesson 6 — TGB Evaluator, not hand-rolled MRR
 
 Pessimistic-only MRR (`(neg ≥ pos).sum() + 1`) differs from TGB's
-official Evaluator at score-tie boundaries. Reported numbers must
-go through `tgb.linkproppred.evaluate.Evaluator.eval(...)` or they
-aren't comparable to anything on the leaderboard. This v3 does it
-properly.
+official Evaluator at score-tie boundaries. Reported numbers go
+through `tgb.linkproppred.evaluate.Evaluator.eval(...)`.
 
 ### Lesson 7 — Walks at seed position lens-1, NEVER 0
 
 Tempest's backward walks are reversed in place so callers see
-chronological order. The seed lives at `nodes[lens-1]`. Treating
-`nodes[0]` as the seed (a bug carried from v1 row 1 through row 11)
-trains the alignment loss against the deepest-past node, which
-acts as a noisy regularizer. The seed-position fix (commit
-`dca4962`) cost 0.020 test MRR vs the buggy version because the
-heavy downstream heads had implicitly tuned to the wrong anchor —
-correctness > noise-band-adjacent metric.
+chronological order. Seed at `nodes[lens-1]`. Treating `nodes[0]` as
+seed (an old bug) trains alignment against the deepest-past node and
+cost 0.020 test MRR.
 
-### Lesson 8 — Exploit Tempest's unique outputs
+### Lesson 8 — Exploit Tempest's per-hop timestamps + edge features
 
-Most random-walk methods don't have per-hop timestamps or per-hop
-edge features. Tempest does. The alignment loss uses per-hop
-timestamps via the `(1 + Δt(c) / time_scale)^(−β)` temporal weight
+Alignment loss uses per-hop timestamps via `(1 + Δt/time_scale)^(−β)`
 and per-hop edge features through `proj_e` inside `context_walk`.
-Both are no-ops when the dataset doesn't provide the signal — see
-the "Feature handling" matrix.
-
-Edge features are intentionally context-side-and-alignment-only.
-They characterise a hop (an edge between two nodes), not a node
-identity, and they're absent from negatives (negative `(u, v_neg)`
-pairs have no associated edge), so feeding them to the link MLP
-would let it key on "edge feat present → positive" — a leak. The
-HISTORICAL note about edge features regressing under the v2 setup
-was the additive-residual variant; the current concat + per-site
-fusion handles them robustly.
+Both are no-ops when dataset doesn't provide them.
 
 ### Lesson 9 — Cross-table link MLP > within-table
 
-The alignment loss trains the `target ↔ context` cosine. The link
-MLP must consume **exactly that interaction** so the BCE signal can
-ride on the supervised geometry instead of re-learning it from
-scratch. Within-table 8-blocks (`target⊙target`, `context⊙context`)
-were the original design — those products have no direct
-supervision and the head had to learn cross-table coupling
-implicitly through its hidden layers. Switching to cross-table
-blocks (`target(u)⊙context(v)` for u→v and `target(v)⊙context(u)`
-for v→u, plus their L1 differences) gave +0.04 test MRR on wiki by
-itself.
+Alignment trains the `target ↔ context` cosine. The link MLP must
+consume exactly that interaction. Within-table products
+(target⊙target, context⊙context) have no direct supervision.
+Cross-table 8-block (`target(u)⊙context(v)` for u→v and
+`target(v)⊙context(u)` for v→u, plus L1 diffs) gave +0.04 test MRR
+on wiki by itself.
 
 ### Lesson 10 — Seed walks on union(src, tgt), not just src
 
-Seeding walks only on `unique(batch.src)` starves `target(v)` and
-`context(u)` of alignment supervision whenever the dataset has a
-bipartite tilt (users → pages on wiki, users → reviews on review,
-etc.). Both tables effectively become half-trained, and the link
-MLP has to lift the un-supervised half from BCE alone. Union
-seeding (`unique(batch.src ∪ batch.tgt)`) gives every node touched
-by the batch a chance to pull its target view, doubles seed
-diversity per step, and is the right default everywhere. Costs
-~2× walk-sampling per batch — negligible.
+On bipartite-flavored datasets (users→pages on wiki, users→reviews on
+review), seeding only on src starves `target(v)` and `context(u)` of
+alignment supervision. Union seeding doubles seed diversity per step;
+cost is negligible.
 
 ### Lesson 11 — `time_scale` must be decoupled from `max_walk_len`
 
-The alignment loss's recency term `(1 + Δt / time_scale)^(−β)` is
-extremely sensitive to `time_scale`. The original derivation
-`(t_max − t_min) / max_walk_len` coupled `time_scale` to walk
-length: bumping L=20 → L=50 collapsed `time_scale` from 93k to 37k
-on wiki and crushed the recency weight, negating the benefit of
-the longer walks.
+The alignment loss's recency term `(1 + Δt/time_scale)^(−β)` is
+extremely sensitive to `time_scale`. Coupling it to `max_walk_len`
+(old derivation `span / max_walk_len`) means bumping L=20→L=50
+collapses `time_scale` from 93k→37k and crushes recency weight.
 
-The right derivation **keeps the dataset-span numerator but uses
-a fixed reference constant `L_REF=20` in the denominator**, NOT
-the configurable `max_walk_len`:
-
-```
-time_scale = (t_max − t_min) / L_REF       where L_REF = 20 (fixed)
-```
-
-For wiki this is 1.86M / 20 ≈ **93k sec ≈ 1.08 days**, regardless
-of `--max-walk-len`. Empirically this beats the per-node mean
-inter-event time `(span × N / E) ≈ 155k` by ~0.02 test MRR on wiki —
-the alignment recency wants a sharper scale than the per-node
-recurrence period, closer to a within-session timescale.
-
-Override at the CLI via `--alignment-time-scale <value>` for
-ablations and per-dataset tuning.
+Right derivation: `time_scale = (t_max − t_min) / L_REF` with
+`L_REF=20` FIXED. On wiki this is 93k seconds ≈ 1.08 days regardless
+of `max_walk_len`. Empirically ~0.02 test MRR over the per-node mean
+inter-event time.
 
 ### Lesson 12 — Edge-feat index at walk position p is `edge_feats[p]`
 
 `timestamps[p]` and `edge_feats[p]` describe the SAME hop (between
-`nodes[p]` and `nodes[p+1]`). The alignment loss reads
-`timestamps[p]` at position p; the per-position context vector
-must therefore read `edge_feats[p]` at position p, not
-`edge_feats[p-1]`. Left-padding the [W, L-1, d_e] tensor was
-introducing a one-position skew between time and edge-feat at
-every walk position — fixed by right-padding (zero at the seed
-slot, which is masked out anyway).
+`nodes[p]` and `nodes[p+1]`). Right-pad edge_feats so position p in
+the [W, L] grid carries `edge_feats[p]`. Left-padding off-by-one was
+a bug.
 
 ### Lesson 13 — Cross-pair attention with 4-channel link MLP regresses
 
-Replacing Phase 2's 12-block link MLP (8 cross-table + 4 walk-encoded)
-with a 4-channel head fed by cross-pair-attended W cost ~0.05 test MRR
-on wiki. The hand-crafted Hadamard/L1 cross-table interactions are
-doing more work than cross-pair attention adds on a 110K-edge dataset.
-Keep the 12-block design; if cross-pair is added back, layer it as
-PAIR-CONDITIONED W INSIDE the 12-block structure, not as a replacement.
+Replacing the 12-block link MLP with a 4-channel head fed by
+cross-pair attended W cost ~0.05 test MRR on wiki. The hand-crafted
+Hadamard/L1 cross-table interactions do more work than cross-pair
+attention adds on a 110K-edge dataset. If cross-pair is added back
+later, layer it ON TOP of the cross-table 8-block, not as a
+replacement.
 
 ### Lesson 14 — Direct (u, v) recurrence is the biggest unpulled lever
 
-On tgbl-wiki, EdgeBank's pure (u, v)-pair-recurrence lookup reaches
-0.571 test MRR. Our co-occurrence feature captures SHARED-NEIGHBOR
-recurrence (second-order), NOT direct (u, v) recurrence (first-order).
-Adding an explicit "is v in u's recent K-history?" feature with
-recency-aware decay gave +0.0506 test MRR (Phase 5 0.4396 → Phase 6
-0.4902) — the largest single architectural gain of the session. The
-recurrence signal is the dominant signal on this dataset; the walk
-encoder, DyG transformer, memory, and co-occurrence all approximate
-it indirectly and inefficiently.
+EdgeBank-tw's 0.571 on wiki shows that direct (u, v) pair-recurrence
+is the dominant signal. Phase 6 historical experiments showed +0.051
+test MRR from adding an explicit "is v in u's recent K-history?"
+recency-aware feature. **Not yet ported to this production codebase**
+— biggest single likely gain remaining.
 
-### Lesson 15 — Capacity scaling hurts on wiki
+### Lesson 15 — Capacity scaling HURTS on wiki
 
-d_emb 128 → 192 with the full Phase 5 stack regressed test MRR by
-0.03 (0.4396 → 0.4093). The architecture is already at the right
-capacity for 110K-edge / 9.2k-node wiki. More params just makes the
-model overfit faster (BCE 0.027 → ~0.025 with no eval improvement).
-Capacity scaling is a tool for bigger datasets, not for squeezing
-more out of small ones.
+d_emb 128 → 192 regressed test MRR by 0.03. Deeper link MLP n=5
+regressed -0.04 over 50 ep. The architecture is at the right capacity
+for 110K-edge / 9.2k-node wiki. Stripped: `link_mlp_n_layers` knob,
+`d_emb` is fixed at 128.
 
-### Lesson 16 — Memory module adds marginal value when recurrence is already captured elsewhere
+### Lesson 16 — Memory module adds marginal value once recurrence is captured
 
-TGN-style raw-message-store memory (with proper one-step BPTT) added
-only +0.003 test MRR on top of Phase 4 (DyG + co). The memory's main
-contribution — "summary of u's history" — overlaps with what the DyG
-transformer already extracts. Memory is more useful on datasets where
-the recurrence horizon is much longer than K_history (e.g., monthly
-patterns vs daily wiki edits). On wiki, K_history=32 already covers
-~the same time window as memory's running state.
+Raw-message-store memory added only +0.003 test MRR on top of walk
+encoder + co-occurrence. On wiki, K_history=32 already covers the
+relevant time window. Memory is more useful on datasets where the
+recurrence horizon exceeds K_history.
 
 ### Lesson 17 — Alignment+uniformity has a 50-epoch over-training cliff
 
-Run alignment+uniformity for 50 epochs on wiki and val MRR drops
-**0.7448 → 0.4625** (peak at ep 2, declining monotonically thereafter).
-The mechanism is diagnosed precisely:
+50-ep training on wiki: val MRR collapses 0.7448 → 0.4625 (drop -0.28).
+Diagnosed mechanism:
 
-- `col_norm(E_target)` grows 2.08 → 10.76 (5.2× in 50 epochs) — monotonic
-  embedding-magnitude runaway under the alignment pull.
-- `grad_E_context` collapses 0.005 → 0.0001 by ep 7 — alignment loss
-  saturates on the context side almost immediately. Adam's accumulated
-  momentum keeps moving E_context anyway via stale state.
-- Link MLP weights grow 0.28 → 2.02 (7×) tracking the embedding
-  growth — the link decoder rescales itself to fit the drifting
-  geometry.
-- The link MLP then "locks onto" a geometry that doesn't generalize,
-  hence the cliff.
-
-The cliff is fundamental to the loss family, not a wiki artifact: review
-shows the same cliff with faster onset (ep 3–4 vs ep 5–10 on wiki) and
-faster col-norm growth. Whatever fixes it on wiki should fix it on
-review too.
+1. **Primary driver — embedding magnitude runaway.** col_norm of E
+   grows 2.08 → 10.76 (5.2×). Adam's accumulated momentum keeps moving
+   E_context even after its per-batch grad collapses (0.005 → 0.0001
+   by ep 7).
+2. **Secondary driver — link MLP weight runaway.** link_w_norm grows
+   0.28 → 2.02 (7×) to track the growing embedding magnitudes.
+3. **Universal context-side grad collapse.** E_context grad drops to
+   ~0.0001 by ep 7 across EVERY fix tested — alignment loss saturates
+   on the context side almost immediately.
 
 ### Lesson 18 — Normbrake (per-column L2 hinge) halves the cliff
 
-A per-column L2 hinge above a calibrated threshold —
-`L_normbrake = λ · Σ_c relu(||col_c||₂ - threshold)²` — directly addresses
-the col-norm runaway. With λ=0.1 and threshold=3.87 (calibrated to
-1.5× early-epoch col_norm), the cliff drops from -0.28 → **-0.11** val
-MRR by ep 50.
+`L_normbrake = λ · Σ_c relu(||col_c||₂ − threshold)²` on both tables.
+With `λ=0.1` and `threshold = 1.5 × col_norm at ep 1-2`:
+- Wiki threshold = 3.87
+- Review threshold = 31.32
 
-The clamp is clean: col_norm freezes at the threshold (3.91 actual vs
-3.87 target) from ~ep 12 onward, and `grad_E_target` stays HEALTHY
-(0.092 vs baseline 0.012, 8× better). Peak val MRR is unchanged
-(0.7448 → 0.7464).
+Result: val drop reduces from -0.28 → -0.11. Clean clamp behavior
+(col_norm freezes at threshold). E_target grad stays HEALTHY (0.092
+vs baseline 0.012 — 8× better). Peak val MRR unchanged.
 
-But normbrake does NOT close the cliff — residual -0.11 drop remains.
-Diagnosed cause: link_w_norm continues to grow (0.28 → 1.83) even with
-embeddings clamped. The link MLP "outflanks" the embedding clamp by
-absorbing the magnitude growth itself. The secondary fix
-(`weight_decay_link`) is being tested in Stage 3 of v2.4.
-
-Calibration rule: threshold = 1.5× measured col_norm at ep 1–2 (after
-the first non-trivial pass). Wiki: 3.87. Review: ~31.32 (16× larger
-embedding range due to larger N).
+Does NOT close the cliff alone — link_w_norm still runs away.
 
 ### Lesson 19 — Joint training (λ_link > 0) collapses contrastive walk-supervision
 
-Letting link BCE backprop into the embedding tables (joint training,
-λ_link > 0) **immediately collapses val MRR** across all contrastive
-loss families tested: InfoNCE, alignment+uniformity. At λ_link=0.1 on
-wiki, val MRR drops 0.7432 → 0.5109 by ep 2 (drop of 0.23 in one
-epoch).
+Letting link BCE backprop into the embedding tables with `λ_link > 0`
+IMMEDIATELY collapses val MRR across ALL contrastive loss families
+and ALL `hist_neg_ratio` values. At `λ_link=0.1` on wiki, val drops
+0.7432 → 0.5109 by ep 2.
 
-**Mechanism:** historical negatives in BCE fight alignment supervision
-directly. Alignment pulls `target(u) ↔ context(v)` together for every
-`v` in u's walk history (= the reservoir of past destinations). BCE on
-the same hist-negative pair `(u, v_hist)` pushes them apart. The two
-gradients act on the **same embedding pairs in opposite directions**.
+Universal: confirmed for InfoNCE, alignment+uniformity, AND across
+hist_neg_ratio ∈ {0, 0.25, 0.5, 0.75}. Mechanism is BCE-into-embeddings
+fighting alignment regardless of negative type.
 
-This is loss-family-universal: InfoNCE λ_link sweep showed the same
-collapse pattern, as did alignment. The Stage 4 hist_neg_ratio × λ_link
-sweep tests the hypothesis directly: if joint training with
-`hist_neg_ratio=0` (pure random negs) doesn't collapse, the destructive
-interference is exactly that. If it still collapses, there's a deeper
-incompatibility (v2.5 follow-up).
+**Locked: `λ_link = 0` (no CLI knob).**
 
-**Default for v2.4 production:** λ_link=0 (decoupled training) unless
-Stage 4 reveals a recoverable joint-training regime.
+### Lesson 20 — Triplet wins wiki, loses review (cross-dataset)
 
-### Lesson 20 — Triplet wins wiki, loses review (cross-dataset robustness)
+Wiki §4.7 loss-family search:
+- Triplet: 0.7105 ± 0.0014 multi-seed (best peak wiki)
+- SGNS+normbrake: 0.7113 (tied)
+- alignment+uniformity: 0.7079 anchor
 
-Wiki §4.7 loss sweep: Triplet at multi-seed (42, 7, 13) gives
-**0.7105 ± 0.0014 test MRR** with no cliff — best single-dataset
-performer. SGNS+normbrake ties at 0.7113. Alignment+uniformity (anchor)
-sits at 0.7079 ± 0.0005.
+Review sweep (6 ep sampled-eval):
+- alignment+nb: **0.3135**
+- Triplet: ~0.16 (decisive loss)
 
-Cross-dataset review sweep: Triplet **decisively loses** (val ~0.16 vs
-alignment ~0.31). Same hyperparams that worked on wiki produce a 2×
-gap. SGNS also lost on review.
-
-**Conclusion:** alignment+uniformity is the cross-dataset-robust choice.
-The user-imposed decision rule (within ±0.01 wiki, prefer the
-cross-dataset winner) makes alignment the locked production loss. Triplet
-and SGNS stay in the codebase as PORT-FLAG paper-ablation paths.
+**Locked: alignment + uniformity** as cross-dataset-robust choice
+(user-imposed within-±0.01 rule). Triplet / InfoNCE / SGNS removed
+entirely from this production codebase.
 
 ### Lesson 21 — Architectural fixes (dropout, depth) don't fix the cliff
 
-Stage 2 ran 6 cells × 50 ep on wiki testing dropout/depth combinations
-against alignment+uniformity's cliff. Final ranking (smaller val drop
-is better):
+Stage 2 ran 6 cells × 50 ep on wiki testing dropout/depth:
 
-| Cell | Val drop (peak → ep 50) |
+| Cell | Val drop |
 |---|---|
 | normbrake λ=0.1 | **-0.11** |
-| nb + n=5 + link_dr=0.3 + emb_dr=0.3 (kitchen sink) | -0.12 |
+| kitchen sink (normbrake + dropout + deeper) | -0.12 |
 | link MLP dropout 0.3 | -0.19 |
-| deeper MLP (n_layers=5) | -0.23 |
+| deeper MLP n=5 | -0.23 |
 | embedding dropout 0.3 | -0.27 |
-| baseline (no fix) | -0.28 |
+| baseline | -0.28 |
 
-**Findings:**
-- Normbrake is the only fix that meaningfully helps.
-- Link MLP dropout barely helps (regularizes head but not embedding
-  magnitude — the upstream cause).
-- Embedding dropout HURTS (noise on inputs makes the cliff sharper).
-- Deeper MLP HURTS (more capacity → faster overfit to drifting
-  embeddings). Reaffirms Lesson 15.
-- Kitchen sink DILUTES — adds noise without improving over nb alone.
-
-The cliff is a regularization problem (constrain magnitudes), not a
-capacity problem (more/fewer layers, dropout).
+Normbrake is the only meaningful fix. Dropout/depth knobs stripped.
 
 ### Lesson 22 — Adam constructor changes induce CUDA non-determinism drift
 
-Stage 3 L0 vs Stage 2 A_long_nb were intended to be bit-identical
-controls (same seed, same hyperparams, same code path). The only
-intentional difference was a `weight_decay=0.0` argument added to the
-`Adam(link_params, ...)` constructor (preparation for the
-`weight_decay_link` knob). Result: mechanism preserved bit-tight
-(col_norm, L_normbrake, gradients all match within 0.001 per epoch),
-but val MRR drifted **-0.030 by ep 50**.
+Same seed, same hyperparams, but adding `weight_decay=0.0` to the
+`Adam(...)` constructor explicitly (vs default-omitted) caused
+mechanism-preserving bit-tight col_norm/grad trajectories BUT val MRR
+drift of -0.030 over 50 epochs. Anchor-validation tolerance is ±0.005
+— well below this drift level. Be suspicious of drift > 0.005.
 
-Likely cause: passing `weight_decay=0` triggers different internal CUDA
-kernel selection in `torch.optim.Adam` than the default-omitted case,
-which has different floating-point ordering and accumulates drift via
-non-deterministic atomic adds in the link MLP forward.
+### Lesson 23 — weight_decay_link closes the residual cliff (Stage 3 BREAKTHROUGH)
 
-**Implication for the port:** "no-op-looking" constructor changes can
-move 50-epoch val MRR by 0.03. The anchor validation gate uses
-±0.005 — well below this drift level. Be SUSPICIOUS of drift > 0.005;
-"that's CUDA noise" is not always true.
+After normbrake halves the cliff (-0.28 → -0.11), the residual is
+link_w_norm runaway. Adding `weight_decay=1e-4` to the link_optimizer
+holds link_w_norm flat (0.18 → 0.17 vs unfixed 0.28 → 2.02). Result:
+
+| Fix | Val drop peak→50ep |
+|---|---|
+| baseline | -0.28 |
+| normbrake only | -0.11 |
+| **normbrake + WD_link=1e-4** | **-0.014** |
+| normbrake + WD_link=1e-3 | -0.001 (over-suppresses link MLP; less robust cross-dataset) |
+
+WD_link=1e-4 is the locked production value.
+
+### Lesson 24 — Single-table architecture fails on cliff shape (Step 6)
+
+A single `E[N, d]` table + `P_src` + `P_tgt` projections (instead of
+two separate tables) was tested on wiki:
+
+| Metric | dual-table | 1T_asym |
+|---|---|---|
+| Best test | 0.7096 | 0.7090 |
+| ep 50 val | 0.7335 | 0.7105 |
+| Drop peak→50 | -0.011 | **-0.035** |
+
+Peak ties within noise (Δ -0.0006) but cliff shape regresses 3.2×.
+Per smooth-curve rule, dual-table locked.
+
+### Lesson 25 — Walk encoder ties locked-v2 on peak, smooths the cliff
+
+Step 7 result:
+
+| Cell | Best test | ep 50 val | Drop peak→50 |
+|---|---|---|---|
+| W_off (encoder OFF) | 0.7096 | 0.7261 | -0.019 |
+| W_gru (K=5) | 0.7080 | 0.7404 | -0.005 |
+| W_gru_k1 (K=1) | 0.7089 | 0.7431 | -0.002 |
+
+Encoder ties locked-v2 on peak (within anchor std) AND produces
+4-10× smoother long-training trajectory. **Locked ON in this
+production codebase.** K=5 retained as Tempest convention default;
+K=1 verified equivalent within noise and 5× cheaper at scoring time.
+
+### Lesson 26 — Freeze-tables sanity confirms wiki tables are dead weight
+
+Phase 1 sanity check (freeze E_target / E_context, retrain encoder +
+link MLP only on wiki):
+
+| Cell | Best test |
+|---|---|
+| W_gru_k1 (encoder, tables train) | 0.7089 |
+| **Sanity (encoder, tables FROZEN)** | **0.7094** |
+
+Δ +0.0005 — essentially identical. The link MLP's cross-table weights
+collapsed to ~0.01 (down from 0.17 with tables training), confirming
+the link MLP voluntarily ignores the static-table contribution.
+Wiki performance comes from walk encoder + Component 0 +
+recurrence-via-time-features, NOT learned per-node identity.
+
+This is the canonical signature predicted by cross-domain literature
+(CAWN ICLR 2021; GraphMixer review #1; TGB v2 leaderboard pattern).
+Strong indicator that walks-only architectures (drop E_target
+entirely; CAWN-style anonymous identity) would help on review
+(surprise index 0.987) without hurting wiki (surprise index 0.108).
+Walks-only is documented as future work below.
 
 ---
 
-## Results (tgbl-wiki, 50 epochs, B=200, K=5, L=20, d=128 unless noted)
+## Historical chronology (consolidated)
 
-All MRR through `tgb.linkproppred.evaluate.Evaluator.eval(...)`.
-
-| Run | Val MRR | Test MRR | Notes |
-|---|---|---|---|
-| v3, additive node-feat residual | 0.3725 | 0.2884 | early v3 baseline |
-| v3 + init-only node-feat | 0.3629 | 0.2942 | |
-| **v3 + cross-table link MLP + union seeding + ef-pad fix (Phase 0)** | **0.4015** | **0.3313** | the 8-block + walk-context baseline that everything stacks on |
-| v3 directed (sanity) | 0.3553 | 0.2735 | TGB negs don't respect direction; undirected is right for wiki |
-| Phase 2 — Phase 0 + walk encoder (GRU over walk) | 0.5128 | 0.4289 | walk encoder produces seed-pooled W; 12-block link MLP (8 cross-table + 4 walk-encoded) |
-| Phase 3 — Phase 2 + cross-pair attention + 4-channel link MLP | 0.4424 | 0.3829 | REGRESSED — Hadamard/L1 cross-table blocks were doing more work than cross-pair attn added |
-| Phase 4 — Phase 2 + DyG node encoder + co-occurrence + 12-block MLP | 0.5118 | 0.4362 | Marginal; cross-pair dropped |
-| Phase 4 @ 15 epochs (early stop) | 0.4847 | 0.3906 | Worse — model still learning past ep 15 |
-| Phase 5 — Phase 4 + raw-message-store memory | 0.5198 | 0.4396 | Memory adds +0.003 test (marginal) |
-| Phase 5 + d_emb=192 (capacity sweep) | 0.5066 | 0.4093 | REGRESSED — capacity hurts on this dataset |
-| **Phase 6 — Phase 5 + EdgeBank-style direct recurrence (K_history=32, WINNER)** | **0.5264** | **0.4902** | **+0.0506 test — biggest single architectural jump of the session** |
-| Phase 6 with K_history=64 | 0.4874 | 0.4437 | REGRESSED — wiki's recurrence is short-horizon, more history adds noise |
-
-Training cost (Phase 6, K_history=32): 50 epochs × ~77 s = ~64 min + ~6 min eval.
-Tempest on CPU, model on RTX 2000 Ada (8 GB VRAM).
-
-### Cumulative gain: +0.159 test MRR over Phase 0 baseline
-
-```
-Phase 0 baseline:                                       Test 0.3313
-+ walk encoder (GRU over per-position context)  +0.098  Test 0.4289
-+ DyG + co + memory (cumulative)                +0.011  Test 0.4396
-+ EdgeBank direct recurrence                    +0.051  Test 0.4902 ← final
-```
-
-The walk encoder gives ~60% of the total gain. EdgeBank-style direct
-recurrence is the single biggest pull beyond that. DyG transformer +
-memory module add only marginal value on top of the walk encoder —
-their information overlap is high on this dataset (all three approximate
-"what has u been doing recently"). EdgeBank's contribution is different:
-it directly answers "is THIS specific (u, v) pair recurrent?", a
-first-order signal that the others only approximate.
-
-### Branch map (all pushed to origin)
-
-| Branch | Test MRR | What it adds |
+| Phase | Outcome | Test MRR |
 |---|---|---|
-| `master` | (docs only) | baseline + docs |
-| `feature/gru-walk-embedder` | 0.429 (Phase 2) | GRU walk encoder + 12-block link MLP |
-| `feature/xpair-attention` | 0.383 (Phase 3) | cross-pair attn + 4-channel — DON'T MERGE |
-| `feature/dyg-node-encoder` | (not measured alone) | DyG node encoder + history buffer |
-| `feature/co-occurrence` | (not measured alone) | co-occurrence channel |
-| `feature/dyg-co-on-phase2` | 0.436 (Phase 4) | DyG + co with Phase 2's link MLP |
-| `feature/raw-msg-memory` | (module only, not wired) | NodeMemory standalone |
-| `feature/phase4-plus-memory` | 0.440 (Phase 5) | Phase 4 + memory wired |
-| `feature/phase5-cap192` | 0.409 (regressed) | d_emb=192 ablation |
-| **`feature/edgebank-feature`** | **0.490 (Phase 6, WINNER)** | EdgeBank direct-recurrence channel |
-| `feature/eb-khistory-64` | 0.444 (regressed) | K_history=64 ablation |
+| **Phase 0** — v3 baseline (alignment+uniformity, cross-table E.1) | locked anchor v0 | 0.3313 |
+| **Phase 0.5** — Component 0 (TimeEncoder + cold-start bits) | anchor v2.2 §3 | **0.7070 ± 0.0016** |
+| **Phase 2** — GRU walk encoder over per-position context | architectural baseline | 0.4289 |
+| **Phase 4–5** — DyG + co-occurrence + memory | marginal +0.011 | 0.4396 |
+| **Phase 6** — EdgeBank-style direct (u,v) recurrence channel | +0.051 (biggest single jump) | 0.4902 |
+| **Phase S** — A2/E head sweeps | E.1 cross-table + A2-on locked | 0.7079 ± 0.0005 |
+| **§4.7** — Loss-family search (Triplet/InfoNCE/SGNS vs alignment) | Triplet wiki marginal lead | 0.7105 ± 0.0014 |
+| **Review sweep** — cross-dataset loss validation | alignment LOCKED (Triplet lost on review) | 0.3135 review |
+| **Stage 2** — architectural fixes for cliff (dropout, depth, normbrake) | normbrake the only fix | drop -0.11 |
+| **Stage 3** — λ_link + WD_link sweep | WD_link=1e-4 BREAKTHROUGH | drop -0.014 |
+| **Stage 4** — hist_neg_ratio × λ_link (2×4 grid) | λ_link=0 confirmed; hist=0.5 default | — |
+| **Stage 5** — uniformity hyperparameter sweep | defaults win (Scenario A) | — |
+| **Step 6** — single-table 1T_asym ablation | dual-table wins on cliff shape | — |
+| **Step 7** — source walk encoder | ties locked-v2 on peak, smoother cliff | **0.7100** |
+| **(this codebase)** | minimal locked production | **0.7100 wiki** |
 
-To merge the winner into master: `git merge feature/edgebank-feature`
-plus rerun once for a clean baseline number with the latest CLAUDE.md.
+Final wiki single-seed: val 0.7423 / **test 0.7100** at ep 1 with the
+minimal production architecture (smoke test 2026-05-21).
 
-Leaderboard reference (note: most carry the TGN memory leak):
+---
 
-| Method | Test MRR |
-|---|---|
-| Random | 0.0075 |
-| EdgeBank-inf | 0.495 |
-| EdgeBank-tw | 0.571 |
-| GraphMixer | 0.594 |
-| DyRep | 0.665 |
-| TGN | 0.690 |
-| DyGFormer | 0.798 |
-| TPNet | 0.827 |
+## What was stripped (`SKIP` per the cleanup)
 
-The current honest walks-supervise-embeddings number is **0.490 test
-MRR** on wiki (Phase 6, all channels stacked). Closing the remaining gap
-to EdgeBank-tw (0.571) and beyond would require:
-- Larger K_history window (eb-feat saturates at K=32 since we only see
-  32 most-recent events per node — wiki has dense interactions)
-- True time-windowed history (vs slot-windowed) — EdgeBank-tw uses a
-  time window, not a count window
-- Per-token co-occurrence features (DyGFormer's full version, not the
-  scalar summary we have)
+Removed entirely from this production codebase:
 
-The historical assertion that "0.331 is the next milestone" is now
-superseded — 0.490 puts us between EdgeBank-inf (0.495) and EdgeBank-tw
-(0.571). Memorisation-via-recurrence is the now-dominant signal; the
-DyG transformer + memory module add small marginal value on top.
+- `align_weighting` B/C variants of the alignment loss (variant A always wins)
+- `cross_table_dropout`, `link_mlp_n_layers > 3`, `link_mlp_dropout`,
+  `embedding_dropout` (Stage 2 demonstrably hurt)
+- `lambda_link` and joint-training code path (Lesson 19 — universal collapse)
+- `primary_loss` ∈ {triplet, infonce, sgns} + their hyperparameters
+  (Triplet decisively lost on review; alignment locked)
+- `head_mode=component_0_only` (E.2 head — Phase S settled E.1 cross-table)
+- `lambda_align=0` (A2-off ablation — Phase S settled A2-on)
+- `single_table` mode (Step 6 cliff-shape regression)
+- `freeze_tables` flag (Phase 1 sanity check — done, no longer needed)
+- All sweep wrapper scripts (one-off experiment drivers, reproducible
+  from this fixed train.py)
 
-(legacy text retained below for context)
+---
 
-Closing the gap to EdgeBank (0.495) was the original milestone; the
-levers we haven't pulled yet (walks-at-scoring, raw-message-store
-memory, longer walks at small batch) are exactly what the leaderboard
-methods rely on.
+## Open / future directions
 
-## Roadmap (in priority order)
+Not in this codebase but documented for future work:
 
-1. **Walks-at-scoring (GRU/transformer encoder feeding the link MLP).**
-   The alignment loss already trains rich walk representations; the
-   link MLP currently re-reads only the raw `target / context` tables.
-   Routing the seed's pooled walk representation INTO the link MLP
-   alongside the table lookups is the largest expected gain — same
-   architectural step that the old codebase used to clear TGN territory.
-2. **Walk-length sweep at small batch with corrected `time_scale`.**
-   B=200, L ∈ {30, 50, 80}, K ∈ {5, 10}. Isolates the long-walk effect
-   from the batch-size regression; the diagnostic in
-   `scripts/diag_walk_lens.py` shows ~38% of walks pin the L=20 cap.
-3. **TGN-style memory with raw-message-store** (Lesson 1's honest
-   pattern). Composes multiplicatively with walks-at-scoring per the
-   old codebase's row 6 → row 7 jump (+0.034).
-4. **Scale-out to tgbl-coin / -comment / -flight / -review** with
-   Tempest paper conventions (`wpn=10, mwl=80`). Edge-feat support is
-   already in; node-feat support is already in.
-5. **Honest-protocol baselines for TGN / DyGFormer / TPNet** — re-run
-   them with raw-message-store memory and report against our numbers.
-   The paper's contribution-defining comparison.
+1. **Direct (u,v) recurrence channel** (Lesson 14 — biggest unpulled
+   lever, +0.051 historical). Port honestly into the link MLP input.
+   Implementation: a `K_history=32` per-source ring buffer of recent
+   destinations + recency-decayed similarity to v.
+
+2. **Walks-only source representation.** Drop `E_target` entirely from
+   the source side. Encoder source-side input = CAWN hitting-count
+   anonymous identity + `E_context[walk_node]` + Φ(Δt) + edge_feats.
+   Predicted to help on review (high surprise index) more than wiki.
+   Lesson 26 motivation.
+
+3. **Multi-scale time encoding.** Current Φ(Δt) uses a single
+   `time_scale`. Multi-scale (short ~minutes + long ~days) might
+   capture both within-session and cross-session patterns.
+
+4. **Honest-protocol leaderboard baselines.** Re-run TPNet / DyGFormer
+   / TGN under raw-message-store memory to compare apples-to-apples.
+   May reveal that 0.82 is leak-inflated and honest ceiling on wiki is
+   ~0.75.
+
+5. **tgbl-coin / -comment / -flight scaling.** Edge-feat + node-feat
+   support is already in. Per-dataset normbrake threshold needs
+   calibration (1.5 × col_norm at ep 1-2).
+
+---
+
+## Branches in this repo
+
+- `master` (THIS) — minimal production at `locked-v2` tag.
+- `experiment/embedding-table-variations` — single-table 1T_asym
+  ablation (Lesson 24, preserved for paper reproducibility).
+- `experiment/add-source-walk-embedding` — Step 7 walk encoder history
+  (with experimental knobs that have been minimized away here).
+- `feature/walk-distribution-embedding` — experimental playground
+  (Stages 1–5 history). Archived as
+  `~/CLionProjects/tempest-walk-embedding-intermediate-archive-20260521.tar.gz`.
 
 ---
 
 ## Operating notes
 
-- Tempest **CPU mode**. The laptop has 8 GB VRAM; the walk arena
-  collides with PyTorch's allocator if both run on GPU. Walks are
-  deterministic regardless of device.
-- Default training negatives: K = 10, uniform random over the
-  training-destination pool (NOT the full node set — bipartite
-  datasets have asymmetric source / target node populations and
-  random over all nodes would create a trivially easy task that
-  doesn't transfer to eval).
-- Default `target_batch_size = 200`. Re-confirmed empirically: at
-  B=1000 on wiki, test MRR regresses by ~0.06 even after fixing the
-  `time_scale` derivation. Smaller datasets need smaller batches —
-  v2's "collapse to constant logit" failure was a more severe form
-  of the same effect.
-- Default `alignment_time_scale` is derived as
-  `(t_max − t_min) / L_REF` with `L_REF=20` fixed. On wiki this
-  gives 93k seconds ≈ 1.08 days — the empirically-best value (see
-  Lesson 11). Pass `--alignment-time-scale` to override for
-  per-dataset tuning.
-- Default `is_directed` is dataset-specific (heuristic in
+- **Tempest CPU mode.** Walk generator runs on CPU regardless of model
+  device. The arena would collide with PyTorch's allocator on 8 GB
+  VRAM. Walks are deterministic regardless of device.
+- **Default training negatives.** K=10, 50% historical reservoir + 50%
+  uniform random over `train.destinations` (NOT full node set).
+- **Default batch size.** 200 — empirically optimal for wiki (Lesson
+  15: larger batches regress).
+- **Default time scale.** Derived (`train_span / L_REF=20`). On wiki
+  this is 93k seconds ≈ 1.08 days. Override via
+  `Config.alignment_time_scale` for ablations.
+- **Default `is_directed`.** Dataset-specific (heuristic in
   `data.py::_UNDIRECTED`). Pass `--is-directed` / `--no-is-directed`
-  to override. TGB does not declare directedness; the choice is
-  interpretive. On wiki, undirected matches TGB's eval semantics
-  (negatives don't respect direction) — running directed regressed
-  test MRR by 0.06.
-- Eval `row_budget` chunks the link-MLP forward at ~500K rows per
-  pass to fit 8 GB. Math is identical to the unchunked path.
-- Diagnostic at `scripts/diag_walk_lens.py` reports the actual walk-
-  length distribution Tempest is returning under the strict-causal
-  protocol. Run it after any change to walk config to verify whether
-  `max_walk_len` is the binding constraint (on wiki at L=20 it is —
-  ~38% of walks pin the cap at end-of-epoch).
+  to override. On wiki, undirected matches TGB's eval semantics.
+- **Eval `row_budget`** chunks the link-MLP forward at ~100K rows per
+  pass to fit 8 GB. Math identical to unchunked path.
