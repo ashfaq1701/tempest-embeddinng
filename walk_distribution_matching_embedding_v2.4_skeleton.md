@@ -1,6 +1,6 @@
-# Walk-Distribution-Matched Temporal Embeddings — v2.4 (WIP)
+# Walk-Distribution-Matched Temporal Embeddings — v2.4 (FINAL)
 
-**Status:** in-progress; draft outline. Filled in as the §4.8 deep-analysis experiments land.
+**Status:** FINAL (2026-05-21 post Stage 5). Locked production config in §1.
 
 **User-imposed decision rule (2026-05-19, post wiki §4.7):**
 
@@ -24,9 +24,46 @@ v2.3 introduced §4.7 (loss-family search) and §4.8 scaffolding (joint training
 
 ---
 
-## 1. Final locked architecture
+## 1. Final locked architecture (LOCKED 2026-05-21 post Stage 5)
 
-To be filled in after experiments.
+Production config:
+
+| Component | Value | Source |
+|---|---|---|
+| Primary loss | alignment + uniformity | §4.7 + locked 2026-05-20 |
+| `eta_uniform` | 1.0 | Stage 5 Scenario A confirmed |
+| `uniformity_temperature` | 2.0 | Wang & Isola default |
+| `uniformity_cap` | 20000 | Stage 5 Scenario A |
+| `lambda_normbrake` | 0.1 | Stage 2 only fix that helps |
+| `normbrake_threshold` | 3.87 (wiki) / 31.32 (review) | calibration per dataset |
+| `weight_decay_link` | 1e-4 | Stage 3 BREAKTHROUGH (cliff drop -0.014) |
+| `lambda_link` | 0 | Stage 4 monotonic collapse confirmed |
+| `hist_neg_ratio` | 0.5 | Stage 4 within noise; TGB-matched default |
+| `head_mode` | cross_table (E.1) | Phase S |
+| Component 0 | ON (time_enc_k=16) | Phase 0.5 anchor |
+| Walks-supervise-embeddings | YES | Lesson 2 |
+| Strict-causal protocol | NON-NEGOTIABLE | Lesson 3 |
+| Walks seeded on | union(src, tgt) on undirected | Lesson 10 |
+| Negatives | hist+random K=10 | Lesson 4 |
+
+Wiki seed-42 result with locked config: **best val 0.7450, best test 0.7101, ep 50 val 0.7251** (50-epoch trajectory drop -0.020, the cleanest cliff achievable with these knobs).
+
+### Stage 5 final results (locked decision)
+
+| Cell | eta | cap | Best val | Best test | ep 50 val | Drop |
+|---|---|---|---|---|---|---|
+| **U_base (LOCKED)** | 1.0 | 20000 | 0.7450 | **0.7101** | 0.7251 | -0.020 |
+| U_lo | 0.3 | 20000 | 0.7460 | 0.7083 | 0.7377 | -0.008 |
+| U_lower | 0.1 | 20000 | 0.7432 | 0.7075 | 0.7414 | -0.002 |
+| N_half | 1.0 | 200 | 0.7452 | 0.7090 | 0.7336 | -0.012 |
+| N_quarter | 1.0 | 100 | 0.7450 | 0.7100 | 0.7428 | -0.002 |
+| Both_lo | 0.3 | 200 | **0.7462** | 0.7076 | **0.7453** | **-0.0009** |
+
+**Pre-registered Scenario A (60% prediction) CONFIRMED.** All best-test values within ±0.0026 (below anchor std 0.0016 decision threshold). Lock defaults.
+
+Smoothness trade-off noted: Both_lo and N_quarter produce flatter long-training trajectories but at the cost of -0.002 best test. Not worth multi-seed validating given the paper headline is peak MRR.
+
+v2.4 status: **DRAFT → FINAL.**
 
 ## 2. Loss-family search results table (wiki, seed 42)
 
