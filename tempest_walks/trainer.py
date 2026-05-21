@@ -71,6 +71,13 @@ class Trainer:
             node_feat=node_feat,
             edge_feat_dim=edge_feat_dim,
         ).to(self.device)
+        # v2.4 §16 Phase 1 sanity check: freeze E_target / E_context.
+        # Ancillary projections (target_final, context_final, node_feat
+        # projections, edge_feat_proj) remain trainable. Alignment +
+        # normbrake still compute but contribute no grad on E.
+        if config.freeze_tables:
+            self.embedding_store.E_target.weight.requires_grad = False
+            self.embedding_store.E_context.weight.requires_grad = False
         # Component 0: time encoding at the link MLP.
         self.use_time_encoding = config.use_time_encoding
         self.link_predictor = LinkPredictor(

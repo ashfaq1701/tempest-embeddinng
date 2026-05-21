@@ -21,6 +21,15 @@ class Config:
     # Default False = locked-v2 baseline (no encoder).
     use_walk_encoder: bool = False
 
+    # v2.4 §16 sanity check (Phase 1 / Option α): freeze the static
+    # embedding tables E_target / E_context (requires_grad=False on
+    # both). Alignment + normbrake still COMPUTE but contribute no
+    # gradient. Only walk encoder + link MLP + ancillary projections
+    # train. Tests whether the static tables carry signal the encoder
+    # relies on, or are dead weight that walks-only (Exp B) could
+    # replace.
+    freeze_tables: bool = False
+
     # Component 0: time encoding at the link MLP (Phase 0.5 of the
     # walk-distribution-matched design).
     # Inputs Δt_u, Δt_v, Δt_uv go through a learned functional time

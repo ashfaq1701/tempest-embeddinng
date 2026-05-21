@@ -38,6 +38,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--walk-encoder", action="store_true",
                    help="Enable source-side GRU walk encoder (v2.4 §14). "
                         "Replaces e_t_u with walk-pooled GRU output.")
+    # v2.4 §16 Phase 1 sanity check: freeze E_target / E_context.
+    p.add_argument("--freeze-tables", action="store_true",
+                   help="Freeze E_target / E_context (requires_grad=False). "
+                        "Tests whether static tables carry encoder-relied signal.")
 
     # Losses
     p.add_argument("--temporal-decay-exp", type=float, default=0.5)
@@ -178,6 +182,7 @@ def main() -> None:
         num_walks_per_node=args.num_walks_per_node,
         walk_bias=args.walk_bias,
         use_walk_encoder=args.walk_encoder,
+        freeze_tables=args.freeze_tables,
         temporal_decay_exp=args.temporal_decay_exp,
         alignment_time_scale=args.alignment_time_scale,
         eta_uniform=args.eta_uniform,
