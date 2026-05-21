@@ -188,9 +188,17 @@ class Trainer:
             l_total = l_total + self.config.lambda_normbrake * l_nb
             l_nb_val = float(l_nb.detach())
 
-        self.emb_optimizer.zero_grad(set_to_none=True)
-        l_total.backward()
-        self.emb_optimizer.step()
+        # Guard against the all-frozen case: when freeze_tables=True AND
+        # walks.edge_feats is None (cold-start before any ingestion on a
+        # dataset with edge features, OR datasets without edge features),
+        # every operand of l_total has no grad path through any trainable
+        # parameter, and backward() raises "element 0 of tensors does not
+        # require grad and does not have a grad_fn". Skipping the step is
+        # the right semantics — there's nothing to update.
+        if l_total.requires_grad:
+            self.emb_optimizer.zero_grad(set_to_none=True)
+            l_total.backward()
+            self.emb_optimizer.step()
         return float(l_align.detach()), float(l_uniform.detach()), l_nb_val
 
     def _e_t_u_for(self, node_ids: np.ndarray, t_query: int) -> torch.Tensor:
