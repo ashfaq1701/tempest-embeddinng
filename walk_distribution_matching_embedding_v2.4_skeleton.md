@@ -283,9 +283,39 @@ This explains why ALL contrastive walk-supervision losses (InfoNCE, alignment, e
 
 This motivates the Stage 4 sweep below.
 
-## 10. §4.8.6 Stage 4 — hist_neg_ratio sweep (planned)
+## 10. §4.8.6 Stage 4 — hist_neg_ratio sweep (DONE)
 
-**Will launch:** after Stage 3 completes (~18:15).
+**Launched:** 2026-05-20 18:37, completed 2026-05-21 02:09 (7.5 hr).
+
+### Final results
+
+| Cell | λ_link | hist_neg_ratio | Best val | Best test | ep 50 val |
+|---|---|---|---|---|---|
+| **D_hnr0** | 0 | 0.00 | 0.7454 | 0.7089 | 0.7410 |
+| **D_hnr0.25** | 0 | 0.25 | **0.7458** | **0.7090** | **0.7449** |
+| **D_hnr0.5** | 0 | 0.50 | 0.7457 | 0.7080 | 0.7364 |
+| **D_hnr0.75** | 0 | 0.75 | 0.7440 | 0.7077 | 0.7361 |
+| J_hnr0 | 0.1 | 0.00 | 0.7021 | 0.6623 | 0.5608 |
+| J_hnr0.25 | 0.1 | 0.25 | 0.7015 | 0.6570 | 0.5555 |
+| J_hnr0.5 | 0.1 | 0.50 | 0.6624 | 0.5996 | 0.5332 |
+| J_hnr0.75 | 0.1 | 0.75 | 0.5844 | 0.5141 | 0.4831 |
+
+**Findings:**
+
+1. **Decoupled column (λ_link=0):** all four hist_neg_ratio values produce best val within ±0.002 (CUDA noise band). D_hnr0.25 marginally leads but indistinguishable from D_hnr0.5. The cliff is GONE on the entire decoupled column thanks to the locked base (alignment + nb + WD).
+
+2. **Joint column (λ_link=0.1):** ALL collapse. **Monotonic worsening with hist_neg_ratio**: 0.7021 → 0.7015 → 0.6624 → 0.5844 as hnr goes 0 → 0.25 → 0.5 → 0.75. Higher hist negs accelerate collapse.
+
+3. **Destructive-interference hypothesis (user, post L0.1):** PARTIALLY confirmed. Historical negs DO add interference (J column degrades with hnr), but joint training collapses even at hnr=0 (J_hnr0 best val 0.7021 vs decoupled 0.7454). The fundamental conflict is BCE-into-embeddings regardless of negative type.
+
+### Locked decisions
+
+- **λ_link = 0** (decisively confirmed across 4 hist_neg_ratio values).
+- **hist_neg_ratio = 0.5** (default — within CUDA noise of 0.25 marginal leader; TGB-distribution-matched per CLAUDE.md Lesson 4).
+
+**Pattern:** with the cliff fix in place (normbrake + WD), the locked base is robust to hist_neg_ratio. No need to deviate from default 0.5.
+
+(Original Stage 4 plan retained below for reference.)
 
 **Design:** 2×4 grid testing interaction between joint training and historical negative ratio.
 
