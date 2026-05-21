@@ -14,6 +14,12 @@ class Config:
     d_emb: int = 128
     d_hidden_link: int = 128
 
+    # v2.4 §13 single-table ablation (1T_asym). When True, E_target and
+    # E_context alias a single [N, d] table; target_final/context_final
+    # become P_src/P_tgt asymmetric projections. Param count halves
+    # (2Nd → Nd + 2d²). Default False = dual-table v2.4 locked.
+    single_table: bool = False
+
     # Component 0: time encoding at the link MLP (Phase 0.5 of the
     # walk-distribution-matched design).
     # Inputs Δt_u, Δt_v, Δt_uv go through a learned functional time

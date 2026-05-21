@@ -71,16 +71,28 @@ class EmbeddingStore(nn.Module):
         d_emb: int,
         node_feat: Optional[np.ndarray] = None,
         edge_feat_dim: int = 0,
+        single_table: bool = False,
     ):
         super().__init__()
         self.n_nodes = n_nodes
         self.d_emb = d_emb
+        self.single_table = single_table
 
         # Identity tables: Xavier-uniform init, always.
-        self.E_target = nn.Embedding(n_nodes, d_emb)
-        self.E_context = nn.Embedding(n_nodes, d_emb)
-        nn.init.xavier_uniform_(self.E_target.weight)
-        nn.init.xavier_uniform_(self.E_context.weight)
+        # Single-table mode (v2.4 §13 1T_asym): E_target and E_context
+        # alias the same nn.Embedding. P_src/P_tgt asymmetry is provided
+        # by target_final/context_final projections below, which are
+        # always-present in single-table mode (even when no node_feat).
+        if single_table:
+            shared_E = nn.Embedding(n_nodes, d_emb)
+            nn.init.xavier_uniform_(shared_E.weight)
+            self.E_target = shared_E
+            self.E_context = shared_E
+        else:
+            self.E_target = nn.Embedding(n_nodes, d_emb)
+            self.E_context = nn.Embedding(n_nodes, d_emb)
+            nn.init.xavier_uniform_(self.E_target.weight)
+            nn.init.xavier_uniform_(self.E_context.weight)
 
         # ── Per-feature projections (bring raw features to d_emb scale) ──
         # Node features. Buffer is non-persistent so checkpoints don't
@@ -111,12 +123,17 @@ class EmbeddingStore(nn.Module):
         # ── Per-site final fusion projections (concat → d_emb) ──────────
         # target / context sites concatenate E with node-feat projection
         # (when present). When no node features, no fusion is needed.
+        # SINGLE-TABLE mode: target_final / context_final are always
+        # present (Linear(d, d) when no node_feat) — they act as
+        # P_src / P_tgt projections providing the role asymmetry that
+        # was previously encoded in two separate embedding tables.
         nf_extra = d_emb if self.has_node_feat else 0
+        need_final = (nf_extra > 0) or single_table
         self.target_final = (
-            nn.Linear(d_emb + nf_extra, d_emb) if nf_extra > 0 else None
+            nn.Linear(d_emb + nf_extra, d_emb) if need_final else None
         )
         self.context_final = (
-            nn.Linear(d_emb + nf_extra, d_emb) if nf_extra > 0 else None
+            nn.Linear(d_emb + nf_extra, d_emb) if need_final else None
         )
 
         # context_walk site: concatenates context(u) ‖ proj_e(edge).
@@ -157,17 +174,26 @@ class EmbeddingStore(nn.Module):
 
     def target(self, ids: torch.Tensor) -> torch.Tensor:
         e = self.E_target(ids)
-        if not self.has_node_feat:
-            return e
-        nf_proj = self.node_feat_proj_target(self.node_feat[ids])
-        return self.target_final(torch.cat([e, nf_proj], dim=-1))
+        if self.has_node_feat:
+            nf_proj = self.node_feat_proj_target(self.node_feat[ids])
+            e = torch.cat([e, nf_proj], dim=-1)
+        # target_final is always present in single_table mode (acts as
+        # P_src projection) or when node_feat is present (fusion). When
+        # neither, we return the raw lookup.
+        if self.target_final is not None:
+            e = self.target_final(e)
+        return e
 
     def context(self, ids: torch.Tensor) -> torch.Tensor:
         e = self.E_context(ids)
-        if not self.has_node_feat:
-            return e
-        nf_proj = self.node_feat_proj_context(self.node_feat[ids])
-        return self.context_final(torch.cat([e, nf_proj], dim=-1))
+        if self.has_node_feat:
+            nf_proj = self.node_feat_proj_context(self.node_feat[ids])
+            e = torch.cat([e, nf_proj], dim=-1)
+        # context_final is always present in single_table mode (acts as
+        # P_tgt projection) or when node_feat is present (fusion).
+        if self.context_final is not None:
+            e = self.context_final(e)
+        return e
 
     def context_walk(
         self,

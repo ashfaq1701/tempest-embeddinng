@@ -69,6 +69,7 @@ class Trainer:
             d_emb=config.d_emb,
             node_feat=node_feat,
             edge_feat_dim=edge_feat_dim,
+            single_table=config.single_table,
         ).to(self.device)
         # Component 0: time encoding at the link MLP.
         self.use_time_encoding = config.use_time_encoding
