@@ -492,7 +492,24 @@ entirely; CAWN-style anonymous identity) would help on review
 (surprise index 0.987) without hurting wiki (surprise index 0.108).
 Walks-only is documented as future work below.
 
-### Lesson 27 — Single-table + dual-projection migration (PRE-REGISTERED 2026-05-21)
+### Lesson 27 — Single-table + dual-projection migration (PRE-REGISTERED 2026-05-21, DEFERRED 2026-05-21)
+
+> **STATUS — DEFERRED pending Lesson 28's shuffle_walk_order bug fix.**
+> This pre-registration was committed on 2026-05-21, then the
+> migration's single-seed wiki run was launched and reached ep 40
+> before being halted at user request. During that run a critical
+> walks-supervision bug was identified (Tempest's `shuffle_walk_order`
+> defaults to True; the codebase has never disabled it). Every
+> diagnostic this migration was retesting — Step 6 (Lesson 24), the
+> Sanity check (Lesson 26), the cliff-mechanism analyses (Lessons
+> 17-23, 25) — was measured against shuffled walks. The migration is
+> therefore comparing two architectures whose supervision signal was
+> randomized in the same way. See Lesson 28 for the bug, the
+> mechanism, the predictive coherence with the sanity-check signature,
+> and the fix. The refactor code is preserved on branch
+> `experiment/single-table-dual-projection` as a paper-ablation
+> artifact. The migration's empirical claims will be re-evaluated
+> after Lesson 28's anchor revalidation under the fix.
 
 This section is committed BEFORE the migration runs as a pre-registered
 prediction. Final empirical result is appended at the bottom of this
@@ -562,12 +579,29 @@ ALL of the following hold:
 DO NOT MERGE if any decision-rule check fails. The branch becomes a
 paper-ablation artifact; master stays at locked-v2.
 
-**Final empirical result.** _To be filled in after Cell A + multi-seed
-verification._
-  - Calibrated normbrake threshold (single-table E.weight, ep 2): _TBD_.
-  - Wiki seed 42: peak val _TBD_ / ep-50 val _TBD_ / drop _TBD_.
-  - Wiki seeds {7, 13}: _TBD_.
-  - Decision: _TBD_.
+**Partial empirical result (HALTED 2026-05-21 before completion).**
+The migration's seed-42 cell ran for ~40 of 50 epochs on the
+`experiment/single-table-dual-projection` branch with calibrated
+threshold 4.13, then was halted at user request because the
+shuffle_walk_order bug (Lesson 28) was identified. The collected
+numbers are recorded for the historical chronology but are NOT to be
+interpreted as evaluating the migration on its merits; both
+architectures (dual-table locked-v2 and single-table experiment) were
+trained against randomized walks.
+  - Calibrated single-table threshold (E.weight, ep 2, walks shuffled):
+    1.5 × 2.7507 = **4.13** (delta vs dual-table 3.87 is +6.7%).
+  - 2-epoch calibration with λ_normbrake=0: val 0.7443 / test 0.7111
+    (within noise of locked-v2 2-ep anchor val 0.7449 / test 0.7081).
+  - Wiki seed 42, 50 ep at threshold 4.13:
+      * Best at ep 28: val 0.7453 / test 0.7096.
+      * Ep 50: val 0.6921 (cliff -0.053, far worse than locked-v2's
+        -0.011 under the same shuffle-bug condition).
+      * Trajectory: nb saturated tiny (0.0017 from ep 10 onward);
+        E.weight clamped near 4.17; P_src_norm RAN AWAY (13 → 38);
+        link_w_norm 10 → 13.
+  - Wiki seeds {7, 13}: NOT RUN (halted).
+  - Decision: DEFERRED. Migration verification re-runs after the
+    Lesson 28 fix lands and the post-fix anchor is established.
 
 ---
 
