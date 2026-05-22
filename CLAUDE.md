@@ -487,6 +487,86 @@ entirely; CAWN-style anonymous identity) would help on review
 (surprise index 0.987) without hurting wiki (surprise index 0.108).
 Walks-only is documented as future work below.
 
+### Lesson 31 — Walk encoder redesigned as transition pairs (2026-05-22)
+
+**Motivation.** Pre-Lesson-31, the walk encoder's per-step input was
+`[node_emb(n_p), Φ(Δt_p), ef_proj(ef_p)]`. The edge feature ef[p]
+semantically describes the (n_p, n_{p+1}) relationship, but it was
+attached to step p alongside n_p only. The destination n_{p+1} showed
+up at the NEXT GRU step as that step's node identity. The GRU had to
+learn to compose (n_p, ef_leaving_p) with (n_{p+1}) across two
+recurrent steps — capacity wasted on a composition that explicit
+pairing would make trivial.
+
+Edge features are RELATIONSHIPS, not node properties. Encoding them
+as node properties was a design error.
+
+**Fix — encode transition tuples, not nodes.** Each non-seed GRU step
+now carries a complete transition; the seed step is a distinct
+terminal step.
+
+```
+For p in [0, lens-2] (transition steps):
+  step_input[p] = concat([
+      context(n_p),               # source of the transition
+      context(n_{p+1}),           # destination of the transition
+      Φ(t_query - t_p),           # when the transition happened
+      ef_proj(ef[p]),             # edge feature  (if has_edge_feat)
+  ])
+
+For p == lens-1 (seed step, terminal):
+  step_input[lens-1] = concat([
+      target(seed),               # source-role lookup (target table)
+      zeros(d_emb),               # no destination — terminal
+      Φ(t_query - t_seed),        # = Φ(0) at scoring time
+      zeros(d_edge_proj),         # no outgoing edge   (if has_edge_feat)
+  ])
+```
+
+Per-step dim grows from `d_emb + d_time + d_emb` (=288 on wiki) to
+`2·d_emb + d_time + d_emb` (=416). GRU input_size updated accordingly;
+~50k additional parameters in the GRU's input projection.
+
+**Resolution of Issue 1 (audit).** The earlier asymmetry — at the
+seed position, `edge_feats_padded[lens-1]` was hard zero when lens=L
+but `ef_proj(0)=bias` when lens<L — dissolves under the new design.
+The seed step has no edge slot in the transition sense; instead the
+encoder explicitly zeros the edge channel at the seed position
+(`edge_feats_padded * (~is_seed_pos)`), uniformly regardless of walk
+length. There is no learnable signal that distinguishes "truncated"
+vs "full" walks from the seed-position edge-feat alone.
+
+**Implementation.** Single-file change in `tempest_walks/walk_encoder.py`:
+  - `__init__`: `d_step` updated to `2·d_emb + d_time + (d_emb if has_edge_feat)`.
+  - `forward`: build `dst_step` as `E_context(next_nodes)` with
+    `next_nodes` = the walk shifted left by one (zero at position L-1).
+    Zero `dst_step` and `edge_feats_padded` at the seed position via
+    `(~is_seed_pos).float()` mask. Append `dst_step` to the concat.
+    The seed step's src side is unchanged (target lookup); the
+    Φ(t_query − t_p) computation is unchanged.
+  - `trainer.py` is unchanged — it still projects + right-pads
+    `walks.edge_feats` and passes `edge_feats_padded` into the encoder.
+  - `embedding_store.context_walk` (used by the alignment loss, NOT by
+    the encoder) is unchanged.
+
+**Verification (anchor + 50-ep, results filled in after running).**
+  - Anchor under transition-pair encoder + normbrake-stripped master:
+    val mean _TBD_ / test mean _TBD_.
+  - Δ vs locked-v2-nb-stripped anchor (test 0.7092 ± 0.0003): _TBD_.
+  - 50-ep wiki seed 42 (peak + cliff): _TBD_.
+  - 6-ep review sampled: _TBD_ (cross-dataset discriminator —
+    paired-input encoder predicted to help more here, where edge-
+    relationship semantics are not memorization-dominated).
+
+**Status of historical lessons.** Lessons 25–29 measured under the
+old (node-bound) encoder. Their qualitative conclusions about peak
+robustness should hold, but cliff dynamics are now under a different
+input geometry. The W_off ablation (encoder OFF) is unchanged in
+behavior; W_gru_k1 / Sanity / W_no_nb were all under the old encoder
+and the cliff numbers don't transfer literally.
+
+---
+
 ### Lesson 30 — Normbrake stripped from master despite being load-bearing (USER OVERRIDE 2026-05-22)
 
 **This lesson records an explicit override of the empirical conclusion
