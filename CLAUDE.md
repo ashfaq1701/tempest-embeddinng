@@ -80,9 +80,18 @@ see Lesson 1):
 
 - `emb_optimizer`  ← `alignment + η·uniformity`
 - `link_optimizer` ← BCE only, `weight_decay=1e-4` (cliff fix)
-  - Includes `walk_encoder.parameters()` AND `time_encoder.parameters()`
-  - BCE backprops through the encoder INTO E_target/E_context via
-    per-step lookups — gradient flow that absorbs link-MLP runaway.
+  - Includes `walk_encoder.parameters()` AND `time_encoder.parameters()`.
+  - BCE.backward() DOES compute gradients on E_target / E_context via
+    the walk encoder's per-step lookups, but those gradients are
+    discarded: `link_optimizer` doesn't include E in its param group,
+    and the next batch's `emb_optimizer.zero_grad(set_to_none=True)`
+    wipes them before `alignment.backward()` runs. The embeddings
+    train ONLY from `alignment + η·uniformity`. This decoupling is
+    the "no joint training" requirement from Lesson 19 — re-enabling
+    BCE → E gradient flow re-introduces the Lesson 19 collapse.
+
+  (Earlier wording in this section claimed BCE "absorbs link-MLP
+  runaway via E"; that's incorrect — see Lesson 34.)
 
 ## Strict-causal protocol (NON-NEGOTIABLE)
 
@@ -486,6 +495,52 @@ Strong indicator that walks-only architectures (drop E_target
 entirely; CAWN-style anonymous identity) would help on review
 (surprise index 0.987) without hurting wiki (surprise index 0.108).
 Walks-only is documented as future work below.
+
+### Lesson 34 — Docs correction: BCE-into-E gradient is computed-then-discarded (2026-05-22)
+
+**The misleading claim.** CLAUDE.md's architecture section previously
+stated:
+
+  > BCE backprops through the encoder INTO E_target/E_context via
+  > per-step lookups — gradient flow that absorbs link-MLP runaway.
+
+This was wrong. The actual per-batch sequence is:
+
+  1. `emb_optimizer.zero_grad(set_to_none=True)` → E.grad cleared.
+  2. `alignment.backward()` → E.grad populated with alignment gradient.
+  3. `emb_optimizer.step()` → E updated using alignment gradient.
+  4. `link_optimizer.zero_grad(set_to_none=True)` — clears LINK
+     params only; E.grad still holds the alignment gradient.
+  5. `BCE.backward()` → adds BCE-via-encoder gradient onto E.grad
+     (accumulating with the stale alignment grad).
+  6. `link_optimizer.step()` → updates link params using their own
+     grads; does NOT touch E.
+  7. Next batch's `emb_optimizer.zero_grad(set_to_none=True)` wipes
+     E.grad before the next alignment.backward() runs.
+
+So the BCE-through-encoder gradient is computed but **never applied**.
+It's wasted compute. The embeddings are trained ONLY by
+`alignment + η·uniformity`.
+
+**Why the "decoupling is right" interpretation matters.** Lesson 19
+documented that letting BCE train E directly (λ_link > 0)
+**immediately collapses** contrastive walk-supervision across all
+loss families and all hist_neg_ratio values. The current decoupling
+is enforced because the BCE gradient on E is discarded. If someone
+later "optimizes" the wasted compute by re-routing BCE to also update
+E, they'd re-introduce Lesson 19's collapse.
+
+**Status of the doc correction.** Architecture section bullet
+rewritten. No code change. Just documentation.
+
+If the wasted-compute aspect matters for a future low-memory deployment,
+the proper fix is `walk_encoder.parameters()` references E only
+through nn.Embedding's gather (which has its own gradient path);
+detaching the embedding lookups inside the encoder would stop the
+gradient from being computed in the first place. Not load-bearing
+for correctness — leaving it as-is.
+
+---
 
 ### Lesson 33 — Tempest's RNG is now seeded for cross-run reproducibility (2026-05-22)
 
