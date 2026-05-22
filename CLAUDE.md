@@ -487,6 +487,58 @@ entirely; CAWN-style anonymous identity) would help on review
 (surprise index 0.987) without hurting wiki (surprise index 0.108).
 Walks-only is documented as future work below.
 
+### Lesson 33 — Tempest's RNG is now seeded for cross-run reproducibility (2026-05-22)
+
+**Motivation.** `temporal_random_walk.TemporalRandomWalk` accepts a
+`global_seed` kwarg. We weren't passing it, so Tempest used a
+non-seeded internal RNG. Effect: walks differed run-to-run even when
+the Python/torch seed was identical. This is plausibly responsible
+for some fraction of the Lesson 22 "Adam-constructor drift" — drift
+attributed to CUDA non-determinism may actually have been Tempest
+RNG churn.
+
+**Fix.** `walks.py:WalkGenerator.__init__` now takes an `Optional[int]
+seed` kwarg and forwards it as `global_seed=seed` to Tempest when
+non-None. `trainer.py` constructs `WalkGenerator(..., seed=config.seed)`.
+
+**Verification.**
+
+  - Determinism probe (out-of-band script): with `global_seed=42`,
+    two `WalkGenerator` instances build identical walk arrays on the
+    same edge stream. With `global_seed=7` vs `42`, the walks
+    differ — confirmed under both Uniform and ExponentialWeight
+    biases. (For small graphs under ExponentialWeight, walks can be
+    deterministic from graph structure alone — the most-recent
+    predecessor is selected with probability ≈ 1 when other edges
+    are exponentially older. Larger or uniformly-distributed graphs
+    expose the RNG dependence.)
+
+  - Anchor (3 seeds × 2 ep on wiki post-seeding):
+    val 0.7441 ± 0.0006 / test **0.7088 ± 0.0003**.
+    Verdict: CONFIRMED vs 0.7070 ± 0.0016 target.
+
+  - Δ vs Lesson 32 anchor (test 0.7097 ± 0.0014): **-0.0009 mean**,
+    within noise. The HEADLINE WIN is std collapse: **0.0014 → 0.0003
+    (4-5× tighter)**. Per-seed test values: L33 0.7084–0.7090
+    (range 0.0006) vs L32 0.7086–0.7117 (range 0.0031). Tempest
+    seeding removes cross-run walk variance — exactly the gap Lesson
+    22 was partially observing.
+
+**Status.** This is a reproducibility fix. MRR effect on wiki is
+within noise, but the per-seed variance reduction is large and
+meaningful for downstream comparison-of-architecture experiments —
+future ablation deltas can now be attributed to architecture rather
+than RNG noise.
+
+**Lesson 22 (Adam-constructor drift) status:** **partially explained**.
+The pre-Lesson-33 drift of ~0.030 across the same Python seed was
+plausibly mostly Tempest RNG variance. With both Python/torch and
+Tempest seeded, single-seed comparisons should now be tight to
+within ±0.001-0.005 (CUDA non-determinism + numpy global RNG state
+churn account for the remaining residual).
+
+---
+
 ### Lesson 32 — Historical-negative reservoir is now true Vitter R (2026-05-22)
 
 **Motivation.** Training-time historical negatives must match the

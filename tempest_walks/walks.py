@@ -44,6 +44,7 @@ class WalkGenerator:
         max_walk_len: int = 20,
         num_walks_per_node: int = 5,
         timescale_bound: int = 300,
+        seed: Optional[int] = None,
     ):
         # CRITICAL: shuffle_walk_order defaults to True in Tempest's
         # constructor (see temporal_random_walk/src/common/const.cuh
@@ -55,13 +56,20 @@ class WalkGenerator:
         # in _compute_walk_repr_for) all assume grouped order. We
         # disable the shuffle so the output is laid out as
         # [seed_0×K, seed_1×K, ..., seed_{N-1}×K]. See Lesson 28.
-        self.trw = TemporalRandomWalk(
+        # `global_seed` (Lesson 33) makes Tempest's internal RNG
+        # deterministic across runs with the same Python/torch seed;
+        # without it, walks differ run-to-run even when the rest of the
+        # pipeline is seeded.
+        trw_kwargs = dict(
             is_directed=is_directed,
             use_gpu=use_gpu,
             enable_weight_computation=True,
             timescale_bound=timescale_bound,
             shuffle_walk_order=False,
         )
+        if seed is not None:
+            trw_kwargs["global_seed"] = int(seed)
+        self.trw = TemporalRandomWalk(**trw_kwargs)
         self.walk_bias = walk_bias
         self.max_walk_len = max_walk_len
         self.num_walks_per_node = num_walks_per_node

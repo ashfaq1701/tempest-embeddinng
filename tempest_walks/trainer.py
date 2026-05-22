@@ -75,6 +75,7 @@ class Trainer:
             walk_bias=config.walk_bias,
             max_walk_len=config.max_walk_len,
             num_walks_per_node=config.num_walks_per_node,
+            seed=config.seed,                 # Lesson 33: cross-run reproducibility
         )
 
         # Walk encoder MANDATORY (no flag — locked architecture).
