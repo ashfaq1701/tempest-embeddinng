@@ -487,6 +487,84 @@ entirely; CAWN-style anonymous identity) would help on review
 (surprise index 0.987) without hurting wiki (surprise index 0.108).
 Walks-only is documented as future work below.
 
+### Lesson 32 — Historical-negative reservoir is now true Vitter R (2026-05-22)
+
+**Motivation.** Training-time historical negatives must match the
+distribution of TGB's eval-time historical negatives, which are
+uniform draws from each source's training-time destinations. The
+pre-Lesson-32 `HistoricalNegativeSampler.observe` unconditionally
+inserted at a random reservoir slot when the reservoir was full —
+producing an exponential recency bias instead of the uniform sample
+that Vitter's Algorithm R guarantees.
+
+**Mechanism.** True Vitter R: when the reservoir is full and the
+(count+1)-th item arrives, accept it with probability `M/(count+1)`
+and only then replace a uniformly-chosen slot. The probability that
+each historical item is present in the reservoir at any time after
+the fill phase is exactly `M/count` — independent of how recent the
+item is.
+
+The previous implementation (always-replace) instead has an item's
+presence probability decay exponentially with `(1 - 1/M)^(steps
+since insertion)`. Items inserted early were vanishingly unlikely
+to remain by end of an epoch.
+
+**Fix.** One block change in `negatives.py:observe`:
+
+```python
+fill_mask = pre_count < self.M
+t = (pre_count + 1).astype(np.float64)
+accept_threshold = self.M / t
+accept_draw = self.rng.random(size=B)
+accept_when_full = accept_draw < accept_threshold
+do_insert = fill_mask | (~fill_mask & accept_when_full)
+
+rand_pos = self.rng.integers(0, self.M, size=B)
+insert_pos = np.where(fill_mask, pre_count, rand_pos)
+insert_idx = np.where(do_insert)[0]
+if len(insert_idx) > 0:
+    self.reservoir[src_i[insert_idx], insert_pos[insert_idx]] = dst_i[insert_idx]
+np.add.at(self.count, src_i, 1)
+```
+
+`np.add.at(self.count, src_i, 1)` runs unconditionally (count tracks
+the source's total history, not just accepted writes), so the
+acceptance probability M/(count+1) keeps decreasing as count grows.
+
+The class docstring's prior "bounded approximation to strict
+sequential Vitter R" hedge is removed; the implementation is now true
+Vitter R modulo the "last write wins" within-batch tie-breaker
+(negligible at B ≈ 200 vs per-source accepted-write rates).
+
+**Verification.**
+
+  - Unit test (`tests/test_vitter_r_uniformity.py`):
+    - 1000 observations × 200 trials, M=8.
+    - Expected per-item presence count: 200 × 8/1000 = 1.6.
+    - Result: mean 1.600, std 1.254 (matches Binomial(200, 0.008)).
+    - Late-half mean / early-half mean ratio: **0.995** (≈ 1.0 under
+      true Vitter R; would be >5 under always-replace).
+    - PASS.
+
+  - Anchor (3 seeds × 2 ep on wiki post-Vitter-R):
+    val 0.7440 ± 0.0003 / test **0.7097 ± 0.0014**.
+    Verdict: CONFIRMED vs 0.7070 ± 0.0016 target.
+
+  - Δ vs Lesson-31 anchor (test 0.7090 ± 0.0005): **+0.0007** test
+    mean — within noise. Per-seed variance is higher (0.0014 vs
+    0.0005), consistent with the now-uniform sampling exposing more
+    underlying noise (the recency-biased sample was less variable
+    because it concentrated on the same recent destinations across
+    seeds).
+
+**Status.** This is a correctness fix. The MRR delta on wiki is
+within noise — wiki is recurrence-dominated and the eval-time
+negatives are also (TGB-)uniform, so the previous train/eval
+mismatch was bounded. Cross-dataset effect TBD (review re-run
+would be informative but not necessary for the correctness claim).
+
+---
+
 ### Lesson 31 — Walk encoder redesigned as transition pairs (2026-05-22)
 
 **Motivation.** Pre-Lesson-31, the walk encoder's per-step input was

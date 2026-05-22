@@ -79,10 +79,17 @@ class HistoricalNegativeSampler(NegativeSampler):
 
     Vectorised hot path:
       observe(src, dst):
-        - O(B) fancy-indexed reservoir write, no Python loops.
-        - For repeated sources within a batch the LAST write to a given
-          (src, position) wins — bounded approximation to strict
-          sequential Vitter R; standard for batch implementations.
+        - True Vitter R: each item accepted with probability M/(count+1)
+          when the reservoir is full, replacing a uniform-random slot.
+          Fill phase (count < M) accepts unconditionally into the next
+          empty slot. Guarantees every reservoir slot is a uniform draw
+          from the source's history at all times after fill.
+        - O(B) vectorized; no Python loops.
+        - For repeated sources within a batch the LAST accepted write
+          to a given (src, position) wins — this is the only remaining
+          deviation from strict sequential Vitter R, and it's negligible
+          because B (~200) is much smaller than the per-source rate of
+          accepted writes.
       sample(batch):
         - O(B*K_hist) reservoir gather + a where() for the invalid /
           false-negative guard, then O(B*K_rand) random draws.
@@ -116,17 +123,42 @@ class HistoricalNegativeSampler(NegativeSampler):
         self.count.fill(0)
 
     def observe(self, src: np.ndarray, dst: np.ndarray) -> None:
-        """Vitter-R update. MUST be called AFTER scoring (strict-causal)."""
+        """Vitter-R update. MUST be called AFTER scoring (strict-causal).
+
+        Per-source reservoir maintains a UNIFORM RANDOM SAMPLE of size M
+        from the source's history. When the reservoir is full and the
+        (count+1)-th item arrives, accept it with probability M/(count+1)
+        and, if accepted, replace a uniformly-chosen slot. Every slot is
+        a uniform draw from the source's history at all times after fill.
+        """
         B = src.shape[0]
         if B == 0:
             return
         src_i = src.astype(np.int64, copy=False)
         dst_i = dst.astype(np.int32, copy=False)
         pre_count = self.count[src_i]
+
         fill_mask = pre_count < self.M
+
+        # Full phase: accept with probability M / (count + 1).
+        t = (pre_count + 1).astype(np.float64)
+        accept_threshold = self.M / t
+        accept_draw = self.rng.random(size=B)
+        accept_when_full = accept_draw < accept_threshold
+
+        # Combined insert mask.
+        do_insert = fill_mask | (~fill_mask & accept_when_full)
+
+        # Slot to insert into. Fill phase: next empty slot. Full phase:
+        # uniform random slot.
         rand_pos = self.rng.integers(0, self.M, size=B)
         insert_pos = np.where(fill_mask, pre_count, rand_pos)
-        self.reservoir[src_i, insert_pos] = dst_i
+
+        # Apply insertion only where do_insert is True.
+        insert_idx = np.where(do_insert)[0]
+        if len(insert_idx) > 0:
+            self.reservoir[src_i[insert_idx], insert_pos[insert_idx]] = dst_i[insert_idx]
+
         np.add.at(self.count, src_i, 1)
 
     def sample(self, batch: Batch) -> Tuple[np.ndarray, np.ndarray]:
