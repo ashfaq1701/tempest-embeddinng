@@ -9,7 +9,7 @@ directly."* This repo implements that.
 
 | Dataset | Test MRR |
 |---|---|
-| tgbl-wiki-v2 | **TBD on current master** (W_off-style; walk encoder on backup branch) |
+| tgbl-wiki-v2 | **0.7096 ± 0.0008** (anchor, 3 seeds × 2 ep; walk encoder on backup branch) |
 | tgbl-review-v2 | **TBD on current master** |
 
 Best numbers measured pre-strip on `backup/important-walk-embedding`
@@ -539,17 +539,27 @@ there.
 
 **Verification.** Module imports succeed; `Trainer` constructs
 without WalkEncoder; `_e_t_u_for` returns `[B, d_emb]` tensors of
-the right shape. Anchor revalidation pending (see commit and the
-fill-in below).
+the right shape.
 
-**Result.** _Anchor (3 seeds × 2 ep) under walk-encoder-stripped
-master: TBD (running)._
+**Anchor result (3 seeds × 2 ep on wiki under stripped master):**
+  val mean **0.7438 ± 0.0000** / test mean **0.7096 ± 0.0008**.
+  Per-seed test: 0.7096, 0.7086, 0.7106. CONFIRMED vs 0.7070 ± 0.0016.
+
+Δ vs L33 anchor (transition-pair encoder, same fixes): +0.0008 test
+mean — within noise. The encoder adds nothing at 2-epoch scale on
+wiki, which we already knew from Step 3 (W_off ≈ W_gru_k1 at the
+peak). The 50-ep gain (test +0.0025) and review gain (test +0.0284)
+remain on `backup/important-walk-embedding`; both will be re-evaluated
+when the encoder is restored.
+
+The val std collapse (0.0000 vs L33's 0.0006) is a side-effect of
+removing the GRU: without the encoder's stochastic gating, the only
+remaining run-to-run variance is CUDA non-determinism. A clean
+baseline for downstream architecture experiments.
 
 This is the W_off-style architecture under all four Lesson 28-33
-fixes: shuffle fix, reservoir-reset fix, normbrake removed, Vitter
-R, Tempest seeded. The expected anchor is close to the W_off Step-3
-number (test 0.7081 pre-Lesson-31) — but with the post-31 fixes the
-exact number is TBD.
+fixes: shuffle fix, reservoir-reset fix, normbrake stripped (L30),
+Vitter R (L32), Tempest seeded (L33).
 
 ---
 
