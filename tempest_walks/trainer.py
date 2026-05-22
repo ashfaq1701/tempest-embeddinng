@@ -320,15 +320,26 @@ class Trainer:
     # Snapshot / restore (for early-stop best-weight restoration).
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _cpu_state_dict(module: torch.nn.Module) -> Dict[str, torch.Tensor]:
+        """Detach + move state_dict to CPU. Keeps snapshots off the GPU so
+        large embedding tables (e.g., review's 352K-node E_target / E_context
+        ≈ 360 MB) don't double the GPU footprint after a best-weight save.
+        """
+        return {k: v.detach().to("cpu", copy=True) for k, v in module.state_dict().items()}
+
     def _snapshot(self) -> Dict[str, Any]:
         return {
-            "embedding_store": copy.deepcopy(self.embedding_store.state_dict()),
-            "link_predictor": copy.deepcopy(self.link_predictor.state_dict()),
-            "time_encoder": copy.deepcopy(self.time_encoder.state_dict()),
-            "walk_encoder": copy.deepcopy(self.walk_encoder.state_dict()),
+            "embedding_store": self._cpu_state_dict(self.embedding_store),
+            "link_predictor": self._cpu_state_dict(self.link_predictor),
+            "time_encoder": self._cpu_state_dict(self.time_encoder),
+            "walk_encoder": self._cpu_state_dict(self.walk_encoder),
         }
 
     def _restore(self, snap: Dict[str, Any]) -> None:
+        # load_state_dict copies values into existing parameters in-place;
+        # CPU → GPU transfer happens implicitly via the existing tensors'
+        # devices.
         self.embedding_store.load_state_dict(snap["embedding_store"])
         self.link_predictor.load_state_dict(snap["link_predictor"])
         self.time_encoder.load_state_dict(snap["time_encoder"])
