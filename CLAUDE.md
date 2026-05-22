@@ -9,8 +9,8 @@ directly."* This repo implements that.
 
 | Dataset | Test MRR |
 |---|---|
-| tgbl-wiki-v2 | **0.7100** |
-| tgbl-review-v2 | **~0.31** (preliminary; 6-ep sampled-eval) |
+| tgbl-wiki-v2 | **0.7111** (50-ep, post-Lesson-31 transition-pair encoder) |
+| tgbl-review-v2 | **0.3419** (6-ep sampled-eval, early-stopped ep 3) |
 
 Leaderboard reference (most carry the TGN within-batch memory leak;
 see Lesson 1):
@@ -572,9 +572,35 @@ vs "full" walks from the seed-position edge-feat alone.
     AND faster convergence. The cliff itself is still dominated by
     embedding-magnitude runaway (post-normbrake-strip); the encoder
     redesign is orthogonal to that.
-  - 6-ep review sampled: _TBD (running)_ — cross-dataset
-    discriminator; paired-input predicted to help more here, where
-    edge-relationship semantics are not memorization-dominated.
+  - 6-ep review sampled (seed 42, K=1, b=100; early-stopped at ep 5
+    when val hit patience 2):
+    - Best at ep 3: val 0.3312 / test **0.3419**.
+    - vs locked-v2 review baseline (~0.3135): **+0.0284 test MRR**.
+
+    Cross-dataset discriminator confirms the prediction: paired-input
+    encoder helps substantially on review (high-surprise-index,
+    less memorization-dominated), where edge-relationship semantics
+    actually matter. The wiki gain was small (+0.0025) because wiki
+    is dominated by Component 0 + recurrence memorization. Review,
+    where the model needs to generalize over relationships, benefits
+    much more (+11.4× the wiki improvement).
+
+**Operational notes for review-scale runs.** This Lesson-31 cycle
+surfaced two laptop-GPU memory issues that needed fixing alongside:
+  - `_snapshot` was deepcopying `state_dict()` on-device, putting a
+    full E_target+E_context copy on the GPU (~360 MB on review). Now
+    moved to CPU via a `_cpu_state_dict` helper. Wiki was unaffected
+    (~5 MB snapshots).
+  - The wider GRU input (416 vs 288) leaves more cached allocator
+    fragments by end of ep 1; ep 2's backward couldn't find a
+    contiguous 3 GiB block on 8 GB even with
+    `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. A
+    `torch.cuda.empty_cache()` at the top of each epoch reclaims
+    fragments. No-op on wiki.
+
+Recommended review-scale config on 8 GB:
+  `--target-batch-size 100 --num-walks-per-node 1`
+  with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` env var.
 
 **Status of historical lessons.** Lessons 25–29 measured under the
 old (node-bound) encoder. Their qualitative conclusions about peak
