@@ -43,10 +43,9 @@ class Config:
     uniformity_temperature: float = 2.0
     uniformity_cap: int = 20_000
 
-    # Normbrake + link-MLP weight_decay — the locked cliff fix.
-    # threshold = 1.5 × col_norm at ep 1-2, per-dataset (wiki: 3.87, review: 31.32).
-    lambda_normbrake: float = 0.1
-    normbrake_threshold: float = 3.87        # wiki default; override per dataset
+    # Link-MLP weight_decay (Lesson 23). Normbrake was stripped per
+    # Lesson 30 (user override) despite being load-bearing on the
+    # post-bug-fix cliff dynamics — see CLAUDE.md.
     weight_decay_link: float = 1e-4
 
     # Negative sampling (training-time). hist_neg_ratio matches TGB eval mix.

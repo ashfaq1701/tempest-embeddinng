@@ -33,8 +33,7 @@ class EmbeddingStore(nn.Module):
     context_walk(u, ef) = context_walk_final([context(u) || edge_feat_proj(ef)])
 
     Alignment loss pulls E_target[seed] toward context_walk reads;
-    uniformity spreads E_target over the unit hypersphere; normbrake
-    clamps column magnitudes on both tables.
+    uniformity spreads E_target over the unit hypersphere.
     """
 
     def __init__(

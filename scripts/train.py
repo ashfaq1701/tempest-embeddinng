@@ -1,11 +1,10 @@
 """Entry point — tempest-walks-v3 (minimal production).
 
-Required: --tgb-name. Per-dataset normbrake_threshold should be passed
-(default 3.87 is wiki-calibrated; review needs 31.32).
+Required: --tgb-name.
 
 Loads TGB dataset, derives alignment_time_scale from train span,
-constructs Trainer (always with walk encoder + Component 0 + normbrake +
-WD_link), runs strict-causal training, evaluates with TGB Evaluator.
+constructs Trainer (always with walk encoder + Component 0 + WD_link),
+runs strict-causal training, evaluates with TGB Evaluator.
 """
 
 import argparse
@@ -33,12 +32,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--early-stop-patience", type=int, default=0,
                    help="0 disables; >0 = patience on val MRR.")
     p.add_argument("--target-batch-size", type=int, default=200)
-
-    # Per-dataset normbrake calibration. 3.87 wiki / 31.32 review.
-    p.add_argument("--normbrake-threshold", type=float, default=3.87)
-    p.add_argument("--lambda-normbrake", type=float, default=None,
-                   help="Override normbrake weight (None = config default 0.1; "
-                        "set to 0 to ablate normbrake entirely).")
 
     # Review-scale conveniences.
     p.add_argument("--monitor-sample-pct", type=float, default=1.0,
@@ -87,7 +80,6 @@ def main() -> None:
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
         target_batch_size=args.target_batch_size,
-        normbrake_threshold=args.normbrake_threshold,
         monitor_sample_pct=args.monitor_sample_pct,
         skip_final_full_eval=args.skip_final_full_eval,
         log_debug=args.log_debug,
@@ -99,8 +91,6 @@ def main() -> None:
         config_kwargs["use_walk_encoder"] = args.use_walk_encoder
     if args.num_walks_per_node is not None:
         config_kwargs["num_walks_per_node"] = args.num_walks_per_node
-    if args.lambda_normbrake is not None:
-        config_kwargs["lambda_normbrake"] = args.lambda_normbrake
     config = Config(**config_kwargs)
 
     train_dst_pool = np.unique(loaded.train.destinations)

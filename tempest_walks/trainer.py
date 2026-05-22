@@ -4,7 +4,7 @@ Per batch — IN THIS EXACT ORDER (training and eval both):
 
   1. walks = walk_gen.walks_for_nodes(seeds = unique(batch.src ∪ batch.tgt))
             ← PRE-ingest Tempest state (events ≤ batch B-1).
-  2. l_align + η·l_uniform + λ·l_normbrake → emb_optimizer.step()
+  2. l_align + η·l_uniform → emb_optimizer.step()
   3. neg = neg_sampler.sample(batch)        ← reservoir ≤ batch B-1.
   4. score = link_predictor(walk_repr_u, e_t_v, e_c_u, e_c_v, Component_0)
             ← e_t_u replaced by walk encoder's per-source GRU output.
@@ -15,8 +15,8 @@ Per batch — IN THIS EXACT ORDER (training and eval both):
   8. walk_gen.add_edges(batch)                  ← LAST.
 
 The architecture is FIXED: alignment+uniformity primary loss,
-normbrake aux, weight_decay on link MLP, walk encoder MANDATORY on
-the source side, Component 0 always on. See CLAUDE.md.
+weight_decay on link MLP, walk encoder MANDATORY on the source side,
+Component 0 always on. See CLAUDE.md.
 """
 
 import copy
@@ -29,7 +29,7 @@ import torch
 from .config import Config
 from .data import Batch
 from .evaluator import Evaluator
-from .losses import alignment_loss, link_bce, normbrake_loss, uniformity_loss
+from .losses import alignment_loss, link_bce, uniformity_loss
 from .model import EmbeddingStore, LinkPredictor, TimeEncoder
 from .negatives import HistoricalNegativeSampler, UniformNegativeSampler, NegativeSampler
 from .timestate import NodeTimeState
@@ -145,8 +145,8 @@ class Trainer:
     # Per-batch step (strict-causal: ingest LAST).
     # ------------------------------------------------------------------ #
 
-    def _embedding_step(self, batch: Batch) -> Tuple[float, float, float]:
-        """alignment + η·uniformity + λ·normbrake. Returns (l_align, l_unif, l_nb)."""
+    def _embedding_step(self, batch: Batch) -> Tuple[float, float]:
+        """alignment + η·uniformity. Returns (l_align, l_unif)."""
         seeds_np = np.unique(np.concatenate([batch.src, batch.tgt]))
         walks = self.walk_gen.walks_for_nodes(seeds_np)
         nodes = walks.nodes.to(self.device).long().clamp_min(0)
@@ -178,15 +178,6 @@ class Trainer:
         )
 
         l_total = l_align + self.config.eta_uniform * l_uniform
-        l_nb_val = 0.0
-        if self.config.lambda_normbrake > 0:
-            l_nb = normbrake_loss(
-                E_target=self.embedding_store.E_target.weight,
-                E_context=self.embedding_store.E_context.weight,
-                threshold=self.config.normbrake_threshold,
-            )
-            l_total = l_total + self.config.lambda_normbrake * l_nb
-            l_nb_val = float(l_nb.detach())
 
         # Guard against the all-frozen case: when freeze_tables=True AND
         # walks.edge_feats is None (cold-start before any ingestion on a
@@ -199,7 +190,7 @@ class Trainer:
             self.emb_optimizer.zero_grad(set_to_none=True)
             l_total.backward()
             self.emb_optimizer.step()
-        return float(l_align.detach()), float(l_uniform.detach()), l_nb_val
+        return float(l_align.detach()), float(l_uniform.detach())
 
     def _e_t_u_for(self, node_ids: np.ndarray, t_query: int) -> torch.Tensor:
         """Source-side e_t_u dispatcher honoring `config.use_walk_encoder`.
@@ -392,12 +383,12 @@ class Trainer:
             self.walk_encoder.train()
 
             t0 = time.time()
-            sum_a = sum_u = sum_nb = sum_link = 0.0
+            sum_a = sum_u = sum_link = 0.0
             n = 0
             for batch in train_batches_factory():
-                la, lu, lnb = self._embedding_step(batch)
+                la, lu = self._embedding_step(batch)
                 ll = self._link_step(batch)
-                sum_a += la; sum_u += lu; sum_nb += lnb; sum_link += ll
+                sum_a += la; sum_u += lu; sum_link += ll
                 n += 1
                 # Post-scoring block — strict-causal:
                 if isinstance(self.neg_sampler_train, HistoricalNegativeSampler):
@@ -409,7 +400,7 @@ class Trainer:
             line = (
                 f"  epoch {ep}/{n_epochs}  "
                 f"align={sum_a/n:.4f}  uniform={sum_u/n:.4f}  "
-                f"nb={sum_nb/n:.4f}  link={sum_link/n:.4f}  "
+                f"link={sum_link/n:.4f}  "
                 f"train {train_dt:.1f}s"
             )
 

@@ -54,8 +54,6 @@ see Lesson 1):
               + optional node-feat residual (proj_t, proj_c)
               + edge_feat_proj (consumed by alignment loss only)
                          │
-                         ▼  + normbrake regularizer (column-norm clamp)
-                         │
               ──────────────────────────────────────────
               At each scoring row (u, v, t):
               ──────────────────────────────────────────
@@ -80,7 +78,7 @@ see Lesson 1):
 
 **Two optimizers, decoupled supervision:**
 
-- `emb_optimizer`  ← `alignment + η·uniformity + λ·normbrake`
+- `emb_optimizer`  ← `alignment + η·uniformity`
 - `link_optimizer` ← BCE only, `weight_decay=1e-4` (cliff fix)
   - Includes `walk_encoder.parameters()` AND `time_encoder.parameters()`
   - BCE backprops through the encoder INTO E_target/E_context via
@@ -93,7 +91,7 @@ Every batch — training AND evaluation — runs in this exact order:
 ```
 1. walks   = walk_gen.walks_for_nodes(seeds = unique(batch.src ∪ batch.tgt))
              ← Tempest state contains events strictly ≤ batch B-1.
-2. (train) l_emb = alignment(walks) + η·uniformity + λ·normbrake
+2. (train) l_emb = alignment(walks) + η·uniformity
            emb_optimizer.step()
 3. negs    = neg_sampler.sample(batch)
            ← Training: 50/50 historical reservoir + uniform random.
@@ -168,8 +166,6 @@ At the link MLP, `walk_repr_u` REPLACES the previously-static
 | `uniformity_cap` | 20000 | Stage 5 (cap never fires at B=200) |
 | `time_enc_k` | 16 | → d_time = 32 |
 | `cold_start_dt_clamp_factor` | 100.0 | Δt clamp to 100×time_scale |
-| `lambda_normbrake` | 0.1 | Stage 2 (only architectural fix that helps) |
-| `normbrake_threshold` | 3.87 (wiki) / 31.32 (review) | 1.5 × col_norm at ep 1-2 |
 | `weight_decay_link` | 1e-4 | Stage 3 BREAKTHROUGH (cliff drop -0.014) |
 | `num_neg_per_pos` (K_train) | 10 | TGB default |
 | `hist_neg_ratio` | 0.5 | Stage 4 (matches TGB eval distribution) |
@@ -188,7 +184,7 @@ below).
 | `tempest_walks/config.py` | Locked production hyperparameters (23 fields) |
 | `tempest_walks/model.py` | EmbeddingStore + TimeEncoder + LinkPredictor |
 | `tempest_walks/walk_encoder.py` | 1-layer GRU walk encoder (source-side) |
-| `tempest_walks/losses.py` | alignment + uniformity + normbrake + link_bce |
+| `tempest_walks/losses.py` | alignment + uniformity + link_bce |
 | `tempest_walks/trainer.py` | Strict-causal step + early-stop + snapshot/restore |
 | `tempest_walks/evaluator.py` | TGB-Evaluator-backed scorer with chunked link forward |
 | `tempest_walks/timestate.py` | NodeTimeState for Component 0 |
@@ -201,14 +197,13 @@ below).
 ## Running
 
 ```bash
-# Wiki (default thresholds calibrated for wiki):
+# Wiki:
 .venv/bin/python -m scripts.train --tgb-name tgbl-wiki --use-gpu \
   --num-epochs 50 --early-stop-patience 5
 
-# Review (override normbrake threshold + use sampled eval):
+# Review (use sampled eval):
 .venv/bin/python -m scripts.train --tgb-name tgbl-review --use-gpu \
   --num-epochs 6 --early-stop-patience 2 \
-  --normbrake-threshold 31.32 \
   --monitor-sample-pct 0.05 --skip-final-full-eval
 
 # Anchor validation (Gate A):
@@ -491,6 +486,47 @@ Strong indicator that walks-only architectures (drop E_target
 entirely; CAWN-style anonymous identity) would help on review
 (surprise index 0.987) without hurting wiki (surprise index 0.108).
 Walks-only is documented as future work below.
+
+### Lesson 30 — Normbrake stripped from master despite being load-bearing (USER OVERRIDE 2026-05-22)
+
+**This lesson records an explicit override of the empirical conclusion
+in Lesson 29.** The W_no_nb ablation showed normbrake is load-bearing
+(cliff -0.193 without brake vs -0.057 with). The principled call was
+to KEEP normbrake. The user nonetheless directed me to "remove
+normbrake completely from master, keep dual table" on 2026-05-22.
+
+**What was stripped:**
+  - `normbrake_loss` function (tempest_walks/losses.py).
+  - `lambda_normbrake`, `normbrake_threshold` fields (tempest_walks/config.py).
+  - `--lambda-normbrake`, `--normbrake-threshold` CLI flags (scripts/train.py).
+  - The L_normbrake aggregation block in `_embedding_step` (tempest_walks/trainer.py).
+  - `nb=…` token from the per-epoch log line.
+  - Architecture-diagram + hyperparameter-table references to normbrake.
+
+**Expected behavioral consequence.** Per W_no_nb (Lesson 29), wiki
+training under the stripped architecture will show a deeper 50-epoch
+cliff (~-0.19 vs the prior ~-0.06 with the brake on). Peak val
+unchanged. The cliff manifests as E_target/E_context col_norm growth
+plus link_w_norm growth — the brake's previously-saturated holding
+of E magnitudes near threshold no longer applies.
+
+**Operating under stripped architecture:**
+  - Anchor validation (3 seeds × 2 ep) should still pass — the cliff
+    only appears at 50 epochs.
+  - Production users SHOULD early-stop on val MRR within 10-15 epochs
+    on wiki to avoid the cliff. (The Lesson 29 W_no_nb best was at
+    ep 8 — early-stop will catch the actual peak.)
+  - Per-dataset thresholding is no longer needed.
+
+**Reversal path.** The full pre-strip codebase remains accessible via
+the `locked-v2-fixed` tag (or commits before this strip). If the
+cliff bites in practice, restoring normbrake is mechanical from that
+tag.
+
+The `experiment/normbrake-ablation` branch (Lesson 29 result) is the
+authoritative record of the load-bearing measurement.
+
+---
 
 ### Lesson 29 — Normbrake IS load-bearing under coherent walks (2026-05-22)
 

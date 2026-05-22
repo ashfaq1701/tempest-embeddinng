@@ -14,7 +14,7 @@ The GRU processes walks left-to-right (oldest → newest). Last hidden
 state corresponds to the seed position. Mean-pool over K walks per
 seed gives `walk_repr[u]`.
 
-Gradient flow (Option α, default — alignment+normbrake stay on):
+Gradient flow (Option α, default — alignment+uniformity stay on):
   ∂L_link / ∂walk_encoder.parameters     ← BCE backprop into GRU
   ∂L_link / ∂E[walk_node_i]              ← BCE *also* trains E via lookups
   ∂L_align / ∂E_{target,context}         ← alignment trains E separately
