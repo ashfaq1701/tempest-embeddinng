@@ -1,16 +1,14 @@
-# Runtime dependencies for tempest-walks v3.
+# Runtime dependencies. The codebase is being rebuilt from first
+# principles (see CLAUDE.md); these four packages are the stable
+# TGB-interfacing + numerical layer that survives the rewrite.
 #
 # `torch` is intentionally NOT pinned to a specific CUDA wheel here —
 # install the matching build for your GPU first from the PyTorch index,
 # e.g.
 #     pip install torch --index-url https://download.pytorch.org/whl/cu126
-# (a CPU-only wheel works too; the training script falls back gracefully
-# when `--use-gpu` is not set).
+# (a CPU-only wheel works too.)
 
 numpy>=1.24,<3
 torch>=2.0
 tgb>=1.2.0
 temporal-random-walk>=1.8.2
-
-# --- dev / lint (optional, not imported at runtime) ---
-# pyflakes>=3.2
