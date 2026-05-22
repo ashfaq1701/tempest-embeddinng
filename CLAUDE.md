@@ -492,6 +492,56 @@ entirely; CAWN-style anonymous identity) would help on review
 (surprise index 0.987) without hurting wiki (surprise index 0.108).
 Walks-only is documented as future work below.
 
+### Lesson 29 — Normbrake IS load-bearing under coherent walks (2026-05-22)
+
+**Pre-Step-3 hypothesis (FALSIFIED).** Across all three Step-3 cells
+(W_off, W_gru_k1, Sanity) the normbrake loss `nb` saturated at
+0.0017 or lower — well below noise. The natural read was "the brake
+is dormant, contributes nothing to the loss, can be stripped."
+
+**W_no_nb ablation (2026-05-22, 50 ep, seed 42, dual-table fixed,
+encoder ON, K=5, --lambda-normbrake 0).** Result:
+  - Best at ep 8: val 0.7445 / test **0.7086** (unchanged vs brake-on).
+  - Ep 50: val 0.5519 → cliff drop **-0.193**.
+
+Comparison to brake-ON Step-3 cells:
+  | Cell | Best test | Cliff |
+  |---|---|---|
+  | W_off (brake ON, K=5)   | 0.7081 | -0.057 |
+  | W_gru_k1 (brake ON, K=1) | 0.7075 | -0.079 |
+  | **W_no_nb (brake OFF, K=5)** | 0.7086 | **-0.193** |
+
+The cliff is **2.5–3.5× worse without the brake**.
+
+**Why the dormancy reading was wrong.** The brake's loss
+`L = mean_j relu(||E[:, j]||₂ − threshold)²` is a HINGE. When E's
+column norms are at-or-below threshold, the loss is exactly 0 and
+gradient is zero. When norms cross threshold, the loss jumps to a
+small positive value AND a clamping gradient kicks in. In Step 3 we
+observed E_col_norm pinned ≈ 4.17 (just above threshold 3.87) and
+nb stuck at 0.0017. That looked dormant. But the brake's job isn't
+to ADD a meaningful loss — it's to provide the clamping gradient that
+HOLDS E at the threshold. Holding takes zero loss budget once
+saturated, but is what prevents runaway. The dormancy IS the brake
+working.
+
+Removing the brake → no clamping → E.weight grows unbounded → link
+MLP overfits the growing geometry → severe cliff.
+
+**Decision (executed): KEEP normbrake.** Master stays at
+`locked-v2-fixed`. The `experiment/normbrake-ablation` branch is
+preserved as a paper artifact showing the brake's load-bearing role.
+
+**Lesson 18 (normbrake halves the cliff, pre-fix) status:**
+**CONFIRMED + STRENGTHENED.** Pre-fix the brake reduced cliff from
+-0.28 → -0.11; post-fix it reduces cliff from -0.193 → -0.057
+(W_off) or -0.079 (W_gru_k1). Different absolute magnitudes (because
+the cliff itself is different under coherent walks), but the brake's
+relative effect — preventing E magnitude runaway — survives the
+bug-fix.
+
+---
+
 ### Lesson 28 — Two coupled strict-causal bugs: `shuffle_walk_order=True` (walks) and reservoir leak (negatives) (2026-05-21)
 
 **This is the most consequential finding in the project's history.**
