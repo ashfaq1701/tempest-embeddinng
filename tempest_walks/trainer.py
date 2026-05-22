@@ -388,6 +388,11 @@ class Trainer:
             # the source will positively interact with later in the same
             # epoch. Strict-causal violation — see Lesson 28.
             self.neg_sampler_train.reset()
+            # Defragment GPU between epochs — review-scale runs accumulate
+            # cached allocator fragments during ep 1 that can cause
+            # multi-GiB OOMs at ep 2's backward pass on an 8 GB GPU.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             self.embedding_store.train()
             self.link_predictor.train()
             self.time_encoder.train()
