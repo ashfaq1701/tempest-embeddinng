@@ -6,8 +6,11 @@ Per batch — IN THIS EXACT ORDER (training and eval both):
             ← PRE-ingest Tempest state (events ≤ batch B-1).
   2. l_align + η·l_uniform → emb_optimizer.step()
   3. neg = neg_sampler.sample(batch)        ← reservoir ≤ batch B-1.
-  4. score = link_predictor(walk_repr_u, e_t_v, e_c_u, e_c_v, Component_0)
-            ← e_t_u replaced by walk encoder's per-source GRU output.
+  4. score = link_predictor(e_t_u, e_t_v, e_c_u, e_c_v, Component_0)
+            ← e_t_u is the static target(u) lookup. The walk-encoder
+            (GRU over Tempest walks) is on backup/important-walk-embedding
+            and will be reinstated when the rest of the pipeline is
+            stable; see Lesson 35 in CLAUDE.md.
   5. (train) BCE → link_optimizer.step()
      (eval)  TGB Evaluator.eval(...)
   6. reservoir.observe(batch.src, batch.tgt)   ← for batch B+1.
@@ -15,7 +18,7 @@ Per batch — IN THIS EXACT ORDER (training and eval both):
   8. walk_gen.add_edges(batch)                  ← LAST.
 
 The architecture is FIXED: alignment+uniformity primary loss,
-weight_decay on link MLP, walk encoder MANDATORY on the source side,
+weight_decay on link MLP, static target(u) on the source side,
 Component 0 always on. See CLAUDE.md.
 """
 
@@ -33,7 +36,6 @@ from .losses import alignment_loss, link_bce, uniformity_loss
 from .model import EmbeddingStore, LinkPredictor, TimeEncoder
 from .negatives import HistoricalNegativeSampler, UniformNegativeSampler, NegativeSampler
 from .timestate import NodeTimeState
-from .walk_encoder import WalkEncoder
 from .walks import WalkGenerator
 
 
@@ -78,14 +80,6 @@ class Trainer:
             seed=config.seed,                 # Lesson 33: cross-run reproducibility
         )
 
-        # Walk encoder MANDATORY (no flag — locked architecture).
-        has_edge = (edge_feat_dim > 0)
-        self.walk_encoder = WalkEncoder(
-            d_emb=config.d_emb,
-            d_time=d_time,
-            has_edge_feat=has_edge,
-        ).to(self.device)
-
         # Training negatives — TGB-protocol-matched mix.
         if config.hist_neg_ratio > 0:
             self.neg_sampler_train: NegativeSampler = HistoricalNegativeSampler(
@@ -116,12 +110,11 @@ class Trainer:
             [p for p in self.embedding_store.parameters() if p.requires_grad],
             lr=config.emb_lr,
         )
-        # Walk encoder + time encoder live in the link-side param group
-        # (BCE-trained). Link MLP gets weight_decay (cliff fix).
+        # Time encoder lives in the link-side param group (BCE-trained).
+        # Link MLP gets weight_decay (cliff fix).
         link_params = (
             list(self.link_predictor.parameters())
             + list(self.time_encoder.parameters())
-            + list(self.walk_encoder.parameters())
         )
         self.link_optimizer = torch.optim.Adam(
             link_params,
@@ -194,73 +187,21 @@ class Trainer:
         return float(l_align.detach()), float(l_uniform.detach())
 
     def _e_t_u_for(self, node_ids: np.ndarray, t_query: int) -> torch.Tensor:
-        """Source-side e_t_u dispatcher honoring `config.use_walk_encoder`.
+        """Source-side e_t_u: static target(u) lookup.
 
-        Encoder ON  → GRU walk_repr (default; locked production).
-        Encoder OFF → static E_target lookup (W_off ablation cell for
-        Lesson 28 Step 3). Same signature as `_compute_walk_repr_for`
-        so the evaluator can bind to a single hook.
+        The walk-encoder route (GRU over Tempest walks producing
+        walk_repr[u]) was removed from master on 2026-05-22 — it lives
+        on `backup/important-walk-embedding` and can be restored when
+        the rest of the pipeline is stable. The link MLP's source slot
+        is now the same static `target(u)` lookup used elsewhere.
+
+        `t_query` is unused under the static path; kept in the signature
+        so the evaluator's `walk_repr_fn` binding doesn't need to know
+        whether walks are involved.
         """
-        if self.config.use_walk_encoder:
-            return self._compute_walk_repr_for(node_ids, t_query)
+        del t_query  # unused
         u_t = torch.from_numpy(node_ids.astype(np.int64)).to(self.device)
         return self.embedding_store.target(u_t)
-
-    def _compute_walk_repr_for(self, node_ids: np.ndarray, t_query: int) -> torch.Tensor:
-        """Compute walk_repr[u] for the given node IDs at query timestamp.
-
-        Separate Tempest walks call seeded on unique(node_ids); GRU encodes
-        each walk; mean-pool over K walks per seed. Returns a tensor with
-        one walk_repr per input node, in input order (repeats look up the
-        same row).
-        """
-        unique_ids = np.unique(node_ids)
-        walks = self.walk_gen.walks_for_nodes(unique_ids)
-        wn = walks.nodes.to(self.device).long().clamp_min(0)
-        wt = walks.timestamps.to(self.device).long()
-        wl = walks.lens.to(self.device).long()
-        NK = wn.shape[0]
-        tq = torch.full(
-            (NK,), int(t_query), dtype=torch.long, device=self.device,
-        )
-
-        edge_feats_padded = None
-        if self.embedding_store.has_edge_feat:
-            L = wn.shape[1]
-            d_emb = self.embedding_store.d_emb
-            if walks.edge_feats is not None:
-                ef = walks.edge_feats.to(self.device)
-                ef_proj = self.embedding_store.edge_feat_proj(ef.float())   # [NK, L-1, d_emb]
-                edge_feats_padded = torch.nn.functional.pad(ef_proj, (0, 0, 0, 1))
-            else:
-                # Cold-start (epoch-1 first batches): Tempest state empty. Pad zeros.
-                edge_feats_padded = torch.zeros(
-                    (NK, L, d_emb), dtype=torch.float32, device=self.device,
-                )
-
-        walk_repr_unique = self.walk_encoder(
-            walk_nodes=wn,
-            walk_timestamps=wt,
-            walk_lens=wl,
-            t_query=tq,
-            embedding_store=self.embedding_store,
-            time_encoder=self.time_encoder,
-            edge_feats_padded=edge_feats_padded,
-            K=walks.K,
-        )  # [N_unique, d_emb]
-
-        seeds_np = (
-            walks.seeds.cpu().numpy()
-            if isinstance(walks.seeds, torch.Tensor)
-            else np.asarray(walks.seeds)
-        )
-        idx_map = {int(n): i for i, n in enumerate(seeds_np)}
-        row_idx = np.fromiter(
-            (idx_map[int(u)] for u in node_ids),
-            dtype=np.int64,
-            count=len(node_ids),
-        )
-        return walk_repr_unique[torch.from_numpy(row_idx).long().to(self.device)]
 
     def _time_features(
         self, all_u: np.ndarray, all_v: np.ndarray, t_query: int,
@@ -293,7 +234,7 @@ class Trainer:
         u_t = torch.from_numpy(all_u).long().to(self.device)
         v_t = torch.from_numpy(all_v).long().to(self.device)
 
-        # Source-side: GRU walk_repr (default) or static target (W_off ablation).
+        # Source-side: static target(u). (Walk encoder is on the backup branch.)
         e_t_u = self._e_t_u_for(all_u, int(batch.t_max))
         # Other slots: static table lookups.
         e_t_v = self.embedding_store.target(v_t)
@@ -334,7 +275,6 @@ class Trainer:
             "embedding_store": self._cpu_state_dict(self.embedding_store),
             "link_predictor": self._cpu_state_dict(self.link_predictor),
             "time_encoder": self._cpu_state_dict(self.time_encoder),
-            "walk_encoder": self._cpu_state_dict(self.walk_encoder),
         }
 
     def _restore(self, snap: Dict[str, Any]) -> None:
@@ -344,7 +284,6 @@ class Trainer:
         self.embedding_store.load_state_dict(snap["embedding_store"])
         self.link_predictor.load_state_dict(snap["link_predictor"])
         self.time_encoder.load_state_dict(snap["time_encoder"])
-        self.walk_encoder.load_state_dict(snap["walk_encoder"])
 
     # ------------------------------------------------------------------ #
     # Train loop with early-stop snapshot/restore and optional sampled eval.
@@ -397,7 +336,6 @@ class Trainer:
             self.embedding_store.train()
             self.link_predictor.train()
             self.time_encoder.train()
-            self.walk_encoder.train()
 
             t0 = time.time()
             sum_a = sum_u = sum_link = 0.0
@@ -487,7 +425,6 @@ class Trainer:
         self.embedding_store.eval()
         self.link_predictor.eval()
         self.time_encoder.eval()
-        self.walk_encoder.eval()
         total = 0.0
         n = 0
         for batch in batches:

@@ -3,8 +3,10 @@
 Required: --tgb-name.
 
 Loads TGB dataset, derives alignment_time_scale from train span,
-constructs Trainer (always with walk encoder + Component 0 + WD_link),
-runs strict-causal training, evaluates with TGB Evaluator.
+constructs Trainer (static target(u) source-side + Component 0 +
+WD_link), runs strict-causal training, evaluates with TGB Evaluator.
+The walk encoder lives on backup/important-walk-embedding pending
+re-stabilization on master.
 """
 
 import argparse
@@ -42,16 +44,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-debug", action="store_true",
                    help="Verbose per-epoch logging (reserved).")
 
-    # Lesson 28 Step-3 ablation toggles. Stripped after Step 5 decides.
-    p.add_argument("--use-walk-encoder", default=None,
-                   action=argparse.BooleanOptionalAction,
-                   help="True (default; locked) = source-side GRU walk_repr; "
-                        "False = static E_target[u] (W_off ablation).")
-    p.add_argument("--num-walks-per-node", type=int, default=None,
-                   help="K. Default 5 (locked); set to 1 for the W_gru_k1 / "
-                        "Sanity cells.")
+    # Ablation toggle — freeze identity tables. The --use-walk-encoder
+    # and --num-walks-per-node flags were removed alongside the walk
+    # encoder itself (Lesson 35); restoring requires checking out
+    # backup/important-walk-embedding.
     p.add_argument("--freeze-tables", action="store_true",
-                   help="Freeze E_target and E_context (Sanity cell).")
+                   help="Freeze E_target and E_context (Sanity-style cell).")
     return p.parse_args()
 
 
@@ -87,10 +85,6 @@ def main() -> None:
         use_gpu=args.use_gpu,
         freeze_tables=args.freeze_tables,
     )
-    if args.use_walk_encoder is not None:
-        config_kwargs["use_walk_encoder"] = args.use_walk_encoder
-    if args.num_walks_per_node is not None:
-        config_kwargs["num_walks_per_node"] = args.num_walks_per_node
     config = Config(**config_kwargs)
 
     train_dst_pool = np.unique(loaded.train.destinations)
@@ -123,9 +117,10 @@ def main() -> None:
     loaded.dataset.load_val_ns()
     loaded.dataset.load_test_ns()
 
-    # walk_repr_fn binding for the evaluator — sourced from the trainer.
-    # _e_t_u_for honors config.use_walk_encoder so W_off ablations work
-    # without a separate evaluator code path.
+    # Source-side e_t_u function for the evaluator — static target(u)
+    # lookup. The kwarg name `walk_repr_fn` is retained for evaluator
+    # API stability; under the current architecture it doesn't produce
+    # a walk representation, just a target embedding.
     walk_repr_fn = trainer._e_t_u_for
 
     _eval_kwargs = dict(

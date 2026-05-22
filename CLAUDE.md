@@ -9,8 +9,13 @@ directly."* This repo implements that.
 
 | Dataset | Test MRR |
 |---|---|
-| tgbl-wiki-v2 | **0.7111** (50-ep, post-Lesson-31 transition-pair encoder) |
-| tgbl-review-v2 | **0.3419** (6-ep sampled-eval, early-stopped ep 3) |
+| tgbl-wiki-v2 | **TBD on current master** (W_off-style; walk encoder on backup branch) |
+| tgbl-review-v2 | **TBD on current master** |
+
+Best numbers measured pre-strip on `backup/important-walk-embedding`
+(Lesson 31 transition-pair walk encoder): wiki test **0.7111** at
+ep 5 / 50; review test **0.3419** at ep 3 / 6 sampled. To reproduce,
+checkout `backup/important-walk-embedding`.
 
 Leaderboard reference (most carry the TGN within-batch memory leak;
 see Lesson 1):
@@ -61,10 +66,11 @@ see Lesson 1):
         ┌────────────────┼────────────────────┐
         ▼                ▼                    ▼
   source side       destination side   Component 0
-  WalkEncoder       E_target[v]        Φ(Δt_u), Φ(Δt_v), Φ(Δt_uv)
-  (1-layer GRU      E_context[v]       + 3 cold-start bits
-   over walks                          (Xu et al. 2020 +
-   for u)                              Phase 0.5)
+  E_target[u]       E_target[v]        Φ(Δt_u), Φ(Δt_v), Φ(Δt_uv)
+  (static lookup;   E_context[v]       + 3 cold-start bits
+   walk encoder is                     (Xu et al. 2020 +
+   on backup branch                    Phase 0.5)
+   — see Lesson 35)
         │                │                    │
         └────────────────┴────────────────────┘
                          ▼
@@ -79,19 +85,12 @@ see Lesson 1):
 **Two optimizers, decoupled supervision:**
 
 - `emb_optimizer`  ← `alignment + η·uniformity`
-- `link_optimizer` ← BCE only, `weight_decay=1e-4` (cliff fix)
-  - Includes `walk_encoder.parameters()` AND `time_encoder.parameters()`.
-  - BCE.backward() DOES compute gradients on E_target / E_context via
-    the walk encoder's per-step lookups, but those gradients are
-    discarded: `link_optimizer` doesn't include E in its param group,
-    and the next batch's `emb_optimizer.zero_grad(set_to_none=True)`
-    wipes them before `alignment.backward()` runs. The embeddings
-    train ONLY from `alignment + η·uniformity`. This decoupling is
-    the "no joint training" requirement from Lesson 19 — re-enabling
-    BCE → E gradient flow re-introduces the Lesson 19 collapse.
-
-  (Earlier wording in this section claimed BCE "absorbs link-MLP
-  runaway via E"; that's incorrect — see Lesson 34.)
+- `link_optimizer` ← BCE only, `weight_decay=1e-4` (cliff fix).
+  Includes `time_encoder.parameters()`. With the walk encoder stripped
+  from master (Lesson 35), there's no longer a non-trivial gradient
+  path from BCE into the identity tables — the link MLP just consumes
+  the static `E_target` / `E_context` lookups. Embeddings train ONLY
+  from `alignment + η·uniformity`.
 
 ## Strict-causal protocol (NON-NEGOTIABLE)
 
@@ -106,11 +105,12 @@ Every batch — training AND evaluation — runs in this exact order:
            ← Training: 50/50 historical reservoir + uniform random.
              Reservoir contains observations through batch B-1.
              Eval: TGB pre-generated negatives (50/50 mix).
-4. walk_repr_u = walk_encoder(walks_for_nodes(unique(batch.src)))
-   score    = link_predictor(walk_repr_u, target(v),
+4. score    = link_predictor(target(u), target(v),
                              context(u), context(v),
                              Φ(Δt_u), Φ(Δt_v), Φ(Δt_uv),
                              is_cold_*)
+   ← source slot is the static target(u); walk encoder lives on
+   backup/important-walk-embedding pending restoration (Lesson 35).
 5. (train) l_link = BCE(score, labels); link_optimizer.step()
    (eval)  evaluator.eval(...)  ← TGB Evaluator, leaderboard-identical.
 6. POST-SCORING BLOCK (all for batch B+1):
@@ -139,26 +139,30 @@ lens:       int — number of valid node positions
 
 **Seed is at `nodes[lens-1]`** (Lesson 7). NEVER assume `nodes[0]`.
 
-## WalkEncoder (source-side, mandatory)
+## Source-side e_t_u (currently static)
 
-1-layer unidirectional GRU. Per-step input:
+Master uses a static `E_target[u]` lookup for the link MLP's
+source-side slot. The walk-encoder route — a 1-layer unidirectional
+GRU that consumed Tempest walks seeded on `u` and produced a
+walk-aware `walk_repr[u]` — was stripped from master on 2026-05-22
+(Lesson 35) and is preserved on `backup/important-walk-embedding`
+for restoration once the rest of the pipeline is stable.
 
+The walks pipeline is still active: alignment loss trains
+`target(seed) ↔ context(walk-position)` via Tempest walks, with
+shuffle_walk_order=False (Lesson 28) + Tempest's RNG seeded
+(Lesson 33). Only the encoder's GRU summarization of walks for the
+link MLP is gone.
+
+When restored, the encoder will be the Lesson 31 transition-pair
+design:
 ```
-step_input_i = concat([
-  E_target[node_i] if i == lens-1 else E_context[node_i],    # role-aware lookup
-  Φ(t_seed - t_i),                                            # time delta
-  edge_features[i] (zero-padded at i=0)                       # if dataset has ef
+step_input[p] = concat([
+  src(n_p), dst(n_{p+1}), Φ(t_query - t_p), ef_proj(ef[p])
 ])
 ```
-
-GRU input dim = `d_emb + d_time + (d_emb if has_edge_feat else 0)`.
-
-Output: `walk_repr[u] = mean_k(GRU(step_inputs_k).hidden_at_seed_position)`
-over K=5 walks per seed.
-
-At the link MLP, `walk_repr_u` REPLACES the previously-static
-`E_target[u]` slot in the cross-table 8-block. `E_target[v]`,
-`E_context[u]`, `E_context[v]` are still static-table lookups.
+with src(n_lens-1)=target(seed), src(n_p<lens-1)=context(n_p), and
+the seed step's destination + edge slots explicitly zeroed.
 
 ## Locked hyperparameters
 
@@ -192,7 +196,6 @@ below).
 |---|---|
 | `tempest_walks/config.py` | Locked production hyperparameters (23 fields) |
 | `tempest_walks/model.py` | EmbeddingStore + TimeEncoder + LinkPredictor |
-| `tempest_walks/walk_encoder.py` | 1-layer GRU walk encoder (source-side) |
 | `tempest_walks/losses.py` | alignment + uniformity + link_bce |
 | `tempest_walks/trainer.py` | Strict-causal step + early-stop + snapshot/restore |
 | `tempest_walks/evaluator.py` | TGB-Evaluator-backed scorer with chunked link forward |
@@ -495,6 +498,60 @@ Strong indicator that walks-only architectures (drop E_target
 entirely; CAWN-style anonymous identity) would help on review
 (surprise index 0.987) without hurting wiki (surprise index 0.108).
 Walks-only is documented as future work below.
+
+### Lesson 35 — Walk encoder stripped from master (paused for stabilization, 2026-05-22)
+
+**User directive.** "Cleanup walk embedding from current master, it
+shouldn't be there now. We will bring it back when required. We will
+stabilize master first."
+
+**What was stripped from master:**
+  - `tempest_walks/walk_encoder.py` deleted.
+  - `WalkEncoder` import / construction / per-epoch train/eval mode
+    calls / snapshot/restore entries removed from `trainer.py`.
+  - `_compute_walk_repr_for` deleted; `_e_t_u_for` simplified to a
+    direct `embedding_store.target(u)` lookup. The function name +
+    signature are retained for evaluator API stability when the
+    encoder is restored.
+  - `walk_encoder.parameters()` removed from the `link_optimizer`
+    param group.
+  - `--use-walk-encoder` and `--num-walks-per-node` CLI flags removed
+    from `scripts/train.py`. `--freeze-tables` stays (it's
+    orthogonal to the encoder).
+  - `config.use_walk_encoder` field removed; `num_walks_per_node`
+    retained as a config field for the still-active Tempest walks
+    pipeline (alignment loss uses it).
+  - CLAUDE.md architecture diagram, hyperparam table, and Files list
+    updated to reflect the strip.
+
+**What was NOT stripped (the walks pipeline stays):**
+  - Tempest walk generation, walks_for_nodes API, shuffle_walk_order=False,
+    Tempest global_seed (Lesson 33) — all unchanged.
+  - Alignment loss + uniformity + context_walk — they still consume
+    walks to train E_target / E_context.
+  - True Vitter R historical-neg sampler (Lesson 32) — orthogonal.
+
+**Where the encoder lives.** `backup/important-walk-embedding` branch
+points at the master tip immediately before this strip
+(`80896aa`, Lesson 34). Restoring is a single cherry-pick or branch
+checkout away. All Lesson 31 transition-pair work is preserved
+there.
+
+**Verification.** Module imports succeed; `Trainer` constructs
+without WalkEncoder; `_e_t_u_for` returns `[B, d_emb]` tensors of
+the right shape. Anchor revalidation pending (see commit and the
+fill-in below).
+
+**Result.** _Anchor (3 seeds × 2 ep) under walk-encoder-stripped
+master: TBD (running)._
+
+This is the W_off-style architecture under all four Lesson 28-33
+fixes: shuffle fix, reservoir-reset fix, normbrake removed, Vitter
+R, Tempest seeded. The expected anchor is close to the W_off Step-3
+number (test 0.7081 pre-Lesson-31) — but with the post-31 fixes the
+exact number is TBD.
+
+---
 
 ### Lesson 34 — Docs correction: BCE-into-E gradient is computed-then-discarded (2026-05-22)
 

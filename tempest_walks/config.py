@@ -28,10 +28,11 @@ class Config:
     num_walks_per_node: int = 5
     walk_bias: str = "ExponentialWeight"
 
-    # Ablation toggles for Lesson 28's Step-3 re-verification — under the
-    # locked architecture both default to the production values
-    # (encoder ON, tables trainable). Stripped after Step 5 decides.
-    use_walk_encoder: bool = True
+    # Ablation toggle — freezes the dual identity tables (Lesson 28
+    # Step-3 Sanity cell). `use_walk_encoder` removed because the
+    # encoder itself was removed from master (see Lesson 35);
+    # backup/important-walk-embedding has the encoder for future
+    # restoration.
     freeze_tables: bool = False
 
     # Alignment loss — variant A (1/depth · (1+Δt/τ)^-β). β=0.5 fixed.

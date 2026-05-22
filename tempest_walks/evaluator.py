@@ -5,9 +5,11 @@ For each batch:
   2. Score every (positive, neg_i) row via link_predictor in chunks.
   3. Component 0 features (Φ(Δt_*) + cold-start bits) computed PRE-batch
      (strict-causal — caller hasn't ingested batch yet).
-  4. Source-side e_t_u comes from `walk_repr_fn(u_chunk, t_query)` — the
-     walk encoder's GRU output. Destination + context slots use the
-     static embedding tables.
+  4. Source-side e_t_u comes from `walk_repr_fn(u_chunk, t_query)` —
+     currently the static target(u) lookup (the walk encoder is on
+     backup/important-walk-embedding, see Lesson 35). The kwarg name
+     is retained for API stability when the encoder is restored.
+     Destination + context slots use the static embedding tables.
   5. Per-positive scoring goes through TGB Evaluator.eval(...), same as
      leaderboard.
 
