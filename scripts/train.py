@@ -36,6 +36,9 @@ def parse_args() -> argparse.Namespace:
 
     # Per-dataset normbrake calibration. 3.87 wiki / 31.32 review.
     p.add_argument("--normbrake-threshold", type=float, default=3.87)
+    p.add_argument("--lambda-normbrake", type=float, default=None,
+                   help="Override normbrake weight (None = config default 0.1; "
+                        "set to 0 to ablate normbrake entirely).")
 
     # Review-scale conveniences.
     p.add_argument("--monitor-sample-pct", type=float, default=1.0,
@@ -96,6 +99,8 @@ def main() -> None:
         config_kwargs["use_walk_encoder"] = args.use_walk_encoder
     if args.num_walks_per_node is not None:
         config_kwargs["num_walks_per_node"] = args.num_walks_per_node
+    if args.lambda_normbrake is not None:
+        config_kwargs["lambda_normbrake"] = args.lambda_normbrake
     config = Config(**config_kwargs)
 
     train_dst_pool = np.unique(loaded.train.destinations)
