@@ -705,7 +705,41 @@ TimeEncoder, etc.) and stand as-is.
     |---|---|---|---|---|
     | W_off (no encoder, tables train, K=5) | ep 3: 0.7433 / **0.7081** | 0.6860 | **-0.057** | 0.7096 best, -0.019 cliff |
     | W_gru_k1 (encoder ON, tables train, K=1) | ep 6: 0.7435 / **0.7075** | 0.6646 | **-0.079** | 0.7089 best, -0.002 cliff |
-    | Sanity (encoder ON, tables FROZEN, K=1) | _Sanity-rerun pending_ | | | 0.7094 best, -0.002 cliff |
+    | Sanity (encoder ON, tables FROZEN, K=1) | ep 1: 0.7449 / **0.7105** | 0.7426 | **-0.002** | 0.7094 best, -0.002 cliff |
+
+    **The Sanity result is the headline finding.** Sanity has:
+      - The HIGHEST peak test MRR of the three (0.7105 vs 0.7081 / 0.7075).
+      - The SMALLEST cliff (-0.002 vs -0.057 / -0.079, ~30× better).
+      - The fastest convergence (best at ep 1, not ep 3 or ep 6).
+
+    Translation: **under coherent walks, training the embedding tables
+    via alignment+uniformity ACTIVELY HURTS on wiki**. Frozen random
+    Xavier-init tables + walk encoder + Component 0 + link MLP
+    collectively reach a stronger, more stable optimum than ANY
+    configuration that trains the tables. The pre-fix Sanity result
+    (0.7094, indistinguishable from W_gru_k1 0.7089) was hiding this —
+    under the shuffle bug, trained tables were random anyway, so
+    "trained" and "frozen random" were both ~equivalent random.
+
+    Note on the W_off vs W_gru_k1 ordering: W_off (0.7081) edges out
+    W_gru_k1 (0.7075) in peak. Once tables are training, the encoder
+    adds nothing on wiki — it just over-fits faster (deeper cliff).
+
+    Architectural implications:
+      - On wiki, the source-side identity is irrelevant; only the
+        downstream channels (encoder, Component 0, link MLP cross-table)
+        matter. This is the canonical CAWN/anonymous-identity signature
+        predicted by cross-domain literature.
+      - The single-table+dual-projection migration is now under-
+        motivated: if tables don't matter, halving them doesn't help
+        either. But complexity reduction is still valuable.
+      - normbrake is observably dormant (nb ≈ 0.0017 across W_off/
+        W_gru_k1; literally 0.0 in Sanity since E.weight has no
+        gradient at all). Strippable.
+      - There's a stronger move available: **freeze the tables, or
+        remove the alignment+uniformity loss entirely**. The user
+        flagged complexity-reduction first; this third move is a
+        candidate but not in the current execution path.
 
     Key observations:
       - **Peak test MRR is unchanged within noise** vs pre-fix
@@ -760,9 +794,11 @@ TimeEncoder, etc.) and stand as-is.
     ties (W_off 0.7081 vs W_gru_k1 0.7075, within noise), but
     encoder's cliff is WORSE (-0.079 vs W_off's -0.057). The
     "smoothing" interpretation was a bug artifact.
-  - Lesson 26 (frozen tables sanity) — **rerun pending** (the cell
-    crashed mid-run and needs the trainer's no-grad guard before
-    re-launching).
+  - Lesson 26 (frozen tables sanity) — **CONFIRMED + STRENGTHENED**.
+    Pre-fix Sanity tied W_gru_k1 (0.7094 vs 0.7089) and was framed as
+    "tables are dead weight". Post-fix Sanity BEATS W_gru_k1 (0.7105
+    vs 0.7075) AND has a 30× smaller cliff. The interpretation is no
+    longer "tables are dead weight"; it's "training the tables hurts".
   - Lesson 27 (single-table migration) — re-evaluated after Step 3
     lands (see Decision Path below).
 
