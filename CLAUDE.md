@@ -557,11 +557,24 @@ vs "full" walks from the seed-position edge-feat alone.
   - Δ vs locked-v2-nb-stripped anchor (test 0.7092 ± 0.0003):
     **-0.0002 test mean — within noise**. Transition-pair redesign is
     structurally correct without disturbing the 2-ep anchor on wiki.
-  - 50-ep wiki seed 42 (peak + cliff): _TBD (running)_.
-  - 6-ep review sampled: _TBD (running after 50-ep wiki)_ —
-    cross-dataset discriminator; paired-input predicted to help more
-    here, where edge-relationship semantics are not memorization-
-    dominated.
+  - 50-ep wiki seed 42 (peak + cliff):
+    - Best at ep 5: val 0.7444 / test **0.7111**.
+    - Ep 50 val 0.5623 → cliff **-0.182**.
+
+    Comparison to W_no_nb (locked-v2-nb-stripped, old encoder):
+      W_no_nb:    best val 0.7445 ep 8 / test 0.7086, cliff -0.193.
+      Lesson 31: best val 0.7444 ep 5 / test **0.7111**, cliff -0.182.
+
+    Peak val essentially identical (Δ = -0.0001); peak test
+    **+0.0025** for transition-pair (above noise floor of ±0.0007 on
+    the 2-ep anchor); cliff slightly milder; best-epoch earlier (ep 5
+    vs ep 8). The redesign delivers a small but real test-MRR gain
+    AND faster convergence. The cliff itself is still dominated by
+    embedding-magnitude runaway (post-normbrake-strip); the encoder
+    redesign is orthogonal to that.
+  - 6-ep review sampled: _TBD (running)_ — cross-dataset
+    discriminator; paired-input predicted to help more here, where
+    edge-relationship semantics are not memorization-dominated.
 
 **Status of historical lessons.** Lessons 25–29 measured under the
 old (node-bound) encoder. Their qualitative conclusions about peak
