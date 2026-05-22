@@ -45,11 +45,22 @@ class WalkGenerator:
         num_walks_per_node: int = 5,
         timescale_bound: int = 300,
     ):
+        # CRITICAL: shuffle_walk_order defaults to True in Tempest's
+        # constructor (see temporal_random_walk/src/common/const.cuh
+        # DEFAULT_SHUFFLE_WALK_ORDER). When True, Tempest randomly
+        # interleaves the [N*K, L] output across all seeds, so the row
+        # at index i*K does NOT correspond to seed i. The downstream
+        # code (alignment_loss's repeat_interleave at losses.py, the
+        # walk-encoder's view(N, K, d) reshape, and the seed→row map
+        # in _compute_walk_repr_for) all assume grouped order. We
+        # disable the shuffle so the output is laid out as
+        # [seed_0×K, seed_1×K, ..., seed_{N-1}×K]. See Lesson 28.
         self.trw = TemporalRandomWalk(
             is_directed=is_directed,
             use_gpu=use_gpu,
             enable_weight_computation=True,
             timescale_bound=timescale_bound,
+            shuffle_walk_order=False,
         )
         self.walk_bias = walk_bias
         self.max_walk_len = max_walk_len

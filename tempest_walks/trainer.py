@@ -102,9 +102,17 @@ class Trainer:
                 seed=config.seed,
             )
 
+        # Ablation: freeze identity tables (Step 3 sanity cell). Auxiliary
+        # heads (node_feat projections, edge_feat_proj, final fusion
+        # projections) are NOT frozen — only the identity tables E_target
+        # and E_context that alignment loss directly trains.
+        if config.freeze_tables:
+            self.embedding_store.E_target.weight.requires_grad_(False)
+            self.embedding_store.E_context.weight.requires_grad_(False)
+
         # Two optimizers — decoupled supervision.
         self.emb_optimizer = torch.optim.Adam(
-            self.embedding_store.parameters(),
+            [p for p in self.embedding_store.parameters() if p.requires_grad],
             lr=config.emb_lr,
         )
         # Walk encoder + time encoder live in the link-side param group
@@ -180,10 +188,31 @@ class Trainer:
             l_total = l_total + self.config.lambda_normbrake * l_nb
             l_nb_val = float(l_nb.detach())
 
-        self.emb_optimizer.zero_grad(set_to_none=True)
-        l_total.backward()
-        self.emb_optimizer.step()
+        # Guard against the all-frozen case: when freeze_tables=True AND
+        # walks.edge_feats is None (cold-start before any ingestion on a
+        # dataset with edge features, OR datasets without edge features),
+        # every operand of l_total has no grad path through any trainable
+        # parameter, and backward() raises "element 0 of tensors does not
+        # require grad and does not have a grad_fn". Skipping the step is
+        # the right semantics — there's nothing to update.
+        if l_total.requires_grad:
+            self.emb_optimizer.zero_grad(set_to_none=True)
+            l_total.backward()
+            self.emb_optimizer.step()
         return float(l_align.detach()), float(l_uniform.detach()), l_nb_val
+
+    def _e_t_u_for(self, node_ids: np.ndarray, t_query: int) -> torch.Tensor:
+        """Source-side e_t_u dispatcher honoring `config.use_walk_encoder`.
+
+        Encoder ON  → GRU walk_repr (default; locked production).
+        Encoder OFF → static E_target lookup (W_off ablation cell for
+        Lesson 28 Step 3). Same signature as `_compute_walk_repr_for`
+        so the evaluator can bind to a single hook.
+        """
+        if self.config.use_walk_encoder:
+            return self._compute_walk_repr_for(node_ids, t_query)
+        u_t = torch.from_numpy(node_ids.astype(np.int64)).to(self.device)
+        return self.embedding_store.target(u_t)
 
     def _compute_walk_repr_for(self, node_ids: np.ndarray, t_query: int) -> torch.Tensor:
         """Compute walk_repr[u] for the given node IDs at query timestamp.
@@ -272,8 +301,8 @@ class Trainer:
         u_t = torch.from_numpy(all_u).long().to(self.device)
         v_t = torch.from_numpy(all_v).long().to(self.device)
 
-        # Source-side: walk_repr from the GRU encoder.
-        e_t_u = self._compute_walk_repr_for(all_u, int(batch.t_max))
+        # Source-side: GRU walk_repr (default) or static target (W_off ablation).
+        e_t_u = self._e_t_u_for(all_u, int(batch.t_max))
         # Other slots: static table lookups.
         e_t_v = self.embedding_store.target(v_t)
         e_c_u = self.embedding_store.context(u_t)
@@ -350,6 +379,13 @@ class Trainer:
         for ep in range(1, n_epochs + 1):
             self.walk_gen.reset()
             self.time_state.reset()
+            # Drop the historical-negative reservoir at epoch boundaries.
+            # Without this, epoch 1's full chronological pass leaves every
+            # source's reservoir reflecting the entire training set, so
+            # epoch 2's "historical negatives" can include destinations
+            # the source will positively interact with later in the same
+            # epoch. Strict-causal violation — see Lesson 28.
+            self.neg_sampler_train.reset()
             self.embedding_store.train()
             self.link_predictor.train()
             self.time_encoder.train()
