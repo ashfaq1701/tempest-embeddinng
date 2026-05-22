@@ -1,14 +1,15 @@
 """Minimal production losses for tempest-walks-v3.
 
-Four losses:
+Three losses:
   1. alignment_loss — pulls E_target[seed] toward E_context[walk_neighbor]
      with positional × temporal weighting.
   2. uniformity_loss — Wang & Isola hypersphere spread (regularizes
      embedding directions).
-  3. normbrake_loss — per-column L2 hinge; clamps embedding magnitudes
-     above a calibrated threshold. The locked cliff fix (with
-     weight_decay_link applied to the link MLP).
-  4. link_bce — BCE-with-logits for the link prediction head.
+  3. link_bce — BCE-with-logits for the link prediction head.
+
+normbrake_loss was stripped per Lesson 30 (user override on
+2026-05-22). See CLAUDE.md for the load-bearing-but-stripped
+rationale.
 """
 
 import torch
@@ -92,23 +93,3 @@ def uniformity_loss(
 def link_bce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """BCE-with-logits on positives (label=1) + negatives (label=0)."""
     return F.binary_cross_entropy_with_logits(logits, labels)
-
-
-def normbrake_loss(
-    E_target: torch.Tensor,         # [N, d]
-    E_context: torch.Tensor,        # [N, d]
-    threshold: float,
-) -> torch.Tensor:
-    """Per-column L2 hinge — saturates embedding magnitudes above threshold.
-
-        L = mean_j (max(0, ||E[:, j]||₂ - threshold))²  summed over both tables.
-
-    Self-limiting: zero gradient below threshold, quadratic above. Composes
-    additively with the primary loss. Threshold calibrated per dataset
-    (1.5× col_norm at ep 1–2).
-    """
-    col_norms_t = E_target.norm(dim=0)
-    col_norms_c = E_context.norm(dim=0)
-    excess_t = F.relu(col_norms_t - threshold)
-    excess_c = F.relu(col_norms_c - threshold)
-    return excess_t.pow(2).mean() + excess_c.pow(2).mean()
