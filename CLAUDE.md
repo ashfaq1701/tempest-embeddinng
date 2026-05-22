@@ -549,14 +549,19 @@ vs "full" walks from the seed-position edge-feat alone.
   - `embedding_store.context_walk` (used by the alignment loss, NOT by
     the encoder) is unchanged.
 
-**Verification (anchor + 50-ep, results filled in after running).**
-  - Anchor under transition-pair encoder + normbrake-stripped master:
-    val mean _TBD_ / test mean _TBD_.
-  - Δ vs locked-v2-nb-stripped anchor (test 0.7092 ± 0.0003): _TBD_.
-  - 50-ep wiki seed 42 (peak + cliff): _TBD_.
-  - 6-ep review sampled: _TBD_ (cross-dataset discriminator —
-    paired-input encoder predicted to help more here, where edge-
-    relationship semantics are not memorization-dominated).
+**Verification.**
+  - Anchor under transition-pair encoder + normbrake-stripped master
+    (2026-05-22, 3 seeds × 2 ep):
+    val mean **0.7430 ± 0.0006** / test mean **0.7090 ± 0.0005**.
+    Verdict: CONFIRMED vs 0.7070 ± 0.0016 target.
+  - Δ vs locked-v2-nb-stripped anchor (test 0.7092 ± 0.0003):
+    **-0.0002 test mean — within noise**. Transition-pair redesign is
+    structurally correct without disturbing the 2-ep anchor on wiki.
+  - 50-ep wiki seed 42 (peak + cliff): _TBD (running)_.
+  - 6-ep review sampled: _TBD (running after 50-ep wiki)_ —
+    cross-dataset discriminator; paired-input predicted to help more
+    here, where edge-relationship semantics are not memorization-
+    dominated.
 
 **Status of historical lessons.** Lessons 25–29 measured under the
 old (node-bound) encoder. Their qualitative conclusions about peak
