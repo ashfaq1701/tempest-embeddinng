@@ -96,3 +96,28 @@ in the 12-run measurement, Option α may be the culprit, not the
 symmetry hypothesis itself — that distinction goes into the summary.
 
 (Sub-sections below filled in as each config completes.)
+
+## C1 — No EF anywhere (anchor)
+
+Flags: `--force-no-ef`. Trainer config: `ef_on_target=False, ef_on_context=False, d_edge_feat → None`.
+p_target: 66,048 params. p_context: 66,048 params.
+
+Per-seed val MRR / test MRR (best across 30 epochs):
+  seed 42  (best ep 29): val 0.2407 / test 0.2151
+  seed 123 (best ep 22): val 0.2285 / test 0.2043
+  seed 7   (best ep 30): val 0.2747 / test 0.2455
+
+Mean ± std:
+  val  0.2480 ± 0.020
+  test 0.2216 ± 0.017
+
+Notes:
+  - Seed 7 peaked AT ep30 (the budget cap) — possibly still
+    climbing.
+  - Variance is tight (std ~0.02), much lower than Task-10's 15-ep
+    population std of 0.036. 30 epochs gives more stable comparisons.
+  - These val/test numbers are substantially higher than Task 10's
+    15-ep V0 anchor (val 0.185), confirming Task 11 T3's finding
+    that wiki has serious unrealised headroom past 15 epochs.
+
+Commit: 16f2cde, e8f09fa (code) + (this commit, C1 logs).
