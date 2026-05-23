@@ -136,6 +136,11 @@ def parse_args() -> argparse.Namespace:
         help="Task 10 V2: per-dim z-score standardisation of EF "
              "computed once on training EF, applied to train/val/test.",
     )
+    p.add_argument(
+        "--ef-low-dim", default=None, type=int,
+        help="Task 10 V3: project EF to this low dim with a single "
+             "Linear before ef_mlp. Default off (keep raw EF dim).",
+    )
 
     return p.parse_args()
 
@@ -301,6 +306,7 @@ def main() -> Dict[str, Any]:
         d_node_feat=d_node_feat,
         d_edge_feat=d_edge_feat,
         ef_input_norm=args.ef_input_norm,
+        ef_low_dim=args.ef_low_dim,
 
         d_emb=args.d_emb,
         d_proj=args.d_proj,

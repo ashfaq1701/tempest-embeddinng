@@ -108,6 +108,45 @@ Notes:
     high-dim EF input apparently reduces sensitivity to initialisation.
   - No instability, no NaN, no OOM.
 
+## V2 — Per-dim EF standardise
+
+Code: `scripts/train.py` computes `mu, sd` over `loaded.train.edge_feat`
+(per-dim, along axis 0) and applies `(x - mu) / sd.clip(1e-6)` to all
+three splits via `SplitData._replace`. Gated by `--ef-standardise`.
+ProjectionHead is unchanged — V1's LayerNorm is OFF. No EF channel code
+change.
+
+Per-seed val MRR / test MRR (best across 15 epochs):
+  seed 42  (best ep 13): val 0.1539 / test 0.1353
+  seed 123 (best ep 14): val 0.1884 / test 0.1570
+  seed 7   (best ep 12): val 0.1551 / test 0.1395
+
+Mean ± std:
+  val  0.1658 ± 0.016
+  test 0.1439 ± 0.009
+
+Δ vs V0 (val 0.1849 ± 0.036 / test 0.1615 ± 0.025):
+  Δval  = -0.0191 (-10% relative)
+  Δtest = -0.0176 (-11% relative)
+  Std also tightens (val 0.036 → 0.016) — confirms input-scale
+  normalisation reduces seed sensitivity, regardless of HOW the
+  normalisation is applied.
+
+Δ vs V1 (val 0.1842 ± 0.019 / test 0.1655 ± 0.008):
+  Δval  = -0.0184  (V1 markedly better)
+  Δtest = -0.0216
+
+Notes:
+  - V2 still trains stably (no NaN, no instabilities).
+  - V2 reduces variance like V1 does, but loses ~10% on the mean,
+    which V1 does not.
+  - Hypothesis: V2's pre-network standardisation is a NON-LEARNED
+    rescale, whereas V1's LayerNorm has affine γ/β that lets the
+    network learn the right scale per-dim. V2 forces unit-variance
+    on every feature, including ones whose information was in their
+    magnitude.
+  - V2 is not a winner; V1 is strictly better.
+
 ## Tier 1 decision point
 
-_(forthcoming)_
+_(forthcoming — V3 still to run)_

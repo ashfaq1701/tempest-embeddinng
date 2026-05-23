@@ -72,6 +72,7 @@ class TrainerConfig:
     d_node_feat: Optional[int] = None
     d_edge_feat: Optional[int] = None    # NEW (Task 6.7)
     ef_input_norm: bool = False          # Task 10 V1
+    ef_low_dim: Optional[int] = None     # Task 10 V3
 
     # Model.
     d_emb: int = 128
@@ -150,6 +151,7 @@ class Trainer:
             d_node_feat=config.d_node_feat,
             d_edge_feat=config.d_edge_feat,   # Task 6.7: convention β
             ef_input_norm=config.ef_input_norm,  # Task 10 V1
+            ef_low_dim=config.ef_low_dim,        # Task 10 V3
         ).to(self.device)
         self.link_head = LinkHead(d_emb=config.d_emb).to(self.device)
 

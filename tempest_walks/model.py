@@ -82,6 +82,7 @@ class ProjectionHead(nn.Module):
         d_edge_feat: Optional[int] = None,
         d_hidden: Optional[int] = None,
         ef_input_norm: bool = False,    # Task 10 V1
+        ef_low_dim: Optional[int] = None,   # Task 10 V3
     ):
         super().__init__()
         if d_hidden is None:
@@ -89,6 +90,7 @@ class ProjectionHead(nn.Module):
 
         self.has_nf = d_node_feat is not None
         self.has_ef = d_edge_feat is not None
+        self.ef_low_dim_size = ef_low_dim
 
         self.e_mlp = nn.Sequential(
             nn.Linear(d_emb, d_hidden),
@@ -111,8 +113,16 @@ class ProjectionHead(nn.Module):
         if self.has_ef:
             if ef_input_norm:
                 self.ef_input_norm = nn.LayerNorm(d_edge_feat)
+            if ef_low_dim is not None:
+                # Task 10 V3: project EF to a small dim with a single
+                # linear before the per-channel MLP. Reduces the
+                # gradient burden of high-dim EF on the network.
+                self.ef_low = nn.Linear(d_edge_feat, ef_low_dim)
+                ef_mlp_in = ef_low_dim
+            else:
+                ef_mlp_in = d_edge_feat
             self.ef_mlp = nn.Sequential(
-                nn.Linear(d_edge_feat, d_hidden),
+                nn.Linear(ef_mlp_in, d_hidden),
                 nn.GELU(),
                 nn.Linear(d_hidden, d_proj),
             )
@@ -147,6 +157,8 @@ class ProjectionHead(nn.Module):
             ef_in = edge_feat
             if self.ef_input_norm_enabled:
                 ef_in = self.ef_input_norm(ef_in)
+            if self.ef_low_dim_size is not None:
+                ef_in = self.ef_low(ef_in)
             branches.append(self.ef_mlp(ef_in))
 
         z = torch.cat(branches, dim=-1)
