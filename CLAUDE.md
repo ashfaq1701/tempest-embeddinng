@@ -153,3 +153,32 @@ EF placement. The real C3 collapse test passes (val=0.048 is 24× the
 pre-fix collapse value of 0.002).
 
 (Per-config sub-sections below filled in as production runs complete.)
+
+## C1 (post-fix) — No EF anywhere (anchor)
+
+Flags: `--force-no-ef`. Trainer config: `ef_on_target=False, ef_on_context=False, d_edge_feat → None`.
+p_target: 66,048 params. p_context: 66,048 params.
+
+Per-seed val MRR / test MRR (best across 30 epochs):
+  seed 42  (best ep 30): val 0.3803 / test 0.3594
+  seed 123 (best ep 30): val 0.3957 / test 0.3821
+  seed 7   (best ep 19): val 0.4139 / test 0.3968
+
+Mean ± std:
+  val  0.3966 ± 0.014
+  test 0.3794 ± 0.015
+
+Δ vs C1 pre-fix (val 0.2480 ± 0.020 / test 0.2216 ± 0.017):
+  Δval  = +0.1486 (+60% relative)
+  Δtest = +0.1578 (+71% relative)
+  Std comparable on val (0.014 vs 0.020), comparable on test (0.015 vs 0.017).
+
+Loss components at ep 30 (mean across seeds):
+  align ≈ 0.46    unif ≈ -7.66    bce ≈ 0.15
+
+Trajectory notes:
+  - Two-head uniformity SUM gives ~2× the anti-collapse pressure vs
+    pre-fix single-head. unif now ~-7.5 vs pre-fix ~-3.7.
+  - Two seeds peaked AT ep30 (cap); one seed peaked at ep19 with
+    early-stop restoration.
+  - No collapse, no NaN, smooth climb.
