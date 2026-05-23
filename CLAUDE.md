@@ -121,3 +121,32 @@ Notes:
     that wiki has serious unrealised headroom past 15 epochs.
 
 Commit: 16f2cde, e8f09fa (code) + (this commit, C1 logs).
+
+## C2 — EF on context only (master default)
+
+Flags: (none). Trainer config: `ef_on_target=False, ef_on_context=True`.
+p_target: 66,048 params. p_context: 121,088 params.
+
+Per-seed val MRR / test MRR (best across 30 epochs):
+  seed 42  (best ep 30): val 0.2533 / test 0.2140
+  seed 123 (best ep 22): val 0.2588 / test 0.2071
+  seed 7   (best ep 26): val 0.2737 / test 0.2282
+
+Mean ± std:
+  val  0.2619 ± 0.009
+  test 0.2164 ± 0.009
+
+Δ vs C1 (val 0.2480 ± 0.020 / test 0.2216 ± 0.017):
+  Δval  = +0.0139 (+5.6% relative — EF on context HELPS at 30 ep)
+  Δtest = -0.0052 (-2.3% — marginally worse on test)
+  Std collapse: val 0.020 → 0.009 (2× tighter)
+                test 0.017 → 0.009 (2× tighter)
+
+Notes:
+  - Master-default C2 at 30 ep is a clear win over C1 on val and a
+    near-tie on test, with markedly tighter std.
+  - This contradicts the 22% regression observed at Task 7's 5-ep
+    snapshot. Either (a) at 5 ep, EF training hasn't had time to
+    extract signal, or (b) the original measurement was high-variance
+    noise. Either way: at 30 ep, master-default EF helps.
+  - Seed 42 peaked AT ep30 again — possibly still climbing.
