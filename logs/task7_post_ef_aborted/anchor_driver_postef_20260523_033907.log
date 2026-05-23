@@ -1,0 +1,266 @@
+===== tgbl-wiki seed 42 → logs/anchor_tgbl-wiki_seed42.log =====
+=== tempest-embedding training ===
+dataset: tgbl-wiki
+device:  cuda
+seed:    42
+loaded in 1.4s
+  num_nodes:     9,227
+  directed:      False  (dataset default)
+  bipartite:     True
+  dst_pool:      952 unique destinations
+  T_train:       1862652
+  train edges:   110,232
+  val edges:     23,621
+  test edges:    23,621
+  has_node_feat: False
+  has_edge_feat: True (d=172)
+
+=== Config ===
+  num_nodes: 9227
+  is_directed: False
+  is_bipartite: True
+  dst_pool: <ndarray shape=(952,) dtype=int32>
+  t_train_span: 1862652.0
+  d_node_feat: None
+  d_edge_feat: 172
+  d_emb: 128
+  d_proj: 128
+  eta_uniform: 1.0
+  uniform_temperature: 2.0
+  uniform_pairs: 5000
+  beta_time: 1.0
+  num_walks_per_node: 5
+  max_walk_len: 20
+  walk_bias: ExponentialWeight
+  start_bias: Uniform
+  num_neg_per_pos: 10
+  hist_neg_ratio: 0.5
+  reservoir_size: 32
+  lr: 0.001
+  weight_decay: 0.0001
+  num_epochs: 5
+  early_stop_patience: 0
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: False
+  monitor_sample_pct: 1.0
+  skip_final_full_eval: True
+
+=== Parameter counts ===
+  embedding_table:    1,181,056
+  p_target:              66,048
+  p_context:            121,088
+  link_head:            574,466
+  TOTAL trainable:    1,942,658
+
+=== Training ===
+epoch 1/5  align=0.4049  unif=-1.7686  bce=0.2929  train 20.5s  val 0.0371  test 0.0390 (new best)  eval 27.4s
+epoch 2/5  align=0.5288  unif=-3.2601  bce=0.2545  train 16.4s  val 0.0445  test 0.0339 (new best)  eval 27.0s
+epoch 3/5  align=0.5466  unif=-3.5642  bce=0.2458  train 17.0s  val 0.0320  patience 1/0  eval 27.2s
+epoch 4/5  align=0.5407  unif=-3.6393  bce=0.2366  train 16.8s  val 0.0581  test 0.0501 (new best)  eval 27.1s
+epoch 5/5  align=0.5357  unif=-3.6737  bce=0.2285  train 15.8s  val 0.0641  test 0.0661 (new best)  eval 26.8s
+  restored best weights from epoch 5 (val 0.0641, test 0.0661)
+
+=== Final results ===
+  dataset:           tgbl-wiki
+  seed:              42
+  stopped_at_epoch:  5
+  best_val_mrr:      0.0641
+  best_test_mrr:     0.0661
+===== tgbl-wiki seed 42 done =====
+===== tgbl-wiki seed 123 → logs/anchor_tgbl-wiki_seed123.log =====
+=== tempest-embedding training ===
+dataset: tgbl-wiki
+device:  cuda
+seed:    123
+loaded in 1.4s
+  num_nodes:     9,227
+  directed:      False  (dataset default)
+  bipartite:     True
+  dst_pool:      952 unique destinations
+  T_train:       1862652
+  train edges:   110,232
+  val edges:     23,621
+  test edges:    23,621
+  has_node_feat: False
+  has_edge_feat: True (d=172)
+
+=== Config ===
+  num_nodes: 9227
+  is_directed: False
+  is_bipartite: True
+  dst_pool: <ndarray shape=(952,) dtype=int32>
+  t_train_span: 1862652.0
+  d_node_feat: None
+  d_edge_feat: 172
+  d_emb: 128
+  d_proj: 128
+  eta_uniform: 1.0
+  uniform_temperature: 2.0
+  uniform_pairs: 5000
+  beta_time: 1.0
+  num_walks_per_node: 5
+  max_walk_len: 20
+  walk_bias: ExponentialWeight
+  start_bias: Uniform
+  num_neg_per_pos: 10
+  hist_neg_ratio: 0.5
+  reservoir_size: 32
+  lr: 0.001
+  weight_decay: 0.0001
+  num_epochs: 5
+  early_stop_patience: 0
+  seed: 123
+  use_gpu: True
+  use_gpu_tempest: False
+  monitor_sample_pct: 1.0
+  skip_final_full_eval: True
+
+=== Parameter counts ===
+  embedding_table:    1,181,056
+  p_target:              66,048
+  p_context:            121,088
+  link_head:            574,466
+  TOTAL trainable:    1,942,658
+
+=== Training ===
+epoch 1/5  align=0.4172  unif=-1.8530  bce=0.2894  train 20.2s  val 0.0566  test 0.0438 (new best)  eval 27.1s
+epoch 2/5  align=0.5021  unif=-3.2028  bce=0.2448  train 16.4s  val 0.0571  test 0.0481 (new best)  eval 27.0s
+epoch 3/5  align=0.5256  unif=-3.5526  bce=0.2261  train 17.7s  val 0.0660  test 0.0777 (new best)  eval 27.1s
+epoch 4/5  align=0.5092  unif=-3.6353  bce=0.2157  train 17.8s  val 0.0875  test 0.0796 (new best)  eval 26.9s
+epoch 5/5  align=0.4988  unif=-3.6708  bce=0.2078  train 17.7s  val 0.0919  test 0.0668 (new best)  eval 26.9s
+  restored best weights from epoch 5 (val 0.0919, test 0.0668)
+
+=== Final results ===
+  dataset:           tgbl-wiki
+  seed:              123
+  stopped_at_epoch:  5
+  best_val_mrr:      0.0919
+  best_test_mrr:     0.0668
+===== tgbl-wiki seed 123 done =====
+===== tgbl-wiki seed 7 → logs/anchor_tgbl-wiki_seed7.log =====
+=== tempest-embedding training ===
+dataset: tgbl-wiki
+device:  cuda
+seed:    7
+loaded in 1.4s
+  num_nodes:     9,227
+  directed:      False  (dataset default)
+  bipartite:     True
+  dst_pool:      952 unique destinations
+  T_train:       1862652
+  train edges:   110,232
+  val edges:     23,621
+  test edges:    23,621
+  has_node_feat: False
+  has_edge_feat: True (d=172)
+
+=== Config ===
+  num_nodes: 9227
+  is_directed: False
+  is_bipartite: True
+  dst_pool: <ndarray shape=(952,) dtype=int32>
+  t_train_span: 1862652.0
+  d_node_feat: None
+  d_edge_feat: 172
+  d_emb: 128
+  d_proj: 128
+  eta_uniform: 1.0
+  uniform_temperature: 2.0
+  uniform_pairs: 5000
+  beta_time: 1.0
+  num_walks_per_node: 5
+  max_walk_len: 20
+  walk_bias: ExponentialWeight
+  start_bias: Uniform
+  num_neg_per_pos: 10
+  hist_neg_ratio: 0.5
+  reservoir_size: 32
+  lr: 0.001
+  weight_decay: 0.0001
+  num_epochs: 5
+  early_stop_patience: 0
+  seed: 7
+  use_gpu: True
+  use_gpu_tempest: False
+  monitor_sample_pct: 1.0
+  skip_final_full_eval: True
+
+=== Parameter counts ===
+  embedding_table:    1,181,056
+  p_target:              66,048
+  p_context:            121,088
+  link_head:            574,466
+  TOTAL trainable:    1,942,658
+
+=== Training ===
+epoch 1/5  align=0.4582  unif=-2.0896  bce=0.2922  train 20.1s  val 0.0555  test 0.0323 (new best)  eval 26.9s
+epoch 2/5  align=0.5416  unif=-3.3029  bce=0.2539  train 16.4s  val 0.1013  test 0.1116 (new best)  eval 26.9s
+epoch 3/5  align=0.5208  unif=-3.5606  bce=0.2323  train 16.0s  val 0.1338  test 0.1262 (new best)  eval 26.9s
+epoch 4/5  align=0.4997  unif=-3.6474  bce=0.2166  train 15.8s  val 0.0844  patience 1/0  eval 26.9s
+epoch 5/5  align=0.4807  unif=-3.6864  bce=0.2066  train 15.9s  val 0.1446  test 0.1453 (new best)  eval 26.8s
+  restored best weights from epoch 5 (val 0.1446, test 0.1453)
+
+=== Final results ===
+  dataset:           tgbl-wiki
+  seed:              7
+  stopped_at_epoch:  5
+  best_val_mrr:      0.1446
+  best_test_mrr:     0.1453
+===== tgbl-wiki seed 7 done =====
+===== tgbl-review seed 42 → logs/anchor_tgbl-review_seed42.log =====
+=== tempest-embedding training ===
+dataset: tgbl-review
+device:  cuda
+seed:    42
+loaded in 1.6s
+  num_nodes:     352,637
+  directed:      False  (dataset default)
+  bipartite:     False
+  dst_pool:      252,261 unique destinations
+  T_train:       535593600
+  train edges:   3,413,837
+  val edges:     730,784
+  test edges:    728,919
+  has_node_feat: False
+  has_edge_feat: True (d=1)
+
+=== Config ===
+  num_nodes: 352637
+  is_directed: False
+  is_bipartite: False
+  dst_pool: <ndarray shape=(252261,) dtype=int32>
+  t_train_span: 535593600.0
+  d_node_feat: None
+  d_edge_feat: 1
+  d_emb: 128
+  d_proj: 128
+  eta_uniform: 1.0
+  uniform_temperature: 2.0
+  uniform_pairs: 5000
+  beta_time: 1.0
+  num_walks_per_node: 5
+  max_walk_len: 20
+  walk_bias: ExponentialWeight
+  start_bias: Uniform
+  num_neg_per_pos: 10
+  hist_neg_ratio: 0.5
+  reservoir_size: 32
+  lr: 0.001
+  weight_decay: 0.0001
+  num_epochs: 5
+  early_stop_patience: 0
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: False
+  monitor_sample_pct: 1.0
+  skip_final_full_eval: True
+
+=== Parameter counts ===
+  embedding_table:   45,137,536
+  p_target:              66,048
+  p_context:             99,200
+  link_head:            574,466
+  TOTAL trainable:   45,877,250
+
+=== Training ===
