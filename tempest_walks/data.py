@@ -32,11 +32,33 @@ class Loaded(NamedTuple):
     node_feat: Optional[np.ndarray]
 
 
-_UNDIRECTED = {"tgbl-wiki", "tgbl-review", "tgbl-subreddit", "tgbl-lastfm"}
+# Datasets known to be undirected (bipartite or otherwise). The
+# check normalises by stripping any "-vN" version suffix, so
+# "tgbl-wiki", "tgbl-wiki-v2", "tgbl-wiki-v3" all match — TGB's
+# versioning bumps refresh negatives / fix data issues but do
+# not change graph orientation.
+_UNDIRECTED_BASE_NAMES = {
+    "tgbl-wiki",
+    "tgbl-review",
+    "tgbl-subreddit",
+    "tgbl-lastfm",
+}
+
+
+def _strip_version_suffix(name: str) -> str:
+    """Drop trailing '-v<digits>' from a TGB dataset name."""
+    # E.g., 'tgbl-wiki-v2' -> 'tgbl-wiki'; 'tgbl-coin' unchanged.
+    import re
+    return re.sub(r"-v\d+$", "", name)
 
 
 def default_is_directed(name: str) -> bool:
-    return name not in _UNDIRECTED
+    """Default directedness for known TGB datasets, ignoring version
+    suffix. Returns True if the dataset isn't on the known-undirected
+    list — but callers should expose an explicit override (the
+    knowledge here is a default, not authoritative)."""
+    base = _strip_version_suffix(name)
+    return base not in _UNDIRECTED_BASE_NAMES
 
 
 def load_tgb(name: str, root: str = "datasets") -> Loaded:

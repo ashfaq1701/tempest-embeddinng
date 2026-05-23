@@ -56,6 +56,28 @@ def parse_args() -> argparse.Namespace:
                    help="TGB dataset name, e.g. tgbl-wiki, tgbl-review")
     p.add_argument("--tgb-root", default="datasets", type=str)
 
+    # Directedness override. The dataset-default comes from
+    # tempest_walks.data.default_is_directed (a curated list with
+    # version-suffix normalisation). These flags let the user force a
+    # choice when running on a dataset the default table doesn't know.
+    directed_group = p.add_mutually_exclusive_group()
+    directed_group.add_argument(
+        "--directed",
+        dest="directed_override",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Force is_directed=True (overrides dataset default).",
+    )
+    directed_group.add_argument(
+        "--undirected",
+        dest="directed_override",
+        action="store_const",
+        const=False,
+        default=None,
+        help="Force is_directed=False (overrides dataset default).",
+    )
+
     # Model.
     p.add_argument("--d-emb", default=128, type=int)
     p.add_argument("--d-proj", default=128, type=int)
@@ -156,7 +178,12 @@ def main() -> Dict[str, Any]:
 
     # Derived dataset constants.
     num_nodes = loaded.max_node_count
-    is_directed = loaded.is_directed
+    if args.directed_override is not None:
+        is_directed = args.directed_override
+        directed_provenance = "CLI override"
+    else:
+        is_directed = loaded.is_directed
+        directed_provenance = "dataset default"
     is_bipartite = detect_bipartite(loaded.train)
     dst_pool = np.unique(loaded.train.destinations).astype(np.int32)
     T_train = derive_t_train(loaded.train.timestamps)
@@ -167,7 +194,7 @@ def main() -> Dict[str, Any]:
     )
 
     print(f"  num_nodes:     {num_nodes:,}")
-    print(f"  directed:      {is_directed}")
+    print(f"  directed:      {is_directed}  ({directed_provenance})")
     print(f"  bipartite:     {is_bipartite}")
     print(f"  dst_pool:      {len(dst_pool):,} unique destinations")
     print(f"  T_train:       {T_train:.0f}")
