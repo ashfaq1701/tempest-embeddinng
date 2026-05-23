@@ -264,3 +264,160 @@ discussion):
     paper-grade tuning is needed later, this is the obvious next
     sweep.
 
+---
+
+# Task 11 — V3 robustness characterisation
+
+Branch: `experiments/ef-architecture-search`
+Started: 2026-05-23
+
+Three-part follow-up to Task 10 to confirm V3 (--ef-low-dim 16)
+should be the new default before the user merges to master. Plan was
+T3 (extended epochs, wiki, seed 42) → T1 (bottleneck sweep, wiki) →
+T2 (review-v2 with V0 anchor). Stopped after T3 — see below.
+
+## T3 — V3 vs V0 extended epochs (wiki, seed 42, 30 ep)
+
+Substituted bare dataset names (`tgbl-wiki`) for the spec's `-v2`
+form, since TGB v1 API only accepts bare names; data IS v2 per
+DATA_VERSION_DICT. Same substitution Task 10 used.
+
+Two runs, sequential on GPU, 30 epochs each, seed 42:
+
+  V0 (no-EF):
+    python scripts/train.py --dataset tgbl-wiki --use-gpu \
+      --num-epochs 30 --seed 42 --skip-final-full-eval \
+      --force-no-ef
+
+  V3 (d=16):
+    python scripts/train.py --dataset tgbl-wiki --use-gpu \
+      --num-epochs 30 --seed 42 --skip-final-full-eval \
+      --ef-low-dim 16
+
+Peak val MRR / test MRR across 30 epochs:
+
+| Run         | best val | best test | best ep | final loss (al/un/bc) |
+|-------------|----------|-----------|---------|-----------------------|
+| V0 (no-EF)  | 0.2290   | 0.1890    | 26      | 0.402 / -3.77 / 0.161 |
+| V3 (d=16)   | 0.2072   | 0.1809    | 27      | 0.391 / -3.77 / 0.158 |
+
+  Δval (V3 − V0)  = -0.0218
+  Δtest (V3 − V0) = -0.0081
+  Final align: V3 lower (0.391 vs 0.402) — V3 fits alignment tighter
+    but the tighter alignment does not translate to better LP.
+
+Per-epoch val MRR (key epochs):
+
+  ep   V0      V3      Δ(V3−V0)
+  5    0.094   0.088   -0.006
+  10   0.090   0.089   -0.001
+  15   0.177   0.122   -0.055
+  20   0.182   0.166   -0.016
+  25   0.228   0.197   -0.031
+  26   0.229   0.168   -0.061   ← V0 peak
+  27   0.182   0.207   +0.025   ← V3 peak
+  30   0.191   0.157   -0.034
+
+Both runs converge with similar shape: rise from ep10-15, climb
+through ep20-26, peak and oscillate. V0 leads V3 from ep14 onwards
+except for brief crossovers (ep22-23, ep27).
+
+### Important seeding caveat
+
+The 30-ep T3 V3 trajectory does NOT match Task 10's V3 seed-42
+15-ep trajectory. Both runs start with bit-identical ep1-5 val
+MRR (~0.16 at ep5), but diverge starting ep10-12:
+
+  Task 10 V3 seed42 ep15: val 0.1954
+  Task 11 T3 V3 seed42 ep15: val 0.1221
+
+Implication: the seed control is not deterministic at the per-epoch
+level beyond ep5. Likely culprit: Tempest walk sampling (which uses
+its own RNG) or CUDA non-determinism in matrix ops. This means
+single-seed 30-ep numbers carry substantial noise that the 3-seed
+15-ep numbers averaged out.
+
+### Decision: STOP-B triggers
+
+Spec rule B: "V3 peak < V0 peak by > 0.02 → STOP, do not run T1/T2".
+Δval = -0.0218, which is over the bright line by 0.0018.
+
+Following the spec strictly: STOP.
+
+**However, the caveat for user review:**
+  - Task 10 val std at 15 ep was 0.036 (population). The single-seed
+    delta of 0.022 lies WELL inside the 15-ep noise floor.
+  - Task 11 was supposed to use T3 as a trajectory check, but the
+    seed-instability above means a single-seed result at 30 ep is
+    NOT a clean comparison.
+  - Test delta is only -0.008 (well inside any noise floor),
+    suggesting val and test disagree on the verdict.
+  - V0 single-seed 15-ep was val 0.1360 (Task 10 anchor seed42);
+    V0 30-ep climbed to 0.2290. That's an 0.09-point single-seed
+    swing from training longer alone — a strong signal that
+    single-seed 30-ep variance dominates the architectural Δ.
+
+**Recommendation to user:** the spec-strict reading is STOP. The
+judgement-call reading is "result is in the noise floor for n=1,
+proceed with caution." Either way, T1 and T2 are NOT run by this
+agent pending user review. If you want T1/T2 to proceed, re-issue
+with explicit "ignore STOP-B for n=1" guidance, or expand T3 to
+3 seeds (~2.5 hrs) for a real comparison.
+
+Open observations (not in Task 11 scope):
+  - Seed non-determinism past ep5 is a finding in its own right and
+    affects every comparison in Task 10 too. Worth instrumenting
+    (e.g., dump walk_gen RNG state, set torch.use_deterministic_algorithms(True))
+    before any paper-grade numbers.
+  - V0 had MASSIVE single-seed headroom past ep15 (val 0.136 →
+    0.229). V3 also climbed (peak at ep27) but the per-seed climb
+    rate is variant-dependent in a way 15-ep snapshots can't see.
+  - Architectural decisions on n=1 30-ep runs are fragile; for
+    Task 7+ the right move is 3-seed 30-50-ep with the chosen arch.
+
+## T1, T2
+
+NOT RUN. STOP-B triggered after T3.
+
+## Task 11 Summary
+
+V3 robustness verdict: **UNCONFIRMED (single-seed 30-ep underperforms
+V0 by 0.022 val, but within Task-10 noise floor of 0.036)**.
+
+Best EF configuration: still V3 d=16 if EF is to be used, BUT see
+the seed non-determinism caveat — n=1 result is not architecturally
+conclusive.
+
+Evidence:
+  - T3 (extended epochs, wiki, seed 42, 30 ep):
+      V0 peak val 0.2290 at ep26
+      V3 peak val 0.2072 at ep27
+      Verdict: V3 underperforms by 0.022 val on this one seed; gap
+               sits inside the 0.036 noise floor measured at 15 ep.
+  - T1: not run.
+  - T2: not run.
+
+**Recommended action for the user:**
+  1. Inspect this section, decide whether to:
+     (a) Accept STOP-B and treat V3 as inconclusive → Task 10's V3
+         winner is questionable; consider keeping no-EF as master
+         default until a 3-seed × 30-ep comparison settles it.
+     (b) Override STOP-B as "in-noise for n=1" → re-launch T1+T2
+         with an explicit override flag, or expand T3 to 3 seeds.
+  2. Address seed non-determinism before any paper-grade run. The
+     30-ep T3 V3 trajectory NOT matching Task 10's V3 trajectory
+     at the same seed is a real reproducibility issue.
+  3. Independently of (1), the single-seed observation that V0 ALSO
+     climbs strongly past 15 epochs (0.136 → 0.229) suggests Task
+     10's 15-ep budget was too short to read final ordering. Task
+     10's seed-mean conclusions may not survive longer training.
+  4. NOT proceeding to Task 7 until (1) and (2) are resolved.
+
+Open questions:
+  - Is V3 really worse, or is this a seed-42-specific artefact?
+  - Why does seed-42 V3 differ between Task 10's 15-ep run and
+    Task 11's 30-ep run at the same nominal seed?
+  - Does V1 (LayerNorm) hold up at 30 ep? Task 10 had V1 tied with
+    V0 at 15 ep with much tighter std — extending V1 might tell a
+    different story.
+
