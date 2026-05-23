@@ -70,6 +70,7 @@ class TrainerConfig:
     dst_pool: np.ndarray
     t_train_span: float
     d_node_feat: Optional[int] = None
+    d_edge_feat: Optional[int] = None    # NEW (Task 6.7)
 
     # Model.
     d_emb: int = 128
@@ -146,6 +147,7 @@ class Trainer:
             d_emb=config.d_emb,
             d_proj=config.d_proj,
             d_node_feat=config.d_node_feat,
+            d_edge_feat=config.d_edge_feat,   # Task 6.7: convention β
         ).to(self.device)
         self.link_head = LinkHead(d_emb=config.d_emb).to(self.device)
 
@@ -245,6 +247,23 @@ class Trainer:
             seeds_np = np.unique(np.concatenate([batch.src, batch.tgt]))
         walks = self.walk_gen.walks_for_nodes(seeds_np)
 
+        # Step 1b: edge features for alignment loss (convention β).
+        # If the dataset has EF but Tempest returned None (cold-start:
+        # no edges ingested yet in this epoch), fill with zeros —
+        # alignment is masked to zero at cold-start anyway (all
+        # walks have lens<=1, no context positions).
+        if self.config.d_edge_feat is not None:
+            if walks.edge_feats is not None:
+                walk_ef = walks.edge_feats.to(device).float()
+            else:
+                NK, L = walks.nodes.shape
+                walk_ef = torch.zeros(
+                    NK, L - 1, self.config.d_edge_feat,
+                    device=device, dtype=torch.float32,
+                )
+        else:
+            walk_ef = None
+
         # Step 2: uniformity pairs.
         unif_a, unif_b = self._sample_uniformity_pairs()
 
@@ -259,6 +278,7 @@ class Trainer:
             T_train=self.config.t_train_span,
             beta=self.config.beta_time,
             node_feat=self.node_feat,
+            edge_feat=walk_ef,
         )
         l_unif = uniformity_loss(
             embedding_table=self.embedding_table,

@@ -203,6 +203,11 @@ def main() -> Dict[str, Any]:
         if loaded.node_feat is not None
         else None
     )
+    d_edge_feat = (
+        int(loaded.train.edge_feat.shape[1])
+        if loaded.train.edge_feat is not None
+        else None
+    )
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  directed:      {is_directed}  ({directed_provenance})")
@@ -214,6 +219,8 @@ def main() -> Dict[str, Any]:
     print(f"  test edges:    {len(loaded.test.sources):,}")
     print(f"  has_node_feat: {loaded.node_feat is not None}"
           + (f" (d={d_node_feat})" if d_node_feat is not None else ""))
+    print(f"  has_edge_feat: {loaded.train.edge_feat is not None}"
+          + (f" (d={d_edge_feat})" if d_edge_feat is not None else ""))
 
     # ─── Build batch factories ─────────────────────────────────────
     # create_batches consumes a SplitData and yields Batches in
@@ -249,6 +256,7 @@ def main() -> Dict[str, Any]:
         dst_pool=dst_pool,
         t_train_span=T_train,
         d_node_feat=d_node_feat,
+        d_edge_feat=d_edge_feat,
 
         d_emb=args.d_emb,
         d_proj=args.d_proj,

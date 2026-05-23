@@ -11,8 +11,9 @@ alignment_loss(E, P_target, P_context, walks, t_now, T_train, β, ...) -> scalar
           w(K, Δt) = 1/K + (1 + Δt / T_train)^(-β).
   - Reduced as weighted-mean over all valid (seed, position) pairs.
   - Padding positions and the seed position itself are masked out.
-  - Edge features are NOT plumbed through this initial version
-    (convention β attachment to context-side is left as future work).
+  - Edge features (when present) are passed to p_context under
+    convention β: walks.edge_feats[p] is the edge OUT of context p.
+    p_target never sees edge features.
 
 uniformity_loss(E, P_target, sample_idx_a, sample_idx_b, t, ...) -> scalar
   - Wang-Isola form on L2-normalised P_target outputs:
@@ -43,12 +44,21 @@ def alignment_loss(
     T_train: float,
     beta: float = 1.0,
     node_feat: Optional[torch.Tensor] = None,     # [num_nodes, d_nf] or None
+    edge_feat: Optional[torch.Tensor] = None,     # [NK, L-1, d_ef] or None
 ) -> torch.Tensor:
     """Multi-positive alignment with hop / time-weighted contexts.
 
     Pulls P_target(E(seed)) toward P_context(E(walk-internal)) in
     squared distance on the unit sphere, weighted by
         w(K, Δt) = 1/K + (1 + Δt / T_train)^(-β).
+
+    edge_feat: Per-walk edge features attached to context positions
+        under convention β (edge OUT of context p lives at index p).
+        Shape [NK, L_max-1, d_edge_feat] from Tempest. Pass None
+        only when the dataset has no edge features. The function
+        pads with one zero row so the projection sees [NK, L, d_ef];
+        the appended slot lines up with the seed position (lens-1),
+        which is masked out of the loss anyway.
     """
     device = embedding_table.E.weight.device
     nodes = walks.nodes.to(device).long()                         # [NK, L]
@@ -57,6 +67,27 @@ def alignment_loss(
     seeds_t = walks.seeds.to(device).long()                       # [N]
     K = walks.K
     NK, L = nodes.shape
+
+    # Pad edge features to align with e_ctx's [NK, L, d_edge_feat] shape.
+    # Tempest stores ef[p] for the edge between nodes[p] and nodes[p+1]
+    # in slots [0, L-1); position L-1 (seed slot) is the appended zero
+    # row and is masked out of the loss.
+    if edge_feat is not None:
+        ef_dev = edge_feat.to(device)
+        assert ef_dev.shape[:2] == (NK, L - 1), (
+            f"edge_feat shape {tuple(ef_dev.shape)} doesn't match walks of "
+            f"shape {(NK, L)} (expected [NK, L-1, d_ef])"
+        )
+        d_ef = ef_dev.shape[-1]
+        ef_padded = torch.cat(
+            [
+                ef_dev,
+                torch.zeros(NK, 1, d_ef, device=device, dtype=ef_dev.dtype),
+            ],
+            dim=1,
+        )                                                          # [NK, L, d_ef]
+    else:
+        ef_padded = None
 
     # Valid context positions: p ∈ [0, lens - 2]. Position lens-1 is
     # the seed (excluded), positions >= lens are padding.
@@ -86,11 +117,22 @@ def alignment_loss(
     nodes_safe = nodes.clamp_min(0)                               # [NK, L]
     e_ctx = embedding_table(nodes_safe)                           # [NK, L, d_emb]
 
-    if node_feat is not None:
+    # Four-way switch on whether node-feat / edge-feat are present.
+    # p_target NEVER takes edge_feat (seeds have no edge channel under
+    # convention β); p_context optionally takes it.
+    if node_feat is not None and ef_padded is not None:
         nf_seed = node_feat[seed_per_row]                         # [NK, d_nf]
         nf_ctx = node_feat[nodes_safe]                            # [NK, L, d_nf]
         p_seed = p_target(e_seed, node_feat=nf_seed)              # [NK, d_proj]
-        p_ctx = p_context(e_ctx, node_feat=nf_ctx)                # [NK, L, d_proj]
+        p_ctx = p_context(e_ctx, node_feat=nf_ctx, edge_feat=ef_padded)
+    elif node_feat is not None:
+        nf_seed = node_feat[seed_per_row]
+        nf_ctx = node_feat[nodes_safe]
+        p_seed = p_target(e_seed, node_feat=nf_seed)
+        p_ctx = p_context(e_ctx, node_feat=nf_ctx)
+    elif ef_padded is not None:
+        p_seed = p_target(e_seed)
+        p_ctx = p_context(e_ctx, edge_feat=ef_padded)
     else:
         p_seed = p_target(e_seed)                                 # [NK, d_proj]
         p_ctx = p_context(e_ctx)                                  # [NK, L, d_proj]

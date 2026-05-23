@@ -8,14 +8,27 @@ Responsibility:
   - Provide add_edges(...) for post-batch ingest (strict-causal).
   - Provide reset() for epoch-boundary state clear.
 
-Walk layout (Tempest convention):
-  nodes:      [n_0, n_1, ..., n_{lens-1}, padding...]
-  timestamps: [t_1, t_2, ..., sentinel, padding...]
-              where t_k = time of edge between nodes[k-1] and nodes[k]
+Walk layout (Tempest convention; verified empirically against the
+TemporalRandomWalk source):
+  nodes:      [n_0, n_1, ..., n_{lens-1}, padding(-1)...]
+              Chronological — n_0 is the oldest predecessor, n_{lens-1}
+              is the seed.
+  timestamps: [t_0, t_1, ..., t_{lens-2}, INT64_MAX, padding(-1)...]
+              t_p = time of the edge between nodes[p] and nodes[p+1]
+              (the OUTGOING edge from nodes[p] in chronological time,
+              equivalently the edge toward the seed).
+              t_{lens-1} = INT64_MAX sentinel (seed has no outgoing edge).
+  edge_feats: shape [NK, max_walk_len - 1, d_ef] or None.
+              ef[p] is the FEATURE of the same edge whose time is
+              timestamps[p]: the edge between nodes[p] and nodes[p+1].
+              ef and timestamps are aligned at the same index p.
+              Slots p >= lens-1 are zeros (Tempest fills empty slots).
   seed:       nodes[lens-1]
-  Edge feature attached to context at position p (under convention β,
-  edge-toward-seed): timestamps and edge_feats index p+1, i.e. the
-  edge LEAVING that context toward the seed.
+
+Convention β (edge-toward-seed) attaches walks.edge_feats[p] to
+context at walk position p as the edge OUT of that context toward
+the seed. Loss-side code in alignment_loss right-pads ef by one row
+so the projection sees shape [NK, L, d_ef] aligned with e_ctx.
 
 Grouping contract (load-bearing):
   Walks for seeds[i] occupy rows [i*K, (i+1)*K) of nodes/timestamps/
@@ -102,6 +115,22 @@ class WalkGenerator:
             num_walks_per_node=self.num_walks_per_node,
             walk_direction="Backward_In_Time",
         )
+
+        # Fail loud if Tempest's edge_feats shape no longer matches the
+        # [NK, L-1, d_ef] convention the loss code assumes. A future
+        # Tempest version-skew that returns [NK, L, d_ef] would silently
+        # mis-align edge features with positions by one step under
+        # convention β.
+        if ef is not None:
+            N = seed_arr.shape[0]
+            expected_2d = (N * self.num_walks_per_node, self.max_walk_len - 1)
+            assert ef.shape[:2] == expected_2d, (
+                f"Tempest edge_feats shape {ef.shape[:2]} != expected "
+                f"{expected_2d} (NK, L-1). The convention-β attachment in "
+                f"alignment_loss assumes ef[p] is the edge between nodes[p] "
+                f"and nodes[p+1]; revisit if Tempest output changed."
+            )
+
         return WalkData(
             nodes=torch.from_numpy(nodes),
             timestamps=torch.from_numpy(ts),
