@@ -15,13 +15,16 @@ alignment_loss(E, P_target, P_context, walks, t_now, T_train, β, ...) -> scalar
     convention β: walks.edge_feats[p] is the edge OUT of context p.
     p_target never sees edge features.
 
-uniformity_loss(E, P_target, sample_idx_a, sample_idx_b, t, ...) -> scalar
-  - Wang-Isola form on L2-normalised P_target outputs:
+uniformity_loss(E, head, sample_idx_a, sample_idx_b, t, ..., bypass_ef) -> scalar
+  - Wang-Isola form on L2-normalised head outputs:
       L = log E_{x,y ~ q⊗q} [ exp(-t ||P(E(x)) - P(E(y))||²) ]
   - Caller supplies the M independent index pairs.
   - Numerically stabilised: L = logsumexp(-t * sq_dist) - log(M).
-  - Operates on P_target only; if context-projection uniformity is
-    needed later, call the function a second time with P_context.
+  - Called once per head (target, context). Caller sums and averages
+    the two losses to preserve eta_uniform scale.
+  - bypass_ef=head.has_ef skips the EF branch on EF-bearing heads
+    (Task 12 Option γ — zeros at the merge concat boundary, NOT
+    at the ef_mlp input).
 
 Link BCE is one line at the call site
 (F.binary_cross_entropy_with_logits(...)), not factored out.
@@ -172,17 +175,25 @@ def alignment_loss(
 
 def uniformity_loss(
     embedding_table,                              # EmbeddingTable
-    p_target,                                     # ProjectionHead — same as alignment's seed-side
+    head,                                         # ProjectionHead (target or context)
     sample_idx_a: torch.Tensor,                   # [M] long
     sample_idx_b: torch.Tensor,                   # [M] long
     t: float = 2.0,
     node_feat: Optional[torch.Tensor] = None,
+    bypass_ef: bool = False,
 ) -> torch.Tensor:
-    """Wang-Isola uniformity on L2-normalised P_target outputs.
+    """Wang-Isola uniformity on L2-normalised projection outputs.
 
     Estimator over M caller-supplied independent pairs:
         L = log (1/M) Σ_i exp(-t || P(E(a_i)) - P(E(b_i)) ||²)
           = logsumexp(-t * sq_dist) - log(M).
+
+    The function is called once per head; the caller sums and
+    averages the two losses to preserve eta_uniform scale. Pass
+    bypass_ef=head.has_ef so heads with EF channels skip the EF
+    branch during uniformity (no edge to feed). Implements Task 12
+    Option γ: zeros are injected at the merge-concat boundary, not
+    at the ef_mlp input.
     """
     device = embedding_table.E.weight.device
     a = sample_idx_a.to(device).long()
@@ -194,26 +205,12 @@ def uniformity_loss(
     e_a = embedding_table(a)                                      # [M, d_emb]
     e_b = embedding_table(b)                                      # [M, d_emb]
 
-    # Task 12: if p_target has the EF channel (ef_on_target=True),
-    # uniformity has no edge for random nodes — zero-fill (Option α).
-    # This introduces a slight train-time vs uniformity-time
-    # inconsistency in p_target's input distribution; documented in
-    # CLAUDE.md Task 12 notes.
     if node_feat is not None:
-        target_kwargs_a = {'node_feat': node_feat[a]}
-        target_kwargs_b = {'node_feat': node_feat[b]}
+        p_a = head(e_a, node_feat=node_feat[a], bypass_ef=bypass_ef)
+        p_b = head(e_b, node_feat=node_feat[b], bypass_ef=bypass_ef)
     else:
-        target_kwargs_a = {}
-        target_kwargs_b = {}
-    if p_target.has_ef:
-        zero_ef = torch.zeros(
-            M, p_target.ef_input_dim,
-            device=device, dtype=torch.float32,
-        )
-        target_kwargs_a['edge_feat'] = zero_ef
-        target_kwargs_b['edge_feat'] = zero_ef
-    p_a = p_target(e_a, **target_kwargs_a)
-    p_b = p_target(e_b, **target_kwargs_b)
+        p_a = head(e_a, bypass_ef=bypass_ef)
+        p_b = head(e_b, bypass_ef=bypass_ef)
 
     sq_dist = (p_a - p_b).pow(2).sum(dim=-1)                      # [M]
     return torch.logsumexp(-t * sq_dist, dim=0) - math.log(M)

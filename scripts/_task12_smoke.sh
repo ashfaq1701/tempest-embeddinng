@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Task 12 smoke tests — 1 epoch each of C1, C2, C3, C4 on wiki seed 42.
+# Task 12 (rewrite) smoke tests — 1 epoch each of C1-C5 on wiki seed 42.
 set -euo pipefail
 PY=/home/ms2420/CLionProjects/tempest-walk-embedding/.venv/bin/python
 HERE=/home/ms2420/CLionProjects/tempest-walk-embedding-new
@@ -26,4 +26,5 @@ run_one c1 --force-no-ef
 run_one c2
 run_one c3 --no-ef-on-context --ef-on-target
 run_one c4 --ef-on-target
+run_one c5 --ef-symmetric
 echo "=== smoke complete ==="

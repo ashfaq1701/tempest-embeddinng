@@ -294,14 +294,30 @@ class Trainer:
             edge_feat=walk_ef,
             ef_target_per_position=self.config.ef_target_per_position,
         )
-        l_unif = uniformity_loss(
+        # Apply uniformity to BOTH heads (Task 12 fix). Each head's
+        # EF channel (if present) is bypassed via Option γ —
+        # bypass_ef=head.has_ef uniformly handles all four placement
+        # cases. The /2 preserves eta_uniform's scale relative to the
+        # original single-head formulation.
+        l_unif_target = uniformity_loss(
             embedding_table=self.embedding_table,
-            p_target=self.p_target,
+            head=self.p_target,
             sample_idx_a=unif_a,
             sample_idx_b=unif_b,
             t=self.config.uniform_temperature,
             node_feat=self.node_feat,
+            bypass_ef=self.p_target.has_ef,
         )
+        l_unif_context = uniformity_loss(
+            embedding_table=self.embedding_table,
+            head=self.p_context,
+            sample_idx_a=unif_a,
+            sample_idx_b=unif_b,
+            t=self.config.uniform_temperature,
+            node_feat=self.node_feat,
+            bypass_ef=self.p_context.has_ef,
+        )
+        l_unif = (l_unif_target + l_unif_context) / 2
         l_table = l_align + self.config.eta_uniform * l_unif
 
         # Step 4: link-pred negatives from PRE-OBSERVE reservoir.
