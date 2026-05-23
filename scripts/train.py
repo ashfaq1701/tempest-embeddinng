@@ -123,6 +123,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-final-full-eval", action="store_true")
     p.add_argument("--monitor-sample-pct", default=1.0, type=float)
 
+    p.add_argument(
+        "--force-no-ef", action="store_true",
+        help="Override d_edge_feat to None regardless of dataset.",
+    )
+    p.add_argument(
+        "--ef-variant",
+        choices=["none", "asym", "sym_shared", "sym_two"],
+        default="none",
+        help="Task 13: EF-as-separate-head architecture. "
+             "'none' = no edge head (Task 6.7 master). "
+             "'asym' = edge head feeds target side only. "
+             "'sym_shared' = one shared edge head feeds both sides. "
+             "'sym_two' = two separate edge heads, one per side.",
+    )
+
     return p.parse_args()
 
 
@@ -208,6 +223,9 @@ def main() -> Dict[str, Any]:
         if loaded.train.edge_feat is not None
         else None
     )
+    if args.force_no_ef:
+        d_edge_feat = None
+        print("  --force-no-ef: overriding d_edge_feat to None")
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  directed:      {is_directed}  ({directed_provenance})")
@@ -257,6 +275,7 @@ def main() -> Dict[str, Any]:
         t_train_span=T_train,
         d_node_feat=d_node_feat,
         d_edge_feat=d_edge_feat,
+        ef_variant=args.ef_variant,
 
         d_emb=args.d_emb,
         d_proj=args.d_proj,

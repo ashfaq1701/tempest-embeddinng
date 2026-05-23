@@ -47,12 +47,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from .data import Batch
 from .evaluator import Evaluator
 from .losses import alignment_loss, uniformity_loss
-from .model import EmbeddingTable, LinkHead, ProjectionHead
+from .model import EdgeHead, EmbeddingTable, LinkHead, ProjectionHead
 from .negatives import (
     HistoricalNegativeSampler,
     NegativeSampler,
@@ -71,6 +72,15 @@ class TrainerConfig:
     t_train_span: float
     d_node_feat: Optional[int] = None
     d_edge_feat: Optional[int] = None    # NEW (Task 6.7)
+    # Task 13: EF-as-separate-head variant.
+    #   'none'       — no edge head; projection heads' EF channels
+    #                  (if any) determined by d_edge_feat as before
+    #   'asym'       — edge head feeds target side only
+    #   'sym_shared' — one edge head shared across both sides
+    #   'sym_two'    — two separate edge heads, one per side
+    # In any non-'none' variant, BOTH projection heads are forced to
+    # d_edge_feat=None (EF only enters via the edge head).
+    ef_variant: str = "none"
 
     # Model.
     d_emb: int = 128
@@ -138,6 +148,12 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=config.d_emb,
         ).to(self.device)
+        # Task 13: in any non-'none' variant, EF goes only to the
+        # edge head(s); both projection heads are constructed without
+        # an EF channel.
+        d_ef_for_p_context = (
+            config.d_edge_feat if config.ef_variant == "none" else None
+        )
         self.p_target = ProjectionHead(
             d_emb=config.d_emb,
             d_proj=config.d_proj,
@@ -147,9 +163,37 @@ class Trainer:
             d_emb=config.d_emb,
             d_proj=config.d_proj,
             d_node_feat=config.d_node_feat,
-            d_edge_feat=config.d_edge_feat,   # Task 6.7: convention β
+            d_edge_feat=d_ef_for_p_context,
         ).to(self.device)
         self.link_head = LinkHead(d_emb=config.d_emb).to(self.device)
+
+        # Task 13: edge head(s) per variant.
+        if config.ef_variant == "none":
+            self.edge_head_t = None
+            self.edge_head_c = None
+            self.alpha_t = None
+            self.alpha_c = None
+        elif config.ef_variant == "asym":
+            assert config.d_edge_feat is not None, "asym needs edge features"
+            self.edge_head_t = EdgeHead(config.d_edge_feat, config.d_proj).to(self.device)
+            self.edge_head_c = None
+            self.alpha_t = nn.Parameter(torch.zeros(1, device=self.device))
+            self.alpha_c = None
+        elif config.ef_variant == "sym_shared":
+            assert config.d_edge_feat is not None, "sym_shared needs edge features"
+            shared = EdgeHead(config.d_edge_feat, config.d_proj).to(self.device)
+            self.edge_head_t = shared
+            self.edge_head_c = shared          # same module, same params
+            self.alpha_t = nn.Parameter(torch.zeros(1, device=self.device))
+            self.alpha_c = nn.Parameter(torch.zeros(1, device=self.device))
+        elif config.ef_variant == "sym_two":
+            assert config.d_edge_feat is not None, "sym_two needs edge features"
+            self.edge_head_t = EdgeHead(config.d_edge_feat, config.d_proj).to(self.device)
+            self.edge_head_c = EdgeHead(config.d_edge_feat, config.d_proj).to(self.device)
+            self.alpha_t = nn.Parameter(torch.zeros(1, device=self.device))
+            self.alpha_c = nn.Parameter(torch.zeros(1, device=self.device))
+        else:
+            raise ValueError(f"unknown ef_variant: {config.ef_variant!r}")
 
         # Walk sampler.
         self.walk_gen = WalkGenerator(
@@ -192,6 +236,15 @@ class Trainer:
             + list(self.p_context.parameters())
             + list(self.link_head.parameters())
         )
+        # Task 13: edge head(s) + alphas. In sym_shared, edge_head_t
+        # and edge_head_c are the same module — deduplicate by id.
+        for m in (self.edge_head_t, self.edge_head_c):
+            if m is not None:
+                params.extend(list(m.parameters()))
+        for a in (self.alpha_t, self.alpha_c):
+            if a is not None:
+                params.append(a)
+        params = list({id(p): p for p in params}.values())
         self.optimizer = torch.optim.Adam(
             params,
             lr=config.lr,
@@ -279,15 +332,38 @@ class Trainer:
             beta=self.config.beta_time,
             node_feat=self.node_feat,
             edge_feat=walk_ef,
+            edge_head_t=self.edge_head_t,
+            edge_head_c=self.edge_head_c,
+            alpha_t=self.alpha_t,
+            alpha_c=self.alpha_c,
         )
-        l_unif = uniformity_loss(
+        # Apply uniformity to BOTH heads (Task 12 fix). Each head's
+        # EF channel (if present) is bypassed via Option γ. The two
+        # head losses are SUMMED (not averaged): heads have disjoint
+        # parameter sets, so averaging would halve each head's
+        # anti-collapse gradient — empirically verified to cause
+        # collapse on C1 smoke in Task 12. Sum preserves p_target's
+        # original gradient and adds new full-strength pressure on
+        # p_context.
+        l_unif_target = uniformity_loss(
             embedding_table=self.embedding_table,
-            p_target=self.p_target,
+            head=self.p_target,
             sample_idx_a=unif_a,
             sample_idx_b=unif_b,
             t=self.config.uniform_temperature,
             node_feat=self.node_feat,
+            bypass_ef=self.p_target.has_ef,
         )
+        l_unif_context = uniformity_loss(
+            embedding_table=self.embedding_table,
+            head=self.p_context,
+            sample_idx_a=unif_a,
+            sample_idx_b=unif_b,
+            t=self.config.uniform_temperature,
+            node_feat=self.node_feat,
+            bypass_ef=self.p_context.has_ef,
+        )
+        l_unif = l_unif_target + l_unif_context
         l_table = l_align + self.config.eta_uniform * l_unif
 
         # Step 4: link-pred negatives from PRE-OBSERVE reservoir.

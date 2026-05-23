@@ -121,14 +121,25 @@ class ProjectionHead(nn.Module):
         e: torch.Tensor,
         node_feat: Optional[torch.Tensor] = None,
         edge_feat: Optional[torch.Tensor] = None,
+        bypass_ef: bool = False,
     ) -> torch.Tensor:
-        """Returns L2-normalised projection, shape e.shape[:-1] + [d_proj]."""
+        """Returns L2-normalised projection, shape e.shape[:-1] + [d_proj].
+
+        bypass_ef=True with has_ef=True: skip the EF branch, inject
+          zeros of shape [..., d_proj] at the EF slot of the merge
+          concat. The merge MLP's EF-slot weights multiply zero,
+          contributing nothing. Option γ from Task 12.
+        bypass_ef=True with has_ef=False: no-op.
+        """
         if self.has_nf and node_feat is None:
             raise ValueError("ProjectionHead has NF channel but no NF passed")
         if not self.has_nf and node_feat is not None:
             raise ValueError("ProjectionHead has no NF channel but NF was passed")
-        if self.has_ef and edge_feat is None:
-            raise ValueError("ProjectionHead has EF channel but no EF passed")
+        if self.has_ef and edge_feat is None and not bypass_ef:
+            raise ValueError(
+                "ProjectionHead has EF channel but no EF passed "
+                "(and bypass_ef=False)"
+            )
         if not self.has_ef and edge_feat is not None:
             raise ValueError("ProjectionHead has no EF channel but EF was passed")
 
@@ -136,10 +147,44 @@ class ProjectionHead(nn.Module):
         if self.has_nf:
             branches.append(self.nf_mlp(node_feat))
         if self.has_ef:
-            branches.append(self.ef_mlp(edge_feat))
+            if bypass_ef:
+                ef_branch = torch.zeros_like(branches[0])
+            else:
+                ef_branch = self.ef_mlp(edge_feat)
+            branches.append(ef_branch)
 
         z = torch.cat(branches, dim=-1)
         out = self.merge(z)
+        return F.normalize(out, p=2, dim=-1, eps=1e-12)
+
+
+class EdgeHead(nn.Module):
+    """Task 13: edge-feature projection into unit-vector space.
+
+    Takes raw edge features, produces a unit vector of dimension
+    d_proj. The output participates in the alignment-side projection
+    via a learnable scalar α (in the Trainer) that scales its
+    contribution before re-normalisation.
+    """
+
+    def __init__(
+        self,
+        d_edge_feat: int,
+        d_proj: int,
+        d_hidden: Optional[int] = None,
+    ):
+        super().__init__()
+        if d_hidden is None:
+            d_hidden = d_proj
+        self.mlp = nn.Sequential(
+            nn.Linear(d_edge_feat, d_hidden),
+            nn.GELU(),
+            nn.Linear(d_hidden, d_proj),
+        )
+
+    def forward(self, edge_feat: torch.Tensor) -> torch.Tensor:
+        """edge_feat shape [..., d_edge_feat] → [..., d_proj] unit-norm."""
+        out = self.mlp(edge_feat)
         return F.normalize(out, p=2, dim=-1, eps=1e-12)
 
 

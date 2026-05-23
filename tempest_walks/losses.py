@@ -15,13 +15,16 @@ alignment_loss(E, P_target, P_context, walks, t_now, T_train, β, ...) -> scalar
     convention β: walks.edge_feats[p] is the edge OUT of context p.
     p_target never sees edge features.
 
-uniformity_loss(E, P_target, sample_idx_a, sample_idx_b, t, ...) -> scalar
-  - Wang-Isola form on L2-normalised P_target outputs:
+uniformity_loss(E, head, sample_idx_a, sample_idx_b, t, ..., bypass_ef) -> scalar
+  - Wang-Isola form on L2-normalised head outputs:
       L = log E_{x,y ~ q⊗q} [ exp(-t ||P(E(x)) - P(E(y))||²) ]
   - Caller supplies the M independent index pairs.
   - Numerically stabilised: L = logsumexp(-t * sq_dist) - log(M).
-  - Operates on P_target only; if context-projection uniformity is
-    needed later, call the function a second time with P_context.
+  - Called once per head. The trainer SUMS the two head losses
+    (target + context) — see _train_step. Averaging halved each
+    head's anti-collapse gradient in Task 12 diagnostic; sum is
+    the principled choice for disjoint-parameter heads.
+  - bypass_ef=head.has_ef skips the EF branch on EF-bearing heads.
 
 Link BCE is one line at the call site
 (F.binary_cross_entropy_with_logits(...)), not factored out.
@@ -45,6 +48,10 @@ def alignment_loss(
     beta: float = 1.0,
     node_feat: Optional[torch.Tensor] = None,     # [num_nodes, d_nf] or None
     edge_feat: Optional[torch.Tensor] = None,     # [NK, L-1, d_ef] or None
+    edge_head_t=None,                             # Task 13: EdgeHead on target side
+    edge_head_c=None,                             # Task 13: EdgeHead on context side
+    alpha_t=None,                                 # Task 13: scalar α for target-side edge head
+    alpha_c=None,                                 # Task 13: scalar α for context-side edge head
 ) -> torch.Tensor:
     """Multi-positive alignment with hop / time-weighted contexts.
 
@@ -117,27 +124,43 @@ def alignment_loss(
     nodes_safe = nodes.clamp_min(0)                               # [NK, L]
     e_ctx = embedding_table(nodes_safe)                           # [NK, L, d_emb]
 
-    # Four-way switch on whether node-feat / edge-feat are present.
-    # p_target NEVER takes edge_feat (seeds have no edge channel under
-    # convention β); p_context optionally takes it.
-    if node_feat is not None and ef_padded is not None:
+    # Build per-head projection inputs. p_target never takes
+    # edge_feat (seeds have no edge channel under convention β);
+    # p_context optionally takes it ONLY when p_context.has_ef.
+    target_kwargs = {}
+    context_kwargs = {}
+    if node_feat is not None:
         nf_seed = node_feat[seed_per_row]                         # [NK, d_nf]
         nf_ctx = node_feat[nodes_safe]                            # [NK, L, d_nf]
-        p_seed = p_target(e_seed, node_feat=nf_seed)              # [NK, d_proj]
-        p_ctx = p_context(e_ctx, node_feat=nf_ctx, edge_feat=ef_padded)
-    elif node_feat is not None:
-        nf_seed = node_feat[seed_per_row]
-        nf_ctx = node_feat[nodes_safe]
-        p_seed = p_target(e_seed, node_feat=nf_seed)
-        p_ctx = p_context(e_ctx, node_feat=nf_ctx)
-    elif ef_padded is not None:
-        p_seed = p_target(e_seed)
-        p_ctx = p_context(e_ctx, edge_feat=ef_padded)
-    else:
-        p_seed = p_target(e_seed)                                 # [NK, d_proj]
-        p_ctx = p_context(e_ctx)                                  # [NK, L, d_proj]
+        target_kwargs['node_feat'] = nf_seed
+        context_kwargs['node_feat'] = nf_ctx
+    if ef_padded is not None and p_context.has_ef:
+        context_kwargs['edge_feat'] = ef_padded
+    p_seed = p_target(e_seed, **target_kwargs)                    # [NK, d_proj]
+    p_ctx = p_context(e_ctx, **context_kwargs)                    # [NK, L, d_proj]
 
-    sq_dist = (p_seed.unsqueeze(1) - p_ctx).pow(2).sum(dim=-1)    # [NK, L]
+    # Task 13: optional EdgeHead contributions on either side.
+    # The edge head produces a unit vector; we add α · edge_head(ef)
+    # to the projection and re-normalise to keep unit-sphere geometry.
+    # In sym_shared, edge_head_t and edge_head_c are the same module;
+    # we recompute on each side for clarity, autograd handles the
+    # shared parameters automatically.
+    if edge_head_t is not None and ef_padded is not None:
+        eh_t = edge_head_t(ef_padded)                             # [NK, L, d_proj]
+        # Broadcast p_seed across positions, add α_t · eh_t, renorm.
+        z_t = p_seed.unsqueeze(1) + alpha_t * eh_t                # [NK, L, d_proj]
+        z_t = torch.nn.functional.normalize(z_t, p=2, dim=-1, eps=1e-12)
+    else:
+        z_t = p_seed.unsqueeze(1)                                 # [NK, 1, d_proj]
+
+    if edge_head_c is not None and ef_padded is not None:
+        eh_c = edge_head_c(ef_padded)                             # [NK, L, d_proj]
+        z_c = p_ctx + alpha_c * eh_c                              # [NK, L, d_proj]
+        z_c = torch.nn.functional.normalize(z_c, p=2, dim=-1, eps=1e-12)
+    else:
+        z_c = p_ctx                                               # [NK, L, d_proj]
+
+    sq_dist = (z_t - z_c).pow(2).sum(dim=-1)                      # [NK, L]
 
     mask = is_context.float()                                     # [NK, L]
     weighted_dist = w * sq_dist * mask                            # [NK, L]
@@ -149,17 +172,23 @@ def alignment_loss(
 
 def uniformity_loss(
     embedding_table,                              # EmbeddingTable
-    p_target,                                     # ProjectionHead — same as alignment's seed-side
+    head,                                         # ProjectionHead (target or context)
     sample_idx_a: torch.Tensor,                   # [M] long
     sample_idx_b: torch.Tensor,                   # [M] long
     t: float = 2.0,
     node_feat: Optional[torch.Tensor] = None,
+    bypass_ef: bool = False,
 ) -> torch.Tensor:
-    """Wang-Isola uniformity on L2-normalised P_target outputs.
+    """Wang-Isola uniformity on L2-normalised projection outputs.
 
     Estimator over M caller-supplied independent pairs:
         L = log (1/M) Σ_i exp(-t || P(E(a_i)) - P(E(b_i)) ||²)
           = logsumexp(-t * sq_dist) - log(M).
+
+    Called once per head. The caller SUMS the two losses (target +
+    context). Pass bypass_ef=head.has_ef so heads with EF channels
+    skip the EF branch during uniformity (Task 12 Option γ — zeros
+    at the merge concat boundary, not at the ef_mlp input).
     """
     device = embedding_table.E.weight.device
     a = sample_idx_a.to(device).long()
@@ -172,11 +201,11 @@ def uniformity_loss(
     e_b = embedding_table(b)                                      # [M, d_emb]
 
     if node_feat is not None:
-        p_a = p_target(e_a, node_feat=node_feat[a])
-        p_b = p_target(e_b, node_feat=node_feat[b])
+        p_a = head(e_a, node_feat=node_feat[a], bypass_ef=bypass_ef)
+        p_b = head(e_b, node_feat=node_feat[b], bypass_ef=bypass_ef)
     else:
-        p_a = p_target(e_a)
-        p_b = p_target(e_b)
+        p_a = head(e_a, bypass_ef=bypass_ef)
+        p_b = head(e_b, bypass_ef=bypass_ef)
 
     sq_dist = (p_a - p_b).pow(2).sum(dim=-1)                      # [M]
     return torch.logsumexp(-t * sq_dist, dim=0) - math.log(M)
