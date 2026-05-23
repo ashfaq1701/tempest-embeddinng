@@ -246,3 +246,124 @@ Trajectory notes:
   - C3 < C2 < C1 ordering on val. EF on target side hurts LESS
     than EF on context side, but both hurt vs no-EF.
   - Peaks at ep 26-28, similar to C2's ep 23-27.
+
+## C4 (post-fix) — EF on both heads (symmetric via merger)
+
+Flags: `--ef-on-target`. Trainer config:
+`ef_on_target=True, ef_on_context=True`.
+p_target: 121,088 params. p_context: 121,088 params.
+
+Per-seed val MRR / test MRR (best across 30 epochs):
+  seed 42  (best ep 26): val 0.0569 / test 0.0797
+  seed 123 (best ep  4): val 0.0310 / test 0.0157
+  seed 7   (best ep 29): val 0.0874 / test 0.1094
+
+Mean ± std:
+  val  0.0584 ± 0.023
+  test 0.0683 ± 0.039
+
+Δ vs C1 post-fix (val 0.3966 ± 0.014 / test 0.3794 ± 0.015):
+  Δval  = -0.3382 (-85% relative — CATASTROPHIC)
+  Δtest = -0.3111 (-82%)
+
+Loss components at ep 30 (mean across seeds):
+  align ≈ 0.0005   unif ≈ -7.76   bce ≈ 0.30
+
+Trajectory notes:
+  - **align collapses to ~0 by ep5 and stays there for all 30 ep.**
+    Both heads converge to the same EF-dominated projection so
+    p_target(seed_ef) ≈ p_context(ef_padded[p]) at every position.
+  - The two heads have separate EF MLPs but learn nearly-identical
+    EF→output mappings — alignment is trivially satisfied through
+    the EF channel alone, and E never gets useful alignment
+    gradient.
+  - Uniformity (with bypass_ef=True) keeps E spread out via the
+    E-channel, but with no alignment gradient, E has no walk
+    structure to learn — embedding table becomes uniform noise.
+  - bce stays at 0.30 — link_head can't extract structure from
+    noise-uniform E.
+  - This is a different degeneracy from C5 (per-position symmetric):
+    C5 was true-symmetric and produced ghost-perfect val 0.99 via
+    TGB tie-break; C4 has different EF inputs per side but both
+    heads still converge to EF-dominated mapping that aligns
+    trivially.
+  - Seed 123 stopped restoring from ep 4 (early plateau); seeds
+    42 and 7 stopped restoring from ep 26-29. All seeds bad.
+  - Hits STOP-D condition (val < 0.5 × C1 mean = 0.198), but per
+    user override "continue all queued", measurement completed.
+
+---
+
+# Task 12 Summary — post-fix 2×2 ablation
+
+Final ordering on wiki, 3 seeds × 30 epochs, val MRR (population std):
+
+| Config | val mean ± std     | test mean ± std    | Δval vs C1    |
+|--------|--------------------|--------------------|---------------|
+| C1     | **0.3966 ± 0.014** | **0.3794 ± 0.015** | (anchor)      |
+| C3     | 0.2541 ± 0.011     | 0.2225 ± 0.014     | -0.143 (-36%) |
+| C2     | 0.2253 ± 0.010     | 0.1943 ± 0.003     | -0.171 (-43%) |
+| C4     | 0.0584 ± 0.023     | 0.0683 ± 0.039     | -0.338 (-85%) |
+
+## 2×2 main effects + interaction (val MRR)
+
+  Effect                                         Δ
+  ──────────────────────────────────────────────────────
+  Main effect of EF-on-context (C2+C4 / C1+C3): -0.183
+  Main effect of EF-on-target  (C3+C4 / C1+C2): -0.169
+  Interaction (C4 - C2 - C3 + C1)              : -0.024
+
+Both main effects are strongly negative (EF in either head hurts).
+The interaction term is also negative — putting EF on BOTH sides
+hurts MORE than the sum of the two main effects, indicating a
+super-additive bad outcome from the combination.
+
+## Symmetry hypothesis verdict
+
+**REJECTED.** The hypothesis was: master's asymmetric placement
+of EF (context only) was holding back the architecture, and symmetric
+placement (both sides) would help. The data:
+
+  - C1 (no EF anywhere) is dramatically the best.
+  - C4 (symmetric, EF both) is dramatically the WORST.
+  - C2 (master default, EF context only) is between C3 (EF target
+    only) and C4 — asymmetry isn't the problem.
+
+Under the post-fix architecture with two-head SUM uniformity,
+ANY EF in the projection heads hurts. The doubled anti-collapse
+pressure of two-head uniformity benefits the pure E-table baseline
+much more than it benefits any EF variant.
+
+## Pre-fix vs post-fix comparison (informational)
+
+| Config | Pre-fix val ± std | Post-fix val ± std | Δ pre→post |
+|--------|-------------------|--------------------|------------|
+| C1     | 0.2480 ± 0.020    | 0.3966 ± 0.014     | +0.149     |
+| C2     | 0.2619 ± 0.009    | 0.2253 ± 0.010     | -0.037     |
+| C3     | 0.002 (collapsed) | 0.2541 ± 0.011     | recovered  |
+| C4     | (not run pre-fix) | 0.0584 ± 0.023     | new        |
+
+Notes:
+  - C1 improved massively (+60%) — the fixed uniformity strongly
+    benefits the pure E-table baseline.
+  - C2 slightly worse (-14%) — master default lost relative
+    advantage under doubled uniformity.
+  - C3 recovered from total collapse — Option γ + two-head SUM
+    successfully prevents the previous Option α failure.
+  - C4 measured for the first time — catastrophically bad.
+  - eta_uniform=1.0 is constant across both regimes, but the
+    actual uniformity gradient pressure is doubled in post-fix.
+
+## Recommendations
+
+**For wiki at this scale of uniformity gradient, drop EF from the
+projection heads entirely.** C1 (no EF) is the best architecture
+of the four tested by a wide margin.
+
+If EF is to be used at all, it should be plumbed through a
+DIFFERENT path that doesn't compete with the projection heads.
+That's Task 13's separate-edge-head architecture.
+
+Next: Task 13 starts on a fresh branch from master, implements
+Variant 4 EF-as-separate-head, and tests three variants
+(asym, sym_shared, sym_two).
