@@ -123,6 +123,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-final-full-eval", action="store_true")
     p.add_argument("--monitor-sample-pct", default=1.0, type=float)
 
+    # Task 12: EF ablation flags.
+    p.add_argument(
+        "--force-no-ef", action="store_true",
+        help="Override d_edge_feat to None regardless of dataset.",
+    )
+    p.add_argument(
+        "--ef-on-target", action="store_true",
+        help="Enable EF channel in p_target. Default off (matches master).",
+    )
+    p.add_argument(
+        "--no-ef-on-context",
+        dest="ef_on_context",
+        action="store_false",
+        default=True,
+        help="Disable EF channel in p_context. Default: enabled (matches master).",
+    )
+
     return p.parse_args()
 
 
@@ -208,6 +225,9 @@ def main() -> Dict[str, Any]:
         if loaded.train.edge_feat is not None
         else None
     )
+    if args.force_no_ef:
+        d_edge_feat = None
+        print("  --force-no-ef: overriding d_edge_feat to None")
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  directed:      {is_directed}  ({directed_provenance})")
@@ -257,6 +277,8 @@ def main() -> Dict[str, Any]:
         t_train_span=T_train,
         d_node_feat=d_node_feat,
         d_edge_feat=d_edge_feat,
+        ef_on_target=args.ef_on_target,
+        ef_on_context=args.ef_on_context,
 
         d_emb=args.d_emb,
         d_proj=args.d_proj,

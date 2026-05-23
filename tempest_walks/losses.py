@@ -72,6 +72,11 @@ def alignment_loss(
     # Tempest stores ef[p] for the edge between nodes[p] and nodes[p+1]
     # in slots [0, L-1); position L-1 (seed slot) is the appended zero
     # row and is masked out of the loss.
+    # Task 12: also build seed_ef under convention B-target — the
+    # seed's "outgoing" edge does not exist in the walk, so we use the
+    # walk's LAST edge (index lens-2), which is the edge INTO the seed
+    # from its immediate context. For walks with lens < 2 (no edges),
+    # zero-fill.
     if edge_feat is not None:
         ef_dev = edge_feat.to(device)
         assert ef_dev.shape[:2] == (NK, L - 1), (
@@ -86,8 +91,14 @@ def alignment_loss(
             ],
             dim=1,
         )                                                          # [NK, L, d_ef]
+        seed_ef_idx = (lens - 2).clamp(min=0)                      # [NK]
+        batch_idx = torch.arange(NK, device=device)
+        seed_ef_raw = ef_dev[batch_idx, seed_ef_idx]               # [NK, d_ef]
+        has_valid_edge = (lens >= 2).unsqueeze(-1).float()         # [NK, 1]
+        seed_ef = seed_ef_raw * has_valid_edge                     # [NK, d_ef]
     else:
         ef_padded = None
+        seed_ef = None
 
     # Valid context positions: p ∈ [0, lens - 2]. Position lens-1 is
     # the seed (excluded), positions >= lens are padding.
@@ -117,25 +128,22 @@ def alignment_loss(
     nodes_safe = nodes.clamp_min(0)                               # [NK, L]
     e_ctx = embedding_table(nodes_safe)                           # [NK, L, d_emb]
 
-    # Four-way switch on whether node-feat / edge-feat are present.
-    # p_target NEVER takes edge_feat (seeds have no edge channel under
-    # convention β); p_context optionally takes it.
-    if node_feat is not None and ef_padded is not None:
+    # Task 12: p_target may or may not have an EF channel (controlled
+    # by ef_on_target flag). Build kwargs per-head based on the head's
+    # advertised has_ef and the loss-time availability of features.
+    target_kwargs = {}
+    context_kwargs = {}
+    if node_feat is not None:
         nf_seed = node_feat[seed_per_row]                         # [NK, d_nf]
         nf_ctx = node_feat[nodes_safe]                            # [NK, L, d_nf]
-        p_seed = p_target(e_seed, node_feat=nf_seed)              # [NK, d_proj]
-        p_ctx = p_context(e_ctx, node_feat=nf_ctx, edge_feat=ef_padded)
-    elif node_feat is not None:
-        nf_seed = node_feat[seed_per_row]
-        nf_ctx = node_feat[nodes_safe]
-        p_seed = p_target(e_seed, node_feat=nf_seed)
-        p_ctx = p_context(e_ctx, node_feat=nf_ctx)
-    elif ef_padded is not None:
-        p_seed = p_target(e_seed)
-        p_ctx = p_context(e_ctx, edge_feat=ef_padded)
-    else:
-        p_seed = p_target(e_seed)                                 # [NK, d_proj]
-        p_ctx = p_context(e_ctx)                                  # [NK, L, d_proj]
+        target_kwargs['node_feat'] = nf_seed
+        context_kwargs['node_feat'] = nf_ctx
+    if seed_ef is not None and p_target.has_ef:
+        target_kwargs['edge_feat'] = seed_ef                      # convention B-target
+    if ef_padded is not None and p_context.has_ef:
+        context_kwargs['edge_feat'] = ef_padded
+    p_seed = p_target(e_seed, **target_kwargs)                    # [NK, d_proj]
+    p_ctx = p_context(e_ctx, **context_kwargs)                    # [NK, L, d_proj]
 
     sq_dist = (p_seed.unsqueeze(1) - p_ctx).pow(2).sum(dim=-1)    # [NK, L]
 
@@ -171,12 +179,26 @@ def uniformity_loss(
     e_a = embedding_table(a)                                      # [M, d_emb]
     e_b = embedding_table(b)                                      # [M, d_emb]
 
+    # Task 12: if p_target has the EF channel (ef_on_target=True),
+    # uniformity has no edge for random nodes — zero-fill (Option α).
+    # This introduces a slight train-time vs uniformity-time
+    # inconsistency in p_target's input distribution; documented in
+    # CLAUDE.md Task 12 notes.
     if node_feat is not None:
-        p_a = p_target(e_a, node_feat=node_feat[a])
-        p_b = p_target(e_b, node_feat=node_feat[b])
+        target_kwargs_a = {'node_feat': node_feat[a]}
+        target_kwargs_b = {'node_feat': node_feat[b]}
     else:
-        p_a = p_target(e_a)
-        p_b = p_target(e_b)
+        target_kwargs_a = {}
+        target_kwargs_b = {}
+    if p_target.has_ef:
+        zero_ef = torch.zeros(
+            M, p_target.ef_input_dim,
+            device=device, dtype=torch.float32,
+        )
+        target_kwargs_a['edge_feat'] = zero_ef
+        target_kwargs_b['edge_feat'] = zero_ef
+    p_a = p_target(e_a, **target_kwargs_a)
+    p_b = p_target(e_b, **target_kwargs_b)
 
     sq_dist = (p_a - p_b).pow(2).sum(dim=-1)                      # [M]
     return torch.logsumexp(-t * sq_dist, dim=0) - math.log(M)

@@ -71,6 +71,10 @@ class TrainerConfig:
     t_train_span: float
     d_node_feat: Optional[int] = None
     d_edge_feat: Optional[int] = None    # NEW (Task 6.7)
+    # Per-head EF gating (Task 12). Defaults preserve master:
+    # EF on context only.
+    ef_on_target: bool = False
+    ef_on_context: bool = True
 
     # Model.
     d_emb: int = 128
@@ -138,16 +142,21 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=config.d_emb,
         ).to(self.device)
+        # Task 12: per-head EF gating. d_edge_feat is the dataset's EF
+        # dim; whether each head sees it is independently controlled.
+        d_ef_target = config.d_edge_feat if config.ef_on_target else None
+        d_ef_context = config.d_edge_feat if config.ef_on_context else None
         self.p_target = ProjectionHead(
             d_emb=config.d_emb,
             d_proj=config.d_proj,
             d_node_feat=config.d_node_feat,
+            d_edge_feat=d_ef_target,
         ).to(self.device)
         self.p_context = ProjectionHead(
             d_emb=config.d_emb,
             d_proj=config.d_proj,
             d_node_feat=config.d_node_feat,
-            d_edge_feat=config.d_edge_feat,   # Task 6.7: convention β
+            d_edge_feat=d_ef_context,
         ).to(self.device)
         self.link_head = LinkHead(d_emb=config.d_emb).to(self.device)
 

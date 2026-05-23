@@ -88,6 +88,9 @@ class ProjectionHead(nn.Module):
 
         self.has_nf = d_node_feat is not None
         self.has_ef = d_edge_feat is not None
+        # Exposed so uniformity_loss can build a zero-fill EF input
+        # when p_target carries the EF channel (Task 12).
+        self.ef_input_dim = d_edge_feat
 
         self.e_mlp = nn.Sequential(
             nn.Linear(d_emb, d_hidden),
