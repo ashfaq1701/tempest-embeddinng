@@ -139,6 +139,11 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Disable EF channel in p_context. Default: enabled (matches master).",
     )
+    p.add_argument(
+        "--ef-symmetric", action="store_true",
+        help="Task 12 C5: p_target evaluates PER-POSITION using the "
+             "same ef_padded that p_context sees. Implies --ef-on-target.",
+    )
 
     return p.parse_args()
 
@@ -277,8 +282,9 @@ def main() -> Dict[str, Any]:
         t_train_span=T_train,
         d_node_feat=d_node_feat,
         d_edge_feat=d_edge_feat,
-        ef_on_target=args.ef_on_target,
+        ef_on_target=args.ef_on_target or args.ef_symmetric,
         ef_on_context=args.ef_on_context,
+        ef_target_per_position=args.ef_symmetric,
 
         d_emb=args.d_emb,
         d_proj=args.d_proj,

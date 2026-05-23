@@ -75,6 +75,10 @@ class TrainerConfig:
     # EF on context only.
     ef_on_target: bool = False
     ef_on_context: bool = True
+    # C5: when True, p_target evaluates PER-POSITION using the same
+    # ef_padded that p_context sees, so at every (row, position) both
+    # heads see the identical edge. Requires ef_on_target=True.
+    ef_target_per_position: bool = False
 
     # Model.
     d_emb: int = 128
@@ -288,6 +292,7 @@ class Trainer:
             beta=self.config.beta_time,
             node_feat=self.node_feat,
             edge_feat=walk_ef,
+            ef_target_per_position=self.config.ef_target_per_position,
         )
         l_unif = uniformity_loss(
             embedding_table=self.embedding_table,

@@ -45,6 +45,7 @@ def alignment_loss(
     beta: float = 1.0,
     node_feat: Optional[torch.Tensor] = None,     # [num_nodes, d_nf] or None
     edge_feat: Optional[torch.Tensor] = None,     # [NK, L-1, d_ef] or None
+    ef_target_per_position: bool = False,         # Task 12 C5
 ) -> torch.Tensor:
     """Multi-positive alignment with hop / time-weighted contexts.
 
@@ -131,21 +132,35 @@ def alignment_loss(
     # Task 12: p_target may or may not have an EF channel (controlled
     # by ef_on_target flag). Build kwargs per-head based on the head's
     # advertised has_ef and the loss-time availability of features.
-    target_kwargs = {}
+    # C5: if ef_target_per_position is set, p_target evaluates
+    # per-position using the same ef_padded that p_context sees.
     context_kwargs = {}
     if node_feat is not None:
         nf_seed = node_feat[seed_per_row]                         # [NK, d_nf]
         nf_ctx = node_feat[nodes_safe]                            # [NK, L, d_nf]
-        target_kwargs['node_feat'] = nf_seed
         context_kwargs['node_feat'] = nf_ctx
-    if seed_ef is not None and p_target.has_ef:
-        target_kwargs['edge_feat'] = seed_ef                      # convention B-target
     if ef_padded is not None and p_context.has_ef:
         context_kwargs['edge_feat'] = ef_padded
-    p_seed = p_target(e_seed, **target_kwargs)                    # [NK, d_proj]
     p_ctx = p_context(e_ctx, **context_kwargs)                    # [NK, L, d_proj]
 
-    sq_dist = (p_seed.unsqueeze(1) - p_ctx).pow(2).sum(dim=-1)    # [NK, L]
+    if ef_target_per_position and p_target.has_ef and ef_padded is not None:
+        # C5: p_target evaluates per-position so target's EF at (i, p)
+        # matches context's ef_padded[i, p] exactly. Same physical edge
+        # on both sides; loss becomes a per-position symmetric pull.
+        e_seed_pp = e_seed.unsqueeze(1).expand(NK, L, -1)         # [NK, L, d_emb]
+        target_kwargs_pp = {'edge_feat': ef_padded}
+        if node_feat is not None:
+            target_kwargs_pp['node_feat'] = nf_seed.unsqueeze(1).expand(NK, L, -1)
+        p_seed_pp = p_target(e_seed_pp, **target_kwargs_pp)       # [NK, L, d_proj]
+        sq_dist = (p_seed_pp - p_ctx).pow(2).sum(dim=-1)          # [NK, L]
+    else:
+        target_kwargs = {}
+        if node_feat is not None:
+            target_kwargs['node_feat'] = nf_seed
+        if seed_ef is not None and p_target.has_ef:
+            target_kwargs['edge_feat'] = seed_ef                  # convention B-target
+        p_seed = p_target(e_seed, **target_kwargs)                # [NK, d_proj]
+        sq_dist = (p_seed.unsqueeze(1) - p_ctx).pow(2).sum(dim=-1)# [NK, L]
 
     mask = is_context.float()                                     # [NK, L]
     weighted_dist = w * sq_dist * mask                            # [NK, L]
