@@ -101,6 +101,7 @@ class TrainerConfig:
     # System.
     seed: int = 42
     use_gpu: bool = False
+    use_gpu_tempest: bool = False    # independent from use_gpu
 
     # Eval.
     monitor_sample_pct: float = 1.0
@@ -151,7 +152,7 @@ class Trainer:
         # Walk sampler.
         self.walk_gen = WalkGenerator(
             is_directed=config.is_directed,
-            use_gpu=False,
+            use_gpu=config.use_gpu_tempest,
             walk_bias=config.walk_bias,
             start_bias=config.start_bias,
             max_walk_len=config.max_walk_len,

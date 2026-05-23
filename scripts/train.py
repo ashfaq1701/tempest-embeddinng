@@ -108,7 +108,18 @@ def parse_args() -> argparse.Namespace:
 
     # System.
     p.add_argument("--seed", default=42, type=int)
-    p.add_argument("--use-gpu", action="store_true")
+    p.add_argument("--use-gpu", action="store_true",
+                   help="Move PyTorch tensors (E, projections, link head, "
+                        "losses) to CUDA. Does NOT affect Tempest.")
+    p.add_argument(
+        "--use-gpu-tempest",
+        action="store_true",
+        help="Run Tempest's walk sampler in GPU mode. Independent from "
+             "--use-gpu, which controls PyTorch tensor placement. "
+             "Tempest GPU mode allocates a multi-GB arena that may "
+             "collide with PyTorch's allocator on small GPUs; default "
+             "off, enable only if you have headroom.",
+    )
     p.add_argument("--skip-final-full-eval", action="store_true")
     p.add_argument("--monitor-sample-pct", default=1.0, type=float)
 
@@ -263,6 +274,7 @@ def main() -> Dict[str, Any]:
 
         seed=args.seed,
         use_gpu=args.use_gpu,
+        use_gpu_tempest=args.use_gpu_tempest,
         skip_final_full_eval=args.skip_final_full_eval,
         monitor_sample_pct=args.monitor_sample_pct,
     )
