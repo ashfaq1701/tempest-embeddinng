@@ -81,6 +81,7 @@ class ProjectionHead(nn.Module):
         d_node_feat: Optional[int] = None,
         d_edge_feat: Optional[int] = None,
         d_hidden: Optional[int] = None,
+        ef_input_norm: bool = False,    # Task 10 V1
     ):
         super().__init__()
         if d_hidden is None:
@@ -102,7 +103,14 @@ class ProjectionHead(nn.Module):
                 nn.Linear(d_hidden, d_proj),
             )
 
+        # Task 10 V1: optional LayerNorm on the raw EF input before
+        # the per-channel MLP. Standardises high-dim EF (e.g., wiki's
+        # 172-d text embedding) so its contribution to the merge MLP
+        # input is on the same scale as the E-branch and NF-branch.
+        self.ef_input_norm_enabled = ef_input_norm
         if self.has_ef:
+            if ef_input_norm:
+                self.ef_input_norm = nn.LayerNorm(d_edge_feat)
             self.ef_mlp = nn.Sequential(
                 nn.Linear(d_edge_feat, d_hidden),
                 nn.GELU(),
@@ -136,7 +144,10 @@ class ProjectionHead(nn.Module):
         if self.has_nf:
             branches.append(self.nf_mlp(node_feat))
         if self.has_ef:
-            branches.append(self.ef_mlp(edge_feat))
+            ef_in = edge_feat
+            if self.ef_input_norm_enabled:
+                ef_in = self.ef_input_norm(ef_in)
+            branches.append(self.ef_mlp(ef_in))
 
         z = torch.cat(branches, dim=-1)
         out = self.merge(z)

@@ -76,9 +76,37 @@ Notes:
     Task 7 anchor at 5 epochs (val 0.128 → 0.185), consistent with
     "not converged at 5 ep" finding.
 
-## V1, V2, V3 — Tier 1 (preprocessing only)
+## V1 — LayerNorm on EF input
 
-_(forthcoming)_
+Code: `ProjectionHead.__init__` gains `ef_input_norm: bool = False`
+arg. When True and EF channel is active, an `nn.LayerNorm(d_edge_feat)`
+is applied to the raw EF input before `ef_mlp`. Threaded through
+`TrainerConfig.ef_input_norm` and `--ef-input-norm` CLI flag.
+
+Per-seed val MRR / test MRR (best across 15 epochs):
+  seed 42  (best ep 13): val 0.1705 / test 0.1629
+  seed 123 (best ep 15): val 0.2104 / test 0.1763
+  seed 7   (best ep 13): val 0.1717 / test 0.1572
+
+Mean ± std:
+  val  0.1842 ± 0.019
+  test 0.1655 ± 0.008
+
+Δ vs V0 (val 0.1849 ± 0.036 / test 0.1615 ± 0.025):
+  Δval  = -0.0007 (tied within noise)
+  Δtest = +0.0040 (slight improvement, within noise)
+  Std collapse: V0 val std 0.036 → V1 val std 0.019 (2× tighter)
+                V0 test std 0.025 → V1 test std 0.008 (3× tighter)
+
+Loss components at ep 15 (mean across seeds): align ≈ 0.46, unif ≈ -3.74, bce ≈ 0.19.
+
+Notes:
+  - V1 RECOVERS from the post-Task-6.7 regression. EF goes from
+    "hurting by 22-25%" to "tied with no-EF, with markedly tighter
+    cross-seed variance".
+  - Tighter std is itself a meaningful finding: normalising the
+    high-dim EF input apparently reduces sensitivity to initialisation.
+  - No instability, no NaN, no OOM.
 
 ## Tier 1 decision point
 

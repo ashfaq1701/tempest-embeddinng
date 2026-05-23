@@ -127,6 +127,15 @@ def parse_args() -> argparse.Namespace:
         help="Override d_edge_feat to None regardless of dataset "
              "(Task 10 no-EF anchor / EF ablation).",
     )
+    p.add_argument(
+        "--ef-input-norm", action="store_true",
+        help="Task 10 V1: LayerNorm on raw EF input before ef_mlp.",
+    )
+    p.add_argument(
+        "--ef-standardise", action="store_true",
+        help="Task 10 V2: per-dim z-score standardisation of EF "
+             "computed once on training EF, applied to train/val/test.",
+    )
 
     return p.parse_args()
 
@@ -191,6 +200,33 @@ def main() -> Dict[str, Any]:
     # negatives can be queried. They're cached on disk after first call.
     loaded.dataset.load_val_ns()
     loaded.dataset.load_test_ns()
+
+    # Task 10 V2: per-dim standardisation of EF using TRAINING stats only.
+    # In-place mutates loaded.train/val/test SplitData edge_feat. No-op
+    # when the dataset has no EF or --force-no-ef is set.
+    if args.ef_standardise and loaded.train.edge_feat is not None and not args.force_no_ef:
+        mu = loaded.train.edge_feat.mean(axis=0, keepdims=True)
+        sd = loaded.train.edge_feat.std(axis=0, keepdims=True).clip(1e-6, None)
+        # SplitData is a NamedTuple — replace in place via the Loaded fields.
+        # Since SplitData is immutable, we rebuild the three splits.
+        from tempest_walks.data import SplitData
+        def _standardise(split):
+            if split.edge_feat is None:
+                return split
+            return SplitData(
+                sources=split.sources,
+                destinations=split.destinations,
+                timestamps=split.timestamps,
+                edge_feat=((split.edge_feat - mu) / sd).astype(np.float32),
+            )
+        loaded = loaded._replace(
+            train=_standardise(loaded.train),
+            val=_standardise(loaded.val),
+            test=_standardise(loaded.test),
+        )
+        print(f"  ef-standardise: applied (mu range "
+              f"[{mu.min():.3f}, {mu.max():.3f}], "
+              f"sd range [{sd.min():.3f}, {sd.max():.3f}])")
 
     # Derived dataset constants.
     num_nodes = loaded.max_node_count
@@ -264,6 +300,7 @@ def main() -> Dict[str, Any]:
         t_train_span=T_train,
         d_node_feat=d_node_feat,
         d_edge_feat=d_edge_feat,
+        ef_input_norm=args.ef_input_norm,
 
         d_emb=args.d_emb,
         d_proj=args.d_proj,

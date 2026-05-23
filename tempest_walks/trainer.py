@@ -71,6 +71,7 @@ class TrainerConfig:
     t_train_span: float
     d_node_feat: Optional[int] = None
     d_edge_feat: Optional[int] = None    # NEW (Task 6.7)
+    ef_input_norm: bool = False          # Task 10 V1
 
     # Model.
     d_emb: int = 128
@@ -148,6 +149,7 @@ class Trainer:
             d_proj=config.d_proj,
             d_node_feat=config.d_node_feat,
             d_edge_feat=config.d_edge_feat,   # Task 6.7: convention β
+            ef_input_norm=config.ef_input_norm,  # Task 10 V1
         ).to(self.device)
         self.link_head = LinkHead(d_emb=config.d_emb).to(self.device)
 
