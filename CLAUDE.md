@@ -212,3 +212,37 @@ Trajectory notes:
     ep 19-30 range. EF on context seems to limit how far training
     can go before plateau.
   - No collapse, no NaN.
+
+## C3 (post-fix) — EF on target only
+
+Flags: `--no-ef-on-context --ef-on-target`. Trainer config:
+`ef_on_target=True, ef_on_context=False`.
+p_target: 121,088 params. p_context: 66,048 params.
+
+Per-seed val MRR / test MRR (best across 30 epochs):
+  seed 42  (best ep 27): val 0.2660 / test 0.2420
+  seed 123 (best ep 28): val 0.2576 / test 0.2169
+  seed 7   (best ep 26): val 0.2386 / test 0.2087
+
+Mean ± std:
+  val  0.2541 ± 0.011
+  test 0.2225 ± 0.014
+
+Δ vs C1 post-fix (val 0.3966 ± 0.014 / test 0.3794 ± 0.015):
+  Δval  = -0.1425 (-36% relative — EF on target also HURTS)
+  Δtest = -0.1569 (-41%)
+
+Δ vs C2 post-fix (val 0.2253 ± 0.010 / test 0.1943 ± 0.003):
+  Δval  = +0.0288 (+13% relative — slightly better than EF on context)
+  Δtest = +0.0282
+
+Loss components at ep 30 (mean across seeds):
+  align ≈ 0.42    unif ≈ -7.68    bce ≈ 0.18
+
+Trajectory notes:
+  - This is the config that catastrophically COLLAPSED under
+    Option α (val locked at 0.002). Option γ + two-head SUM fix
+    fully recovered it — no collapse, smooth climb to val ~0.25.
+  - C3 < C2 < C1 ordering on val. EF on target side hurts LESS
+    than EF on context side, but both hurt vs no-EF.
+  - Peaks at ep 26-28, similar to C2's ep 23-27.
