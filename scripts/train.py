@@ -122,6 +122,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--skip-final-full-eval", action="store_true")
     p.add_argument("--monitor-sample-pct", default=1.0, type=float)
+    p.add_argument(
+        "--force-no-ef", action="store_true",
+        help="Override d_edge_feat to None regardless of dataset "
+             "(Task 10 no-EF anchor / EF ablation).",
+    )
 
     return p.parse_args()
 
@@ -208,6 +213,8 @@ def main() -> Dict[str, Any]:
         if loaded.train.edge_feat is not None
         else None
     )
+    if args.force_no_ef:
+        d_edge_feat = None  # Task 10 no-EF ablation
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  directed:      {is_directed}  ({directed_provenance})")
