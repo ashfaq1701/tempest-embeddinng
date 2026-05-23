@@ -182,3 +182,33 @@ Trajectory notes:
   - Two seeds peaked AT ep30 (cap); one seed peaked at ep19 with
     early-stop restoration.
   - No collapse, no NaN, smooth climb.
+
+## C2 (post-fix) — EF on context only (master default)
+
+Flags: (none). Trainer config: `ef_on_target=False, ef_on_context=True`.
+p_target: 66,048 params. p_context: 121,088 params.
+
+Per-seed val MRR / test MRR (best across 30 epochs):
+  seed 42  (best ep 27): val 0.2273 / test 0.1959
+  seed 123 (best ep 27): val 0.2120 / test 0.1902
+  seed 7   (best ep 23): val 0.2366 / test 0.1968
+
+Mean ± std:
+  val  0.2253 ± 0.010
+  test 0.1943 ± 0.003
+
+Δ vs C1 post-fix (val 0.3966 ± 0.014 / test 0.3794 ± 0.015):
+  Δval  = -0.1713 (-43% relative — EF on context HURTS under SUM uniformity)
+  Δtest = -0.1851 (-49% relative)
+
+Loss components at ep 30 (mean across seeds):
+  align ≈ 0.43    unif ≈ -7.66    bce ≈ 0.18
+
+Trajectory notes:
+  - Relationship to C1 INVERTED vs pre-fix: pre-fix C2 was +5.6%
+    over C1; post-fix C2 is -43% under C1. The doubled uniformity
+    benefits the no-EF baseline more than the EF-context-only setup.
+  - All three seeds peak in the ep 23-27 range — earlier than C1's
+    ep 19-30 range. EF on context seems to limit how far training
+    can go before plateau.
+  - No collapse, no NaN.
