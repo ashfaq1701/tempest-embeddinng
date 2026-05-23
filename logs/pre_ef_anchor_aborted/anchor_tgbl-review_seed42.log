@@ -1,0 +1,54 @@
+=== tempest-embedding training ===
+dataset: tgbl-review
+device:  cuda
+seed:    42
+loaded in 1.8s
+  num_nodes:     352,637
+  directed:      False  (dataset default)
+  bipartite:     False
+  dst_pool:      252,261 unique destinations
+  T_train:       535593600
+  train edges:   3,413,837
+  val edges:     730,784
+  test edges:    728,919
+  has_node_feat: False
+
+=== Config ===
+  num_nodes: 352637
+  is_directed: False
+  is_bipartite: False
+  dst_pool: <ndarray shape=(252261,) dtype=int32>
+  t_train_span: 535593600.0
+  d_node_feat: None
+  d_emb: 128
+  d_proj: 128
+  eta_uniform: 1.0
+  uniform_temperature: 2.0
+  uniform_pairs: 5000
+  beta_time: 1.0
+  num_walks_per_node: 5
+  max_walk_len: 20
+  walk_bias: ExponentialWeight
+  start_bias: Uniform
+  num_neg_per_pos: 10
+  hist_neg_ratio: 0.5
+  reservoir_size: 32
+  lr: 0.001
+  weight_decay: 0.0001
+  num_epochs: 5
+  early_stop_patience: 0
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: False
+  monitor_sample_pct: 1.0
+  skip_final_full_eval: True
+
+=== Parameter counts ===
+  embedding_table:   45,137,536
+  p_target:              66,048
+  p_context:             66,048
+  link_head:            574,466
+  TOTAL trainable:   45,844,098
+
+=== Training ===
+epoch 1/5  align=0.0019  unif=-0.0000  bce=0.3060  train 405.2s  val 0.0193  test 0.0497 (new best)  eval 223.7s
