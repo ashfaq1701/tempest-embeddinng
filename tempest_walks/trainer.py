@@ -294,11 +294,15 @@ class Trainer:
             edge_feat=walk_ef,
             ef_target_per_position=self.config.ef_target_per_position,
         )
-        # Apply uniformity to BOTH heads (Task 12 fix). Each head's
-        # EF channel (if present) is bypassed via Option γ —
+        # Apply uniformity to BOTH heads (Task 12 fix). Each head's EF
+        # channel (if present) is bypassed via Option γ —
         # bypass_ef=head.has_ef uniformly handles all four placement
-        # cases. The /2 preserves eta_uniform's scale relative to the
-        # original single-head formulation.
+        # cases. The two terms are SUMMED (not averaged): the heads
+        # have disjoint parameter sets, so averaging would halve each
+        # head's anti-collapse gradient relative to pre-fix single-head
+        # and cause projection collapse (empirically verified C1 smoke).
+        # Summing preserves p_target's original gradient and adds new
+        # full-strength pressure on p_context.
         l_unif_target = uniformity_loss(
             embedding_table=self.embedding_table,
             head=self.p_target,
@@ -317,7 +321,7 @@ class Trainer:
             node_feat=self.node_feat,
             bypass_ef=self.p_context.has_ef,
         )
-        l_unif = (l_unif_target + l_unif_context) / 2
+        l_unif = l_unif_target + l_unif_context
         l_table = l_align + self.config.eta_uniform * l_unif
 
         # Step 4: link-pred negatives from PRE-OBSERVE reservoir.

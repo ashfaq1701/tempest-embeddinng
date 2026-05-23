@@ -20,8 +20,10 @@ uniformity_loss(E, head, sample_idx_a, sample_idx_b, t, ..., bypass_ef) -> scala
       L = log E_{x,y ~ q⊗q} [ exp(-t ||P(E(x)) - P(E(y))||²) ]
   - Caller supplies the M independent index pairs.
   - Numerically stabilised: L = logsumexp(-t * sq_dist) - log(M).
-  - Called once per head (target, context). Caller sums and averages
-    the two losses to preserve eta_uniform scale.
+  - Called once per head (target, context). Caller SUMS the two
+    losses (not averages): heads have disjoint parameter sets, so
+    averaging would halve each head's anti-collapse gradient and
+    cause collapse. Empirically verified on C1 smoke test.
   - bypass_ef=head.has_ef skips the EF branch on EF-bearing heads
     (Task 12 Option γ — zeros at the merge concat boundary, NOT
     at the ef_mlp input).
@@ -188,9 +190,10 @@ def uniformity_loss(
         L = log (1/M) Σ_i exp(-t || P(E(a_i)) - P(E(b_i)) ||²)
           = logsumexp(-t * sq_dist) - log(M).
 
-    The function is called once per head; the caller sums and
-    averages the two losses to preserve eta_uniform scale. Pass
-    bypass_ef=head.has_ef so heads with EF channels skip the EF
+    The function is called once per head. The caller SUMS the two
+    losses (target + context); averaging halved each head's
+    anti-collapse gradient and caused collapse (see trainer comment).
+    Pass bypass_ef=head.has_ef so heads with EF channels skip the EF
     branch during uniformity (no edge to feed). Implements Task 12
     Option γ: zeros are injected at the merge-concat boundary, not
     at the ef_mlp input.

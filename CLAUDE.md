@@ -77,6 +77,42 @@ used in the 2×2 summary):
   7. CLI flags in `scripts/train.py`: `--force-no-ef`, `--ef-on-target`,
      `--no-ef-on-context` (default-on inverse).
 
+## Uniformity aggregation fix (SUM, not /2 average)
+
+The original spec for the post-fix specified
+`l_unif = (l_unif_target + l_unif_context) / 2`. C1 smoke test
+under the `/2` averaging collapsed:
+  - ep1: align=0.014 unif=-0.0000 val=0.021
+  - ep2: align=0.000 unif=0.000   val=0.887 (ghost-perfect)
+  - ep3: align=0.000 unif=0.000   val=0.005
+
+**Mechanism.** The two heads have disjoint parameter sets, so
+`d(l_unif/2)/dθ_target = (1/2) · dX/dθ_target` — exactly HALF
+the anti-collapse pressure p_target had under pre-fix single-head
+uniformity. Halving the pressure lets alignment dominate, drives
+projections into the merge-bias direction, and once collapsed,
+sq_dist=0 across pairs → unif≈0 → no gradient → E stuck. The
+ghost-perfect val=0.99 at later epochs is a TGB tie-break artifact
+(pos≥neg with all logits near-identical).
+
+**Three diagnostic runs on C1 ep1-ep2 confirmed empirically:**
+
+  | Variant                       | ep1 align | ep1 unif | ep2 val |
+  |-------------------------------|-----------|----------|---------|
+  | Pre-fix single-head p_target  | 0.42      | -1.79    | 0.045 ✓ |
+  | Two-head AVG /2               | 0.014     | -0.0000  | 0.887 ✗ |
+  | Two-head SUM (no /2)          | 0.58      | -3.54    | 0.179 ✓ |
+
+**Fix.** `l_unif = l_unif_target + l_unif_context`. Each head gets
+its full original anti-collapse gradient (p_target unchanged from
+pre-fix; p_context now also fully pressured, was zero before). The
+total uniformity loss MAGNITUDE doubles relative to single-head,
+which means `eta_uniform=1.0` post-fix is NOT directly comparable
+to `eta_uniform=1.0` pre-fix — post-fix has effectively `2.0` of
+uniformity weight in the table loss. All Task 12 configs use
+`eta_uniform=1.0` consistently, so this doesn't bias the within-task
+comparison; note for the eventual paper writeup.
+
 ## C5 — dropped (originally "EF on both, per-position")
 
 C5 was an extra probe ("same EF on both sides, position-matched"):
