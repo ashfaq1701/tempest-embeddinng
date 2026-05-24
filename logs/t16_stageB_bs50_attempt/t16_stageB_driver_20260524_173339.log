@@ -1,0 +1,6 @@
+===== t16 comment seed 42 → logs/t16_comment_seed42.log =====
+=== tempest-embedding training ===
+dataset: tgbl-comment
+device:  cuda
+seed:    42
+Terminated

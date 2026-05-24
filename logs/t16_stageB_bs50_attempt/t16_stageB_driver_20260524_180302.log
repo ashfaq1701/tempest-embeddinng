@@ -1,0 +1,64 @@
+===== t16 review seed 42 → logs/t16_review_seed42.log =====
+=== tempest-embedding training ===
+dataset: tgbl-review
+device:  cuda
+seed:    42
+loaded in 1.7s
+  num_nodes:     352,637
+  directed:      False  (dataset default)
+  bipartite:     False
+  dst_pool:      252,261 unique destinations
+  T_train:       535593600
+  train edges:   3,413,837
+  val edges:     730,784
+  test edges:    728,919
+  has_node_feat: False
+
+=== Config ===
+  num_nodes: 352637
+  is_directed: False
+  is_bipartite: False
+  dst_pool: <ndarray shape=(252261,) dtype=int32>
+  t_train_span: 535593600.0
+  d_node_feat: None
+  d_emb: 128
+  d_proj: 128
+  tau: 0.5
+  beta_time: 1.0
+  num_walks_per_node: 5
+  max_walk_len: 20
+  walk_bias: ExponentialWeight
+  start_bias: Uniform
+  num_neg_per_pos: 10
+  hist_neg_ratio: 0.5
+  reservoir_size: 32
+  lr: 0.001
+  weight_decay: 0.0001
+  num_epochs: 5
+  early_stop_patience: 0
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: False
+  monitor_sample_pct: 1.0
+  skip_final_full_eval: True
+
+=== Parameter counts ===
+  embedding_table:   45,137,536
+  p_target:              66,048
+  p_context:             66,048
+  link_head:            574,466
+  TOTAL trainable:   45,844,098
+
+=== Training ===
+Traceback (most recent call last):
+  File "/home/ms2420/CLionProjects/tempest-walk-embedding-new/scripts/train.py", line 321, in <module>
+    main()
+  File "/home/ms2420/CLionProjects/tempest-walk-embedding-new/scripts/train.py", line 301, in main
+    result = trainer.train(
+  File "/home/ms2420/CLionProjects/tempest-walk-embedding-new/tempest_walks/trainer.py", line 444, in train
+    metrics = self._train_step(batch)
+  File "/home/ms2420/CLionProjects/tempest-walk-embedding-new/tempest_walks/trainer.py", line 226, in _train_step
+    l_align = alignment_loss(
+  File "/home/ms2420/CLionProjects/tempest-walk-embedding-new/tempest_walks/losses.py", line 113, in alignment_loss
+    weighted_log_p = w_pos * log_p                                # [NK, NK*L]
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1.01 GiB. GPU 0 has a total capacity of 7.63 GiB of which 806.31 MiB is free. Process 4568 has 129.51 MiB memory in use. Including non-PyTorch memory, this process has 6.69 GiB memory in use. Of the allocated memory 6.53 GiB is allocated by PyTorch, and 42.78 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
