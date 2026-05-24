@@ -106,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     # Optimisation.
     p.add_argument("--lr", default=1e-3, type=float)
     p.add_argument("--weight-decay", default=1e-4, type=float)
-    p.add_argument("--batch-size", default=200, type=int)
+    p.add_argument("--batch-size", default=2000, type=int)
     p.add_argument("--num-epochs", default=50, type=int)
     p.add_argument("--early-stop-patience", default=0, type=int)
 
