@@ -96,3 +96,107 @@ Trajectory notes:
     shared EdgeHead instead of identical EF inputs).
   - The spec flagged this as the structural risk for sym_shared.
     Empirically confirmed.
+
+## V4-sym-two — Two separate edge heads, one per side
+
+Flag: `--ef-variant sym_two`. p_target: 66,048 params. p_context:
+66,048 params. EdgeHead on target side AND EdgeHead on context
+side (separate modules, separate parameters): ~110,080 EdgeHead
+params total. α_t and α_c learnable scalars (both zero-init).
+
+Per-seed val MRR / test MRR (best across 30 epochs):
+  seed 42  (best ep 6): val 0.1500 / test 0.1462
+  seed 123 (best ep 5): val 0.1431 / test 0.1306
+  seed 7   (best ep 3): val 0.1419 / test 0.1342
+
+Mean ± std:
+  val  0.1450 ± 0.004
+  test 0.1370 ± 0.007
+
+Δ vs C1 (val 0.3966 ± 0.014):
+  Δval  = -0.252 (-63% relative — CATASTROPHIC, same as sym_shared)
+  Δtest = -0.242 (-64%)
+
+Δ vs V4-sym-shared (val 0.1440 ± 0.017):
+  Δval  = +0.0010 (essentially tied)
+  Δtest = +0.0017
+
+Loss components at ep 30 (mean across seeds):
+  align ≈ 0.01   unif ≈ -7.76   bce ≈ 0.29
+
+Trajectory notes:
+  - **Same catastrophic trajectory as sym_shared.** All three seeds
+    peak at ep 3-6 and degrade thereafter.
+  - **Key finding**: separate edge heads do NOT protect against
+    degeneracy. Even with disjoint parameter sets for the two
+    EdgeHeads, both heads independently converge to similar
+    EF→direction mappings under the alignment pressure. The two-
+    sided EF addition+renorm still admits the trivial "make both
+    sides EF-dominated" solution.
+  - This says the symmetry of the EF integration is the structural
+    problem, not parameter sharing per se. Anywhere both sides
+    receive an EF contribution, the alignment loss finds a
+    trivial optimum.
+
+---
+
+# Task 12 + Task 13 combined comparison
+
+All runs on tgbl-wiki, 3 seeds × 30 epochs, post-fix code base
+(Option γ EF bypass + two-head SUM uniformity).
+
+| Config                           | val mean ± std     | test mean ± std    | Δval vs C1    |
+|----------------------------------|--------------------|--------------------|---------------|
+| **C1 (no EF anywhere)**          | **0.3966 ± 0.014** | **0.3794 ± 0.015** | (anchor)      |
+| V4-asym (edge head, target only) | 0.3546 ± 0.023     | 0.3260 ± 0.029     | -0.042 (-11%) |
+| C3 (EF in p_target only)         | 0.2541 ± 0.011     | 0.2225 ± 0.014     | -0.143 (-36%) |
+| C2 (EF in p_context only)        | 0.2253 ± 0.010     | 0.1943 ± 0.003     | -0.171 (-43%) |
+| V4-sym-two (two edge heads)      | 0.1450 ± 0.004     | 0.1370 ± 0.007     | -0.252 (-63%) |
+| V4-sym-shared (one shared)       | 0.1440 ± 0.017     | 0.1353 ± 0.016     | -0.253 (-64%) |
+| C4 (EF in both projections)      | 0.0584 ± 0.023     | 0.0683 ± 0.039     | -0.338 (-85%) |
+
+## Verdict
+
+**C1 (no EF) is the winner across all 7 configs by a wide margin.**
+
+The pattern is clear and consistent:
+  - **No EF anywhere** → best by ~0.04 over the runner-up.
+  - **EF on one side only** (C2, C3, V4-asym) → modest hurt (-11
+    to -43%), trains stably to a worse plateau.
+  - **EF symmetric on both sides** (C4, V4-sym-two, V4-sym-shared)
+    → catastrophic collapse (-63 to -85%), peaks early then
+    degrades. The asymmetry isn't the help we hypothesised in
+    Task 12; the symmetry is the structural problem.
+
+The α-zero-init trick of V4 doesn't save it: α grows during
+training, the EF contribution becomes non-zero, and the same
+trivial-alignment degeneracy that broke C4 also breaks V4-sym-*.
+Separate edge heads (sym_two) vs shared edge head (sym_shared)
+give essentially identical bad outcomes — parameter sharing isn't
+the cause.
+
+## Recommended action
+
+**Adopt C1 (no EF in projection heads, no edge head) as the master
+default.** Specifically:
+  - Drop EF from `p_context` in the master `Trainer.__init__`.
+  - Keep the two-head SUM uniformity (essential — pre-fix
+    single-head uniformity gave C1 only val 0.248, less than half
+    of post-fix's 0.397).
+  - Keep `bypass_ef` infrastructure (harmless and useful if EF
+    is reintroduced via a non-projection-head route in future).
+
+Open question (NOT in Task 13 scope): is EF inherently unhelpful
+on wiki, or does it need a fundamentally different architecture
+to be useful? Three things tried so far (per-channel sub-MLP in
+projection head, low-dim bottleneck V3 from Task 10, addition+
+renormalise via EdgeHead) all underperform no-EF. Possible next
+directions for a future task:
+  - FiLM-style modulation (EF → γ, β; out = γ·E + β).
+  - EF as edge-time prior to the walk sampler (not at projection).
+  - Concatenate EF to (u, v) features in the LinkHead instead of
+    in the projection — keeps E table training clean while letting
+    EF inform scoring.
+
+No further EF experiments without explicit user direction.
+

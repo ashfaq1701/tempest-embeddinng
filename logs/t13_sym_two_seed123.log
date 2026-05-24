@@ -1,0 +1,94 @@
+=== tempest-embedding training ===
+dataset: tgbl-wiki
+device:  cuda
+seed:    123
+loaded in 1.4s
+  num_nodes:     9,227
+  directed:      False  (dataset default)
+  bipartite:     True
+  dst_pool:      952 unique destinations
+  T_train:       1862652
+  train edges:   110,232
+  val edges:     23,621
+  test edges:    23,621
+  has_node_feat: False
+  has_edge_feat: True (d=172)
+
+=== Config ===
+  num_nodes: 9227
+  is_directed: False
+  is_bipartite: True
+  dst_pool: <ndarray shape=(952,) dtype=int32>
+  t_train_span: 1862652.0
+  d_node_feat: None
+  d_edge_feat: 172
+  ef_variant: sym_two
+  d_emb: 128
+  d_proj: 128
+  eta_uniform: 1.0
+  uniform_temperature: 2.0
+  uniform_pairs: 5000
+  beta_time: 1.0
+  num_walks_per_node: 5
+  max_walk_len: 20
+  walk_bias: ExponentialWeight
+  start_bias: Uniform
+  num_neg_per_pos: 10
+  hist_neg_ratio: 0.5
+  reservoir_size: 32
+  lr: 0.001
+  weight_decay: 0.0001
+  num_epochs: 30
+  early_stop_patience: 0
+  seed: 123
+  use_gpu: True
+  use_gpu_tempest: False
+  monitor_sample_pct: 1.0
+  skip_final_full_eval: True
+
+=== Parameter counts ===
+  embedding_table:    1,181,056
+  p_target:              66,048
+  p_context:             66,048
+  link_head:            574,466
+  TOTAL trainable:    1,887,618
+
+=== Training ===
+epoch 1/30  align=0.4678  unif=-3.9546  bce=0.2929  train 21.3s  val 0.0980  test 0.1130 (new best)  eval 26.7s
+epoch 2/30  align=0.3361  unif=-6.6583  bce=0.2446  train 18.4s  val 0.0691  patience 1/0  eval 26.7s
+epoch 3/30  align=0.2437  unif=-7.3349  bce=0.2386  train 18.4s  val 0.1121  test 0.0862 (new best)  eval 26.6s
+epoch 4/30  align=0.1840  unif=-7.5158  bce=0.2371  train 19.1s  val 0.0803  patience 1/0  eval 26.8s
+epoch 5/30  align=0.1461  unif=-7.5845  bce=0.2404  train 18.9s  val 0.1431  test 0.1306 (new best)  eval 26.8s
+epoch 6/30  align=0.1196  unif=-7.6279  bce=0.2435  train 18.3s  val 0.1063  patience 1/0  eval 26.6s
+epoch 7/30  align=0.1005  unif=-7.6574  bce=0.2461  train 18.3s  val 0.0955  patience 2/0  eval 26.6s
+epoch 8/30  align=0.0855  unif=-7.6771  bce=0.2485  train 18.2s  val 0.1294  patience 3/0  eval 26.7s
+epoch 9/30  align=0.0742  unif=-7.6933  bce=0.2500  train 18.2s  val 0.0686  patience 4/0  eval 26.7s
+epoch 10/30  align=0.0650  unif=-7.7034  bce=0.2529  train 18.2s  val 0.1210  patience 5/0  eval 26.9s
+epoch 11/30  align=0.0570  unif=-7.7105  bce=0.2568  train 18.2s  val 0.1254  patience 6/0  eval 26.7s
+epoch 12/30  align=0.0509  unif=-7.7171  bce=0.2588  train 18.2s  val 0.1272  patience 7/0  eval 26.7s
+epoch 13/30  align=0.0453  unif=-7.7244  bce=0.2614  train 18.2s  val 0.0700  patience 8/0  eval 26.7s
+epoch 14/30  align=0.0406  unif=-7.7263  bce=0.2643  train 18.3s  val 0.0617  patience 9/0  eval 26.8s
+epoch 15/30  align=0.0364  unif=-7.7279  bce=0.2687  train 18.1s  val 0.0596  patience 10/0  eval 26.7s
+epoch 16/30  align=0.0328  unif=-7.7349  bce=0.2729  train 18.1s  val 0.0358  patience 11/0  eval 26.8s
+epoch 17/30  align=0.0296  unif=-7.7324  bce=0.2749  train 18.2s  val 0.0476  patience 12/0  eval 26.8s
+epoch 18/30  align=0.0266  unif=-7.7328  bce=0.2771  train 18.1s  val 0.0420  patience 13/0  eval 26.6s
+epoch 19/30  align=0.0242  unif=-7.7395  bce=0.2800  train 18.1s  val 0.0460  patience 14/0  eval 26.5s
+epoch 20/30  align=0.0221  unif=-7.7470  bce=0.2828  train 18.1s  val 0.0592  patience 15/0  eval 26.5s
+epoch 21/30  align=0.0203  unif=-7.7417  bce=0.2861  train 18.1s  val 0.0420  patience 16/0  eval 26.6s
+epoch 22/30  align=0.0186  unif=-7.7501  bce=0.2865  train 18.2s  val 0.0721  patience 17/0  eval 26.7s
+epoch 23/30  align=0.0171  unif=-7.7504  bce=0.2883  train 18.1s  val 0.0392  patience 18/0  eval 26.6s
+epoch 24/30  align=0.0157  unif=-7.7570  bce=0.2890  train 18.1s  val 0.0722  patience 19/0  eval 26.6s
+epoch 25/30  align=0.0145  unif=-7.7492  bce=0.2900  train 18.1s  val 0.0562  patience 20/0  eval 26.6s
+epoch 26/30  align=0.0135  unif=-7.7515  bce=0.2897  train 18.2s  val 0.0984  patience 21/0  eval 26.6s
+epoch 27/30  align=0.0126  unif=-7.7589  bce=0.2892  train 18.1s  val 0.0816  patience 22/0  eval 26.7s
+epoch 28/30  align=0.0119  unif=-7.7521  bce=0.2892  train 18.1s  val 0.0534  patience 23/0  eval 26.5s
+epoch 29/30  align=0.0113  unif=-7.7573  bce=0.2898  train 18.0s  val 0.0895  patience 24/0  eval 26.6s
+epoch 30/30  align=0.0107  unif=-7.7591  bce=0.2908  train 18.1s  val 0.1158  patience 25/0  eval 26.6s
+  restored best weights from epoch 5 (val 0.1431, test 0.1306)
+
+=== Final results ===
+  dataset:           tgbl-wiki
+  seed:              123
+  stopped_at_epoch:  5
+  best_val_mrr:      0.1431
+  best_test_mrr:     0.1306
