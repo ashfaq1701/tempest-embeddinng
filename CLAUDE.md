@@ -70,5 +70,16 @@ Stage A decision: **PASS** (val 0.49 ≫ 0.32 threshold). InfoNCE
 wins wiki by +24% on val and +23% on test with 3.5× tighter std.
 Proceeding to Stage B.
 
-## Stage B — Comment 3 seeds × 5 ep, tau=0.5 — in progress
+## Stage B — Review 3 seeds × 5 ep, tau=0.5
+
+Dataset swapped from comment to review for Stage B. Review (~5M
+edges, ~25K batches/epoch) is the dataset where C1 + two-head SUM
+uniformity demonstrably collapsed (Task 15 Stage 7 review anchor
+locked at val 0.0196 across all 5 epochs with align=unif=0).
+
+Expectation: InfoNCE should NOT collapse on review like the old
+alignment+uniformity formulation did. The softmax denominator
+provides anti-collapse via task-relevant in-batch negatives at
+every batch — it doesn't depend on the seed-vs-context bias
+asymmetry that the old uniformity term needed to stabilise.
 
