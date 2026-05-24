@@ -15,13 +15,12 @@ alignment_loss(E, P_target, P_context, walks, t_now, T_train, β, ...) -> scalar
     convention β: walks.edge_feats[p] is the edge OUT of context p.
     p_target never sees edge features.
 
-uniformity_loss(E, P_target, sample_idx_a, sample_idx_b, t, ...) -> scalar
-  - Wang-Isola form on L2-normalised P_target outputs:
-      L = log E_{x,y ~ q⊗q} [ exp(-t ||P(E(x)) - P(E(y))||²) ]
+uniformity_loss(E, head, sample_idx_a, sample_idx_b, t, ..., bypass_ef) -> scalar
+  - Wang-Isola form on L2-normalised head outputs.
   - Caller supplies the M independent index pairs.
   - Numerically stabilised: L = logsumexp(-t * sq_dist) - log(M).
-  - Operates on P_target only; if context-projection uniformity is
-    needed later, call the function a second time with P_context.
+  - Called once per head (target, context); trainer SUMS them.
+  - bypass_ef=head.has_ef skips the EF branch on EF-bearing heads.
 
 Link BCE is one line at the call site
 (F.binary_cross_entropy_with_logits(...)), not factored out.
@@ -45,6 +44,7 @@ def alignment_loss(
     beta: float = 1.0,
     node_feat: Optional[torch.Tensor] = None,     # [num_nodes, d_nf] or None
     edge_feat: Optional[torch.Tensor] = None,     # [NK, L-1, d_ef] or None
+    ef_weight_mod=None,                           # Task 14a: EFWeightModulator or None
 ) -> torch.Tensor:
     """Multi-positive alignment with hop / time-weighted contexts.
 
@@ -109,6 +109,17 @@ def alignment_loss(
     w_time = (1.0 + dt_norm).pow(-beta)                           # [NK, L]
     w = w_hop + w_time                                            # [NK, L]
 
+    # Task 14a: optional EF modulation of the alignment weight.
+    # mod ∈ (-1, +1) via tanh; (1 + mod) gives a ±100% scale on
+    # the base weight per (seed, context) position. EF is read from
+    # ef_padded — same per-position EF that p_context would see in
+    # the original Task 12 master architecture. Position L-1 has
+    # zero EF padding → tanh(linear(0)) ≈ 0 (modulo bias), but
+    # that position is masked out of the loss anyway.
+    if ef_weight_mod is not None and ef_padded is not None:
+        mod = ef_weight_mod(ef_padded)                            # [NK, L]
+        w = w * (1.0 + mod)
+
     # Seeds: walks.seeds is the unique seed array; row i belongs to
     # seeds[i // K] under the K-contiguous grouping contract from walks.py.
     seed_per_row = seeds_t.repeat_interleave(K)                   # [NK]
@@ -117,25 +128,21 @@ def alignment_loss(
     nodes_safe = nodes.clamp_min(0)                               # [NK, L]
     e_ctx = embedding_table(nodes_safe)                           # [NK, L, d_emb]
 
-    # Four-way switch on whether node-feat / edge-feat are present.
-    # p_target NEVER takes edge_feat (seeds have no edge channel under
-    # convention β); p_context optionally takes it.
-    if node_feat is not None and ef_padded is not None:
+    # Build per-head kwargs. p_target never takes edge_feat (seeds
+    # have no edge channel under convention β). p_context takes
+    # edge_feat ONLY if its has_ef is True (Task 14 decouples
+    # ef_in_p_context from d_edge_feat being present).
+    target_kwargs = {}
+    context_kwargs = {}
+    if node_feat is not None:
         nf_seed = node_feat[seed_per_row]                         # [NK, d_nf]
         nf_ctx = node_feat[nodes_safe]                            # [NK, L, d_nf]
-        p_seed = p_target(e_seed, node_feat=nf_seed)              # [NK, d_proj]
-        p_ctx = p_context(e_ctx, node_feat=nf_ctx, edge_feat=ef_padded)
-    elif node_feat is not None:
-        nf_seed = node_feat[seed_per_row]
-        nf_ctx = node_feat[nodes_safe]
-        p_seed = p_target(e_seed, node_feat=nf_seed)
-        p_ctx = p_context(e_ctx, node_feat=nf_ctx)
-    elif ef_padded is not None:
-        p_seed = p_target(e_seed)
-        p_ctx = p_context(e_ctx, edge_feat=ef_padded)
-    else:
-        p_seed = p_target(e_seed)                                 # [NK, d_proj]
-        p_ctx = p_context(e_ctx)                                  # [NK, L, d_proj]
+        target_kwargs['node_feat'] = nf_seed
+        context_kwargs['node_feat'] = nf_ctx
+    if ef_padded is not None and p_context.has_ef:
+        context_kwargs['edge_feat'] = ef_padded
+    p_seed = p_target(e_seed, **target_kwargs)                    # [NK, d_proj]
+    p_ctx = p_context(e_ctx, **context_kwargs)                    # [NK, L, d_proj]
 
     sq_dist = (p_seed.unsqueeze(1) - p_ctx).pow(2).sum(dim=-1)    # [NK, L]
 
@@ -149,17 +156,22 @@ def alignment_loss(
 
 def uniformity_loss(
     embedding_table,                              # EmbeddingTable
-    p_target,                                     # ProjectionHead — same as alignment's seed-side
+    head,                                         # ProjectionHead (target or context)
     sample_idx_a: torch.Tensor,                   # [M] long
     sample_idx_b: torch.Tensor,                   # [M] long
     t: float = 2.0,
     node_feat: Optional[torch.Tensor] = None,
+    bypass_ef: bool = False,
 ) -> torch.Tensor:
-    """Wang-Isola uniformity on L2-normalised P_target outputs.
+    """Wang-Isola uniformity on L2-normalised projection outputs.
 
     Estimator over M caller-supplied independent pairs:
         L = log (1/M) Σ_i exp(-t || P(E(a_i)) - P(E(b_i)) ||²)
           = logsumexp(-t * sq_dist) - log(M).
+
+    Called once per head. The caller SUMS the two losses (target +
+    context). Pass bypass_ef=head.has_ef so heads with EF channels
+    skip the EF branch during uniformity (Task 12 Option γ).
     """
     device = embedding_table.E.weight.device
     a = sample_idx_a.to(device).long()
@@ -172,11 +184,11 @@ def uniformity_loss(
     e_b = embedding_table(b)                                      # [M, d_emb]
 
     if node_feat is not None:
-        p_a = p_target(e_a, node_feat=node_feat[a])
-        p_b = p_target(e_b, node_feat=node_feat[b])
+        p_a = head(e_a, node_feat=node_feat[a], bypass_ef=bypass_ef)
+        p_b = head(e_b, node_feat=node_feat[b], bypass_ef=bypass_ef)
     else:
-        p_a = p_target(e_a)
-        p_b = p_target(e_b)
+        p_a = head(e_a, bypass_ef=bypass_ef)
+        p_b = head(e_b, bypass_ef=bypass_ef)
 
     sq_dist = (p_a - p_b).pow(2).sum(dim=-1)                      # [M]
     return torch.logsumexp(-t * sq_dist, dim=0) - math.log(M)

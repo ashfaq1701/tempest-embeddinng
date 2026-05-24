@@ -121,14 +121,25 @@ class ProjectionHead(nn.Module):
         e: torch.Tensor,
         node_feat: Optional[torch.Tensor] = None,
         edge_feat: Optional[torch.Tensor] = None,
+        bypass_ef: bool = False,
     ) -> torch.Tensor:
-        """Returns L2-normalised projection, shape e.shape[:-1] + [d_proj]."""
+        """Returns L2-normalised projection, shape e.shape[:-1] + [d_proj].
+
+        bypass_ef=True with has_ef=True: skip the EF branch, inject
+          zeros of shape [..., d_proj] at the EF slot of the merge
+          concat. The merge MLP's EF-slot weights multiply zero,
+          contributing nothing. Option γ from Task 12.
+        bypass_ef=True with has_ef=False: no-op.
+        """
         if self.has_nf and node_feat is None:
             raise ValueError("ProjectionHead has NF channel but no NF passed")
         if not self.has_nf and node_feat is not None:
             raise ValueError("ProjectionHead has no NF channel but NF was passed")
-        if self.has_ef and edge_feat is None:
-            raise ValueError("ProjectionHead has EF channel but no EF passed")
+        if self.has_ef and edge_feat is None and not bypass_ef:
+            raise ValueError(
+                "ProjectionHead has EF channel but no EF passed "
+                "(and bypass_ef=False)"
+            )
         if not self.has_ef and edge_feat is not None:
             raise ValueError("ProjectionHead has no EF channel but EF was passed")
 
@@ -136,11 +147,62 @@ class ProjectionHead(nn.Module):
         if self.has_nf:
             branches.append(self.nf_mlp(node_feat))
         if self.has_ef:
-            branches.append(self.ef_mlp(edge_feat))
+            if bypass_ef:
+                ef_branch = torch.zeros_like(branches[0])
+            else:
+                ef_branch = self.ef_mlp(edge_feat)
+            branches.append(ef_branch)
 
         z = torch.cat(branches, dim=-1)
         out = self.merge(z)
         return F.normalize(out, p=2, dim=-1, eps=1e-12)
+
+
+class EFWeightModulator(nn.Module):
+    """Task 14a: maps raw EF to a scalar modulator in [-1, +1] via tanh.
+
+    Output is multiplied into the alignment weight w(K, Δt) as
+    (1 + tanh(W_ef · EF)), so EF can boost or suppress the
+    contribution of each (seed, context) pair by ±100%. EF never
+    enters the projection or LinkHead — pure training-time signal.
+    """
+
+    def __init__(self, d_edge_feat: int):
+        super().__init__()
+        self.linear = nn.Linear(d_edge_feat, 1)
+
+    def forward(self, edge_feat: torch.Tensor) -> torch.Tensor:
+        """edge_feat shape [..., d_edge_feat] → [...] scalar in (-1, +1)."""
+        return torch.tanh(self.linear(edge_feat)).squeeze(-1)
+
+
+class EFPredictor(nn.Module):
+    """Task 14b: auxiliary EF prediction from endpoint embeddings.
+
+    Trained via MSE on positive edges only (negatives have no EF).
+    Provides gradient to E so that endpoint pairs of real edges
+    can reconstruct their EF — encourages E to encode EF-relevant
+    structure. NOT used at eval; pure auxiliary regulariser.
+    """
+
+    def __init__(
+        self,
+        d_emb: int,
+        d_edge_feat: int,
+        d_hidden: Optional[int] = None,
+    ):
+        super().__init__()
+        if d_hidden is None:
+            d_hidden = d_edge_feat
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * d_emb, d_hidden),
+            nn.GELU(),
+            nn.Linear(d_hidden, d_edge_feat),
+        )
+
+    def forward(self, e_u: torch.Tensor, e_v: torch.Tensor) -> torch.Tensor:
+        """e_u, e_v shape [B, d_emb] → [B, d_edge_feat] EF prediction."""
+        return self.mlp(torch.cat([e_u, e_v], dim=-1))
 
 
 class LinkHead(nn.Module):

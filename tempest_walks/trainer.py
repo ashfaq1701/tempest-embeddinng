@@ -52,7 +52,13 @@ import torch.nn.functional as F
 from .data import Batch
 from .evaluator import Evaluator
 from .losses import alignment_loss, uniformity_loss
-from .model import EmbeddingTable, LinkHead, ProjectionHead
+from .model import (
+    EFPredictor,
+    EFWeightModulator,
+    EmbeddingTable,
+    LinkHead,
+    ProjectionHead,
+)
 from .negatives import (
     HistoricalNegativeSampler,
     NegativeSampler,
@@ -71,6 +77,16 @@ class TrainerConfig:
     t_train_span: float
     d_node_feat: Optional[int] = None
     d_edge_feat: Optional[int] = None    # NEW (Task 6.7)
+    # Task 14: decouple "EF in projection head" from "EF in aux modules".
+    # Default True preserves master (Task 6.7). Set False for Task 14
+    # runs to get the C1-base (no EF in p_context) plus an aux module.
+    ef_in_p_context: bool = True
+    # Task 14a: EF modulates alignment weight via tanh modulator.
+    # EF never enters projection or LinkHead — training-time signal only.
+    ef_modulate_weight: bool = False
+    # Task 14b: weight on auxiliary EF prediction loss (predict EF from
+    # endpoint E embeddings). 0 = disabled. EF never enters inference path.
+    ef_aux_lambda: float = 0.0
 
     # Model.
     d_emb: int = 128
@@ -143,13 +159,34 @@ class Trainer:
             d_proj=config.d_proj,
             d_node_feat=config.d_node_feat,
         ).to(self.device)
+        # Task 14: ef_in_p_context flag decouples "EF channel in
+        # p_context" from d_edge_feat (which the aux modules still need).
+        d_ef_for_p_context = (
+            config.d_edge_feat if config.ef_in_p_context else None
+        )
         self.p_context = ProjectionHead(
             d_emb=config.d_emb,
             d_proj=config.d_proj,
             d_node_feat=config.d_node_feat,
-            d_edge_feat=config.d_edge_feat,   # Task 6.7: convention β
+            d_edge_feat=d_ef_for_p_context,   # Task 6.7 / Task 14
         ).to(self.device)
         self.link_head = LinkHead(d_emb=config.d_emb).to(self.device)
+
+        # Task 14a/14b: optional EF auxiliary modules. Both are gated
+        # on having edge features in the dataset.
+        if config.ef_modulate_weight and config.d_edge_feat is not None:
+            self.ef_weight_mod = EFWeightModulator(
+                d_edge_feat=config.d_edge_feat,
+            ).to(self.device)
+        else:
+            self.ef_weight_mod = None
+        if config.ef_aux_lambda > 0 and config.d_edge_feat is not None:
+            self.ef_predictor = EFPredictor(
+                d_emb=config.d_emb,
+                d_edge_feat=config.d_edge_feat,
+            ).to(self.device)
+        else:
+            self.ef_predictor = None
 
         # Walk sampler.
         self.walk_gen = WalkGenerator(
@@ -192,6 +229,10 @@ class Trainer:
             + list(self.p_context.parameters())
             + list(self.link_head.parameters())
         )
+        if self.ef_weight_mod is not None:
+            params.extend(list(self.ef_weight_mod.parameters()))
+        if self.ef_predictor is not None:
+            params.extend(list(self.ef_predictor.parameters()))
         self.optimizer = torch.optim.Adam(
             params,
             lr=config.lr,
@@ -279,15 +320,33 @@ class Trainer:
             beta=self.config.beta_time,
             node_feat=self.node_feat,
             edge_feat=walk_ef,
+            ef_weight_mod=self.ef_weight_mod,    # Task 14a
         )
-        l_unif = uniformity_loss(
+        # Apply uniformity to BOTH heads (Task 12 fix). Each head's
+        # EF channel (if present) is bypassed via Option γ. The two
+        # head losses are SUMMED (not averaged): heads have disjoint
+        # parameter sets, so averaging would halve each head's
+        # anti-collapse gradient — empirically verified to cause
+        # collapse on C1 smoke in Task 12.
+        l_unif_target = uniformity_loss(
             embedding_table=self.embedding_table,
-            p_target=self.p_target,
+            head=self.p_target,
             sample_idx_a=unif_a,
             sample_idx_b=unif_b,
             t=self.config.uniform_temperature,
             node_feat=self.node_feat,
+            bypass_ef=self.p_target.has_ef,
         )
+        l_unif_context = uniformity_loss(
+            embedding_table=self.embedding_table,
+            head=self.p_context,
+            sample_idx_a=unif_a,
+            sample_idx_b=unif_b,
+            t=self.config.uniform_temperature,
+            node_feat=self.node_feat,
+            bypass_ef=self.p_context.has_ef,
+        )
+        l_unif = l_unif_target + l_unif_context
         l_table = l_align + self.config.eta_uniform * l_unif
 
         # Step 4: link-pred negatives from PRE-OBSERVE reservoir.
@@ -309,8 +368,27 @@ class Trainer:
         ])
         l_bce = F.binary_cross_entropy_with_logits(logits, labels)
 
+        # Task 14b: optional auxiliary EF prediction loss. Predicts
+        # EF from (E[u], E[v]) of POSITIVE edges only (negatives have
+        # no EF in TGB). E is NOT detached here — the aux loss gives
+        # gradient to E so the table encodes EF-relevant structure.
+        # ef_predictor is NOT used at eval (info-symmetric scoring).
+        if (
+            self.ef_predictor is not None
+            and batch.edge_feat is not None
+        ):
+            pos_u = torch.from_numpy(batch.src.astype(np.int64)).to(device)
+            pos_v = torch.from_numpy(batch.tgt.astype(np.int64)).to(device)
+            pos_ef = torch.from_numpy(batch.edge_feat).float().to(device)
+            e_u_aux = self.embedding_table(pos_u)
+            e_v_aux = self.embedding_table(pos_v)
+            ef_pred = self.ef_predictor(e_u_aux, e_v_aux)
+            l_aux = F.mse_loss(ef_pred, pos_ef)
+        else:
+            l_aux = torch.tensor(0.0, device=device)
+
         # Step 6 + 7: total loss + single backward + step.
-        l_total = l_table + l_bce
+        l_total = l_table + l_bce + self.config.ef_aux_lambda * l_aux
         self.optimizer.zero_grad(set_to_none=True)
         l_total.backward()
         self.optimizer.step()
@@ -326,6 +404,7 @@ class Trainer:
             "align": float(l_align.detach()),
             "uniform": float(l_unif.detach()),
             "bce": float(l_bce.detach()),
+            "aux": float(l_aux.detach()),
             "total": float(l_total.detach()),
         }
 
@@ -494,7 +573,7 @@ class Trainer:
             self.link_head.train()
 
             t0 = time.time()
-            sums = {"align": 0.0, "uniform": 0.0, "bce": 0.0, "total": 0.0}
+            sums = {"align": 0.0, "uniform": 0.0, "bce": 0.0, "aux": 0.0, "total": 0.0}
             n_batches = 0
             for batch in train_batches_factory():
                 metrics = self._train_step(batch)
@@ -508,6 +587,7 @@ class Trainer:
                 f"align={sums['align']/max(n_batches,1):.4f}  "
                 f"unif={sums['uniform']/max(n_batches,1):.4f}  "
                 f"bce={sums['bce']/max(n_batches,1):.4f}  "
+                f"aux={sums['aux']/max(n_batches,1):.4f}  "
                 f"train {train_dt:.1f}s"
             )
 

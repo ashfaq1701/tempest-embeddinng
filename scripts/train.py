@@ -123,6 +123,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-final-full-eval", action="store_true")
     p.add_argument("--monitor-sample-pct", default=1.0, type=float)
 
+    p.add_argument(
+        "--force-no-ef", action="store_true",
+        help="Override d_edge_feat to None regardless of dataset.",
+    )
+    p.add_argument(
+        "--no-ef-in-projection",
+        dest="ef_in_p_context",
+        action="store_false",
+        default=True,
+        help="Task 14: drop EF from p_context (matches C1 base). Use "
+             "with --ef-modulate-weight or --ef-aux-lambda to feed EF "
+             "via the aux module instead.",
+    )
+    p.add_argument(
+        "--ef-modulate-weight", action="store_true",
+        help="Task 14a: EF modulates alignment weight w(K, Δt) via "
+             "tanh modulator. EF never enters projection or LinkHead.",
+    )
+    p.add_argument(
+        "--ef-aux-lambda", type=float, default=0.0,
+        help="Task 14b: weight on auxiliary EF prediction loss "
+             "(predict EF from endpoint E embeddings, MSE). 0 = "
+             "disabled. Try 0.1.",
+    )
+
     return p.parse_args()
 
 
@@ -208,6 +233,9 @@ def main() -> Dict[str, Any]:
         if loaded.train.edge_feat is not None
         else None
     )
+    if args.force_no_ef:
+        d_edge_feat = None
+        print("  --force-no-ef: overriding d_edge_feat to None")
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  directed:      {is_directed}  ({directed_provenance})")
@@ -257,6 +285,9 @@ def main() -> Dict[str, Any]:
         t_train_span=T_train,
         d_node_feat=d_node_feat,
         d_edge_feat=d_edge_feat,
+        ef_in_p_context=args.ef_in_p_context,
+        ef_modulate_weight=args.ef_modulate_weight,
+        ef_aux_lambda=args.ef_aux_lambda,
 
         d_emb=args.d_emb,
         d_proj=args.d_proj,
