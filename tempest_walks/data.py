@@ -62,10 +62,17 @@ def default_is_directed(name: str) -> bool:
 
 
 def load_tgb(name: str, root: str = "datasets") -> Loaded:
-    """Load a TGB link-property-prediction dataset using only TGB's APIs."""
+    """Load a TGB link-property-prediction dataset using only TGB's APIs.
+
+    `-vN` suffixes (e.g. tgbl-review-v2) are stripped before the call —
+    TGB's registry uses bare names ("tgbl-review") and serves the
+    current version internally; passing "tgbl-review-v2" raises
+    "Dataset not supported" because the suffixed key isn't registered.
+    """
     from tgb.linkproppred.dataset import LinkPropPredDataset
 
-    dataset = LinkPropPredDataset(name=name, root=root, preprocess=True)
+    tgb_name = _strip_version_suffix(name)
+    dataset = LinkPropPredDataset(name=tgb_name, root=root, preprocess=True)
     full = dataset.full_data
     sources = np.asarray(full["sources"], dtype=np.int64)
     destinations = np.asarray(full["destinations"], dtype=np.int64)
