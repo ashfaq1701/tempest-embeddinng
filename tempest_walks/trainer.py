@@ -40,6 +40,7 @@ Early stop:
 """
 
 import copy
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -47,6 +48,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
@@ -94,7 +96,15 @@ class TrainerConfig:
     reservoir_size: int = 32
 
     # Optimisation.
-    lr: float = 1e-3
+    lr: float = 1e-3            # peak LR (after warmup)
+    lr_min: float = 1e-5        # cosine decay floor
+    warmup_fraction: float = 0.05
+    warmup_steps_cap: int = 500
+    decay_horizon_epochs: int = 50  # cosine reaches lr_min at this
+                                    # epoch count. SEPARATE from
+                                    # num_epochs — short runs stay
+                                    # near peak; full decay is hit
+                                    # only at num_epochs = horizon.
     weight_decay: float = 1e-4
     num_epochs: int = 50
     early_stop_patience: int = 0
@@ -193,9 +203,74 @@ class Trainer:
             weight_decay=config.weight_decay,
         )
 
+        # LR scheduler is set up at the start of train() once we know
+        # batches_per_epoch (which depends on the train_batches_factory).
+        self.lr_scheduler: Optional[LambdaLR] = None
+        self._global_step = 0
+
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────
+
+    def _setup_lr_scheduler(self, batches_per_epoch: int) -> None:
+        """Set up cosine decay with linear warmup.
+
+        Shape:
+          step 0..W       linear warmup from 0 to peak LR
+          step W..T       cosine decay from peak to lr_min
+          step > T        stay at lr_min
+
+        W = min(warmup_fraction * decay_steps, warmup_steps_cap)
+        T = decay_horizon_epochs * batches_per_epoch
+
+        T is based on decay_horizon_epochs (a property of the
+        schedule), NOT num_epochs. This decouples short anchor runs
+        (5 ep — stays near peak) from full runs (50 ep — completes
+        decay).
+        """
+        peak_lr = float(self.config.lr)
+        lr_min = float(self.config.lr_min)
+
+        decay_steps = self.config.decay_horizon_epochs * max(batches_per_epoch, 1)
+        warmup_steps = min(
+            int(self.config.warmup_fraction * decay_steps),
+            self.config.warmup_steps_cap,
+        )
+        warmup_steps = max(warmup_steps, 1)
+
+        # Set optimizer base lr to peak so lambda returns [0, 1] scaling.
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = peak_lr
+            param_group["initial_lr"] = peak_lr
+
+        lr_min_ratio = lr_min / peak_lr if peak_lr > 0 else 0.0
+
+        def lr_lambda(step: int) -> float:
+            # step is 0-indexed (PyTorch LambdaLR convention).
+            if step < warmup_steps:
+                return float(step + 1) / float(warmup_steps)
+
+            decay_progress = step - warmup_steps
+            decay_total = decay_steps - warmup_steps
+            if decay_total <= 0:
+                return lr_min_ratio
+
+            progress = float(decay_progress) / float(decay_total)
+            if progress >= 1.0:
+                return lr_min_ratio
+
+            cos_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return lr_min_ratio + (1.0 - lr_min_ratio) * cos_factor
+
+        self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+        self._global_step = 0
+        print(
+            f"  LR schedule: peak={peak_lr:.2e}, min={lr_min:.2e}, "
+            f"warmup={warmup_steps} steps, "
+            f"decay_horizon={decay_steps} steps "
+            f"({self.config.decay_horizon_epochs} epochs × "
+            f"{batches_per_epoch} batches)"
+        )
 
     def _compute_auto_chunk_size(self, walks) -> int:
         """Auto-size InfoNCE seed-chunk based on available GPU memory.
@@ -344,6 +419,9 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         l_total.backward()
         self.optimizer.step()
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+            self._global_step += 1
 
         # Step 7: observe positives into reservoir (post-scoring).
         if isinstance(self.neg_sampler_train, HistoricalNegativeSampler):
@@ -356,6 +434,7 @@ class Trainer:
             "align": float(l_align.detach()),
             "bce": float(l_bce.detach()),
             "total": float(l_total.detach()),
+            "lr": float(self.optimizer.param_groups[0]["lr"]),
         }
 
     # ──────────────────────────────────────────────────────────────────
@@ -502,6 +581,12 @@ class Trainer:
         n_epochs = self.config.num_epochs
         patience = self.config.early_stop_patience
         sample_pct = self.config.monitor_sample_pct
+
+        # Set up the LR scheduler. We need batches_per_epoch which
+        # we compute by exhausting the factory once (cheap — counts
+        # only, doesn't materialise tensors per batch).
+        batches_per_epoch = sum(1 for _ in train_batches_factory())
+        self._setup_lr_scheduler(batches_per_epoch)
 
         best_val = -1.0
         best_test = -1.0
