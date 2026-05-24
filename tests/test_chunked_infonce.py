@@ -44,6 +44,11 @@ from tempest_walks.walks import WalkData
 # contributions vs the non-chunked logsumexp's internal reduction.
 TOL = 1e-5
 
+# Module-level device. Functions read this directly so pytest can
+# discover and run the tests without needing to inject a fixture.
+# Override by setting env CUDA_VISIBLE_DEVICES="" to force CPU.
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 # ─── Fixtures ───────────────────────────────────────────────────────
 
@@ -257,7 +262,8 @@ def naive_alignment_loss(E, p_t, p_c, walks, *, t_now, T_train, beta, tau,
 # ─── Test cases ─────────────────────────────────────────────────────
 
 
-def test_chunk_vs_full_K1(device):
+def test_chunk_vs_full_K1():
+    device = _DEVICE
     print(f"Test 1: chunk vs full, K=1, NK=200  [{device}]")
     N, K, L = 200, 1, 20
     d_emb, d_proj, num_nodes = 64, 64, 1000
@@ -279,10 +285,11 @@ def test_chunk_vs_full_K1(device):
                                   T_train=T_train, chunk_size=cs)
         if not _assert_match(f"chunk={cs}", ref, val):
             failed = True
-    return not failed
+    assert not failed, "at least one chunk variant differs from reference"
 
 
-def test_chunk_vs_full_Kgt1(device):
+def test_chunk_vs_full_Kgt1():
+    device = _DEVICE
     print(f"Test 2: chunk vs full, K=4 (multi-walk per seed)  [{device}]")
     N, K, L = 50, 4, 16
     d_emb, d_proj, num_nodes = 64, 64, 500
@@ -304,10 +311,11 @@ def test_chunk_vs_full_Kgt1(device):
                                   T_train=T_train, chunk_size=cs)
         if not _assert_match(f"chunk={cs}", ref, val):
             failed = True
-    return not failed
+    assert not failed, "at least one chunk variant differs from reference"
 
 
-def test_chunk_vs_full_node_feat(device):
+def test_chunk_vs_full_node_feat():
+    device = _DEVICE
     print(f"Test 3: chunk vs full, node_feat path  [{device}]")
     N, K, L = 60, 2, 14
     d_emb, d_proj, num_nodes, d_nf = 48, 48, 400, 8
@@ -333,13 +341,14 @@ def test_chunk_vs_full_node_feat(device):
                                   node_feat=node_feat)
         if not _assert_match(f"chunk={cs}", ref, val):
             failed = True
-    return not failed
+    assert not failed, "at least one chunk variant differs from reference"
 
 
-def test_chunked_matches_naive_reference(device):
+def test_chunked_matches_naive_reference():
     """Both chunked and non-chunked production paths match an
     independent triple-loop implementation. Catches bugs shared by
     both code paths."""
+    device = _DEVICE
     print(f"Test 4: chunked + full match naive triple-loop reference  [{device}]")
     N, K, L = 8, 3, 10                       # small enough for the loop
     d_emb, d_proj, num_nodes = 32, 32, 50
@@ -370,26 +379,28 @@ def test_chunked_matches_naive_reference(device):
                                   T_train=T_train, chunk_size=cs)
         if not _assert_match(f"production chunk={cs} vs naive", naive_ref, val):
             failed = True
-    return not failed
+    assert not failed, "production path diverges from naive reference"
 
 
 def main():
-    # Run on CUDA when available so we exercise the actual training
-    # device. CPU run is implicit if CUDA isn't present.
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
+    if _DEVICE.type == "cuda":
         print(f"Device: cuda ({torch.cuda.get_device_name(0)})")
     else:
         print("Device: cpu (no CUDA available)")
 
-    results = [
-        test_chunk_vs_full_K1(device),
-        test_chunk_vs_full_Kgt1(device),
-        test_chunk_vs_full_node_feat(device),
-        test_chunked_matches_naive_reference(device),
-    ]
-    if not all(results):
-        print("\nFAIL: at least one test failed.")
+    failed_any = False
+    for fn in (
+        test_chunk_vs_full_K1,
+        test_chunk_vs_full_Kgt1,
+        test_chunk_vs_full_node_feat,
+        test_chunked_matches_naive_reference,
+    ):
+        try:
+            fn()
+        except AssertionError as e:
+            print(f"FAIL: {fn.__name__} — {e}")
+            failed_any = True
+    if failed_any:
         sys.exit(1)
     print(f"\nPASS: all chunked InfoNCE tests match reference within {TOL:.0e}.")
 
