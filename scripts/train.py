@@ -105,13 +105,17 @@ def parse_args() -> argparse.Namespace:
 
     # Optimisation.
     p.add_argument(
-        "--lr", default=1e-3, type=float,
-        help="Peak learning rate (after warmup). Default 1e-3 is the "
-             "standard Adam value for graph/contrastive workloads.",
+        "--lr", default=1e-2, type=float,
+        help="Peak learning rate (after warmup). Default 1e-2 scales "
+             "linearly with --batch-size 2000 default (Goyal et al. 2017 "
+             "linear-scaling rule). Smaller batch sizes should override "
+             "with lr=1e-3 at bs=200 to maintain LR×steps budget.",
     )
     p.add_argument(
         "--lr-min", default=1e-5, type=float,
-        help="Minimum LR at end of cosine decay. Default lr/100.",
+        help="Minimum LR at end of cosine decay. Default 1e-5 follows "
+             "contrastive-SSL convention (SimCLR/MoCo/BYOL cosine to ~0; "
+             "we use 1e-5 ≈ peak/1000).",
     )
     p.add_argument(
         "--warmup-fraction", default=0.05, type=float,
