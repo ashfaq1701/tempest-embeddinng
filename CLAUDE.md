@@ -40,3 +40,35 @@ If Stage A degrades wiki by more than 20%, or Stage B shows the
 same collapse pattern, the architecture needs rethinking before
 committing to InfoNCE as the default.
 
+## Stage A — Wiki 3 seeds × 30 ep, tau=0.5
+
+Per-seed peak val MRR / test MRR (best across 30 epochs):
+  seed 42  (best ep 22): val 0.4924 / test 0.4651
+  seed 123 (best ep 25): val 0.4934 / test 0.4722
+  seed 7   (best ep 23): val 0.4852 / test 0.4636
+
+Mean ± std:
+  val  0.4903 ± 0.004
+  test 0.4670 ± 0.004
+
+Compare to Task 12 post-fix C1 (regression alignment + uniformity):
+  C1 val 0.3966 ± 0.014 / test 0.3794 ± 0.015 (30 ep, 3 seeds).
+
+Δ vs C1: Δval = +0.094 (+24% relative), Δtest = +0.088 (+23%).
+
+Std collapse: val 0.014 → 0.004 (3.5× tighter). InfoNCE training
+is dramatically more reproducible across seeds than C1.
+
+Trajectory shape: all three seeds peak in ep22-25 range, then
+val noise/overfit drifts the value down slightly. Best-val
+snapshotting captures the peak. Loss decomposition (from
+verification): pull (= -mean sim_pos) and push (= mean log_Z)
+both decrease monotonically from ep1 to ep30; align went from
+7.98 → 6.08 across the trajectory.
+
+Stage A decision: **PASS** (val 0.49 ≫ 0.32 threshold). InfoNCE
+wins wiki by +24% on val and +23% on test with 3.5× tighter std.
+Proceeding to Stage B.
+
+## Stage B — Comment 3 seeds × 5 ep, tau=0.5 — in progress
+
