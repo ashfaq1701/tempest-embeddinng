@@ -229,9 +229,15 @@ class Trainer:
         OVERHEAD_BYTES = 500 * 1024 * 1024  # 500 MB
         available = max(free_bytes - OVERHEAD_BYTES, 0)
 
-        # Per seed in the chunk, the sim matrix row is M floats.
-        # Backward pass activations roughly double this.
-        bytes_per_seed = M * 4 * 2
+        # Per seed in the chunk, autograd keeps ~6 [chunk, M] float32
+        # intermediates alive for backward:
+        #   sim_dot, sim (post divide+mask), log_p, w_pos, weighted_log_p,
+        #   plus ~one gradient buffer of similar size during backward.
+        # Use a conservative factor of 6 × float32(4 bytes) = 24 bytes
+        # per (seed, pool-entry).
+        BYTES_PER_INTERMEDIATE = 4
+        INTERMEDIATES_KEPT = 6
+        bytes_per_seed = M * BYTES_PER_INTERMEDIATE * INTERMEDIATES_KEPT
         if bytes_per_seed == 0:
             return 0
 
@@ -240,8 +246,9 @@ class Trainer:
         safe_chunk = int(raw_chunk * 0.7)
         # Cap at NK — no point chunking larger than the batch itself.
         safe_chunk = min(safe_chunk, NK)
-        # Floor at 32 to amortise per-chunk kernel launch overhead.
-        safe_chunk = max(safe_chunk, 32)
+        # Floor at 1 (no kernel-launch amortisation; correctness over
+        # efficiency under tight memory — better to be slow than OOM).
+        safe_chunk = max(safe_chunk, 1)
         return safe_chunk
 
     def _score_pairs(self, u_ids: torch.Tensor, v_ids: torch.Tensor) -> torch.Tensor:
