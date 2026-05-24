@@ -24,7 +24,6 @@ Derived from the dataset (not exposed):
 
 import argparse
 import pathlib
-import random
 import sys
 import time
 from typing import Any, Dict
@@ -43,6 +42,7 @@ from tempest_walks.data import Loaded, create_batches, load_tgb
 from tempest_walks.evaluator import Evaluator
 from tempest_walks.negatives import TGBNegativeSampler
 from tempest_walks.trainer import Trainer, TrainerConfig
+from tempest_walks.utils import derive_t_train, detect_bipartite, seed_all
 
 
 def parse_args() -> argparse.Namespace:
@@ -154,44 +154,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--monitor-sample-pct", default=1.0, type=float)
 
     return p.parse_args()
-
-
-def seed_all(seed: int) -> None:
-    """Seed every standard RNG from one root seed.
-
-    Sampler-internal RNGs (negative samplers) are seeded via
-    TrainerConfig.seed downstream. Tempest's walk RNG is NOT
-    controlled here — Tempest CPU mode uses its own internal RNG
-    and may exhibit small run-to-run drift even with the same Python
-    seed. Multi-seed anchoring is the correct way to measure this.
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def derive_t_train(train_ts: np.ndarray) -> float:
-    """T_train: training-span (max - min). Required > 0 — used as a
-    denominator in alignment_loss's time weighting."""
-    if train_ts.size == 0:
-        raise ValueError("Empty training timestamps; cannot derive T_train.")
-    span = float(train_ts.max() - train_ts.min())
-    if span <= 0:
-        raise ValueError(f"Non-positive T_train: {span}")
-    return span
-
-
-def detect_bipartite(train_split) -> bool:
-    """A graph is bipartite (under the link-pred convention) iff the
-    set of source IDs and the set of destination IDs are disjoint.
-    Holds for tgbl-wiki (users→pages), tgbl-review (users→items),
-    tgbl-subreddit (users→subreddits). Fails for tgbl-coin / tgbl-flight
-    / tgbl-comment where any node can be either endpoint."""
-    src_set = set(np.unique(train_split.sources).tolist())
-    dst_set = set(np.unique(train_split.destinations).tolist())
-    return src_set.isdisjoint(dst_set)
 
 
 def main() -> Dict[str, Any]:
