@@ -104,7 +104,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reservoir-size", default=32, type=int)
 
     # Optimisation.
-    p.add_argument("--lr", default=1e-3, type=float)
+    p.add_argument(
+        "--lr", default=1e-3, type=float,
+        help="Peak learning rate (after warmup). Default 1e-3 is the "
+             "standard Adam value for graph/contrastive workloads.",
+    )
+    p.add_argument(
+        "--lr-min", default=1e-5, type=float,
+        help="Minimum LR at end of cosine decay. Default lr/100.",
+    )
+    p.add_argument(
+        "--warmup-fraction", default=0.05, type=float,
+        help="Warmup as fraction of decay horizon steps.",
+    )
+    p.add_argument(
+        "--warmup-steps-cap", default=500, type=int,
+        help="Maximum warmup steps regardless of fraction.",
+    )
+    p.add_argument(
+        "--decay-horizon-epochs", default=50, type=int,
+        help="Target epoch count for cosine decay to reach lr-min. "
+             "SEPARATE from --num-epochs — short runs stay near peak; "
+             "full decay is hit only at num_epochs = horizon.",
+    )
     p.add_argument("--weight-decay", default=1e-4, type=float)
     p.add_argument("--batch-size", default=2000, type=int)
     p.add_argument("--num-epochs", default=50, type=int)
@@ -271,6 +293,10 @@ def main() -> Dict[str, Any]:
         reservoir_size=args.reservoir_size,
 
         lr=args.lr,
+        lr_min=args.lr_min,
+        warmup_fraction=args.warmup_fraction,
+        warmup_steps_cap=args.warmup_steps_cap,
+        decay_horizon_epochs=args.decay_horizon_epochs,
         weight_decay=args.weight_decay,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
