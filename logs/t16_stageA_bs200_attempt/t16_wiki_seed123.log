@@ -1,0 +1,89 @@
+=== tempest-embedding training ===
+dataset: tgbl-wiki
+device:  cuda
+seed:    123
+loaded in 1.6s
+  num_nodes:     9,227
+  directed:      False  (dataset default)
+  bipartite:     True
+  dst_pool:      952 unique destinations
+  T_train:       1862652
+  train edges:   110,232
+  val edges:     23,621
+  test edges:    23,621
+  has_node_feat: False
+
+=== Config ===
+  num_nodes: 9227
+  is_directed: False
+  is_bipartite: True
+  dst_pool: <ndarray shape=(952,) dtype=int32>
+  t_train_span: 1862652.0
+  d_node_feat: None
+  d_emb: 128
+  d_proj: 128
+  tau: 0.5
+  beta_time: 1.0
+  num_walks_per_node: 5
+  max_walk_len: 20
+  walk_bias: ExponentialWeight
+  start_bias: Uniform
+  num_neg_per_pos: 10
+  hist_neg_ratio: 0.5
+  reservoir_size: 32
+  lr: 0.001
+  weight_decay: 0.0001
+  num_epochs: 30
+  early_stop_patience: 0
+  seed: 123
+  use_gpu: True
+  use_gpu_tempest: False
+  monitor_sample_pct: 1.0
+  skip_final_full_eval: True
+
+=== Parameter counts ===
+  embedding_table:    1,181,056
+  p_target:              66,048
+  p_context:             66,048
+  link_head:            574,466
+  TOTAL trainable:    1,887,618
+
+=== Training ===
+epoch 1/30  align=7.9774  bce=0.2705  train 33.3s  val 0.1733  test 0.1718 (new best)  eval 35.3s
+epoch 2/30  align=7.6433  bce=0.2164  train 23.7s  val 0.2047  test 0.1743 (new best)  eval 40.1s
+epoch 3/30  align=7.1594  bce=0.1944  train 28.9s  val 0.2900  test 0.2357 (new best)  eval 37.7s
+epoch 4/30  align=6.9813  bce=0.1758  train 28.7s  val 0.3414  test 0.3145 (new best)  eval 36.0s
+epoch 5/30  align=6.9362  bce=0.1707  train 24.7s  val 0.3388  patience 1/0  eval 40.7s
+epoch 6/30  align=6.9178  bce=0.1684  train 26.2s  val 0.2950  patience 2/0  eval 28.0s
+epoch 7/30  align=6.8976  bce=0.1663  train 19.2s  val 0.3002  patience 3/0  eval 27.5s
+epoch 8/30  align=6.7015  bce=0.1633  train 19.5s  val 0.3590  test 0.3271 (new best)  eval 27.4s
+epoch 9/30  align=6.5666  bce=0.1565  train 18.4s  val 0.4243  test 0.3963 (new best)  eval 27.4s
+epoch 10/30  align=6.4477  bce=0.1525  train 18.7s  val 0.4049  patience 1/0  eval 27.6s
+epoch 11/30  align=6.3668  bce=0.1483  train 18.8s  val 0.4096  patience 2/0  eval 27.5s
+epoch 12/30  align=6.3439  bce=0.1460  train 18.3s  val 0.4143  patience 3/0  eval 27.2s
+epoch 13/30  align=6.3259  bce=0.1453  train 18.3s  val 0.4585  test 0.4320 (new best)  eval 27.3s
+epoch 14/30  align=6.3094  bce=0.1441  train 17.9s  val 0.4150  patience 1/0  eval 27.0s
+epoch 15/30  align=6.2948  bce=0.1437  train 17.9s  val 0.4166  patience 2/0  eval 27.2s
+epoch 16/30  align=6.2792  bce=0.1412  train 18.2s  val 0.4239  patience 3/0  eval 27.3s
+epoch 17/30  align=6.2574  bce=0.1399  train 17.8s  val 0.4574  patience 4/0  eval 27.3s
+epoch 18/30  align=6.2301  bce=0.1394  train 17.9s  val 0.4646  test 0.4408 (new best)  eval 27.0s
+epoch 19/30  align=6.1976  bce=0.1393  train 18.0s  val 0.4372  patience 1/0  eval 27.4s
+epoch 20/30  align=6.1738  bce=0.1387  train 18.2s  val 0.4748  test 0.4537 (new best)  eval 27.1s
+epoch 21/30  align=6.1537  bce=0.1387  train 18.7s  val 0.4415  patience 1/0  eval 27.3s
+epoch 22/30  align=6.1428  bce=0.1372  train 18.0s  val 0.4431  patience 2/0  eval 27.1s
+epoch 23/30  align=6.1316  bce=0.1364  train 18.0s  val 0.4545  patience 3/0  eval 27.1s
+epoch 24/30  align=6.1271  bce=0.1359  train 18.1s  val 0.4464  patience 4/0  eval 27.1s
+epoch 25/30  align=6.1170  bce=0.1351  train 17.8s  val 0.4934  test 0.4722 (new best)  eval 27.1s
+epoch 26/30  align=6.1122  bce=0.1357  train 18.5s  val 0.4880  patience 1/0  eval 27.1s
+epoch 27/30  align=6.1080  bce=0.1342  train 18.0s  val 0.4440  patience 2/0  eval 27.0s
+epoch 28/30  align=6.1017  bce=0.1342  train 18.1s  val 0.4440  patience 3/0  eval 26.9s
+epoch 29/30  align=6.0973  bce=0.1319  train 18.0s  val 0.4435  patience 4/0  eval 27.1s
+epoch 30/30  align=6.0946  bce=0.1324  train 18.3s  val 0.4386  patience 5/0  eval 27.4s
+  restored best weights from epoch 25 (val 0.4934, test 0.4722)
+
+=== Final results ===
+  dataset:           tgbl-wiki
+  seed:              123
+  stopped_at_epoch:  25
+  best_val_mrr:      0.4934
+  best_test_mrr:     0.4722
