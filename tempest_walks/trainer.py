@@ -251,17 +251,40 @@ class Trainer:
         safe_chunk = max(safe_chunk, 1)
         return safe_chunk
 
+    # LinkHead.pair_feats has 6 * d_emb columns and 4 bytes/float, so
+    # a batch of N pairs allocates N * 6 * d_emb * 4 bytes at the
+    # concat. At 1000 TGB negs/pos and bs=2000, N reaches 2M, which
+    # OOMs an 8 GB GPU at d_emb=128. Chunk the score so per-call
+    # allocations stay under a fixed budget.
+    _EVAL_SCORE_CHUNK = 50_000
+
     def _score_pairs(self, u_ids: torch.Tensor, v_ids: torch.Tensor) -> torch.Tensor:
         """Score [P] (u, v) pairs through E + link_head. Undirected eval
         symmetrises by averaging forward(u, v) + forward(v, u). Used at
         eval (no_grad context); training has its own inline path with
-        .detach()."""
-        e_u = self.embedding_table(u_ids)
-        e_v = self.embedding_table(v_ids)
-        logits = self.link_head(e_u, e_v)
-        if not self.config.is_directed:
-            logits = 0.5 * (logits + self.link_head(e_v, e_u))
-        return logits
+        .detach().
+
+        Chunks internally to bound peak GPU memory regardless of P.
+        """
+        P = u_ids.shape[0]
+        if P <= self._EVAL_SCORE_CHUNK:
+            e_u = self.embedding_table(u_ids)
+            e_v = self.embedding_table(v_ids)
+            logits = self.link_head(e_u, e_v)
+            if not self.config.is_directed:
+                logits = 0.5 * (logits + self.link_head(e_v, e_u))
+            return logits
+
+        out_parts = []
+        for start in range(0, P, self._EVAL_SCORE_CHUNK):
+            end = min(start + self._EVAL_SCORE_CHUNK, P)
+            e_u = self.embedding_table(u_ids[start:end])
+            e_v = self.embedding_table(v_ids[start:end])
+            logits = self.link_head(e_u, e_v)
+            if not self.config.is_directed:
+                logits = 0.5 * (logits + self.link_head(e_v, e_u))
+            out_parts.append(logits)
+        return torch.cat(out_parts, dim=0)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
