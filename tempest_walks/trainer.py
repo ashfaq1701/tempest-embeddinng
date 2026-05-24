@@ -5,15 +5,14 @@ Single Trainer class. Per-batch ordering:
   TRAINING:
     1. walks = walk_gen.walks_for_nodes(seeds)       ← pre-ingest state
        seeds = unique(B_src ∪ B_tgt) (undirected) or unique(B_tgt) (directed)
-    2. unif_a, unif_b = sample uniformity pairs (M pairs)
-    3. L_table = L_align(walks) + η · L_unif(unif_a, unif_b)
-    4. neg = neg_sampler.sample(batch)               ← pre-observe state
-    5. logits = link_head(E[u].detach(), E[v].detach()) for pos + neg
+    2. L_align = InfoNCE(walks, τ)
+    3. neg = neg_sampler.sample(batch)               ← pre-observe state
+    4. logits = link_head(E[u].detach(), E[v].detach()) for pos + neg
        L_bce = BCE(logits, [1×B, 0×B*K])
-    6. L_total = L_table + L_bce
-    7. L_total.backward(); optimizer.step(); optimizer.zero_grad()
-    8. neg_sampler.observe(B_src, B_tgt)             ← post-scoring
-    9. walk_gen.add_edges(B_src, B_tgt, B_ts, B_ef)  ← post-scoring, last
+    5. L_total = L_align + L_bce
+    6. L_total.backward(); optimizer.step(); optimizer.zero_grad()
+    7. neg_sampler.observe(B_src, B_tgt)             ← post-scoring
+    8. walk_gen.add_edges(B_src, B_tgt, B_ts, B_ef)  ← post-scoring, last
 
   EVAL (within torch.no_grad()):
     1. neg_dst_list = tgb_neg_sampler.sample(batch)  ← per-positive negs
@@ -51,7 +50,7 @@ import torch.nn.functional as F
 
 from .data import Batch
 from .evaluator import Evaluator
-from .losses import alignment_loss, uniformity_loss
+from .losses import alignment_loss
 from .model import EmbeddingTable, LinkHead, ProjectionHead
 from .negatives import (
     HistoricalNegativeSampler,
@@ -76,10 +75,8 @@ class TrainerConfig:
     d_proj: int = 128
 
     # Loss-formulation.
-    eta_uniform: float = 1.0
-    uniform_temperature: float = 2.0
-    uniform_pairs: int = 5000
-    beta_time: float = 1.0
+    tau: float = 0.5            # InfoNCE temperature
+    beta_time: float = 1.0      # hop/time weight exponent
 
     # Walks.
     num_walks_per_node: int = 5
@@ -176,14 +173,10 @@ class Trainer:
                 seed=config.seed,
             )
 
-        # Uniformity-pair RNG — separate stream so toggling uniform_pairs
-        # doesn't perturb the negative-sampling sequence.
-        self.unif_rng = np.random.default_rng(config.seed + 1)
-
         # Single optimiser over all trainable parameters. The decoupling
-        # between E-training (alignment + uniformity) and link-head-
-        # training (BCE) comes from the .detach() at the BCE call site,
-        # NOT from separate optimisers.
+        # between E-training (InfoNCE alignment) and link-head training
+        # (BCE) comes from the .detach() at the BCE call site, NOT from
+        # separate optimisers.
         params = (
             list(self.embedding_table.parameters())
             + list(self.p_target.parameters())
@@ -199,25 +192,6 @@ class Trainer:
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────
-
-    def _sample_uniformity_pairs(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """M independent pairs. Bipartite → both endpoints from dst_pool;
-        unipartite → both from the full node range."""
-        M = self.config.uniform_pairs
-        if self.config.is_bipartite:
-            pool = self.config.dst_pool
-            idx_a = self.unif_rng.integers(0, pool.shape[0], size=M)
-            idx_b = self.unif_rng.integers(0, pool.shape[0], size=M)
-            a = torch.from_numpy(pool[idx_a].astype(np.int64))
-            b = torch.from_numpy(pool[idx_b].astype(np.int64))
-        else:
-            a = torch.from_numpy(
-                self.unif_rng.integers(0, self.config.num_nodes, size=M)
-            ).long()
-            b = torch.from_numpy(
-                self.unif_rng.integers(0, self.config.num_nodes, size=M)
-            ).long()
-        return a, b
 
     def _score_pairs(self, u_ids: torch.Tensor, v_ids: torch.Tensor) -> torch.Tensor:
         """Score [P] (u, v) pairs through E + link_head. Undirected eval
@@ -245,14 +219,9 @@ class Trainer:
             seeds_np = np.unique(np.concatenate([batch.src, batch.tgt]))
         walks = self.walk_gen.walks_for_nodes(seeds_np)
 
-        # Step 2: uniformity pairs.
-        unif_a, unif_b = self._sample_uniformity_pairs()
-
-        # Step 3: table loss = alignment + η · uniformity.
-        # Uniformity applies to BOTH heads, summed (Task 12 finding:
-        # the two heads have disjoint parameter sets, so averaging
-        # halves each head's anti-collapse gradient and causes
-        # projection collapse on C1 smoke).
+        # Step 2: InfoNCE contrastive alignment over batched walks.
+        # The softmax denominator over all batch contexts is the
+        # anti-collapse mechanism (replaces Wang-Isola uniformity).
         t_now = int(batch.t_max)
         l_align = alignment_loss(
             embedding_table=self.embedding_table,
@@ -262,26 +231,9 @@ class Trainer:
             t_now=t_now,
             T_train=self.config.t_train_span,
             beta=self.config.beta_time,
+            tau=self.config.tau,
             node_feat=self.node_feat,
         )
-        l_unif_target = uniformity_loss(
-            embedding_table=self.embedding_table,
-            head=self.p_target,
-            sample_idx_a=unif_a,
-            sample_idx_b=unif_b,
-            t=self.config.uniform_temperature,
-            node_feat=self.node_feat,
-        )
-        l_unif_context = uniformity_loss(
-            embedding_table=self.embedding_table,
-            head=self.p_context,
-            sample_idx_a=unif_a,
-            sample_idx_b=unif_b,
-            t=self.config.uniform_temperature,
-            node_feat=self.node_feat,
-        )
-        l_unif = l_unif_target + l_unif_context
-        l_table = l_align + self.config.eta_uniform * l_unif
 
         # Step 4: link-pred negatives from PRE-OBSERVE reservoir.
         neg_src, neg_tgt = self.neg_sampler_train.sample(batch)
@@ -302,22 +254,21 @@ class Trainer:
         ])
         l_bce = F.binary_cross_entropy_with_logits(logits, labels)
 
-        # Step 6 + 7: total loss + single backward + step.
-        l_total = l_table + l_bce
+        # Step 5 + 6: total loss + single backward + step.
+        l_total = l_align + l_bce
         self.optimizer.zero_grad(set_to_none=True)
         l_total.backward()
         self.optimizer.step()
 
-        # Step 8: observe positives into reservoir (post-scoring).
+        # Step 7: observe positives into reservoir (post-scoring).
         if isinstance(self.neg_sampler_train, HistoricalNegativeSampler):
             self.neg_sampler_train.observe(batch.src, batch.tgt)
 
-        # Step 9: ingest into Tempest (LAST).
+        # Step 8: ingest into Tempest (LAST).
         self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
 
         return {
             "align": float(l_align.detach()),
-            "uniform": float(l_unif.detach()),
             "bce": float(l_bce.detach()),
             "total": float(l_total.detach()),
         }
@@ -487,7 +438,7 @@ class Trainer:
             self.link_head.train()
 
             t0 = time.time()
-            sums = {"align": 0.0, "uniform": 0.0, "bce": 0.0, "total": 0.0}
+            sums = {"align": 0.0, "bce": 0.0, "total": 0.0}
             n_batches = 0
             for batch in train_batches_factory():
                 metrics = self._train_step(batch)
@@ -499,7 +450,6 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"align={sums['align']/max(n_batches,1):.4f}  "
-                f"unif={sums['uniform']/max(n_batches,1):.4f}  "
                 f"bce={sums['bce']/max(n_batches,1):.4f}  "
                 f"train {train_dt:.1f}s"
             )

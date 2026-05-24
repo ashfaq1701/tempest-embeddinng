@@ -4,8 +4,8 @@ Three classes, no shared state:
 
 EmbeddingTable
   - Single nn.Embedding(num_nodes, d_emb).
-  - Lookup-only. Trained by alignment+uniformity through the
-    projection heads.
+  - Lookup-only. Trained by InfoNCE contrastive alignment through
+    the projection heads.
 
 ProjectionHead
   - Conditional architecture based on node-feature availability:

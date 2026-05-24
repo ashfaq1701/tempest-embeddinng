@@ -8,8 +8,7 @@ repeatedly with different CLI args.
 Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root
   Model:          --d-emb, --d-proj
-  Loss:           --eta-uniform, --uniform-temperature, --uniform-pairs,
-                  --beta-time
+  Loss:           --tau, --beta-time
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias,
                   --start-bias
   Negatives:      --num-neg-per-pos, --hist-neg-ratio, --reservoir-size
@@ -83,9 +82,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--d-proj", default=128, type=int)
 
     # Loss.
-    p.add_argument("--eta-uniform", default=1.0, type=float)
-    p.add_argument("--uniform-temperature", default=2.0, type=float)
-    p.add_argument("--uniform-pairs", default=5000, type=int)
+    p.add_argument("--tau", default=0.5, type=float,
+                   help="InfoNCE contrastive temperature")
     p.add_argument("--beta-time", default=1.0, type=float)
 
     # Walks.
@@ -129,9 +127,9 @@ def parse_args() -> argparse.Namespace:
 def seed_all(seed: int) -> None:
     """Seed every standard RNG from one root seed.
 
-    Sampler-internal RNGs (negative samplers, uniformity pairs) are
-    seeded via TrainerConfig.seed downstream. Tempest's walk RNG is
-    NOT controlled here — Tempest CPU mode uses its own internal RNG
+    Sampler-internal RNGs (negative samplers) are seeded via
+    TrainerConfig.seed downstream. Tempest's walk RNG is NOT
+    controlled here — Tempest CPU mode uses its own internal RNG
     and may exhibit small run-to-run drift even with the same Python
     seed. Multi-seed anchoring is the correct way to measure this.
     """
@@ -253,9 +251,7 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
         d_proj=args.d_proj,
 
-        eta_uniform=args.eta_uniform,
-        uniform_temperature=args.uniform_temperature,
-        uniform_pairs=args.uniform_pairs,
+        tau=args.tau,
         beta_time=args.beta_time,
 
         num_walks_per_node=args.num_walks_per_node,
