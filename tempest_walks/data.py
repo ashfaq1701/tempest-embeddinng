@@ -103,7 +103,10 @@ def load_tgb(name: str, root: str = "datasets") -> Loaded:
         val=_apply(val_mask),
         test=_apply(test_mask),
         dataset=dataset,
-        name=name,
+        # Store the TGB-canonical name (suffix stripped). Downstream
+        # consumers (Evaluator) pass this back to TGB and must use
+        # the registry key, not the user's input suffix.
+        name=tgb_name,
         eval_metric=str(dataset.eval_metric),
         max_node_count=int(max(sources.max(), destinations.max())) + 1,
         is_directed=default_is_directed(name),
