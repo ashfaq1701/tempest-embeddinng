@@ -40,7 +40,6 @@ Early stop:
 """
 
 import copy
-import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -59,6 +58,7 @@ from .negatives import (
     NegativeSampler,
     UniformNegativeSampler,
 )
+from .utils import compute_auto_chunk_size, make_lr_lambda
 from .walks import WalkGenerator
 
 
@@ -215,12 +215,7 @@ class Trainer:
     # ──────────────────────────────────────────────────────────────────
 
     def _setup_lr_scheduler(self, batches_per_epoch: int) -> None:
-        """Set up cosine decay with linear warmup.
-
-        Shape:
-          step 0..W       linear warmup from 0 to peak LR
-          step W..T       cosine decay from peak to lr_min
-          step > T        stay at lr_min
+        """Build a cosine-decay + linear-warmup LR schedule.
 
         W = min(warmup_fraction * decay_steps, warmup_steps_cap)
         T = decay_horizon_epochs * batches_per_epoch
@@ -240,30 +235,14 @@ class Trainer:
         )
         warmup_steps = max(warmup_steps, 1)
 
-        # Set optimizer base lr to peak so lambda returns [0, 1] scaling.
+        # Set optimizer base lr to peak so the lambda returns a [0, 1]
+        # scaling factor relative to peak.
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = peak_lr
             param_group["initial_lr"] = peak_lr
 
         lr_min_ratio = lr_min / peak_lr if peak_lr > 0 else 0.0
-
-        def lr_lambda(step: int) -> float:
-            # step is 0-indexed (PyTorch LambdaLR convention).
-            if step < warmup_steps:
-                return float(step + 1) / float(warmup_steps)
-
-            decay_progress = step - warmup_steps
-            decay_total = decay_steps - warmup_steps
-            if decay_total <= 0:
-                return lr_min_ratio
-
-            progress = float(decay_progress) / float(decay_total)
-            if progress >= 1.0:
-                return lr_min_ratio
-
-            cos_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return lr_min_ratio + (1.0 - lr_min_ratio) * cos_factor
-
+        lr_lambda = make_lr_lambda(warmup_steps, decay_steps, lr_min_ratio)
         self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
         self._global_step = 0
         print(
@@ -273,60 +252,6 @@ class Trainer:
             f"({self.config.decay_horizon_epochs} epochs × "
             f"{batches_per_epoch} batches)"
         )
-
-    def _compute_auto_chunk_size(self, walks) -> int:
-        """Auto-size InfoNCE seed-chunk based on available GPU memory.
-
-        The InfoNCE sim matrix is the dominant per-batch memory cost:
-        [chunk, M] float32, where M = NK * L. Backward pass roughly
-        doubles this. We size the chunk to fit (free GPU memory minus
-        PyTorch overhead) with a 0.7 safety factor.
-
-        Returns:
-            - User's config.chunk_size if > 0 (manual override).
-            - 0 if running on CPU (no chunking needed; chunked path
-              gives no benefit without GPU memory pressure).
-            - Auto-computed positive integer on GPU.
-        """
-        # User override takes priority.
-        if self.config.chunk_size > 0:
-            return self.config.chunk_size
-
-        # On CPU, no memory pressure; let alignment_loss use the
-        # no-chunking branch (chunk_size=0).
-        if not torch.cuda.is_available() or self.device.type != "cuda":
-            return 0
-
-        NK, L = walks.nodes.shape
-        M = NK * L
-        if M == 0:
-            return 0
-
-        free_bytes, _ = torch.cuda.mem_get_info(self.device)
-        OVERHEAD_BYTES = 500 * 1024 * 1024  # 500 MB
-        available = max(free_bytes - OVERHEAD_BYTES, 0)
-
-        # Per seed in the chunk, autograd keeps ~6 [chunk, M] float32
-        # intermediates alive for backward:
-        #   sim_dot, sim (post divide+mask), log_p, w_pos, weighted_log_p,
-        #   plus ~one gradient buffer of similar size during backward.
-        # Use a conservative factor of 6 × float32(4 bytes) = 24 bytes
-        # per (seed, pool-entry).
-        BYTES_PER_INTERMEDIATE = 4
-        INTERMEDIATES_KEPT = 6
-        bytes_per_seed = M * BYTES_PER_INTERMEDIATE * INTERMEDIATES_KEPT
-        if bytes_per_seed == 0:
-            return 0
-
-        raw_chunk = available // bytes_per_seed
-        # Safety factor 0.7 for PyTorch allocator fragmentation.
-        safe_chunk = int(raw_chunk * 0.7)
-        # Cap at NK — no point chunking larger than the batch itself.
-        safe_chunk = min(safe_chunk, NK)
-        # Floor at 1 (no kernel-launch amortisation; correctness over
-        # efficiency under tight memory — better to be slow than OOM).
-        safe_chunk = max(safe_chunk, 1)
-        return safe_chunk
 
     # LinkHead.pair_feats has 6 * d_emb columns and 4 bytes/float, so
     # a batch of N pairs allocates N * 6 * d_emb * 4 bytes at the
@@ -382,7 +307,11 @@ class Trainer:
         # anti-collapse mechanism (replaces Wang-Isola uniformity).
         # Auto-size the seed-chunk for memory safety (chunking is
         # exact, not approximate).
-        effective_chunk_size = self._compute_auto_chunk_size(walks)
+        effective_chunk_size = compute_auto_chunk_size(
+            walks=walks,
+            chunk_size_override=self.config.chunk_size,
+            device=self.device,
+        )
         t_now = int(batch.t_max)
         l_align = alignment_loss(
             embedding_table=self.embedding_table,
