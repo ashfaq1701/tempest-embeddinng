@@ -123,6 +123,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-final-full-eval", action="store_true")
     p.add_argument("--monitor-sample-pct", default=1.0, type=float)
 
+    p.add_argument(
+        "--config-tag", type=str, default=None,
+        help="Identifier suffix for diagnostic CSV filenames "
+             "(logs/diag_<dataset>_<config_tag>_seed<S>.csv and "
+             "logs/epoch_<dataset>_<config_tag>_seed<S>.csv). "
+             "If None, no CSVs are written.",
+    )
+
     return p.parse_args()
 
 
@@ -277,6 +285,14 @@ def main() -> Dict[str, Any]:
         use_gpu_tempest=args.use_gpu_tempest,
         skip_final_full_eval=args.skip_final_full_eval,
         monitor_sample_pct=args.monitor_sample_pct,
+        diag_csv_path=(
+            f"logs/diag_{args.dataset}_{args.config_tag}_seed{args.seed}.csv"
+            if args.config_tag else None
+        ),
+        epoch_csv_path=(
+            f"logs/epoch_{args.dataset}_{args.config_tag}_seed{args.seed}.csv"
+            if args.config_tag else None
+        ),
     )
 
     print("\n=== Config ===")

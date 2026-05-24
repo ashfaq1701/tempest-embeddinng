@@ -1,0 +1,2 @@
+epoch,train_time_s,eval_time_s,val_mrr,test_mrr,align_mean,unif_mean,bce_mean,E_norm_mean_end,E_norm_p99_end
+1,22.939,27.812,0.075714,0.082364,0.580460,-3.550737,0.291272,0.161689,1.202510

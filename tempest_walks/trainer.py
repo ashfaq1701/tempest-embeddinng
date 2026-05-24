@@ -41,6 +41,7 @@ Early stop:
 """
 
 import copy
+import csv
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -106,6 +107,11 @@ class TrainerConfig:
     # Eval.
     monitor_sample_pct: float = 1.0
     skip_final_full_eval: bool = False
+
+    # Task 15 Stage 8.1: diagnostic CSV paths (per-batch + per-epoch).
+    # If None, no CSVs are written.
+    diag_csv_path: Optional[str] = None
+    epoch_csv_path: Optional[str] = None
 
 
 class Trainer:
@@ -235,6 +241,15 @@ class Trainer:
     # Per-batch training step
     # ──────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _grad_norm(module) -> float:
+        """L2 norm of all .grad tensors in a module (after backward)."""
+        total_sq = 0.0
+        for p in module.parameters():
+            if p.grad is not None:
+                total_sq += float(p.grad.detach().pow(2).sum().item())
+        return total_sq ** 0.5
+
     def _train_step(self, batch: Batch) -> Dict[str, float]:
         device = self.device
 
@@ -306,6 +321,12 @@ class Trainer:
         l_total = l_table + l_bce
         self.optimizer.zero_grad(set_to_none=True)
         l_total.backward()
+        # Task 15 Stage 8.1: grad norms captured AFTER backward(),
+        # BEFORE optimizer.step().
+        grad_norm_E = self._grad_norm(self.embedding_table)
+        grad_norm_p_target = self._grad_norm(self.p_target)
+        grad_norm_p_context = self._grad_norm(self.p_context)
+        grad_norm_link_head = self._grad_norm(self.link_head)
         self.optimizer.step()
 
         # Step 8: observe positives into reservoir (post-scoring).
@@ -315,11 +336,35 @@ class Trainer:
         # Step 9: ingest into Tempest (LAST).
         self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
 
+        # Task 15 Stage 8.1: diagnostic stats captured AFTER step.
+        with torch.no_grad():
+            row_norms = self.embedding_table.E.weight.norm(p=2, dim=-1)
+            E_norm_mean = float(row_norms.mean().item())
+            E_norm_p99 = float(row_norms.quantile(0.99).item())
+            E_norm_max = float(row_norms.max().item())
+        lens_np = walks.lens.cpu().numpy() if hasattr(walks.lens, 'cpu') else np.asarray(walks.lens)
+        valid_mask = lens_np >= 2
+        active_seed_count = int(valid_mask.sum())
+        total_seed_count = int(lens_np.size)
+        mean_walk_len_valid = (
+            float(lens_np[valid_mask].mean()) if active_seed_count > 0 else 0.0
+        )
+
         return {
             "align": float(l_align.detach()),
             "uniform": float(l_unif.detach()),
             "bce": float(l_bce.detach()),
             "total": float(l_total.detach()),
+            "grad_norm_E": grad_norm_E,
+            "grad_norm_p_target": grad_norm_p_target,
+            "grad_norm_p_context": grad_norm_p_context,
+            "grad_norm_link_head": grad_norm_link_head,
+            "E_norm_mean": E_norm_mean,
+            "E_norm_p99": E_norm_p99,
+            "E_norm_max": E_norm_max,
+            "active_seed_count": active_seed_count,
+            "total_seed_count": total_seed_count,
+            "mean_walk_len_valid": mean_walk_len_valid,
         }
 
     # ──────────────────────────────────────────────────────────────────
@@ -475,6 +520,36 @@ class Trainer:
         per_epoch_val: List[float] = []
         per_epoch_test: List[float] = []
 
+        # Task 15 Stage 8.1: optional CSV diagnostics.
+        diag_file = None
+        diag_writer = None
+        epoch_file = None
+        epoch_writer = None
+        diag_columns = [
+            "epoch", "batch_idx", "t_seconds_since_start",
+            "l_align", "l_uniform", "l_bce", "l_total",
+            "grad_norm_E", "grad_norm_p_target",
+            "grad_norm_p_context", "grad_norm_link_head",
+            "E_norm_mean", "E_norm_p99", "E_norm_max",
+            "active_seed_count", "total_seed_count",
+            "mean_walk_len_valid",
+        ]
+        epoch_columns = [
+            "epoch", "train_time_s", "eval_time_s",
+            "val_mrr", "test_mrr",
+            "align_mean", "unif_mean", "bce_mean",
+            "E_norm_mean_end", "E_norm_p99_end",
+        ]
+        if self.config.diag_csv_path:
+            diag_file = open(self.config.diag_csv_path, "w", newline="")
+            diag_writer = csv.writer(diag_file)
+            diag_writer.writerow(diag_columns)
+        if self.config.epoch_csv_path:
+            epoch_file = open(self.config.epoch_csv_path, "w", newline="")
+            epoch_writer = csv.writer(epoch_file)
+            epoch_writer.writerow(epoch_columns)
+        train_start_t = time.time()
+
         for ep in range(1, n_epochs + 1):
             # Epoch boundary: walks + reservoir reset only.
             self.walk_gen.reset()
@@ -488,12 +563,33 @@ class Trainer:
 
             t0 = time.time()
             sums = {"align": 0.0, "uniform": 0.0, "bce": 0.0, "total": 0.0}
+            last_metrics: Optional[Dict[str, float]] = None
             n_batches = 0
             for batch in train_batches_factory():
                 metrics = self._train_step(batch)
                 for k in sums:
                     sums[k] += metrics[k]
                 n_batches += 1
+                last_metrics = metrics
+                if diag_writer is not None:
+                    diag_writer.writerow([
+                        ep, n_batches - 1,
+                        f"{time.time() - train_start_t:.3f}",
+                        f"{metrics['align']:.6f}",
+                        f"{metrics['uniform']:.6f}",
+                        f"{metrics['bce']:.6f}",
+                        f"{metrics['total']:.6f}",
+                        f"{metrics['grad_norm_E']:.6f}",
+                        f"{metrics['grad_norm_p_target']:.6f}",
+                        f"{metrics['grad_norm_p_context']:.6f}",
+                        f"{metrics['grad_norm_link_head']:.6f}",
+                        f"{metrics['E_norm_mean']:.6f}",
+                        f"{metrics['E_norm_p99']:.6f}",
+                        f"{metrics['E_norm_max']:.6f}",
+                        metrics['active_seed_count'],
+                        metrics['total_seed_count'],
+                        f"{metrics['mean_walk_len_valid']:.4f}",
+                    ])
             train_dt = time.time() - t0
 
             line = (
@@ -504,6 +600,11 @@ class Trainer:
                 f"train {train_dt:.1f}s"
             )
 
+            # Task 15 Stage 8.1: epoch-level metrics for CSV row.
+            ep_val_metric: float = -1.0
+            ep_test_metric: float = -1.0
+            ep_eval_dt: float = 0.0
+
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()
                 val_metric = self._eval(
@@ -511,6 +612,8 @@ class Trainer:
                 )
                 eval_dt = time.time() - t1
                 per_epoch_val.append(val_metric)
+                ep_val_metric = val_metric
+                ep_eval_dt = eval_dt
 
                 test_metric = -1.0
                 if val_metric > best_val:
@@ -527,6 +630,7 @@ class Trainer:
                         )
                         best_test = test_metric
                         per_epoch_test.append(test_metric)
+                        ep_test_metric = test_metric
                         line += f"  val {val_metric:.4f}  test {test_metric:.4f} (new best)"
                     else:
                         line += f"  val {val_metric:.4f} (new best)"
@@ -538,6 +642,30 @@ class Trainer:
                     )
                 line += f"  eval {eval_dt:.1f}s"
             print(line)
+
+            # Task 15 Stage 8.1: write per-epoch CSV row.
+            if epoch_writer is not None:
+                E_mean_end = (
+                    last_metrics['E_norm_mean'] if last_metrics else 0.0
+                )
+                E_p99_end = (
+                    last_metrics['E_norm_p99'] if last_metrics else 0.0
+                )
+                epoch_writer.writerow([
+                    ep,
+                    f"{train_dt:.3f}",
+                    f"{ep_eval_dt:.3f}",
+                    f"{ep_val_metric:.6f}",
+                    f"{ep_test_metric:.6f}",
+                    f"{sums['align'] / max(n_batches, 1):.6f}",
+                    f"{sums['uniform'] / max(n_batches, 1):.6f}",
+                    f"{sums['bce'] / max(n_batches, 1):.6f}",
+                    f"{E_mean_end:.6f}",
+                    f"{E_p99_end:.6f}",
+                ])
+                epoch_file.flush()
+            if diag_file is not None:
+                diag_file.flush()
 
             if patience > 0 and no_improve >= patience:
                 break
@@ -562,6 +690,12 @@ class Trainer:
                 final_test = self._eval(test_evaluator, test_batches_factory(), 1.0)
                 print(f"  test MRR: {final_test:.4f}")
                 best_val, best_test = final_val, final_test
+
+        # Task 15 Stage 8.1: close CSV files cleanly.
+        if diag_file is not None:
+            diag_file.close()
+        if epoch_file is not None:
+            epoch_file.close()
 
         return {
             "stopped_at_epoch": best_epoch if best_snap is not None else n_epochs,
