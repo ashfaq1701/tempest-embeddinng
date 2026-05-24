@@ -96,8 +96,10 @@ class TrainerConfig:
     reservoir_size: int = 32
 
     # Optimisation.
-    lr: float = 1e-3            # peak LR (after warmup)
-    lr_min: float = 1e-5        # cosine decay floor
+    lr: float = 1e-2            # peak LR (after warmup); scales linearly
+                                # with batch_size default 2000 (Goyal 2017).
+    lr_min: float = 1e-5        # cosine decay floor (~peak/1000; matches
+                                # contrastive-SSL cosine-to-near-0 norm).
     warmup_fraction: float = 0.05
     warmup_steps_cap: int = 500
     decay_horizon_epochs: int = 50  # cosine reaches lr_min at this
