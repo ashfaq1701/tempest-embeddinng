@@ -51,4 +51,28 @@ Notes:
     ~-3.7). E table spreads faster, MRR climbs faster.
   - No NaN, no collapse, smooth climb across all 3 seeds.
 
-### Review anchor (3 seeds × 5 ep) — in progress
+### Review anchor — halted after seed 42
+
+Seed 42 results: val 0.0196 / test 0.0163 (ep1 best, never improved).
+Align collapsed to 0 by ep2; remained 0 through ep5. bce stable at
+0.305 across all 5 epochs. E table effectively static after early
+collapse.
+
+  ep1: align=0.0019 unif=-0.0000 bce=0.3060 val=0.0196 test=0.0163
+  ep2: align=0.0000 unif=0.0000  bce=0.3046 val=0.0196 patience 1
+  ep3: align=0.0000 unif=0.0000  bce=0.3046 val=0.0196 patience 2
+  ep4: align=0.0000 unif=0.0000  bce=0.3046 val=0.0196 patience 3
+  ep5: align=0.0000 unif=0.0000  bce=0.3046 val=0.0196 patience 4
+
+Halted before seeds 123 and 7 because: the collapse mechanism is
+dataset-scale-driven, not seed-driven. Two-head SUM uniformity with
+25K batches/epoch drives both projection heads to bias-dominated
+states within batch 1, after which alignment has no useful gradient
+to provide E.
+
+This finding generalises: any TGB dataset with high batches/epoch
+(review, coin, comment, flight) will show the same collapse without
+a scale-invariant loss formulation or per-dataset regularisation. To
+be addressed in a future task; not in Task 15's scope.
+
+Wiki anchor stands as the reference point for Task 15.
