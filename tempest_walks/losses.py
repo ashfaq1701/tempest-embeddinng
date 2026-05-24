@@ -88,12 +88,12 @@ def alignment_loss(
         p_seed_all = p_target(e_seed)                             # [NK, d_proj]
         p_ctx_pool = p_context(e_ctx_flat)                        # [M, d_proj]
 
-    # Positive mask: pool entry j is a positive of seed i iff
-    # j // L == i (same walk) AND ctx_valid_mask[j].
+    # Positive-mask helper: pool entry j is a positive of seed i iff
+    # j // L == i (same walk) AND ctx_valid_mask[j]. The mask itself
+    # is built per-chunk inside the loop below — at full [NK, M] bool
+    # it is the dominant memory term (5+ GB on comment-scale batches)
+    # and defeats the point of chunking.
     pool_walk_idx = torch.arange(M, device=device) // L           # [M]
-    seed_indices = torch.arange(NK, device=device).unsqueeze(1)   # [NK, 1]
-    same_walk = pool_walk_idx.unsqueeze(0) == seed_indices        # [NK, M]
-    pos_mask = same_walk & ctx_valid_mask.unsqueeze(0)            # [NK, M]
 
     # Hop/time weights (computed once; broadcast across pool entries).
     hop_dist = (lens.unsqueeze(1) - 1 - positions).clamp_min(1).float()  # [NK, L]
@@ -134,7 +134,11 @@ def alignment_loss(
         log_Z = torch.logsumexp(sim, dim=1)                       # [chunk]
         log_p = sim - log_Z.unsqueeze(1)                          # [chunk, M]
 
-        pos_mask_chunk = pos_mask[start:end]                      # [chunk, M]
+        # Per-chunk positive mask — sized [chunk, M], not [NK, M].
+        seed_indices_chunk = torch.arange(
+            start, end, device=device).unsqueeze(1)               # [chunk, 1]
+        pos_mask_chunk = (pool_walk_idx.unsqueeze(0) == seed_indices_chunk) \
+                         & ctx_valid_mask.unsqueeze(0)            # [chunk, M]
         w_pos = w_flat.unsqueeze(0).expand(chunk_n, -1) \
                 * pos_mask_chunk.float()                          # [chunk, M]
 
