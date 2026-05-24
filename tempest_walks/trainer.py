@@ -77,6 +77,10 @@ class TrainerConfig:
     # Loss-formulation.
     tau: float = 0.5            # InfoNCE temperature
     beta_time: float = 1.0      # hop/time weight exponent
+    chunk_size: int = 0         # InfoNCE seed-chunk size. 0 = auto-size
+                                # based on free GPU memory. Set > 0 to
+                                # override with a fixed chunk size. The
+                                # loss is exact regardless of chunk size.
 
     # Walks.
     num_walks_per_node: int = 5
@@ -193,6 +197,53 @@ class Trainer:
     # Helpers
     # ──────────────────────────────────────────────────────────────────
 
+    def _compute_auto_chunk_size(self, walks) -> int:
+        """Auto-size InfoNCE seed-chunk based on available GPU memory.
+
+        The InfoNCE sim matrix is the dominant per-batch memory cost:
+        [chunk, M] float32, where M = NK * L. Backward pass roughly
+        doubles this. We size the chunk to fit (free GPU memory minus
+        PyTorch overhead) with a 0.7 safety factor.
+
+        Returns:
+            - User's config.chunk_size if > 0 (manual override).
+            - 0 if running on CPU (no chunking needed; chunked path
+              gives no benefit without GPU memory pressure).
+            - Auto-computed positive integer on GPU.
+        """
+        # User override takes priority.
+        if self.config.chunk_size > 0:
+            return self.config.chunk_size
+
+        # On CPU, no memory pressure; let alignment_loss use the
+        # no-chunking branch (chunk_size=0).
+        if not torch.cuda.is_available() or self.device.type != "cuda":
+            return 0
+
+        NK, L = walks.nodes.shape
+        M = NK * L
+        if M == 0:
+            return 0
+
+        free_bytes, _ = torch.cuda.mem_get_info(self.device)
+        OVERHEAD_BYTES = 500 * 1024 * 1024  # 500 MB
+        available = max(free_bytes - OVERHEAD_BYTES, 0)
+
+        # Per seed in the chunk, the sim matrix row is M floats.
+        # Backward pass activations roughly double this.
+        bytes_per_seed = M * 4 * 2
+        if bytes_per_seed == 0:
+            return 0
+
+        raw_chunk = available // bytes_per_seed
+        # Safety factor 0.7 for PyTorch allocator fragmentation.
+        safe_chunk = int(raw_chunk * 0.7)
+        # Cap at NK — no point chunking larger than the batch itself.
+        safe_chunk = min(safe_chunk, NK)
+        # Floor at 32 to amortise per-chunk kernel launch overhead.
+        safe_chunk = max(safe_chunk, 32)
+        return safe_chunk
+
     def _score_pairs(self, u_ids: torch.Tensor, v_ids: torch.Tensor) -> torch.Tensor:
         """Score [P] (u, v) pairs through E + link_head. Undirected eval
         symmetrises by averaging forward(u, v) + forward(v, u). Used at
@@ -222,6 +273,9 @@ class Trainer:
         # Step 2: InfoNCE contrastive alignment over batched walks.
         # The softmax denominator over all batch contexts is the
         # anti-collapse mechanism (replaces Wang-Isola uniformity).
+        # Auto-size the seed-chunk for memory safety (chunking is
+        # exact, not approximate).
+        effective_chunk_size = self._compute_auto_chunk_size(walks)
         t_now = int(batch.t_max)
         l_align = alignment_loss(
             embedding_table=self.embedding_table,
@@ -233,6 +287,7 @@ class Trainer:
             beta=self.config.beta_time,
             tau=self.config.tau,
             node_feat=self.node_feat,
+            chunk_size=effective_chunk_size,
         )
 
         # Step 4: link-pred negatives from PRE-OBSERVE reservoir.
