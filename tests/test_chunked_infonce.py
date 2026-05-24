@@ -88,7 +88,8 @@ class _NodeFeatHead(nn.Module):
 
 def build_synthetic_walks(N, K, L, num_nodes, seed):
     """Construct a WalkData with N seeds × K walks of random length.
-    Each row [i*K + k, :] is a walk for seed i.
+    Each row [i*K + k, :] is a walk for seed i. CPU tensors —
+    alignment_loss moves them to its target device automatically.
     """
     rng = np.random.default_rng(seed)
     NK = N * K
@@ -110,10 +111,8 @@ def build_synthetic_walks(N, K, L, num_nodes, seed):
     )
 
 
-def make_model(num_nodes, d_emb, d_proj, seed, d_nf=None):
-    """Fresh deterministic embedding + two projection heads.
-    If d_nf is set, returns NodeFeatHeads; else IdentityHeads.
-    """
+def make_model(num_nodes, d_emb, d_proj, seed, *, device, d_nf=None):
+    """Fresh deterministic embedding + two projection heads on `device`."""
     torch.manual_seed(seed)
     E = _FakeE(num_nodes, d_emb)
     if d_nf is None:
@@ -122,7 +121,7 @@ def make_model(num_nodes, d_emb, d_proj, seed, d_nf=None):
     else:
         p_t = _NodeFeatHead(d_emb, d_nf, d_proj, seed=seed + 1)
         p_c = _NodeFeatHead(d_emb, d_nf, d_proj, seed=seed + 2)
-    return E, p_t, p_c
+    return E.to(device), p_t.to(device), p_c.to(device)
 
 
 def call_loss_and_grads(E, p_t, p_c, walks, *, tau, beta, T_train, chunk_size,
@@ -258,8 +257,8 @@ def naive_alignment_loss(E, p_t, p_c, walks, *, t_now, T_train, beta, tau,
 # ─── Test cases ─────────────────────────────────────────────────────
 
 
-def test_chunk_vs_full_K1():
-    print("Test 1: chunk vs full, K=1, NK=200")
+def test_chunk_vs_full_K1(device):
+    print(f"Test 1: chunk vs full, K=1, NK=200  [{device}]")
     N, K, L = 200, 1, 20
     d_emb, d_proj, num_nodes = 64, 64, 1000
     tau, beta, T_train = 0.5, 1.0, 1_000_000.0
@@ -268,14 +267,14 @@ def test_chunk_vs_full_K1():
     walks = build_synthetic_walks(N, K, L, num_nodes, seed)
     NK = N * K
 
-    E, p_t, p_c = make_model(num_nodes, d_emb, d_proj, seed)
+    E, p_t, p_c = make_model(num_nodes, d_emb, d_proj, seed, device=device)
     ref = call_loss_and_grads(E, p_t, p_c, walks, tau=tau, beta=beta,
                               T_train=T_train, chunk_size=0)
     print(f"  reference loss = {ref[0]:.10f}")
 
     failed = False
     for cs in [10, 50, 100, 7, 32, 1, NK, 500]:
-        E, p_t, p_c = make_model(num_nodes, d_emb, d_proj, seed)
+        E, p_t, p_c = make_model(num_nodes, d_emb, d_proj, seed, device=device)
         val = call_loss_and_grads(E, p_t, p_c, walks, tau=tau, beta=beta,
                                   T_train=T_train, chunk_size=cs)
         if not _assert_match(f"chunk={cs}", ref, val):
@@ -283,8 +282,8 @@ def test_chunk_vs_full_K1():
     return not failed
 
 
-def test_chunk_vs_full_Kgt1():
-    print("Test 2: chunk vs full, K=4 (multi-walk per seed)")
+def test_chunk_vs_full_Kgt1(device):
+    print(f"Test 2: chunk vs full, K=4 (multi-walk per seed)  [{device}]")
     N, K, L = 50, 4, 16
     d_emb, d_proj, num_nodes = 64, 64, 500
     tau, beta, T_train = 0.3, 1.5, 500_000.0
@@ -293,14 +292,14 @@ def test_chunk_vs_full_Kgt1():
     walks = build_synthetic_walks(N, K, L, num_nodes, seed)
     NK = N * K
 
-    E, p_t, p_c = make_model(num_nodes, d_emb, d_proj, seed)
+    E, p_t, p_c = make_model(num_nodes, d_emb, d_proj, seed, device=device)
     ref = call_loss_and_grads(E, p_t, p_c, walks, tau=tau, beta=beta,
                               T_train=T_train, chunk_size=0)
     print(f"  reference loss = {ref[0]:.10f}  (NK={NK})")
 
     failed = False
     for cs in [1, 7, 32, NK, 1000]:
-        E, p_t, p_c = make_model(num_nodes, d_emb, d_proj, seed)
+        E, p_t, p_c = make_model(num_nodes, d_emb, d_proj, seed, device=device)
         val = call_loss_and_grads(E, p_t, p_c, walks, tau=tau, beta=beta,
                                   T_train=T_train, chunk_size=cs)
         if not _assert_match(f"chunk={cs}", ref, val):
@@ -308,8 +307,8 @@ def test_chunk_vs_full_Kgt1():
     return not failed
 
 
-def test_chunk_vs_full_node_feat():
-    print("Test 3: chunk vs full, node_feat path")
+def test_chunk_vs_full_node_feat(device):
+    print(f"Test 3: chunk vs full, node_feat path  [{device}]")
     N, K, L = 60, 2, 14
     d_emb, d_proj, num_nodes, d_nf = 48, 48, 400, 8
     tau, beta, T_train = 0.5, 1.0, 1_000_000.0
@@ -318,9 +317,9 @@ def test_chunk_vs_full_node_feat():
     walks = build_synthetic_walks(N, K, L, num_nodes, seed)
     NK = N * K
     g = torch.Generator().manual_seed(seed + 99)
-    node_feat = torch.randn(num_nodes, d_nf, generator=g)
+    node_feat = torch.randn(num_nodes, d_nf, generator=g).to(device)
 
-    E, p_t, p_c = make_model(num_nodes, d_emb, d_proj, seed, d_nf=d_nf)
+    E, p_t, p_c = make_model(num_nodes, d_emb, d_proj, seed, device=device, d_nf=d_nf)
     ref = call_loss_and_grads(E, p_t, p_c, walks, tau=tau, beta=beta,
                               T_train=T_train, chunk_size=0,
                               node_feat=node_feat)
@@ -328,7 +327,7 @@ def test_chunk_vs_full_node_feat():
 
     failed = False
     for cs in [1, 13, NK]:
-        E, p_t, p_c = make_model(num_nodes, d_emb, d_proj, seed, d_nf=d_nf)
+        E, p_t, p_c = make_model(num_nodes, d_emb, d_proj, seed, device=device, d_nf=d_nf)
         val = call_loss_and_grads(E, p_t, p_c, walks, tau=tau, beta=beta,
                                   T_train=T_train, chunk_size=cs,
                                   node_feat=node_feat)
@@ -337,11 +336,11 @@ def test_chunk_vs_full_node_feat():
     return not failed
 
 
-def test_chunked_matches_naive_reference():
+def test_chunked_matches_naive_reference(device):
     """Both chunked and non-chunked production paths match an
     independent triple-loop implementation. Catches bugs shared by
     both code paths."""
-    print("Test 4: chunked + full match naive triple-loop reference")
+    print(f"Test 4: chunked + full match naive triple-loop reference  [{device}]")
     N, K, L = 8, 3, 10                       # small enough for the loop
     d_emb, d_proj, num_nodes = 32, 32, 50
     tau, beta, T_train = 0.4, 1.2, 250_000.0
@@ -350,7 +349,7 @@ def test_chunked_matches_naive_reference():
     walks = build_synthetic_walks(N, K, L, num_nodes, seed)
     NK = N * K
 
-    E_n, p_t_n, p_c_n = make_model(num_nodes, d_emb, d_proj, seed)
+    E_n, p_t_n, p_c_n = make_model(num_nodes, d_emb, d_proj, seed, device=device)
     naive = naive_alignment_loss(
         E_n, p_t_n, p_c_n, walks,
         t_now=1_000_000, T_train=T_train, beta=beta, tau=tau,
@@ -366,7 +365,7 @@ def test_chunked_matches_naive_reference():
 
     failed = False
     for cs in [0, 7, 1, NK]:
-        E, p_t, p_c = make_model(num_nodes, d_emb, d_proj, seed)
+        E, p_t, p_c = make_model(num_nodes, d_emb, d_proj, seed, device=device)
         val = call_loss_and_grads(E, p_t, p_c, walks, tau=tau, beta=beta,
                                   T_train=T_train, chunk_size=cs)
         if not _assert_match(f"production chunk={cs} vs naive", naive_ref, val):
@@ -375,17 +374,24 @@ def test_chunked_matches_naive_reference():
 
 
 def main():
+    # Run on CUDA when available so we exercise the actual training
+    # device. CPU run is implicit if CUDA isn't present.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        print(f"Device: cuda ({torch.cuda.get_device_name(0)})")
+    else:
+        print("Device: cpu (no CUDA available)")
+
     results = [
-        test_chunk_vs_full_K1(),
-        test_chunk_vs_full_Kgt1(),
-        test_chunk_vs_full_node_feat(),
-        test_chunked_matches_naive_reference(),
+        test_chunk_vs_full_K1(device),
+        test_chunk_vs_full_Kgt1(device),
+        test_chunk_vs_full_node_feat(device),
+        test_chunked_matches_naive_reference(device),
     ]
     if not all(results):
         print("\nFAIL: at least one test failed.")
         sys.exit(1)
-    print("\nPASS: all chunked InfoNCE tests match reference within "
-          f"{TOL:.0e}.")
+    print(f"\nPASS: all chunked InfoNCE tests match reference within {TOL:.0e}.")
 
 
 if __name__ == "__main__":
