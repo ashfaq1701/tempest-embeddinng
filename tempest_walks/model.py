@@ -8,16 +8,16 @@ EmbeddingTable
     projection heads.
 
 ProjectionHead
-  - Conditional architecture based on feature availability:
-      E only          → MLP on E
-      E + NF          → MLP on E + MLP on NF, concat, merge MLP
-      E + EF          → MLP on E + MLP on EF, concat, merge MLP
-      E + NF + EF     → MLP on E + MLP on NF + MLP on EF, concat,
-                        merge MLP
+  - Conditional architecture based on node-feature availability:
+      E only   → MLP on E
+      E + NF   → MLP on E + MLP on NF, concat, merge MLP
   - Output is L2-normalised via F.normalize(..., p=2, dim=-1, eps=1e-12).
   - Two instances: P_target (for seed/downstream nodes) and
-    P_context (for walk-internal/upstream nodes). EF channel only
-    appears in P_context per convention β.
+    P_context (for walk-internal/upstream nodes), each with its own
+    parameters. Both heads have the same architecture.
+  - Edge features were tested in Tasks 12-14 and consistently
+    underperformed the no-EF baseline; the EF channel has been
+    removed.
 
 LinkHead
   - score(u, v) = bilinear(E(u), E(v)) + small_MLP(pair_features(u, v))
@@ -57,21 +57,22 @@ class EmbeddingTable(nn.Module):
 
 
 class ProjectionHead(nn.Module):
-    """Loss-side projection with conditional NF / EF channels.
+    """Loss-side projection with optional node-feature channel.
 
     Architecture:
       - One sub-MLP per active input channel (E always; NF if
-        d_node_feat is not None; EF if d_edge_feat is not None).
+        d_node_feat is not None).
       - Concat the active sub-MLP outputs along the last dim.
       - Merge MLP mixes back to d_proj.
       - Output is L2-normalised on the unit sphere.
 
-    Two instances are typically constructed:
-      P_target  — for seed/downstream nodes. EF channel disabled.
-      P_context — for walk-internal/upstream nodes. EF channel
-                  enabled iff the dataset has edge features and the
-                  caller wants to consume them (convention β:
-                  ef[p] = edge OUT of position p toward the seed).
+    Two instances are typically constructed: P_target (for
+    seed/downstream nodes) and P_context (for walk-internal/upstream
+    nodes), each with its own parameters.
+
+    Edge features were tested in Tasks 12-14 and consistently
+    underperformed the no-EF baseline (val 0.397 no-EF vs ≤0.355
+    for every EF variant). The EF channel has been removed.
     """
 
     def __init__(
@@ -79,7 +80,6 @@ class ProjectionHead(nn.Module):
         d_emb: int,
         d_proj: int,
         d_node_feat: Optional[int] = None,
-        d_edge_feat: Optional[int] = None,
         d_hidden: Optional[int] = None,
     ):
         super().__init__()
@@ -87,7 +87,6 @@ class ProjectionHead(nn.Module):
             d_hidden = d_proj
 
         self.has_nf = d_node_feat is not None
-        self.has_ef = d_edge_feat is not None
 
         self.e_mlp = nn.Sequential(
             nn.Linear(d_emb, d_hidden),
@@ -102,14 +101,7 @@ class ProjectionHead(nn.Module):
                 nn.Linear(d_hidden, d_proj),
             )
 
-        if self.has_ef:
-            self.ef_mlp = nn.Sequential(
-                nn.Linear(d_edge_feat, d_hidden),
-                nn.GELU(),
-                nn.Linear(d_hidden, d_proj),
-            )
-
-        n_branches = 1 + int(self.has_nf) + int(self.has_ef)
+        n_branches = 1 + int(self.has_nf)
         self.merge = nn.Sequential(
             nn.Linear(n_branches * d_proj, d_hidden),
             nn.GELU(),
@@ -120,23 +112,16 @@ class ProjectionHead(nn.Module):
         self,
         e: torch.Tensor,
         node_feat: Optional[torch.Tensor] = None,
-        edge_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Returns L2-normalised projection, shape e.shape[:-1] + [d_proj]."""
         if self.has_nf and node_feat is None:
             raise ValueError("ProjectionHead has NF channel but no NF passed")
         if not self.has_nf and node_feat is not None:
             raise ValueError("ProjectionHead has no NF channel but NF was passed")
-        if self.has_ef and edge_feat is None:
-            raise ValueError("ProjectionHead has EF channel but no EF passed")
-        if not self.has_ef and edge_feat is not None:
-            raise ValueError("ProjectionHead has no EF channel but EF was passed")
 
         branches = [self.e_mlp(e)]
         if self.has_nf:
             branches.append(self.nf_mlp(node_feat))
-        if self.has_ef:
-            branches.append(self.ef_mlp(edge_feat))
 
         z = torch.cat(branches, dim=-1)
         out = self.merge(z)
