@@ -40,6 +40,20 @@ import torch
 from .walks import WalkData
 
 
+# Sim value for invalid (padding/seed-slot) pool entries. Chosen so
+# exp(_INVALID_SIM) ≈ 0 in float32 but not -inf — prevents NaN when
+# every entry in a row is invalid (e.g. a walk with zero contexts).
+_INVALID_SIM = -1e9
+
+# Threshold for treating a seed as having no valid positives. Seeds
+# whose weight sum is below this are excluded from the loss mean.
+# The same threshold is used in the denominator clamp for numerical
+# safety, so the "valid" mask and the clamp are consistent: a seed
+# excluded from the mean is also exactly the seed whose denominator
+# would otherwise be artificially inflated by the clamp.
+_SEED_VALID_THRESHOLD = 1e-9
+
+
 def alignment_loss(
     embedding_table,                              # EmbeddingTable
     p_target,                                     # ProjectionHead — seed/downstream
@@ -70,8 +84,7 @@ def alignment_loss(
     # the seed (excluded), positions >= lens are padding.
     positions = torch.arange(L, device=device).unsqueeze(0)       # [1, L]
     seed_pos = (lens - 1).unsqueeze(1)                            # [NK, 1]
-    is_context = positions < seed_pos                             # [NK, L]
-    ctx_valid_mask = is_context.reshape(M)                        # [M]
+    ctx_valid_mask = (positions < seed_pos).reshape(M)            # [M]
 
     # Projections.
     seed_per_row = seeds_t.repeat_interleave(K)                   # [NK]
@@ -117,19 +130,16 @@ def alignment_loss(
     # Accumulate loss across chunks. Each chunk's per-seed loss
     # contributes independently; the final mean is over all seeds
     # with positives.
-    INVALID_MASK = -1e9
     total_loss_sum = torch.zeros((), device=device)
     total_valid_seeds = torch.zeros((), device=device)
 
     for start, end in chunk_bounds:
-        chunk_n = end - start
         p_seed_chunk = p_seed_all[start:end]                      # [chunk, d_proj]
 
         # Sim against the FULL pool — exact log Z_i for each seed.
         sim_dot = p_seed_chunk @ p_ctx_pool.T                     # [chunk, M]
-        sq_dist = 2.0 - 2.0 * sim_dot                             # [chunk, M]
-        sim = -sq_dist / tau                                      # [chunk, M]
-        sim = sim.masked_fill(~ctx_valid_mask.unsqueeze(0), INVALID_MASK)
+        sim = -(2.0 - 2.0 * sim_dot) / tau                        # [chunk, M]
+        sim = sim.masked_fill(~ctx_valid_mask.unsqueeze(0), _INVALID_SIM)
 
         log_Z = torch.logsumexp(sim, dim=1)                       # [chunk]
         log_p = sim - log_Z.unsqueeze(1)                          # [chunk, M]
@@ -139,14 +149,13 @@ def alignment_loss(
             start, end, device=device).unsqueeze(1)               # [chunk, 1]
         pos_mask_chunk = (pool_walk_idx.unsqueeze(0) == seed_indices_chunk) \
                          & ctx_valid_mask.unsqueeze(0)            # [chunk, M]
-        w_pos = w_flat.unsqueeze(0).expand(chunk_n, -1) \
-                * pos_mask_chunk.float()                          # [chunk, M]
+        w_pos = w_flat.unsqueeze(0) * pos_mask_chunk.float()      # [chunk, M]
 
+        w_pos_sum = w_pos.sum(dim=1)                              # [chunk]
         numerator = (w_pos * log_p).sum(dim=1)                    # [chunk]
-        denominator = w_pos.sum(dim=1).clamp_min(1e-6)            # [chunk]
-        loss_per_seed = -numerator / denominator                  # [chunk]
+        loss_per_seed = -numerator / w_pos_sum.clamp_min(_SEED_VALID_THRESHOLD)
+        valid = (w_pos_sum > _SEED_VALID_THRESHOLD).float()       # [chunk]
 
-        valid = (w_pos.sum(dim=1) > 1e-9).float()                 # [chunk]
         total_loss_sum = total_loss_sum + (loss_per_seed * valid).sum()
         total_valid_seeds = total_valid_seeds + valid.sum()
 
