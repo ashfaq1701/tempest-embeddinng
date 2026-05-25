@@ -16,12 +16,12 @@ tempest_walks/
   negatives.py   Uniform / Historical (Vitter R) / TGB samplers
   walks.py       Tempest walk-sampler wrapper
   model.py       EmbeddingTable + ProjectionHead + LinkHead
-  losses.py      alignment_loss (InfoNCE, per-chunk backward)
+  losses.py      alignment_loss (InfoNCE with sampled negatives)
   trainer.py     Strict-causal train + eval loop
-  utils.py       seeding, dataset derivation, chunk auto-sizer, LR λ
+  utils.py       seeding, dataset derivation, LR schedule λ
 scripts/
   train.py       CLI entry point
 tests/
-  test_chunked_infonce.py    chunked-vs-full + vs naive triple-loop
-  test_vitter_r_uniformity.py
+  test_walk_contract.py        shape + alignment contract for Tempest walks
+  test_vitter_r_uniformity.py  χ² check on Historical (Vitter R) reservoir
 ```
