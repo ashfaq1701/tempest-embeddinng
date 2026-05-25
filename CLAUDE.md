@@ -29,6 +29,72 @@ No changes to alignment, positive weighting, or other architecture.
 Only the partition function changes from "softmax over all M pool
 entries" to "softmax over (positives ∪ sampled_negatives)".
 
+## Tempest walk contract — verified 2026-05-25
+
+Verified empirically on tgbl-wiki (10 000 ingested edges, 8 seeds,
+40 walks at max_walk_len=20). Pinned in `tests/test_walk_contract.py`.
+
+Shapes:
+  - `walks.nodes`        `[NK, L]`            int32   ; padding `-1`
+  - `walks.timestamps`   `[NK, L]`            int64   ; sentinel `INT64_MAX` at `lens-1`; padding `-1`
+  - `walks.edge_feats`   `[NK, L-1, d_ef]`    float32 ; **one column shorter than nodes**; tail rows are zero
+  - `walks.lens`         `[NK]`               int64
+  - `walks.seeds`        `[N]`                int64
+  - `walks.K` = walks per seed; `NK == N · K`
+
+Row grouping: rows `[i·K, (i+1)·K)` belong to `seeds[i]`. Guaranteed
+by `shuffle_walk_order=False` at the Tempest constructor.
+
+Walk direction: `"Backward_In_Time"`. Chronologically oldest predecessor
+at position 0; seed at position `lens-1`.
+
+Alignment: for `p ∈ [0, lens[i]-2]`, `timestamps[i, p]` is the
+timestamp of the edge `(nodes[i, p], nodes[i, p+1])`. Verified
+79 / 79 (u, v, t) tuples match an ingested edge.
+
+Seed slot `p = lens-1`:
+  - `nodes[i, lens-1]` = seed (matches `seeds[i // K]`)
+  - `timestamps[i, lens-1]` = `INT64_MAX` sentinel ("for parity"
+    with nodes' shape; seed has no outgoing edge in the walk)
+  - `edge_feats` has no row here (its last index is `lens-2`)
+
+Padding (`p >= lens[i]`): both `nodes` and `timestamps` = `-1`;
+`edge_feats` rows are all-zero.
+
+### Implications for alignment_loss
+
+The loss code is **correct** under this contract. Verification
+walk-through:
+
+- `is_context = positions < (lens-1)` masks both the seed slot
+  AND padding positions out of the loss.
+- At seed slot: `INT64_MAX − t_now` is hugely negative → `clamp_min(0)`
+  → `dt = 0` → `w_time = 1`. But the slot is masked, so `w_pos = 0`.
+  Sentinel value never leaks into the gradient.
+- At padding: `timestamps = -1` → `dt = t_now + 1` (large positive)
+  → small `w_time`. Also masked, no leak.
+- At seed slot: `nodes[i, lens-1] = seed` — `sim_pos` here would
+  be a "trivial self-positive" (seed vs its own projection) but
+  it's also masked via `_INVALID_SIM`.
+- At padding: `nodes = -1` is clamped to 0 by `nodes.clamp_min(0)`
+  before embedding lookup, so no out-of-range index error. The
+  resulting bogus context contribution is masked away.
+
+No fix needed.
+
+### Implications for upcoming walk encoder
+
+- Positions `[0, lens-2]` are real (node, edge-to-next-node)
+  pairs; the encoder can consume both `nodes[p]` and
+  `edge_feats[p]` along with the time signal `timestamps[p]`.
+- Position `lens-1` is the seed, has no associated edge time
+  (`INT64_MAX` sentinel) and no `edge_feats` row. The encoder
+  needs either a learned "seed marker" embedding here or just
+  to skip this position in any edge-feature pathway.
+- Padding (`p >= lens`) must be masked; the encoder should
+  derive its mask from `lens` directly (e.g.
+  `mask = arange(L) < lens.unsqueeze(1)`).
+
 ---
 
 ## Architecture
