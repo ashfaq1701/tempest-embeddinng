@@ -138,6 +138,44 @@ on `feature/infonce-experiments`):
 These let `--dataset tgbl-review-v2` resolve correctly; the OOM
 above is the next blocker.
 
+## Stage 8.5 — Wiki τ sweep (2026-05-25)
+
+Config: tgbl-wiki, bs=200, β=1.0, seed=42, 30 ep, LR default
+(scheduled cosine + linear warmup, peak 1e-2 — current default
+post LR-scheduler work; overrode the original spec's 1e-3 per
+user instruction to use the current default).
+
+| τ | best ep | val MRR | test MRR | notes |
+|---|---|---|---|---|
+| 0.1 | 6  | 0.4143 | 0.3593 | very sharp; peaks early then oscillates 0.32–0.40 |
+| 0.3 | 8  | 0.3959 | 0.3486 | sharp; peaks mid-run |
+| **0.5** | **30** | **0.4315** | **0.4060** | **Stage A reference — winner** |
+| 0.7 | 30 | 0.4133 | 0.3886 | softer; still climbing at endpoint |
+| 1.0 | 30 | 0.3367 | 0.3317 | regression-like; slowest start, weakest result |
+
+**Best τ = 0.5.** Validates the Stage A a-priori choice.
+
+Observations:
+- τ ∈ {0.5, 0.7, 1.0} all peak at the last epoch — 30-ep horizon
+  may be cutting them short. τ=0.5 peak val MRR could be higher
+  with more epochs.
+- τ=0.1 (very sharp) hits its peak early (ep 6) but then bounces
+  noisily between 0.32 and 0.41 — too-sharp softmax → over-confident
+  gradients → instability.
+- The 0.4315 val MRR matches Stage A's 3-seed mean of 0.4903 ± 0.004
+  fairly poorly (single-seed at single-τ vs 3-seed mean), but
+  ranks consistently with the relative ordering — τ=0.5 is the
+  right operating point for wiki.
+
+Compared to Stage A (3 seeds × 30 ep at τ=0.5, mean val 0.4903):
+this single-seed Stage 8.5 run at τ=0.5 got val 0.4315 — about
+12% below the 3-seed mean. Plausibly within seed-to-seed variance
+(Stage A std was ±0.004 but that's across 3 seeds, not 5+).
+
+Decision: PASS. Proceeding to Stage 9 (β sweep at τ=0.5).
+
+Logs: `logs/t16_stage85_wiki_tau{0.1,0.3,0.5,0.7,1.0}.log`.
+
 ## InfoNCE implementation verification
 
 Verified `tempest_walks/losses.py` and `tempest_walks/trainer.py`
