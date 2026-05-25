@@ -23,16 +23,9 @@ alignment_loss(E, P_target, P_context, walks, ...,
     (push seed projections away from non-positive contexts), but
     with task-relevant negatives sampled by frequency.
 
-False-negative exclusion. Sampled negatives that coincide with
-any positive of the same seed are masked out of the partition
-function via batched searchsorted in the seed's sorted positive
-set (per seed, shape [walks_per_node × max_walk_len]). We
-oversample by _NEG_OVERSAMPLE_FACTOR (1.5×) and keep the first
-num_align_negatives valid samples per walk. Walks that fall
-short of num_align_negatives valid samples after exclusion get
-their trailing entries masked _INVALID_SIM — logsumexp ignores
-them, so the partition still works, just with fewer effective
-negatives.
+False negatives (sampled nodes that happen to be positives of the
+same seed) are accepted. Per-sample bias is small (~3%) and
+matches standard SimCLR/CLIP practice. No exclusion masking.
 
 Returns a standard graph-attached scalar tensor. The trainer
 combines it with the BCE term and calls .backward() once.
@@ -65,12 +58,6 @@ _SEED_VALID_THRESHOLD = 1e-9
 # unique-node counts. Word2Vec convention; balances sampling
 # popular and rare nodes.
 _SAMPLING_EXPONENT = 0.75
-
-# Oversample factor for negative sampling, used by the false-
-# negative exclusion path. Drawing 1.5×K means we can absorb ~30%
-# rejection and still have K valid negatives per walk with high
-# probability. Empirical FN rate is 3-5%; 1.5× is conservative.
-_NEG_OVERSAMPLE_FACTOR = 1.5
 
 
 def alignment_loss(
@@ -157,72 +144,38 @@ def alignment_loss(
     valid_nodes = nodes.reshape(M)[ctx_valid_mask]                # [V_total]
     unique_nodes, counts = torch.unique(valid_nodes, return_counts=True)
     sampling_weights = counts.float().pow(_SAMPLING_EXPONENT)     # [V_unique]
+
+    # Sample NK × num_align_negatives integer indices into unique_nodes
+    # via inverse-CDF sampling. torch.multinomial on CUDA fails at
+    # large num_samples (kernel-launch limits); searchsorted on a
+    # normalised cumulative distribution has the same distributional
+    # semantics with no launch-size cap.
     cum_weights = sampling_weights.cumsum(0)                      # [V_unique]
     cum_weights = cum_weights / cum_weights[-1]                   # normalised to [0, 1]
-
-    # False-negative exclusion. Per-seed sorted positive set
-    # (padded with -1 sentinels for entries beyond walks_per_node ×
-    # max_walk_len that aren't real positives). Sort puts -1s at
-    # the start; real node IDs cluster at the high end.
-    N_seeds = walks.seeds.shape[0]
-    positives_width = K * L                                       # walks_per_node × max_walk_len
-    seed_pos_per_seed_sorted, _ = nodes.view(
-        N_seeds, positives_width,
-    ).sort(dim=1)                                                 # [N_seeds, positives_width]
-    # Each walk shares its seed's positive set; broadcast.
-    seed_pos_per_walk_sorted = seed_pos_per_seed_sorted.repeat_interleave(K, dim=0)
-    # [NK, positives_width]
-
-    # Sample K_over candidates per walk via inverse-CDF
-    # (torch.multinomial on CUDA fails at large num_samples;
-    # searchsorted on a normalised CDF has identical semantics
-    # with no launch-size cap).
-    K_over = int(num_align_negatives * _NEG_OVERSAMPLE_FACTOR)
-    total_samples = NK * K_over
+    total_samples = NK * num_align_negatives
     u = torch.rand(total_samples, device=device)
     flat_neg_idx = torch.searchsorted(cum_weights, u).clamp(
         max=unique_nodes.shape[0] - 1,
-    )                                                             # [NK · K_over]
-    candidate_neg_node_ids = unique_nodes[flat_neg_idx].view(
-        NK, K_over,
-    )                                                             # [NK, K_over]
+    )                                                             # [NK * R]
+    sampled_neg_node_ids = unique_nodes[flat_neg_idx].view(
+        NK, num_align_negatives,
+    )                                                             # [NK, R]
 
-    # Membership check: searchsorted finds where each candidate
-    # would insert in the sorted positives; if the value at that
-    # index equals the candidate, the candidate IS a positive
-    # (false negative) and we reject it.
-    insert_idx = torch.searchsorted(
-        seed_pos_per_walk_sorted, candidate_neg_node_ids,
-    ).clamp(max=positives_width - 1)                              # [NK, K_over]
-    gathered = torch.gather(
-        seed_pos_per_walk_sorted, dim=1, index=insert_idx,
-    )                                                             # [NK, K_over]
-    valid_mask = gathered != candidate_neg_node_ids               # True = real negative
-
-    # Keep the first num_align_negatives valid samples per walk.
-    # Walks with shortfall (< K valid after rejection) keep all
-    # their valid samples; trailing entries beyond shortfall get
-    # masked _INVALID_SIM in sim_neg below.
-    cumulative_valid = valid_mask.long().cumsum(dim=1)            # [NK, K_over]
-    keep_mask = valid_mask & (cumulative_valid <= num_align_negatives)
-    # [NK, K_over], True iff this candidate contributes to log Z_i.
-
-    # Project candidates through P_context.
-    e_neg = embedding_table(candidate_neg_node_ids.reshape(-1))   # [NK·K_over, d_emb]
+    # Project the sampled negatives through P_context.
+    e_neg = embedding_table(sampled_neg_node_ids.reshape(-1))     # [NK·R, d_emb]
     if node_feat is not None:
-        nf_neg = node_feat[candidate_neg_node_ids.reshape(-1)]
+        nf_neg = node_feat[sampled_neg_node_ids.reshape(-1)]
         p_neg = p_context(e_neg, node_feat=nf_neg)
     else:
         p_neg = p_context(e_neg)
-    p_neg = p_neg.view(NK, K_over, d_proj)                        # [NK, K_over, d_proj]
+    p_neg = p_neg.view(NK, num_align_negatives, d_proj)           # [NK, R, d_proj]
 
-    # ── Sim to sampled negatives (FN-masked) ─────────────────────
+    # ── Sim to sampled negatives ─────────────────────────────────
     sq_dist_neg = ((p_seed.unsqueeze(1) - p_neg) ** 2).sum(dim=-1)
-    sim_neg = -sq_dist_neg / tau                                  # [NK, K_over]
-    sim_neg = sim_neg.masked_fill(~keep_mask, _INVALID_SIM)
+    sim_neg = -sq_dist_neg / tau                                  # [NK, R]
 
     # ── Partition function: log Z_i over positives ∪ negatives ───
-    sim_combined = torch.cat([sim_pos, sim_neg], dim=1)           # [NK, L + K_over]
+    sim_combined = torch.cat([sim_pos, sim_neg], dim=1)           # [NK, L + R]
     log_Z = torch.logsumexp(sim_combined, dim=1)                  # [NK]
     log_p_pos = sim_pos - log_Z.unsqueeze(1)                      # [NK, L]
 
