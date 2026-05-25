@@ -1,151 +1,146 @@
 # Tempest walk-supervised temporal link prediction
 
-Walks-supervised temporal link prediction with Tempest. Currently being
-rebuilt from first principles. The prior architecture and its 26+ lessons
-are preserved on branch `backup/important-walk-embedding` for reference.
-This file will be repopulated as the new design stabilises.
+Walks-supervised temporal link prediction with Tempest. The
+architecture below replaces the prior alignment+uniformity design
+(preserved on `backup/important-walk-embedding`) with a single
+InfoNCE contrastive loss + a separate BCE link head.
 
 ---
 
-# Loss variation — InfoNCE contrastive alignment
+## Architecture
 
-Branch: `loss_variation/infonce` (from master, clean C1)
-Started: 2026-05-24
+### Loss
 
-Replaces regression alignment + Wang-Isola uniformity with single
-InfoNCE contrastive alignment. Drops uniformity entirely; InfoNCE's
-softmax denominator does the anti-collapse work using task-relevant
-in-batch negatives.
+`tempest_walks/losses.py` — `alignment_loss(...)`
 
-This branch contains the architectural change only. Experiments run
-on `feature/infonce-experiments` which branches from this.
+InfoNCE contrastive alignment over batched temporal random walks.
+For each seed `s_i` with positive contexts `{n_p^+ : p in walk i}`
+and a flat pool of all batch contexts (size `M = NK · L`):
 
-## InfoNCE implementation verification
+```
+L_i      = -(Σ_p w[i,p] · log p(n_p^+ | s_i)) / (Σ_p w[i,p])
+log p(n | s_i)
+         = -‖p_t(s_i) - p_c(n)‖² / τ
+           - log Σ_j exp(-‖p_t(s_i) - p_c(n_j)‖² / τ)
+L_total  = mean_i (L_i for i with at least one valid positive)
+```
 
-Verified `tempest_walks/losses.py` and `tempest_walks/trainer.py`
-against the mathematical specification. All 15 static checks pass.
+`j` ranges over **all valid batch contexts** — every other walk's
+positions act as in-batch negatives. The softmax denominator does
+the anti-collapse work that Wang-Isola uniformity used to do in the
+old architecture, but with task-relevant negatives instead of random
+pairs.
 
-### Static checks
+Hop/time weights:
 
-Check 1 (squared distance via dot product): **PASS**
-  `sim_dot = p_seed @ p_ctx_flat.T` (losses.py:81)
-  `sq_dist_full = 2.0 - 2.0 * sim_dot` (losses.py:82)
-  Constant 2.0 and negative sign correct for unit-sphere outputs.
+```
+w(K_hop, Δt) = 1/K_hop + (1 + Δt/T_train)^(-β)
+```
 
-Check 2 (sim sign and τ position): **PASS**
-  `sim = -sq_dist_full / tau` (losses.py:83)
-  Negative sign present; τ is divisor.
+Defaults: `τ = 0.5`, `β = 1.0` — empirically validated by τ and β
+sweeps on wiki under InfoNCE (single seed 30 epochs at bs=200; the
+defaults won both sweeps).
 
-Check 3 (log Z over ENTIRE pool): **PASS**
-  `log_Z = torch.logsumexp(sim, dim=1)  # [NK]` (losses.py:109)
-  sim has shape [NK, NK*L]; dim=1 sums over the full pool.
+### Chunked InfoNCE (memory-bounded backward)
 
-Check 4 (invalid pool entries masked before logsumexp): **PASS**
-  `sim = sim.masked_fill(~ctx_valid_mask.unsqueeze(0), INVALID_MASK)`
-  with `INVALID_MASK = -1e9` (losses.py:88-89). Path (a).
-  Masking happens BEFORE logsumexp.
+`alignment_loss` performs backward **internally**, per chunk, with
+`retain_graph=True` on every chunk except the last. The function
+returns a **detached scalar** — callers must not call `.backward()`
+on it.
 
-Check 5 (positive mask = walk_idx AND valid context): **PASS**
-  `same_walk = pool_walk_idx.unsqueeze(0) == seed_indices` (losses.py:95)
-  `pos_mask = same_walk & ctx_valid_mask.unsqueeze(0)` (losses.py:96)
-  Both conditions present.
+Why: a single accumulator `total_loss_sum` would otherwise pin every
+chunk's autograd graph until the outer `.backward()`, so peak memory
+would scale with NK·M regardless of chunk_size. With per-chunk
+backward, each chunk's local intermediates are released by Python
+refcounting between iterations, and only the shared upstream graph
+(p_target(e_seed), p_context(e_ctx_flat)) is retained across chunks.
 
-Check 6 (weights for positives only): **PASS**
-  `w_pos = w_flat.unsqueeze(0).expand(NK, -1) * pos_mask.float()`
-  (losses.py:106). Non-positives multiplied by 0.
+Peak memory under this design:
+```
+fixed (model + Adam + retained projection graph)
++ max over chunks of (one chunk's sim / log_p / w_pos intermediates)
+```
+which is finally bounded by the `chunk_size` knob.
 
-Check 7 (log_p broadcast): **PASS**
-  `log_p = sim - log_Z.unsqueeze(1)  # [NK, NK*L]` (losses.py:110)
-  log_Z [NK] → [NK, 1] broadcast across pool.
+The auto-sizer in `tempest_walks/utils.py:compute_auto_chunk_size`
+picks chunk_size based on free GPU memory, with explicit terms for
+the projection-graph retention overhead (scales with NK + M) and
+Adam-state overhead (1.5 GB default; override for very large
+embeddings).
 
-Check 8 (per-seed weighted average + negative sign): **PASS**
-  `sum_weighted_log_p = weighted_log_p.sum(dim=1)  # [NK]` (losses.py:114)
-  `sum_weights = w_pos.sum(dim=1).clamp_min(1e-6)  # [NK]` (losses.py:115)
-  `loss_per_seed = -sum_weighted_log_p / sum_weights` (losses.py:116)
-  Per-seed division, negative sign at end.
+### Trainer
 
-Check 9 (division-by-zero protection): **PASS, both (a) and (b)**
-  (a) `clamp_min(1e-6)` on denominator (losses.py:115).
-  (b) Separate mask `has_positives = (w_pos.sum(dim=1) > 1e-9)`
-      (losses.py:120) used to exclude 0-positive seeds from the
-      final mean.
+`tempest_walks/trainer.py` — strict-causal per-batch ordering:
 
-Check 10 (batch mean over valid seeds only): **PASS**
-  `n_valid_seeds = has_positives.float().sum().clamp_min(1.0)`
-  (losses.py:121)
-  `return (loss_per_seed * has_positives.float()).sum() / n_valid_seeds`
-  (losses.py:122). 0-positive seeds contribute 0 to both
-  numerator and denominator.
+1. `walks = walk_gen.walks_for_nodes(seeds)`  — pre-ingest
+2. `optimizer.zero_grad(set_to_none=True)`
+3. `L_align = alignment_loss(...)`             — does its own backward
+4. `neg = neg_sampler.sample(batch)`           — pre-observe
+5. Build link BCE on **detached** embeddings: `link_head(E[u].detach(), E[v].detach())`
+6. `L_bce.backward()`                          — grads on link_head only
+7. `optimizer.step()`
+8. `neg_sampler.observe(...)`                  — post-scoring
+9. `walk_gen.add_edges(...)`                   — post-scoring, last
 
-Check 11 (no uniformity in trainer): **PASS**
-  Only match in trainer.py is a comment at L224 ("anti-collapse
-  mechanism (replaces Wang-Isola uniformity)") — explanatory, not
-  a code path. No `uniform_temperature`, `eta_uniform`, `unif_a`,
-  `unif_b`, `_sample_uniformity_pairs`, or `uniformity_loss`
-  references remain.
+The two backwards touch disjoint parameter sets: alignment owns
+`E + p_target + p_context`; BCE owns `link_head` (its E lookups are
+detached).
 
-Check 12 (TrainerConfig clean): **PASS**
-  No `eta_uniform`, `uniform_temperature`, `uniform_pairs`, or
-  `uniform_sample_size` fields. Present: `tau: float = 0.5`
-  (trainer.py:78).
+### Model components
 
-Check 13 (CLI flags clean): **PASS**
-  No `--eta-uniform`, `--uniform-temperature`, or `--uniform-pairs`
-  CLI flags in scripts/train.py. Present: `--tau` at line 85.
+`tempest_walks/model.py`:
 
-Check 14 (metrics dict has no "uniform" key): **PASS**
-  `return {"align": ..., "bce": ..., "total": ...}` (trainer.py:270-274).
-  No "uniform" key.
+- `EmbeddingTable`     single `nn.Embedding(num_nodes, d_emb)`.
+- `ProjectionHead`     conditional architecture (E-only or
+                       E + node-features). Two instances:
+                       `P_target` for seeds, `P_context` for
+                       walk-internal nodes. L2-normalised output.
+                       Edge features were tested earlier and
+                       consistently underperformed the no-EF
+                       baseline; the EF channel is removed.
+- `LinkHead`           bilinear + 6-channel pair-MLP. Caller's
+                       responsibility to detach E on inputs.
 
-Check 15 (l_total construction): **PASS**
-  `l_total = l_align + l_bce` (trainer.py:258). No `l_table`
-  wrapper, no uniformity term.
+---
 
-### Empirical sanity
+## Tests
 
-Mock batch on N=20 seeds × K=5 walks × L=20 (NK=100, pool=2000,
-valid contexts=964). Random init with `torch.manual_seed(42)`.
+`tests/test_chunked_infonce.py` — four tests, all on CUDA when
+available:
 
-  sim stats (before mask): min=-3.884, max=-3.856, mean=-3.870.
-  sq_dist mean: 1.935 (random unit vectors → expected ~2.0).
-  log_Z per-seed: mean=3.001, min=2.996, max=3.007.
-  log(valid pool) = log(964) = 6.871.
+1. **chunk_vs_full_K1**     chunk sizes {0,1,7,10,32,50,100,NK,500}
+                            agree with the chunk=0 reference on
+                            loss + grad(target) + grad(context) +
+                            grad(E).
+2. **chunk_vs_full_Kgt1**   K=4 multi-walk per seed — verifies
+                            pool_walk_idx groups by row, not seed.
+3. **chunk_vs_full_node_feat**  alternate projection signature.
+4. **chunked_matches_naive_reference**
+                            both chunked AND non-chunked production
+                            paths match an independent triple-loop
+                            implementation written from the math
+                            spec. The load-bearing test: it doesn't
+                            trust either production path on its own.
 
-Sanity 1 (log_Z magnitude): the spec expected `log_Z ~ 7-9 at init`.
-Observed `log_Z = 3.0`. The spec's expectation assumed `sim ≈ 0`
-(cross-head projections aligned). In reality, at random init the
-two heads have DIFFERENT bias directions; their cross-head sim
-is `~ -d²/τ ~ -2/0.5 = -4`. Then `log_Z ≈ log(M) + mean_sim ≈
-6.87 + (-3.87) = 3.0`. The math is internally consistent; the
-spec's hand-wavy 7-9 was based on a different init assumption.
+Tolerance 1e-5 across all four (float32 reorder noise). Run with
+`python tests/test_chunked_infonce.py` or
+`python -m pytest tests/test_chunked_infonce.py`.
 
-This is consistent with the observed wiki ep1 align = 7.98:
-  - Wiki pool ≈ 3000 valid → log(3000) ≈ 8.0.
-  - sim_pos ≈ -4 → push = log_Z ≈ 8.0 - 4 = 4.0.
-  - pull = -sim_pos ≈ +4.0.
-  - align ≈ pull + push ≈ 8.0. ✓
+`tests/test_vitter_r_uniformity.py` — χ² uniformity check on the
+Historical (Vitter R) reservoir sampler.
 
-Sanity 2 (pull/push decomposition): **EXACT MATCH**
-  pull  = 3.8704  (avg of -sim_pos weighted by w)
-  push  = 3.0005  (avg of log_Z)
-  pull + push = 6.8710
-  L_align (from function) = 6.8710
-  Match within float epsilon.
+---
 
-This confirms the loss decomposition `L_align = pull + push` is
-algebraically exact, and the function output matches the manual
-computation.
+## Defaults
 
-### Issues found
-
-None. Implementation matches specification on all 15 static checks
-and 2 empirical sanity tests.
-
-### Verdict
-
-**Implementation matches specification.** The empirical sanity-check
-log_Z magnitude is lower than the spec's hand-wavy expectation
-because the spec assumed cross-head bias alignment at init
-(unrealistic for fresh random init); the actual magnitude is
-algebraically correct and consistent with the observed wiki ep1
-loss. Proceeding with Stage A as originally specified.
+| Knob | Default | Source |
+|---|---|---|
+| `tau` | 0.5 | a-priori; validated by τ sweep on wiki |
+| `beta_time` | 1.0 | a-priori; validated by β sweep at τ=0.5 |
+| `d_emb` | 128 | |
+| `d_proj` | 128 | |
+| `num_walks_per_node` | 5 | DeepWalk/CTDNE convention |
+| `max_walk_len` | 20 | |
+| `chunk_size` | 0 | auto-size; override only if you need a fixed value |
+| `lr` | 1e-2 | linear-scaling default at bs=2000 (Goyal 2017) |
+| `batch_size` | 2000 | |

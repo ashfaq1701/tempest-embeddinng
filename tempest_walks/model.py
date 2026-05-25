@@ -15,9 +15,8 @@ ProjectionHead
   - Two instances: P_target (for seed/downstream nodes) and
     P_context (for walk-internal/upstream nodes), each with its own
     parameters. Both heads have the same architecture.
-  - Edge features were tested in Tasks 12-14 and consistently
-    underperformed the no-EF baseline; the EF channel has been
-    removed.
+  - Edge features were tested and consistently underperformed the
+    no-EF baseline; the EF channel has been removed.
 
 LinkHead
   - score(u, v) = bilinear(E(u), E(v)) + small_MLP(pair_features(u, v))
@@ -70,9 +69,9 @@ class ProjectionHead(nn.Module):
     seed/downstream nodes) and P_context (for walk-internal/upstream
     nodes), each with its own parameters.
 
-    Edge features were tested in Tasks 12-14 and consistently
-    underperformed the no-EF baseline (val 0.397 no-EF vs ≤0.355
-    for every EF variant). The EF channel has been removed.
+    Edge features were tested and consistently underperformed the
+    no-EF baseline (val 0.397 no-EF vs ≤ 0.355 for every EF
+    variant). The EF channel has been removed.
     """
 
     def __init__(
