@@ -8,7 +8,7 @@ repeatedly with different CLI args.
 Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root
   Model:          --d-emb, --d-proj
-  Loss:           --tau, --beta-time
+  Loss:           --tau, --beta-time, --num-align-negatives
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias,
                   --start-bias
   Negatives:      --num-neg-per-pos, --hist-neg-ratio, --reservoir-size
@@ -85,6 +85,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tau", default=0.5, type=float,
                    help="InfoNCE contrastive temperature")
     p.add_argument("--beta-time", default=1.0, type=float)
+    p.add_argument(
+        "--num-align-negatives", type=int, default=64,
+        help="Number of sampled negatives per seed in InfoNCE "
+             "alignment loss. Higher = sharper contrastive signal "
+             "but more memory. Sweepable. Default 64 — lower end "
+             "of the InfoNCE paper's range (van den Oord 2018: "
+             "64-256), memory-safe on 8 GB at all TGB scales.",
+    )
 
     # Walks.
     p.add_argument("--num-walks-per-node", default=5, type=int)
@@ -241,6 +249,7 @@ def main() -> Dict[str, Any]:
 
         tau=args.tau,
         beta_time=args.beta_time,
+        num_align_negatives=args.num_align_negatives,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,

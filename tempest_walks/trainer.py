@@ -79,6 +79,17 @@ class TrainerConfig:
     # Loss-formulation.
     tau: float = 0.5            # InfoNCE temperature
     beta_time: float = 1.0      # hop/time weight exponent
+    num_align_negatives: int = 64     # Sampled negatives per seed in
+                                      # the InfoNCE partition function.
+                                      # Frequency-weighted (count^0.75)
+                                      # from the pool's unique nodes.
+                                      # Default sits at the lower end of
+                                      # the InfoNCE range (van den Oord
+                                      # 2018: 64-256), keeps memory
+                                      # bounded for comment-scale NK on
+                                      # 8 GB, and exceeds the per-seed
+                                      # positive count (≤ L=20) by a
+                                      # healthy margin.
 
     # Walks.
     num_walks_per_node: int = 5
@@ -315,6 +326,7 @@ class Trainer:
             beta=self.config.beta_time,
             tau=self.config.tau,
             node_feat=self.node_feat,
+            num_align_negatives=self.config.num_align_negatives,
         )
 
         # Step 3: link-pred negatives from PRE-OBSERVE reservoir.
