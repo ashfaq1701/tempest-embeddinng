@@ -5,14 +5,25 @@ Single Trainer class. Per-batch ordering:
   TRAINING:
     1. walks = walk_gen.walks_for_nodes(seeds)       ← pre-ingest state
        seeds = unique(B_src ∪ B_tgt) (undirected) or unique(B_tgt) (directed)
-    2. L_align = InfoNCE(walks, τ)
-    3. neg = neg_sampler.sample(batch)               ← pre-observe state
-    4. logits = link_head(E[u].detach(), E[v].detach()) for pos + neg
+    2. optimizer.zero_grad(set_to_none=True)
+    3. L_align = alignment_loss(walks, τ)            ← does .backward()
+                                                       INTERNALLY (per-chunk
+                                                       with retain_graph) so
+                                                       chunking actually bounds
+                                                       peak memory. Returns a
+                                                       DETACHED scalar; grads
+                                                       on E + p_target + p_context
+                                                       already accumulated.
+    4. neg = neg_sampler.sample(batch)               ← pre-observe state
+    5. logits = link_head(E[u].detach(), E[v].detach()) for pos + neg
        L_bce = BCE(logits, [1×B, 0×B*K])
-    5. L_total = L_align + L_bce
-    6. L_total.backward(); optimizer.step(); optimizer.zero_grad()
-    7. neg_sampler.observe(B_src, B_tgt)             ← post-scoring
-    8. walk_gen.add_edges(B_src, B_tgt, B_ts, B_ef)  ← post-scoring, last
+    6. L_bce.backward()                              ← grads on link_head only
+       (the two backwards touch disjoint params: alignment_loss owns
+       E + p_target + p_context, L_bce owns link_head — its E lookups
+       are detached so it cannot reach embedding params).
+    7. optimizer.step()
+    8. neg_sampler.observe(B_src, B_tgt)             ← post-scoring
+    9. walk_gen.add_edges(B_src, B_tgt, B_ts, B_ef)  ← post-scoring, last
 
   EVAL (within torch.no_grad()):
     1. neg_dst_list = tgb_neg_sampler.sample(batch)  ← per-positive negs
