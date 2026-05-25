@@ -65,50 +65,22 @@ Defaults: `τ = 0.5`, `β = 1.0` — empirically validated by τ and β
 sweeps on wiki under InfoNCE (single seed 30 epochs at bs=200; the
 defaults won both sweeps).
 
-### Chunked InfoNCE (memory-bounded backward)
-
-`alignment_loss` performs backward **internally**, per chunk, with
-`retain_graph=True` on every chunk except the last. The function
-returns a **detached scalar** — callers must not call `.backward()`
-on it.
-
-Why: a single accumulator `total_loss_sum` would otherwise pin every
-chunk's autograd graph until the outer `.backward()`, so peak memory
-would scale with NK·M regardless of chunk_size. With per-chunk
-backward, each chunk's local intermediates are released by Python
-refcounting between iterations, and only the shared upstream graph
-(p_target(e_seed), p_context(e_ctx_flat)) is retained across chunks.
-
-Peak memory under this design:
-```
-fixed (model + Adam + retained projection graph)
-+ max over chunks of (one chunk's sim / log_p / w_pos intermediates)
-```
-which is finally bounded by the `chunk_size` knob.
-
-The auto-sizer in `tempest_walks/utils.py:compute_auto_chunk_size`
-picks chunk_size based on free GPU memory, with explicit terms for
-the projection-graph retention overhead (scales with NK + M) and
-Adam-state overhead (1.5 GB default; override for very large
-embeddings).
-
 ### Trainer
 
 `tempest_walks/trainer.py` — strict-causal per-batch ordering:
 
 1. `walks = walk_gen.walks_for_nodes(seeds)`  — pre-ingest
-2. `optimizer.zero_grad(set_to_none=True)`
-3. `L_align = alignment_loss(...)`             — does its own backward
-4. `neg = neg_sampler.sample(batch)`           — pre-observe
-5. Build link BCE on **detached** embeddings: `link_head(E[u].detach(), E[v].detach())`
-6. `L_bce.backward()`                          — grads on link_head only
-7. `optimizer.step()`
-8. `neg_sampler.observe(...)`                  — post-scoring
-9. `walk_gen.add_edges(...)`                   — post-scoring, last
+2. `L_align = alignment_loss(...)`             — InfoNCE scalar
+3. `neg = neg_sampler.sample(batch)`           — pre-observe
+4. Build link BCE on **detached** embeddings: `link_head(E[u].detach(), E[v].detach())`
+5. `L_total = L_align + L_bce`
+6. `optimizer.zero_grad(set_to_none=True); L_total.backward(); optimizer.step()`
+7. `neg_sampler.observe(...)`                  — post-scoring
+8. `walk_gen.add_edges(...)`                   — post-scoring, last
 
-The two backwards touch disjoint parameter sets: alignment owns
-`E + p_target + p_context`; BCE owns `link_head` (its E lookups are
-detached).
+`E` is detached on the BCE path so the single backward routes
+alignment-side gradients to `E + p_target + p_context` and BCE
+gradients to `link_head` only.
 
 ### Model components
 
@@ -129,27 +101,6 @@ detached).
 
 ## Tests
 
-`tests/test_chunked_infonce.py` — four tests, all on CUDA when
-available:
-
-1. **chunk_vs_full_K1**     chunk sizes {0,1,7,10,32,50,100,NK,500}
-                            agree with the chunk=0 reference on
-                            loss + grad(target) + grad(context) +
-                            grad(E).
-2. **chunk_vs_full_Kgt1**   K=4 multi-walk per seed — verifies
-                            pool_walk_idx groups by row, not seed.
-3. **chunk_vs_full_node_feat**  alternate projection signature.
-4. **chunked_matches_naive_reference**
-                            both chunked AND non-chunked production
-                            paths match an independent triple-loop
-                            implementation written from the math
-                            spec. The load-bearing test: it doesn't
-                            trust either production path on its own.
-
-Tolerance 1e-5 across all four (float32 reorder noise). Run with
-`python tests/test_chunked_infonce.py` or
-`python -m pytest tests/test_chunked_infonce.py`.
-
 `tests/test_vitter_r_uniformity.py` — χ² uniformity check on the
 Historical (Vitter R) reservoir sampler.
 
@@ -165,6 +116,5 @@ Historical (Vitter R) reservoir sampler.
 | `d_proj` | 128 | |
 | `num_walks_per_node` | 5 | DeepWalk/CTDNE convention |
 | `max_walk_len` | 20 | |
-| `chunk_size` | 0 | auto-size; override only if you need a fixed value |
 | `lr` | 1e-2 | linear-scaling default at bs=2000 (Goyal 2017) |
 | `batch_size` | 2000 | |

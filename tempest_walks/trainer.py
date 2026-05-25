@@ -4,26 +4,15 @@ Single Trainer class. Per-batch ordering:
 
   TRAINING:
     1. walks = walk_gen.walks_for_nodes(seeds)       ← pre-ingest state
-       seeds = unique(B_src ∪ B_tgt) (undirected) or unique(B_tgt) (directed)
-    2. optimizer.zero_grad(set_to_none=True)
-    3. L_align = alignment_loss(walks, τ)            ← does .backward()
-                                                       INTERNALLY (per-chunk
-                                                       with retain_graph) so
-                                                       chunking actually bounds
-                                                       peak memory. Returns a
-                                                       DETACHED scalar; grads
-                                                       on E + p_target + p_context
-                                                       already accumulated.
-    4. neg = neg_sampler.sample(batch)               ← pre-observe state
-    5. logits = link_head(E[u].detach(), E[v].detach()) for pos + neg
+       seeds = unique(B_src ∪ B_tgt)
+    2. L_align = alignment_loss(walks, τ)            ← InfoNCE scalar
+    3. neg = neg_sampler.sample(batch)               ← pre-observe state
+    4. logits = link_head(E[u].detach(), E[v].detach()) for pos + neg
        L_bce = BCE(logits, [1×B, 0×B*K])
-    6. L_bce.backward()                              ← grads on link_head only
-       (the two backwards touch disjoint params: alignment_loss owns
-       E + p_target + p_context, L_bce owns link_head — its E lookups
-       are detached so it cannot reach embedding params).
-    7. optimizer.step()
-    8. neg_sampler.observe(B_src, B_tgt)             ← post-scoring
-    9. walk_gen.add_edges(B_src, B_tgt, B_ts, B_ef)  ← post-scoring, last
+    5. L_total = L_align + L_bce
+    6. optimizer.zero_grad(set_to_none=True); L_total.backward(); optimizer.step()
+    7. neg_sampler.observe(B_src, B_tgt)             ← post-scoring
+    8. walk_gen.add_edges(B_src, B_tgt, B_ts, B_ef)  ← post-scoring, last
 
   EVAL (within torch.no_grad()):
     1. neg_dst_list = tgb_neg_sampler.sample(batch)  ← per-positive negs
@@ -69,7 +58,7 @@ from .negatives import (
     NegativeSampler,
     UniformNegativeSampler,
 )
-from .utils import compute_auto_chunk_size, make_lr_lambda
+from .utils import make_lr_lambda
 from .walks import WalkGenerator
 
 
@@ -90,10 +79,6 @@ class TrainerConfig:
     # Loss-formulation.
     tau: float = 0.5            # InfoNCE temperature
     beta_time: float = 1.0      # hop/time weight exponent
-    chunk_size: int = 0         # InfoNCE seed-chunk size. 0 = auto-size
-                                # based on free GPU memory. Set > 0 to
-                                # override with a fixed chunk size. The
-                                # loss is exact regardless of chunk size.
 
     # Walks.
     num_walks_per_node: int = 5
@@ -319,25 +304,7 @@ class Trainer:
         # Step 2: InfoNCE contrastive alignment over batched walks.
         # The softmax denominator over all batch contexts is the
         # anti-collapse mechanism (replaces Wang-Isola uniformity).
-        # Auto-size the seed-chunk for memory safety (chunking is
-        # exact, not approximate).
-        effective_chunk_size = compute_auto_chunk_size(
-            walks=walks,
-            chunk_size_override=self.config.chunk_size,
-            device=self.device,
-        )
         t_now = int(batch.t_max)
-
-        # alignment_loss performs backward internally (per-chunk, with
-        # retain_graph on all but the last chunk) and returns a
-        # DETACHED scalar — that's how the chunking actually bounds
-        # peak memory. zero_grad must come BEFORE this call; l_bce's
-        # backward comes AFTER. The two backwards touch disjoint
-        # params (alignment_loss → E + p_target + p_context;
-        # l_bce → link_head only, because the BCE path uses detached
-        # embeddings) so they accumulate cleanly into the same
-        # optimizer .grad slots.
-        self.optimizer.zero_grad(set_to_none=True)
         l_align = alignment_loss(
             embedding_table=self.embedding_table,
             p_target=self.p_target,
@@ -348,10 +315,9 @@ class Trainer:
             beta=self.config.beta_time,
             tau=self.config.tau,
             node_feat=self.node_feat,
-            chunk_size=effective_chunk_size,
         )
 
-        # Step 4: link-pred negatives from PRE-OBSERVE reservoir.
+        # Step 3: link-pred negatives from PRE-OBSERVE reservoir.
         neg_src, neg_tgt = self.neg_sampler_train.sample(batch)
         B = len(batch.src)
         K = neg_src.shape[1]
@@ -360,7 +326,7 @@ class Trainer:
         u_t = torch.from_numpy(all_u).long().to(device)
         v_t = torch.from_numpy(all_v).long().to(device)
 
-        # Step 5: link logits with DETACHED E (stop-grad on E for BCE).
+        # Step 4: link logits with DETACHED E (stop-grad on E for BCE).
         e_u = self.embedding_table(u_t).detach()
         e_v = self.embedding_table(v_t).detach()
         logits = self.link_head(e_u, e_v)
@@ -370,9 +336,10 @@ class Trainer:
         ])
         l_bce = F.binary_cross_entropy_with_logits(logits, labels)
 
-        # Step 6: backward l_bce (alignment_loss already backwarded
-        # its part). The two grads accumulate on disjoint params.
-        l_bce.backward()
+        # Step 5 + 6: total loss + single backward + step.
+        l_total = l_align + l_bce
+        self.optimizer.zero_grad(set_to_none=True)
+        l_total.backward()
         self.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
@@ -385,12 +352,10 @@ class Trainer:
         # Step 8: ingest into Tempest (LAST).
         self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
 
-        l_align_v = float(l_align.detach())
-        l_bce_v = float(l_bce.detach())
         return {
-            "align": l_align_v,
-            "bce": l_bce_v,
-            "total": l_align_v + l_bce_v,
+            "align": float(l_align.detach()),
+            "bce": float(l_bce.detach()),
+            "total": float(l_total.detach()),
             "lr": float(self.optimizer.param_groups[0]["lr"]),
         }
 

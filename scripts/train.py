@@ -85,12 +85,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tau", default=0.5, type=float,
                    help="InfoNCE contrastive temperature")
     p.add_argument("--beta-time", default=1.0, type=float)
-    p.add_argument(
-        "--chunk-size", type=int, default=0,
-        help="InfoNCE seed-chunk size. Default 0 = auto-size based on "
-             "free GPU memory. Set > 0 to override with a fixed chunk "
-             "size. Loss values are exact regardless of chunk size.",
-    )
 
     # Walks.
     p.add_argument("--num-walks-per-node", default=5, type=int)
@@ -246,7 +240,6 @@ def main() -> Dict[str, Any]:
         d_proj=args.d_proj,
 
         tau=args.tau,
-        chunk_size=args.chunk_size,
         beta_time=args.beta_time,
 
         num_walks_per_node=args.num_walks_per_node,
