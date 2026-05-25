@@ -10,12 +10,7 @@ Contents:
   Dataset derivation:
     - derive_t_train(train_ts)    — span of training timestamps.
     - detect_bipartite(train_split) — src/dst disjointness check.
-  Training-side memory + schedule:
-    - compute_auto_chunk_size(walks, chunk_size_override, device,
-                              overhead_bytes, intermediates_kept,
-                              safety_factor)
-                                  — pick an InfoNCE seed-chunk size
-                                    that fits available GPU memory.
+  LR schedule:
     - make_lr_lambda(warmup_steps, decay_steps, lr_min_ratio)
                                   — closure for LambdaLR that does
                                     linear warmup then cosine decay
@@ -79,107 +74,8 @@ def detect_bipartite(train_split) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Training-side memory + schedule
+# LR schedule
 # ──────────────────────────────────────────────────────────────────────
-
-
-def compute_auto_chunk_size(
-    walks,
-    chunk_size_override: int,
-    device: torch.device,
-    overhead_bytes: int = 1500 * 1024 * 1024,
-    intermediates_kept: int = 6,
-    bytes_per_intermediate: int = 4,
-    safety_factor: float = 0.7,
-    projection_d_hidden: int = 128,
-    projection_saved_tensors: int = 7,
-) -> int:
-    """Auto-size InfoNCE seed-chunk based on available GPU memory.
-
-    Memory model (Option B with per-chunk backward).
-
-    With per-chunk backward (chunk_mean.backward(retain_graph=...) inside
-    alignment_loss), peak memory is bounded by:
-
-        fixed_overhead = optimizer Adam state + the projection-graph
-                         saved activations retained across chunks by
-                         retain_graph=True
-
-        per_chunk      = intermediates_kept × chunk_size × M
-                         × bytes_per_intermediate
-                         (sim_dot / sim / log_p / w_pos / etc — only
-                         ONE chunk's worth alive at a time, freed by
-                         Python refcounting between iterations)
-
-    The projection retention term scales with M (the pool size), so a
-    fixed `overhead_bytes` constant isn't enough for high-vocab datasets.
-    We add an explicit `projection_retention` estimate sized to M.
-
-    Defaults:
-      overhead_bytes = 1.5 GB
-        Covers model parameters + Adam state + small safety margin.
-        Bigger than the old 500 MB default which only accounted for
-        the model.
-      projection_d_hidden = 128
-        ProjectionHead.d_hidden default. Override if model is wider.
-      projection_saved_tensors = 7
-        Each ProjectionHead saves ~7 activations per forward (3 in
-        e_mlp Linear→GELU→Linear, 3 in merge Linear→GELU→Linear, 1
-        in F.normalize). Two heads call into the same upstream:
-        p_target on [NK] inputs, p_context on [M] inputs. We size
-        the term by (NK + M) to account for both heads' saved
-        activations, since the retained projection graph holds both.
-
-    Returns:
-        - chunk_size_override if > 0 (manual override).
-        - 0 if running on CPU (no chunking needed; chunked path
-          gives no benefit without GPU memory pressure).
-        - Auto-computed positive integer on GPU, in [1, NK].
-    """
-    # User override takes priority.
-    if chunk_size_override > 0:
-        return chunk_size_override
-
-    # On CPU, no memory pressure; let alignment_loss use the
-    # no-chunking branch (chunk_size=0).
-    if not torch.cuda.is_available() or device.type != "cuda":
-        return 0
-
-    NK, L = walks.nodes.shape
-    M = NK * L
-    if M == 0:
-        return 0
-
-    free_bytes, _ = torch.cuda.mem_get_info(device)
-
-    # Projection-graph saved activations retained across the whole
-    # chunk loop (because retain_graph=True keeps them alive). The
-    # term scales linearly with M.
-    projection_retention = (
-        projection_saved_tensors
-        * (NK + M)
-        * projection_d_hidden
-        * bytes_per_intermediate
-    )
-
-    available = max(free_bytes - overhead_bytes - projection_retention, 0)
-
-    # Per chunk_size step costs intermediates_kept tensors of shape
-    # [chunk_size, M] floats — bytes_per_chunk_row is the total bytes
-    # one chunk-row contributes (M × intermediates_kept × 4).
-    bytes_per_chunk_row = M * bytes_per_intermediate * intermediates_kept
-    if bytes_per_chunk_row == 0:
-        return 0
-
-    raw_chunk = available // bytes_per_chunk_row
-    # Safety factor for PyTorch allocator fragmentation.
-    safe_chunk = int(raw_chunk * safety_factor)
-    # Cap at NK — no point chunking larger than the batch itself.
-    safe_chunk = min(safe_chunk, NK)
-    # Floor at 1 (no kernel-launch amortisation; correctness over
-    # efficiency under tight memory — better to be slow than OOM).
-    safe_chunk = max(safe_chunk, 1)
-    return safe_chunk
 
 
 def make_lr_lambda(

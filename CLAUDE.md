@@ -13,9 +13,10 @@ InfoNCE contrastive loss + a separate BCE link head.
 
 `tempest_walks/losses.py` — `alignment_loss(...)`
 
-InfoNCE contrastive alignment over batched temporal random walks.
-For each seed `s_i` with positive contexts `{n_p^+ : p in walk i}`
-and a flat pool of all batch contexts (size `M = NK · L`):
+InfoNCE contrastive alignment over batched temporal random walks
+with **sampled-negative** partition function. For each seed `s_i`
+with positive contexts `{n_p^+ : p ∈ [0, lens_i − 2]}` (positions
+of walk i, with the seed itself at position `lens_i − 1`):
 
 ```
 L_i      = -(Σ_p w[i,p] · log p(n_p^+ | s_i)) / (Σ_p w[i,p])
@@ -25,66 +26,46 @@ log p(n | s_i)
 L_total  = mean_i (L_i for i with at least one valid positive)
 ```
 
-`j` ranges over **all valid batch contexts** — every other walk's
-positions act as in-batch negatives. The softmax denominator does
-the anti-collapse work that Wang-Isola uniformity used to do in the
-old architecture, but with task-relevant negatives instead of random
-pairs.
+`j` ranges over **(positives of seed i)** ∪ **(per-seed sampled
+negatives)** — the partition is over the walk's own positives plus
+`num_align_negatives` negatives drawn for each walk from the
+batch's pool of unique nodes, weighted by `count^0.75`
+(Word2Vec convention). The sim matrix is `[NK, L + K_neg]`
+regardless of batch size — fits in a single pass on memory-bounded
+GPUs.
 
-Hop/time weights:
+False negatives (sampled nodes that happen to be positives of the
+same seed) are accepted. Per-sample bias is ~3%; matches standard
+SimCLR / CLIP practice. An A/B confirmed that excluding them
+**hurts** val MRR (false negatives function as useful hard
+negatives).
+
+Hop/time weights on positives:
 
 ```
 w(K_hop, Δt) = 1/K_hop + (1 + Δt/T_train)^(-β)
 ```
 
-Defaults: `τ = 0.5`, `β = 1.0` — empirically validated by τ and β
-sweeps on wiki under InfoNCE (single seed 30 epochs at bs=200; the
-defaults won both sweeps).
-
-### Chunked InfoNCE (memory-bounded backward)
-
-`alignment_loss` performs backward **internally**, per chunk, with
-`retain_graph=True` on every chunk except the last. The function
-returns a **detached scalar** — callers must not call `.backward()`
-on it.
-
-Why: a single accumulator `total_loss_sum` would otherwise pin every
-chunk's autograd graph until the outer `.backward()`, so peak memory
-would scale with NK·M regardless of chunk_size. With per-chunk
-backward, each chunk's local intermediates are released by Python
-refcounting between iterations, and only the shared upstream graph
-(p_target(e_seed), p_context(e_ctx_flat)) is retained across chunks.
-
-Peak memory under this design:
-```
-fixed (model + Adam + retained projection graph)
-+ max over chunks of (one chunk's sim / log_p / w_pos intermediates)
-```
-which is finally bounded by the `chunk_size` knob.
-
-The auto-sizer in `tempest_walks/utils.py:compute_auto_chunk_size`
-picks chunk_size based on free GPU memory, with explicit terms for
-the projection-graph retention overhead (scales with NK + M) and
-Adam-state overhead (1.5 GB default; override for very large
-embeddings).
+Defaults: `τ = 0.5`, `β = 1.0` — empirically validated on wiki
+under full-pool InfoNCE; expected to transfer to sampled-neg but
+not re-swept under sampled-neg yet.
 
 ### Trainer
 
 `tempest_walks/trainer.py` — strict-causal per-batch ordering:
 
 1. `walks = walk_gen.walks_for_nodes(seeds)`  — pre-ingest
-2. `optimizer.zero_grad(set_to_none=True)`
-3. `L_align = alignment_loss(...)`             — does its own backward
-4. `neg = neg_sampler.sample(batch)`           — pre-observe
-5. Build link BCE on **detached** embeddings: `link_head(E[u].detach(), E[v].detach())`
-6. `L_bce.backward()`                          — grads on link_head only
-7. `optimizer.step()`
-8. `neg_sampler.observe(...)`                  — post-scoring
-9. `walk_gen.add_edges(...)`                   — post-scoring, last
+2. `L_align = alignment_loss(...)`             — InfoNCE scalar
+3. `neg = neg_sampler.sample(batch)`           — pre-observe
+4. Build link BCE on **detached** embeddings: `link_head(E[u].detach(), E[v].detach())`
+5. `L_total = L_align + L_bce`
+6. `optimizer.zero_grad(set_to_none=True); L_total.backward(); optimizer.step()`
+7. `neg_sampler.observe(...)`                  — post-scoring
+8. `walk_gen.add_edges(...)`                   — post-scoring, last
 
-The two backwards touch disjoint parameter sets: alignment owns
-`E + p_target + p_context`; BCE owns `link_head` (its E lookups are
-detached).
+`E` is detached on the BCE path so the single backward routes
+alignment-side gradients to `E + p_target + p_context` and BCE
+gradients to `link_head` only.
 
 ### Model components
 
@@ -103,28 +84,79 @@ detached).
 
 ---
 
+## Tempest walk contract — verified 2026-05-25
+
+Verified empirically on tgbl-wiki (10 000 ingested edges, 8 seeds,
+40 walks at max_walk_len=20). Pinned in `tests/test_walk_contract.py`.
+
+Shapes:
+  - `walks.nodes`        `[NK, L]`            int32   ; padding `-1`
+  - `walks.timestamps`   `[NK, L]`            int64   ; sentinel `INT64_MAX` at `lens-1`; padding `-1`
+  - `walks.edge_feats`   `[NK, L-1, d_ef]`    float32 ; **one column shorter than nodes**; tail rows are zero
+  - `walks.lens`         `[NK]`               int64
+  - `walks.seeds`        `[N]`                int64
+  - `walks.K` = walks per seed; `NK == N · K`
+
+Row grouping: rows `[i·K, (i+1)·K)` belong to `seeds[i]`. Guaranteed
+by `shuffle_walk_order=False` at the Tempest constructor.
+
+Walk direction: `"Backward_In_Time"`. Chronologically oldest predecessor
+at position 0; seed at position `lens-1`.
+
+Alignment: for `p ∈ [0, lens[i]-2]`, `timestamps[i, p]` is the
+timestamp of the edge `(nodes[i, p], nodes[i, p+1])`. Verified
+79 / 79 (u, v, t) tuples match an ingested edge.
+
+Seed slot `p = lens-1`:
+  - `nodes[i, lens-1]` = seed (matches `seeds[i // K]`)
+  - `timestamps[i, lens-1]` = `INT64_MAX` sentinel ("for parity"
+    with nodes' shape; seed has no outgoing edge in the walk)
+  - `edge_feats` has no row here (its last index is `lens-2`)
+
+Padding (`p >= lens[i]`): both `nodes` and `timestamps` = `-1`;
+`edge_feats` rows are all-zero.
+
+### Implications for alignment_loss
+
+The loss code is **correct** under this contract. Verification
+walk-through:
+
+- `is_context = positions < (lens-1)` masks both the seed slot
+  AND padding positions out of the loss.
+- At seed slot: `INT64_MAX − t_now` is hugely negative → `clamp_min(0)`
+  → `dt = 0` → `w_time = 1`. But the slot is masked, so `w_pos = 0`.
+  Sentinel value never leaks into the gradient.
+- At padding: `timestamps = -1` → `dt = t_now + 1` (large positive)
+  → small `w_time`. Also masked, no leak.
+- At seed slot: `nodes[i, lens-1] = seed` — `sim_pos` here would
+  be a "trivial self-positive" but it's also masked via `_INVALID_SIM`.
+- At padding: `nodes = -1` is clamped to 0 by `nodes.clamp_min(0)`
+  before embedding lookup; the resulting bogus context contribution
+  is masked away.
+
+### Implications for upcoming walk encoder
+
+- Positions `[0, lens-2]` are real (node, edge-to-next-node)
+  pairs; the encoder can consume both `nodes[p]` and
+  `edge_feats[p]` along with the time signal `timestamps[p]`.
+- Position `lens-1` is the seed, has no associated edge time
+  (`INT64_MAX` sentinel) and no `edge_feats` row. The encoder
+  needs either a learned "seed marker" embedding here or just
+  to skip this position in any edge-feature pathway.
+- Padding (`p >= lens`) must be masked; the encoder should
+  derive its mask from `lens` directly (e.g.
+  `mask = arange(L) < lens.unsqueeze(1)`).
+
+---
+
 ## Tests
 
-`tests/test_chunked_infonce.py` — four tests, all on CUDA when
-available:
-
-1. **chunk_vs_full_K1**     chunk sizes {0,1,7,10,32,50,100,NK,500}
-                            agree with the chunk=0 reference on
-                            loss + grad(target) + grad(context) +
-                            grad(E).
-2. **chunk_vs_full_Kgt1**   K=4 multi-walk per seed — verifies
-                            pool_walk_idx groups by row, not seed.
-3. **chunk_vs_full_node_feat**  alternate projection signature.
-4. **chunked_matches_naive_reference**
-                            both chunked AND non-chunked production
-                            paths match an independent triple-loop
-                            implementation written from the math
-                            spec. The load-bearing test: it doesn't
-                            trust either production path on its own.
-
-Tolerance 1e-5 across all four (float32 reorder noise). Run with
-`python tests/test_chunked_infonce.py` or
-`python -m pytest tests/test_chunked_infonce.py`.
+`tests/test_walk_contract.py` — 5 tests pinning the Tempest walk
+output: shapes / dtypes, seed at `lens-1`, alignment of
+`timestamps[i,p]` with edge `(nodes[i,p], nodes[i,p+1])`,
+`INT64_MAX` sentinel at the seed slot, `-1` padding for nodes
+and timestamps. Runs against a live Tempest instance with 10 k
+wiki edges ingested.
 
 `tests/test_vitter_r_uniformity.py` — χ² uniformity check on the
 Historical (Vitter R) reservoir sampler.
@@ -135,12 +167,12 @@ Historical (Vitter R) reservoir sampler.
 
 | Knob | Default | Source |
 |---|---|---|
-| `tau` | 0.5 | a-priori; validated by τ sweep on wiki |
-| `beta_time` | 1.0 | a-priori; validated by β sweep at τ=0.5 |
+| `tau` | 0.5 | a-priori; validated by τ sweep on wiki (full-InfoNCE) |
+| `beta_time` | 1.0 | a-priori; validated by β sweep on wiki (full-InfoNCE) |
+| `num_align_negatives` | 64 | lower end of InfoNCE range (van den Oord 2018: 64-256); memory-safe at comment-scale on 8 GB |
 | `d_emb` | 128 | |
 | `d_proj` | 128 | |
 | `num_walks_per_node` | 5 | DeepWalk/CTDNE convention |
 | `max_walk_len` | 20 | |
-| `chunk_size` | 0 | auto-size; override only if you need a fixed value |
-| `lr` | 1e-2 | linear-scaling default at bs=2000 (Goyal 2017) |
+| `lr` | 1e-3 | wiki seed-42 A/B (sampled-neg K=64): lr=1e-3 → val 0.4594 vs lr=1e-2 → 0.4301 |
 | `batch_size` | 2000 | |

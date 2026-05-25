@@ -8,7 +8,7 @@ repeatedly with different CLI args.
 Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root
   Model:          --d-emb, --d-proj
-  Loss:           --tau, --beta-time
+  Loss:           --tau, --beta-time, --num-align-negatives
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias,
                   --start-bias
   Negatives:      --num-neg-per-pos, --hist-neg-ratio, --reservoir-size
@@ -86,10 +86,12 @@ def parse_args() -> argparse.Namespace:
                    help="InfoNCE contrastive temperature")
     p.add_argument("--beta-time", default=1.0, type=float)
     p.add_argument(
-        "--chunk-size", type=int, default=0,
-        help="InfoNCE seed-chunk size. Default 0 = auto-size based on "
-             "free GPU memory. Set > 0 to override with a fixed chunk "
-             "size. Loss values are exact regardless of chunk size.",
+        "--num-align-negatives", type=int, default=64,
+        help="Number of sampled negatives per seed in InfoNCE "
+             "alignment loss. Higher = sharper contrastive signal "
+             "but more memory. Sweepable. Default 64 — lower end "
+             "of the InfoNCE paper's range (van den Oord 2018: "
+             "64-256), memory-safe on 8 GB at all TGB scales.",
     )
 
     # Walks.
@@ -105,11 +107,13 @@ def parse_args() -> argparse.Namespace:
 
     # Optimisation.
     p.add_argument(
-        "--lr", default=1e-2, type=float,
-        help="Peak learning rate (after warmup). Default 1e-2 scales "
-             "linearly with --batch-size 2000 default (Goyal et al. 2017 "
-             "linear-scaling rule). Smaller batch sizes should override "
-             "with lr=1e-3 at bs=200 to maintain LR×steps budget.",
+        "--lr", default=1e-3, type=float,
+        help="Peak learning rate (after warmup). Default 1e-3 — "
+             "wiki bs=200 seed-42 A/B (sampled-neg K=64): lr=1e-3 "
+             "hit val 0.4454 vs lr=1e-2 at val 0.4301. The K=64 "
+             "sampled-negative gradients are noisier than the full "
+             "in-batch InfoNCE's, so a smaller step size converges "
+             "more reliably.",
     )
     p.add_argument(
         "--lr-min", default=1e-5, type=float,
@@ -246,8 +250,8 @@ def main() -> Dict[str, Any]:
         d_proj=args.d_proj,
 
         tau=args.tau,
-        chunk_size=args.chunk_size,
         beta_time=args.beta_time,
+        num_align_negatives=args.num_align_negatives,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,
