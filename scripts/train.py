@@ -8,8 +8,7 @@ repeatedly with different CLI args.
 Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root
   Model:          --d-emb, --d-proj
-  Loss:           --eta-uniform, --uniform-temperature, --uniform-pairs,
-                  --beta-time
+  Loss:           --tau, --beta-time
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias,
                   --start-bias
   Negatives:      --num-neg-per-pos, --hist-neg-ratio, --reservoir-size
@@ -25,7 +24,6 @@ Derived from the dataset (not exposed):
 
 import argparse
 import pathlib
-import random
 import sys
 import time
 from typing import Any, Dict
@@ -44,6 +42,7 @@ from tempest_walks.data import Loaded, create_batches, load_tgb
 from tempest_walks.evaluator import Evaluator
 from tempest_walks.negatives import TGBNegativeSampler
 from tempest_walks.trainer import Trainer, TrainerConfig
+from tempest_walks.utils import derive_t_train, detect_bipartite, seed_all
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,10 +82,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--d-proj", default=128, type=int)
 
     # Loss.
-    p.add_argument("--eta-uniform", default=1.0, type=float)
-    p.add_argument("--uniform-temperature", default=2.0, type=float)
-    p.add_argument("--uniform-pairs", default=5000, type=int)
+    p.add_argument("--tau", default=0.5, type=float,
+                   help="InfoNCE contrastive temperature")
     p.add_argument("--beta-time", default=1.0, type=float)
+    p.add_argument(
+        "--chunk-size", type=int, default=0,
+        help="InfoNCE seed-chunk size. Default 0 = auto-size based on "
+             "free GPU memory. Set > 0 to override with a fixed chunk "
+             "size. Loss values are exact regardless of chunk size.",
+    )
 
     # Walks.
     p.add_argument("--num-walks-per-node", default=5, type=int)
@@ -100,9 +104,35 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reservoir-size", default=32, type=int)
 
     # Optimisation.
-    p.add_argument("--lr", default=1e-3, type=float)
+    p.add_argument(
+        "--lr", default=1e-2, type=float,
+        help="Peak learning rate (after warmup). Default 1e-2 scales "
+             "linearly with --batch-size 2000 default (Goyal et al. 2017 "
+             "linear-scaling rule). Smaller batch sizes should override "
+             "with lr=1e-3 at bs=200 to maintain LR×steps budget.",
+    )
+    p.add_argument(
+        "--lr-min", default=1e-5, type=float,
+        help="Minimum LR at end of cosine decay. Default 1e-5 follows "
+             "contrastive-SSL convention (SimCLR/MoCo/BYOL cosine to ~0; "
+             "we use 1e-5 ≈ peak/1000).",
+    )
+    p.add_argument(
+        "--warmup-fraction", default=0.05, type=float,
+        help="Warmup as fraction of decay horizon steps.",
+    )
+    p.add_argument(
+        "--warmup-steps-cap", default=500, type=int,
+        help="Maximum warmup steps regardless of fraction.",
+    )
+    p.add_argument(
+        "--decay-horizon-epochs", default=50, type=int,
+        help="Target epoch count for cosine decay to reach lr-min. "
+             "SEPARATE from --num-epochs — short runs stay near peak; "
+             "full decay is hit only at num_epochs = horizon.",
+    )
     p.add_argument("--weight-decay", default=1e-4, type=float)
-    p.add_argument("--batch-size", default=200, type=int)
+    p.add_argument("--batch-size", default=2000, type=int)
     p.add_argument("--num-epochs", default=50, type=int)
     p.add_argument("--early-stop-patience", default=0, type=int)
 
@@ -124,44 +154,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--monitor-sample-pct", default=1.0, type=float)
 
     return p.parse_args()
-
-
-def seed_all(seed: int) -> None:
-    """Seed every standard RNG from one root seed.
-
-    Sampler-internal RNGs (negative samplers, uniformity pairs) are
-    seeded via TrainerConfig.seed downstream. Tempest's walk RNG is
-    NOT controlled here — Tempest CPU mode uses its own internal RNG
-    and may exhibit small run-to-run drift even with the same Python
-    seed. Multi-seed anchoring is the correct way to measure this.
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def derive_t_train(train_ts: np.ndarray) -> float:
-    """T_train: training-span (max - min). Required > 0 — used as a
-    denominator in alignment_loss's time weighting."""
-    if train_ts.size == 0:
-        raise ValueError("Empty training timestamps; cannot derive T_train.")
-    span = float(train_ts.max() - train_ts.min())
-    if span <= 0:
-        raise ValueError(f"Non-positive T_train: {span}")
-    return span
-
-
-def detect_bipartite(train_split) -> bool:
-    """A graph is bipartite (under the link-pred convention) iff the
-    set of source IDs and the set of destination IDs are disjoint.
-    Holds for tgbl-wiki (users→pages), tgbl-review (users→items),
-    tgbl-subreddit (users→subreddits). Fails for tgbl-coin / tgbl-flight
-    / tgbl-comment where any node can be either endpoint."""
-    src_set = set(np.unique(train_split.sources).tolist())
-    dst_set = set(np.unique(train_split.destinations).tolist())
-    return src_set.isdisjoint(dst_set)
 
 
 def main() -> Dict[str, Any]:
@@ -253,9 +245,8 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
         d_proj=args.d_proj,
 
-        eta_uniform=args.eta_uniform,
-        uniform_temperature=args.uniform_temperature,
-        uniform_pairs=args.uniform_pairs,
+        tau=args.tau,
+        chunk_size=args.chunk_size,
         beta_time=args.beta_time,
 
         num_walks_per_node=args.num_walks_per_node,
@@ -268,6 +259,10 @@ def main() -> Dict[str, Any]:
         reservoir_size=args.reservoir_size,
 
         lr=args.lr,
+        lr_min=args.lr_min,
+        warmup_fraction=args.warmup_fraction,
+        warmup_steps_cap=args.warmup_steps_cap,
+        decay_horizon_epochs=args.decay_horizon_epochs,
         weight_decay=args.weight_decay,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,

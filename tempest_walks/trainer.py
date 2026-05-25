@@ -5,13 +5,23 @@ Single Trainer class. Per-batch ordering:
   TRAINING:
     1. walks = walk_gen.walks_for_nodes(seeds)       ← pre-ingest state
        seeds = unique(B_src ∪ B_tgt) (undirected) or unique(B_tgt) (directed)
-    2. unif_a, unif_b = sample uniformity pairs (M pairs)
-    3. L_table = L_align(walks) + η · L_unif(unif_a, unif_b)
+    2. optimizer.zero_grad(set_to_none=True)
+    3. L_align = alignment_loss(walks, τ)            ← does .backward()
+                                                       INTERNALLY (per-chunk
+                                                       with retain_graph) so
+                                                       chunking actually bounds
+                                                       peak memory. Returns a
+                                                       DETACHED scalar; grads
+                                                       on E + p_target + p_context
+                                                       already accumulated.
     4. neg = neg_sampler.sample(batch)               ← pre-observe state
     5. logits = link_head(E[u].detach(), E[v].detach()) for pos + neg
        L_bce = BCE(logits, [1×B, 0×B*K])
-    6. L_total = L_table + L_bce
-    7. L_total.backward(); optimizer.step(); optimizer.zero_grad()
+    6. L_bce.backward()                              ← grads on link_head only
+       (the two backwards touch disjoint params: alignment_loss owns
+       E + p_target + p_context, L_bce owns link_head — its E lookups
+       are detached so it cannot reach embedding params).
+    7. optimizer.step()
     8. neg_sampler.observe(B_src, B_tgt)             ← post-scoring
     9. walk_gen.add_edges(B_src, B_tgt, B_ts, B_ef)  ← post-scoring, last
 
@@ -48,16 +58,18 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
-from .losses import alignment_loss, uniformity_loss
+from .losses import alignment_loss
 from .model import EmbeddingTable, LinkHead, ProjectionHead
 from .negatives import (
     HistoricalNegativeSampler,
     NegativeSampler,
     UniformNegativeSampler,
 )
+from .utils import compute_auto_chunk_size, make_lr_lambda
 from .walks import WalkGenerator
 
 
@@ -76,10 +88,12 @@ class TrainerConfig:
     d_proj: int = 128
 
     # Loss-formulation.
-    eta_uniform: float = 1.0
-    uniform_temperature: float = 2.0
-    uniform_pairs: int = 5000
-    beta_time: float = 1.0
+    tau: float = 0.5            # InfoNCE temperature
+    beta_time: float = 1.0      # hop/time weight exponent
+    chunk_size: int = 0         # InfoNCE seed-chunk size. 0 = auto-size
+                                # based on free GPU memory. Set > 0 to
+                                # override with a fixed chunk size. The
+                                # loss is exact regardless of chunk size.
 
     # Walks.
     num_walks_per_node: int = 5
@@ -93,7 +107,17 @@ class TrainerConfig:
     reservoir_size: int = 32
 
     # Optimisation.
-    lr: float = 1e-3
+    lr: float = 1e-2            # peak LR (after warmup); scales linearly
+                                # with batch_size default 2000 (Goyal 2017).
+    lr_min: float = 1e-5        # cosine decay floor (~peak/1000; matches
+                                # contrastive-SSL cosine-to-near-0 norm).
+    warmup_fraction: float = 0.05
+    warmup_steps_cap: int = 500
+    decay_horizon_epochs: int = 50  # cosine reaches lr_min at this
+                                    # epoch count. SEPARATE from
+                                    # num_epochs — short runs stay
+                                    # near peak; full decay is hit
+                                    # only at num_epochs = horizon.
     weight_decay: float = 1e-4
     num_epochs: int = 50
     early_stop_patience: int = 0
@@ -176,14 +200,10 @@ class Trainer:
                 seed=config.seed,
             )
 
-        # Uniformity-pair RNG — separate stream so toggling uniform_pairs
-        # doesn't perturb the negative-sampling sequence.
-        self.unif_rng = np.random.default_rng(config.seed + 1)
-
         # Single optimiser over all trainable parameters. The decoupling
-        # between E-training (alignment + uniformity) and link-head-
-        # training (BCE) comes from the .detach() at the BCE call site,
-        # NOT from separate optimisers.
+        # between E-training (InfoNCE alignment) and link-head training
+        # (BCE) comes from the .detach() at the BCE call site, NOT from
+        # separate optimisers.
         params = (
             list(self.embedding_table.parameters())
             + list(self.p_target.parameters())
@@ -196,40 +216,88 @@ class Trainer:
             weight_decay=config.weight_decay,
         )
 
+        # LR scheduler is set up at the start of train() once we know
+        # batches_per_epoch (which depends on the train_batches_factory).
+        self.lr_scheduler: Optional[LambdaLR] = None
+        self._global_step = 0
+
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────
 
-    def _sample_uniformity_pairs(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """M independent pairs. Bipartite → both endpoints from dst_pool;
-        unipartite → both from the full node range."""
-        M = self.config.uniform_pairs
-        if self.config.is_bipartite:
-            pool = self.config.dst_pool
-            idx_a = self.unif_rng.integers(0, pool.shape[0], size=M)
-            idx_b = self.unif_rng.integers(0, pool.shape[0], size=M)
-            a = torch.from_numpy(pool[idx_a].astype(np.int64))
-            b = torch.from_numpy(pool[idx_b].astype(np.int64))
-        else:
-            a = torch.from_numpy(
-                self.unif_rng.integers(0, self.config.num_nodes, size=M)
-            ).long()
-            b = torch.from_numpy(
-                self.unif_rng.integers(0, self.config.num_nodes, size=M)
-            ).long()
-        return a, b
+    def _setup_lr_scheduler(self, batches_per_epoch: int) -> None:
+        """Build a cosine-decay + linear-warmup LR schedule.
+
+        W = min(warmup_fraction * decay_steps, warmup_steps_cap)
+        T = decay_horizon_epochs * batches_per_epoch
+
+        T is based on decay_horizon_epochs (a property of the
+        schedule), NOT num_epochs. This decouples short anchor runs
+        (5 ep — stays near peak) from full runs (50 ep — completes
+        decay).
+        """
+        peak_lr = float(self.config.lr)
+        lr_min = float(self.config.lr_min)
+
+        decay_steps = self.config.decay_horizon_epochs * max(batches_per_epoch, 1)
+        warmup_steps = min(
+            int(self.config.warmup_fraction * decay_steps),
+            self.config.warmup_steps_cap,
+        )
+        warmup_steps = max(warmup_steps, 1)
+
+        # Set optimizer base lr to peak so the lambda returns a [0, 1]
+        # scaling factor relative to peak.
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = peak_lr
+            param_group["initial_lr"] = peak_lr
+
+        lr_min_ratio = lr_min / peak_lr if peak_lr > 0 else 0.0
+        lr_lambda = make_lr_lambda(warmup_steps, decay_steps, lr_min_ratio)
+        self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+        self._global_step = 0
+        print(
+            f"  LR schedule: peak={peak_lr:.2e}, min={lr_min:.2e}, "
+            f"warmup={warmup_steps} steps, "
+            f"decay_horizon={decay_steps} steps "
+            f"({self.config.decay_horizon_epochs} epochs × "
+            f"{batches_per_epoch} batches)"
+        )
+
+    # LinkHead.pair_feats has 6 * d_emb columns and 4 bytes/float, so
+    # a batch of N pairs allocates N * 6 * d_emb * 4 bytes at the
+    # concat. At 1000 TGB negs/pos and bs=2000, N reaches 2M, which
+    # OOMs an 8 GB GPU at d_emb=128. Chunk the score so per-call
+    # allocations stay under a fixed budget.
+    _EVAL_SCORE_CHUNK = 50_000
 
     def _score_pairs(self, u_ids: torch.Tensor, v_ids: torch.Tensor) -> torch.Tensor:
         """Score [P] (u, v) pairs through E + link_head. Undirected eval
         symmetrises by averaging forward(u, v) + forward(v, u). Used at
         eval (no_grad context); training has its own inline path with
-        .detach()."""
-        e_u = self.embedding_table(u_ids)
-        e_v = self.embedding_table(v_ids)
-        logits = self.link_head(e_u, e_v)
-        if not self.config.is_directed:
-            logits = 0.5 * (logits + self.link_head(e_v, e_u))
-        return logits
+        .detach().
+
+        Chunks internally to bound peak GPU memory regardless of P.
+        """
+        P = u_ids.shape[0]
+        if P <= self._EVAL_SCORE_CHUNK:
+            e_u = self.embedding_table(u_ids)
+            e_v = self.embedding_table(v_ids)
+            logits = self.link_head(e_u, e_v)
+            if not self.config.is_directed:
+                logits = 0.5 * (logits + self.link_head(e_v, e_u))
+            return logits
+
+        out_parts = []
+        for start in range(0, P, self._EVAL_SCORE_CHUNK):
+            end = min(start + self._EVAL_SCORE_CHUNK, P)
+            e_u = self.embedding_table(u_ids[start:end])
+            e_v = self.embedding_table(v_ids[start:end])
+            logits = self.link_head(e_u, e_v)
+            if not self.config.is_directed:
+                logits = 0.5 * (logits + self.link_head(e_v, e_u))
+            out_parts.append(logits)
+        return torch.cat(out_parts, dim=0)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
@@ -245,15 +313,28 @@ class Trainer:
             seeds_np = np.unique(np.concatenate([batch.src, batch.tgt]))
         walks = self.walk_gen.walks_for_nodes(seeds_np)
 
-        # Step 2: uniformity pairs.
-        unif_a, unif_b = self._sample_uniformity_pairs()
-
-        # Step 3: table loss = alignment + η · uniformity.
-        # Uniformity applies to BOTH heads, summed (Task 12 finding:
-        # the two heads have disjoint parameter sets, so averaging
-        # halves each head's anti-collapse gradient and causes
-        # projection collapse on C1 smoke).
+        # Step 2: InfoNCE contrastive alignment over batched walks.
+        # The softmax denominator over all batch contexts is the
+        # anti-collapse mechanism (replaces Wang-Isola uniformity).
+        # Auto-size the seed-chunk for memory safety (chunking is
+        # exact, not approximate).
+        effective_chunk_size = compute_auto_chunk_size(
+            walks=walks,
+            chunk_size_override=self.config.chunk_size,
+            device=self.device,
+        )
         t_now = int(batch.t_max)
+
+        # alignment_loss performs backward internally (per-chunk, with
+        # retain_graph on all but the last chunk) and returns a
+        # DETACHED scalar — that's how the chunking actually bounds
+        # peak memory. zero_grad must come BEFORE this call; l_bce's
+        # backward comes AFTER. The two backwards touch disjoint
+        # params (alignment_loss → E + p_target + p_context;
+        # l_bce → link_head only, because the BCE path uses detached
+        # embeddings) so they accumulate cleanly into the same
+        # optimizer .grad slots.
+        self.optimizer.zero_grad(set_to_none=True)
         l_align = alignment_loss(
             embedding_table=self.embedding_table,
             p_target=self.p_target,
@@ -262,26 +343,10 @@ class Trainer:
             t_now=t_now,
             T_train=self.config.t_train_span,
             beta=self.config.beta_time,
+            tau=self.config.tau,
             node_feat=self.node_feat,
+            chunk_size=effective_chunk_size,
         )
-        l_unif_target = uniformity_loss(
-            embedding_table=self.embedding_table,
-            head=self.p_target,
-            sample_idx_a=unif_a,
-            sample_idx_b=unif_b,
-            t=self.config.uniform_temperature,
-            node_feat=self.node_feat,
-        )
-        l_unif_context = uniformity_loss(
-            embedding_table=self.embedding_table,
-            head=self.p_context,
-            sample_idx_a=unif_a,
-            sample_idx_b=unif_b,
-            t=self.config.uniform_temperature,
-            node_feat=self.node_feat,
-        )
-        l_unif = l_unif_target + l_unif_context
-        l_table = l_align + self.config.eta_uniform * l_unif
 
         # Step 4: link-pred negatives from PRE-OBSERVE reservoir.
         neg_src, neg_tgt = self.neg_sampler_train.sample(batch)
@@ -302,24 +367,28 @@ class Trainer:
         ])
         l_bce = F.binary_cross_entropy_with_logits(logits, labels)
 
-        # Step 6 + 7: total loss + single backward + step.
-        l_total = l_table + l_bce
-        self.optimizer.zero_grad(set_to_none=True)
-        l_total.backward()
+        # Step 6: backward l_bce (alignment_loss already backwarded
+        # its part). The two grads accumulate on disjoint params.
+        l_bce.backward()
         self.optimizer.step()
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+            self._global_step += 1
 
-        # Step 8: observe positives into reservoir (post-scoring).
+        # Step 7: observe positives into reservoir (post-scoring).
         if isinstance(self.neg_sampler_train, HistoricalNegativeSampler):
             self.neg_sampler_train.observe(batch.src, batch.tgt)
 
-        # Step 9: ingest into Tempest (LAST).
+        # Step 8: ingest into Tempest (LAST).
         self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
 
+        l_align_v = float(l_align.detach())
+        l_bce_v = float(l_bce.detach())
         return {
-            "align": float(l_align.detach()),
-            "uniform": float(l_unif.detach()),
-            "bce": float(l_bce.detach()),
-            "total": float(l_total.detach()),
+            "align": l_align_v,
+            "bce": l_bce_v,
+            "total": l_align_v + l_bce_v,
+            "lr": float(self.optimizer.param_groups[0]["lr"]),
         }
 
     # ──────────────────────────────────────────────────────────────────
@@ -467,6 +536,12 @@ class Trainer:
         patience = self.config.early_stop_patience
         sample_pct = self.config.monitor_sample_pct
 
+        # Set up the LR scheduler. We need batches_per_epoch which
+        # we compute by exhausting the factory once (cheap — counts
+        # only, doesn't materialise tensors per batch).
+        batches_per_epoch = sum(1 for _ in train_batches_factory())
+        self._setup_lr_scheduler(batches_per_epoch)
+
         best_val = -1.0
         best_test = -1.0
         best_epoch = -1
@@ -487,7 +562,7 @@ class Trainer:
             self.link_head.train()
 
             t0 = time.time()
-            sums = {"align": 0.0, "uniform": 0.0, "bce": 0.0, "total": 0.0}
+            sums = {"align": 0.0, "bce": 0.0, "total": 0.0}
             n_batches = 0
             for batch in train_batches_factory():
                 metrics = self._train_step(batch)
@@ -499,7 +574,6 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"align={sums['align']/max(n_batches,1):.4f}  "
-                f"unif={sums['uniform']/max(n_batches,1):.4f}  "
                 f"bce={sums['bce']/max(n_batches,1):.4f}  "
                 f"train {train_dt:.1f}s"
             )
