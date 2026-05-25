@@ -87,19 +87,47 @@ def compute_auto_chunk_size(
     walks,
     chunk_size_override: int,
     device: torch.device,
-    overhead_bytes: int = 500 * 1024 * 1024,
+    overhead_bytes: int = 1500 * 1024 * 1024,
     intermediates_kept: int = 6,
     bytes_per_intermediate: int = 4,
     safety_factor: float = 0.7,
+    projection_d_hidden: int = 128,
+    projection_saved_tensors: int = 7,
 ) -> int:
     """Auto-size InfoNCE seed-chunk based on available GPU memory.
 
-    The InfoNCE sim matrix is the dominant per-batch memory cost:
-    [chunk, M] float32, where M = NK * L. Autograd keeps several
-    [chunk, M] intermediates alive for backward — sim_dot, sim
-    (post divide+mask), log_p, w_pos, weighted_log_p, plus a
-    gradient buffer of similar size. The default
-    intermediates_kept=6 covers all of these conservatively.
+    Memory model (Option B with per-chunk backward).
+
+    With per-chunk backward (chunk_mean.backward(retain_graph=...) inside
+    alignment_loss), peak memory is bounded by:
+
+        fixed_overhead = optimizer Adam state + the projection-graph
+                         saved activations retained across chunks by
+                         retain_graph=True
+
+        per_chunk      = intermediates_kept × chunk_size × M
+                         × bytes_per_intermediate
+                         (sim_dot / sim / log_p / w_pos / etc — only
+                         ONE chunk's worth alive at a time, freed by
+                         Python refcounting between iterations)
+
+    The projection retention term scales with M (the pool size), so a
+    fixed `overhead_bytes` constant isn't enough for high-vocab datasets.
+    We add an explicit `projection_retention` estimate sized to M.
+
+    Defaults:
+      overhead_bytes = 1.5 GB
+        Covers model parameters + Adam state + small safety margin.
+        Bigger than the old 500 MB default which only accounted for
+        the model.
+      projection_d_hidden = 128
+        ProjectionHead.d_hidden default. Override if model is wider.
+      projection_saved_tensors = 7
+        Each ProjectionHead saves ~7 activations per forward (3 in
+        e_mlp Linear→GELU→Linear, 3 in merge Linear→GELU→Linear, 1
+        in F.normalize). Two heads call into the same upstream:
+        p_target on [NK] inputs, p_context on [M] inputs. We size
+        the term by M since M >> NK in realistic batches.
 
     Returns:
         - chunk_size_override if > 0 (manual override).
@@ -122,7 +150,18 @@ def compute_auto_chunk_size(
         return 0
 
     free_bytes, _ = torch.cuda.mem_get_info(device)
-    available = max(free_bytes - overhead_bytes, 0)
+
+    # Projection-graph saved activations retained across the whole
+    # chunk loop (because retain_graph=True keeps them alive). The
+    # term scales linearly with M.
+    projection_retention = (
+        projection_saved_tensors
+        * (NK + M)
+        * projection_d_hidden
+        * bytes_per_intermediate
+    )
+
+    available = max(free_bytes - overhead_bytes - projection_retention, 0)
 
     bytes_per_seed = M * bytes_per_intermediate * intermediates_kept
     if bytes_per_seed == 0:
