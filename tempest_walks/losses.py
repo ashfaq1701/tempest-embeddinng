@@ -54,13 +54,9 @@ _INVALID_SIM = -1e9
 # would otherwise be artificially inflated by the clamp.
 _SEED_VALID_THRESHOLD = 1e-9
 
-# Negative-sampling distribution over unique pool nodes.
-#   "uniform"      — every unique pool node equally likely.
-#   "frequency"    — weighted by count^0.75 (Word2Vec convention).
-# Set via the module-level constant; not a per-call argument.
-_NEG_SAMPLING_MODE = "uniform"
-
-# Exponent used when _NEG_SAMPLING_MODE == "frequency".
+# Frequency-weighting exponent for negative sampling, applied to
+# unique-node counts. Word2Vec convention; balances sampling
+# popular and rare nodes.
 _SAMPLING_EXPONENT = 0.75
 
 
@@ -143,18 +139,11 @@ def alignment_loss(
     sim_pos = sim_pos.masked_fill(~is_context, _INVALID_SIM)
 
     # ── Sampled negatives ────────────────────────────────────────
-    # Unique-node pool from the VALID context positions (excludes
-    # padding and seed slots). Sampling distribution over those
-    # unique nodes is selected by _NEG_SAMPLING_MODE.
+    # Build the unique-node frequency distribution over the VALID
+    # context positions in the pool (excludes padding and seed slots).
     valid_nodes = nodes.reshape(M)[ctx_valid_mask]                # [V_total]
     unique_nodes, counts = torch.unique(valid_nodes, return_counts=True)
-    if _NEG_SAMPLING_MODE == "uniform":
-        sampling_weights = torch.ones_like(counts, dtype=torch.float)
-    elif _NEG_SAMPLING_MODE == "frequency":
-        sampling_weights = counts.float().pow(_SAMPLING_EXPONENT)
-    else:
-        raise ValueError(f"unknown _NEG_SAMPLING_MODE={_NEG_SAMPLING_MODE!r}")
-    # sampling_weights: [V_unique]
+    sampling_weights = counts.float().pow(_SAMPLING_EXPONENT)     # [V_unique]
 
     # Sample NK × num_align_negatives integer indices into unique_nodes
     # via inverse-CDF sampling. torch.multinomial on CUDA fails at
