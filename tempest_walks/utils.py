@@ -127,7 +127,8 @@ def compute_auto_chunk_size(
         e_mlp Linear→GELU→Linear, 3 in merge Linear→GELU→Linear, 1
         in F.normalize). Two heads call into the same upstream:
         p_target on [NK] inputs, p_context on [M] inputs. We size
-        the term by M since M >> NK in realistic batches.
+        the term by (NK + M) to account for both heads' saved
+        activations, since the retained projection graph holds both.
 
     Returns:
         - chunk_size_override if > 0 (manual override).
@@ -163,11 +164,14 @@ def compute_auto_chunk_size(
 
     available = max(free_bytes - overhead_bytes - projection_retention, 0)
 
-    bytes_per_seed = M * bytes_per_intermediate * intermediates_kept
-    if bytes_per_seed == 0:
+    # Per chunk_size step costs intermediates_kept tensors of shape
+    # [chunk_size, M] floats — bytes_per_chunk_row is the total bytes
+    # one chunk-row contributes (M × intermediates_kept × 4).
+    bytes_per_chunk_row = M * bytes_per_intermediate * intermediates_kept
+    if bytes_per_chunk_row == 0:
         return 0
 
-    raw_chunk = available // bytes_per_seed
+    raw_chunk = available // bytes_per_chunk_row
     # Safety factor for PyTorch allocator fragmentation.
     safe_chunk = int(raw_chunk * safety_factor)
     # Cap at NK — no point chunking larger than the batch itself.
