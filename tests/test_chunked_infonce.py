@@ -131,7 +131,13 @@ def make_model(num_nodes, d_emb, d_proj, seed, *, device, d_nf=None):
 
 def call_loss_and_grads(E, p_t, p_c, walks, *, tau, beta, T_train, chunk_size,
                         node_feat=None):
-    """Reset grads, run loss + backward, return (loss, gT, gC, gE) snapshots."""
+    """Reset grads, run loss, return (loss, gT, gC, gE) snapshots.
+
+    Note: alignment_loss performs backward INTERNALLY (per-chunk with
+    retain_graph=True). It returns a detached scalar. So we don't
+    call .backward() here — gradients are already accumulated on the
+    params by the time alignment_loss returns.
+    """
     for p in list(E.parameters()) + list(p_t.parameters()) + list(p_c.parameters()):
         if p.grad is not None:
             p.grad.detach_()
@@ -149,7 +155,6 @@ def call_loss_and_grads(E, p_t, p_c, walks, *, tau, beta, T_train, chunk_size,
         node_feat=node_feat,
         chunk_size=chunk_size,
     )
-    loss.backward()
     return (
         float(loss.item()),
         p_t.W.grad.detach().clone(),
