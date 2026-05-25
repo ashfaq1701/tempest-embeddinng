@@ -83,6 +83,61 @@ provides anti-collapse via task-relevant in-batch negatives at
 every batch — it doesn't depend on the seed-vs-context bias
 asymmetry that the old uniformity term needed to stabilise.
 
+## Stage B' — Review-v2 5ep × 3 seeds at bs=2000 (BLOCKED, 2026-05-25)
+
+**Outcome: BLOCKED on this 8 GB GPU. No epoch results.**
+
+Tried bs ∈ {2000, 1000, 500, 200}, all OOM during
+`alignment_loss` forward. Workaround attempt at bs=200 + K=2
+(num_walks_per_node=2 vs default 5) also OOM.
+
+Root cause (two compounding issues):
+
+1. **Chunked InfoNCE retains every chunk's intermediates** for
+   backward. `total_loss_sum` accumulates a single scalar across
+   chunks; autograd keeps the graph for the whole loop alive
+   until `.backward()`. Per-batch peak memory therefore scales
+   as `NK × M × 24 bytes` (≈ 6 intermediates × float4) regardless
+   of `chunk_size`. The chunking only reduces forward peak when
+   you also `.backward()` inside the loop, which the current
+   implementation does not.
+
+2. **Timestamp-grouped batches have a long tail.** `create_batches`
+   never splits a single timestamp tick across batches. At
+   `--batch-size 200` on review-v2 (first 500 train batches):
+   median 179 edges / batch, **max 674 edges → 1056 unique seeds →
+   NK=5280 at K=5 → ~14 GB of chunked-loss intermediates** on the
+   worst-case batch. Most batches peak ~1.5 GB; the spike-batches
+   are what OOM.
+
+Confirmed by per-batch memory monitoring (bs=200, K=5):
+  - typical batch: peak 1.5–1.8 GB, alloc stable at 0.75 GB
+  - batch 260: peak 6.19 GB
+  - batch 340: peak 3.52 GB
+  - batch ?: > 7.4 GB → OOM at line 141 / 152 of losses.py
+
+K=2 reduces NK by 2.5× but tail batches still cross the 7+ GB
+threshold deeper into training.
+
+**Unblock options** (none applied — left for the user):
+  a) Run on a ≥ 24 GB GPU (A40, A100). bs=2000 K=5 fits there
+     because peak ≈ 14 GB on worst batches.
+  b) Fix the chunked InfoNCE to backward per-chunk so
+     intermediates actually release between chunks. ~50 LOC.
+     This is the structural fix called out earlier in the day.
+  c) Activation checkpointing wrapper on each chunk's forward.
+     ~20 LOC, 2× compute cost.
+  d) Hard-cap actual batch size by splitting timestamp groups.
+     Changes the semantics ("strict-causal ingest after scoring"
+     would break across split-tick boundaries).
+
+Three TGB-name bugs were uncovered + fixed along the way (commits
+on `feature/infonce-experiments`):
+  - `af49b8d` data: strip `-vN` suffix before TGB load
+  - `c7ea5c4` data: canonicalize `Loaded.name` for Evaluator
+These let `--dataset tgbl-review-v2` resolve correctly; the OOM
+above is the next blocker.
+
 ## InfoNCE implementation verification
 
 Verified `tempest_walks/losses.py` and `tempest_walks/trainer.py`
