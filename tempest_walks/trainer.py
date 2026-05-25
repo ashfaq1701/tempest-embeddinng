@@ -103,8 +103,10 @@ class TrainerConfig:
     reservoir_size: int = 32
 
     # Optimisation.
-    lr: float = 1e-2            # peak LR (after warmup); scales linearly
-                                # with batch_size default 2000 (Goyal 2017).
+    lr: float = 1e-3            # peak LR (after warmup). Validated on
+                                # wiki bs=200 seed-42 sampled-neg K=64:
+                                # lr=1e-3 → val 0.4454 vs lr=1e-2 → 0.4301.
+                                # Noisier K=64 gradients prefer smaller steps.
     lr_min: float = 1e-5        # cosine decay floor (~peak/1000; matches
                                 # contrastive-SSL cosine-to-near-0 norm).
     warmup_fraction: float = 0.05

@@ -107,11 +107,13 @@ def parse_args() -> argparse.Namespace:
 
     # Optimisation.
     p.add_argument(
-        "--lr", default=1e-2, type=float,
-        help="Peak learning rate (after warmup). Default 1e-2 scales "
-             "linearly with --batch-size 2000 default (Goyal et al. 2017 "
-             "linear-scaling rule). Smaller batch sizes should override "
-             "with lr=1e-3 at bs=200 to maintain LR×steps budget.",
+        "--lr", default=1e-3, type=float,
+        help="Peak learning rate (after warmup). Default 1e-3 — "
+             "wiki bs=200 seed-42 A/B (sampled-neg K=64): lr=1e-3 "
+             "hit val 0.4454 vs lr=1e-2 at val 0.4301. The K=64 "
+             "sampled-negative gradients are noisier than the full "
+             "in-batch InfoNCE's, so a smaller step size converges "
+             "more reliably.",
     )
     p.add_argument(
         "--lr-min", default=1e-5, type=float,
