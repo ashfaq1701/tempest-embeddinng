@@ -7,6 +7,30 @@ InfoNCE contrastive loss + a separate BCE link head.
 
 ---
 
+# Loss variation — InfoNCE with sampled negatives
+
+Branch: `loss-impl/infonce-sampled-negatives` (from master)
+Started: 2026-05-25T15:24:43Z
+
+Replaces in-batch negative pool (M = NK × L entries per seed)
+with frequency-weighted sampled negatives from the pool's
+unique nodes. Removes the [NK, M] sim matrix that required
+chunking; sim matrix becomes [N_seeds, max_positives + num_neg]
+and fits in a single pass on 8 GB GPU for all TGB datasets.
+
+Sampling strategy: per batch, build (unique_node, count) over
+the pool. Per seed, draw num_negatives = N × walks_per_node ×
+max_walk_len samples from a categorical distribution weighted by
+count^0.75 (Word2Vec convention). False negatives (sampled nodes
+that are positives of the same seed) are accepted — the bias is
+small (~3% per sample) and matches standard SimCLR/CLIP practice.
+
+No changes to alignment, positive weighting, or other architecture.
+Only the partition function changes from "softmax over all M pool
+entries" to "softmax over (positives ∪ sampled_negatives)".
+
+---
+
 ## Architecture
 
 ### Loss
