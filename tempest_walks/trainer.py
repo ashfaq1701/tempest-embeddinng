@@ -313,6 +313,17 @@ class Trainer:
             device=self.device,
         )
         t_now = int(batch.t_max)
+
+        # alignment_loss performs backward internally (per-chunk, with
+        # retain_graph on all but the last chunk) and returns a
+        # DETACHED scalar — that's how the chunking actually bounds
+        # peak memory. zero_grad must come BEFORE this call; l_bce's
+        # backward comes AFTER. The two backwards touch disjoint
+        # params (alignment_loss → E + p_target + p_context;
+        # l_bce → link_head only, because the BCE path uses detached
+        # embeddings) so they accumulate cleanly into the same
+        # optimizer .grad slots.
+        self.optimizer.zero_grad(set_to_none=True)
         l_align = alignment_loss(
             embedding_table=self.embedding_table,
             p_target=self.p_target,
@@ -345,10 +356,9 @@ class Trainer:
         ])
         l_bce = F.binary_cross_entropy_with_logits(logits, labels)
 
-        # Step 5 + 6: total loss + single backward + step.
-        l_total = l_align + l_bce
-        self.optimizer.zero_grad(set_to_none=True)
-        l_total.backward()
+        # Step 6: backward l_bce (alignment_loss already backwarded
+        # its part). The two grads accumulate on disjoint params.
+        l_bce.backward()
         self.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
@@ -361,10 +371,12 @@ class Trainer:
         # Step 8: ingest into Tempest (LAST).
         self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
 
+        l_align_v = float(l_align.detach())
+        l_bce_v = float(l_bce.detach())
         return {
-            "align": float(l_align.detach()),
-            "bce": float(l_bce.detach()),
-            "total": float(l_total.detach()),
+            "align": l_align_v,
+            "bce": l_bce_v,
+            "total": l_align_v + l_bce_v,
             "lr": float(self.optimizer.param_groups[0]["lr"]),
         }
 
