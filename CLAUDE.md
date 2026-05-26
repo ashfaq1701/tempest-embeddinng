@@ -176,3 +176,31 @@ Historical (Vitter R) reservoir sampler.
 | `max_walk_len` | 20 | |
 | `lr` | 1e-3 | wiki seed-42 A/B (sampled-neg K=64): lr=1e-3 → val 0.4594 vs lr=1e-2 → 0.4301 |
 | `batch_size` | 2000 | |
+
+---
+
+## K sweep — wiki, 3 seeds × 50 ep at lr=1e-3, bs=200
+
+Halted early. K=1024 abandoned (~6.4× slower than K=64, OOMs at
+comment scale, not viable as a multi-dataset default).
+
+Per-K summary (best-val epoch; 3 seeds each, K=1024 dropped as
+incomplete — 1 seed full, 2 unfinished):
+
+| K | val MRR (mean ± std) | test MRR at best-val | train_s/epoch | notes |
+|---|---|---|---|---|
+| 16  | 0.4281 ± 0.019  | 0.4007 ± 0.020 | ~16  | too few negs; high seed variance |
+| 64  | 0.4798 ± 0.013  | 0.4501 ± 0.012 | ~17  | prior default |
+| **128** | **0.4929 ± 0.003**  | **0.4604 ± 0.007** | ~21  | **new default** |
+| 256 | 0.4850 ± 0.003  | 0.4563 ± 0.004 | ~32  | slight regression vs K=128 |
+| 512 | 0.4949 ± 0.005  | 0.4722 ± 0.006 | ~55  | best test, 2.6× cost; OOM-risk at comment |
+| ~~1024~~ | (n=1) 0.5062 | (n=1) 0.4714 | ~117 | dropped: 6.4× cost, OOMs at comment |
+
+Decision: **K=128**. Matches/beats Stage A full-pool (0.4903 ± 0.004
+val, 0.4670 ± 0.004 test) on val (+0.003), close on test (-0.007).
+Val std meaningfully tighter than K=64 (0.003 vs 0.013). Memory fits
+all TGB datasets. K=512 has slightly higher test MRR (+0.012) but
+2.6× slower per epoch and unlikely to fit comment-scale NK.
+
+Sweep CSV at `logs/sweeps/sweep_master.csv` (15 rows × 50 epochs of
+3-seed data + K=1024 partials).
