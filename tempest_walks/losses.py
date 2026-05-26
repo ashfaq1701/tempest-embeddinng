@@ -71,7 +71,6 @@ def alignment_loss(
     tau: float = 0.5,
     node_feat: Optional[torch.Tensor] = None,     # [num_nodes, d_nf] or None
     num_align_negatives: int = 128,
-    h_seed: Optional[torch.Tensor] = None,        # [N, d_emb] from walk encoder
 ) -> torch.Tensor:
     """InfoNCE contrastive alignment over batched walks.
 
@@ -118,24 +117,17 @@ def alignment_loss(
     # [NK, L, d_proj] so per-seed-own-walk positives can be sliced
     # by indexing — no [NK, M] sim matrix is built.
     seed_per_row = seeds_t.repeat_interleave(K)                   # [NK]
-    # Seed projection input: encoder output h_seed if provided,
-    # else direct E[seed] lookup. h_seed is shape [N, d_emb] aligned
-    # with walks.seeds; repeat_interleave to [NK, d_emb] so each
-    # walk row of seed s_i sees the same h_{s_i}.
-    if h_seed is not None:
-        seed_input = h_seed.repeat_interleave(K, dim=0)           # [NK, d_emb]
-    else:
-        seed_input = embedding_table(seed_per_row)                # [NK, d_emb]
+    e_seed = embedding_table(seed_per_row)                        # [NK, d_emb]
     nodes_safe = nodes.clamp_min(0)                               # [NK, L]
     e_ctx_flat = embedding_table(nodes_safe.reshape(-1))          # [M, d_emb]
 
     if node_feat is not None:
         nf_seed = node_feat[seed_per_row]                         # [NK, d_nf]
         nf_ctx_flat = node_feat[nodes_safe.reshape(-1)]           # [M, d_nf]
-        p_seed = p_target(seed_input, node_feat=nf_seed)          # [NK, d_proj]
+        p_seed = p_target(e_seed, node_feat=nf_seed)              # [NK, d_proj]
         p_ctx = p_context(e_ctx_flat, node_feat=nf_ctx_flat)      # [M, d_proj]
     else:
-        p_seed = p_target(seed_input)                             # [NK, d_proj]
+        p_seed = p_target(e_seed)                                 # [NK, d_proj]
         p_ctx = p_context(e_ctx_flat)                             # [M, d_proj]
 
     d_proj = p_seed.shape[-1]
