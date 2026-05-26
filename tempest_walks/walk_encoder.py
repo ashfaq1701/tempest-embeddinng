@@ -1,0 +1,214 @@
+"""Edge-centric walk encoder (v3 design).
+
+Converts a batch of Tempest backward walks (K per seed) into a per-
+seed representation `h_seed` of dim d_emb that downstream heads can
+consume in place of E[seed].
+
+Architecture:
+  1. Per-edge embedding: each of the L-1 walk edges contributes
+     (src_emb, tgt_emb, edge_feat, time2vec(Δt), hop_emb) → MLP_edge.
+  2. GRU over the L-1 edges chronologically (oldest first). Final
+     hidden state per walk = the walk representation.
+  3. Mean-pool the K walks per seed.
+  4. Concatenate with E[seed] and pass through MLP_seed → h_seed.
+
+Gradient routing (Approach 2):
+  - EVERY E lookup inside this module is .detach().
+  - Encoder MLPs / GRU / Time2Vec / hop_emb / MLP_seed train from BOTH
+    losses (InfoNCE alignment via p_target(h_seed) and BCE via
+    link_head(h_u, h_v)).
+  - E learns ONLY via InfoNCE context-side (p_context(E[contexts]))
+    in losses.py — unchanged.
+
+h_seed output dim is fixed to d_emb so existing ProjectionHead /
+LinkHead can accept h_seed without re-shaping.
+"""
+
+from typing import Optional
+
+import torch
+import torch.nn as nn
+
+from .walks import WalkData
+
+
+class Time2Vec(nn.Module):
+    """Time2Vec (Kazemi et al. 2019). Scalar Δt → R^{d_te}.
+
+    First component linear (w0·Δt + b0); the remaining d_te-1
+    components are sinusoidal (sin(w_k·Δt + b_k)).
+    """
+
+    def __init__(self, d_te: int):
+        super().__init__()
+        assert d_te >= 1
+        self.w = nn.Parameter(torch.randn(d_te))
+        self.b = nn.Parameter(torch.randn(d_te))
+
+    def forward(self, dt: torch.Tensor) -> torch.Tensor:
+        v = dt.unsqueeze(-1) * self.w + self.b
+        v_lin = v[..., 0:1]
+        v_sin = torch.sin(v[..., 1:])
+        return torch.cat([v_lin, v_sin], dim=-1)
+
+
+class WalkEncoder(nn.Module):
+    """Edge-centric encoder producing h_seed of shape [N, d_emb]
+    from a WalkData of N seeds × K walks each.
+
+    Args:
+        embedding_table: shared E (reference, not deep-copied).
+        d_emb: node embedding dim. Output h_seed dim is also d_emb.
+        d_ef: edge feature dim. 0 if dataset has no edge features.
+        d_te, d_he, d_edge, d_walk: encoder hidden dims.
+        max_walk_len: L from the walk sampler — sets hop_emb table size.
+    """
+
+    def __init__(
+        self,
+        embedding_table,
+        d_emb: int,
+        d_ef: int,
+        d_te: int = 32,
+        d_he: int = 16,
+        d_edge: int = 128,
+        d_walk: int = 128,
+        max_walk_len: int = 20,
+    ):
+        super().__init__()
+        self.E = embedding_table
+        self.d_emb = d_emb
+        self.d_ef = d_ef
+        self.d_te = d_te
+        self.d_he = d_he
+        self.d_edge = d_edge
+        self.d_walk = d_walk
+        self.max_walk_len = max_walk_len
+
+        self.time2vec = Time2Vec(d_te)
+
+        # Hop indices range 1..L-1; index 0 unused. Allocate L+1 slots
+        # so any clamp-to-(1, L) lookup is in range.
+        self.hop_emb = nn.Embedding(max_walk_len + 1, d_he)
+
+        d_edge_in = 2 * d_emb + d_ef + d_te + d_he
+        self.mlp_edge = nn.Sequential(
+            nn.Linear(d_edge_in, d_edge),
+            nn.GELU(),
+            nn.Linear(d_edge, d_edge),
+        )
+
+        self.gru = nn.GRU(
+            input_size=d_edge,
+            hidden_size=d_walk,
+            num_layers=1,
+            batch_first=True,
+        )
+
+        # Output dim pinned to d_emb so downstream heads accept h_seed
+        # in place of E[seed] without re-shaping.
+        self.mlp_seed = nn.Sequential(
+            nn.Linear(d_emb + d_walk, d_emb),
+            nn.GELU(),
+            nn.Linear(d_emb, d_emb),
+        )
+
+    def forward(
+        self,
+        walks: WalkData,
+        t_now: float,
+        T_train: float,
+    ) -> torch.Tensor:
+        """Returns h_seed: [N, d_emb], row i = encoded rep of walks.seeds[i]."""
+        device = self.E.E.weight.device
+        nodes = walks.nodes.to(device).long()                # [NK, L]
+        timestamps = walks.timestamps.to(device).long()      # [NK, L]
+        edge_feats = (
+            walks.edge_feats.to(device).float()
+            if walks.edge_feats is not None
+            else None
+        )                                                    # [NK, L-1, d_ef] or None
+        lens = walks.lens.to(device).long()                  # [NK]
+        seeds = walks.seeds.to(device).long()                # [N]
+        K = walks.K
+        NK, L = nodes.shape
+        N = NK // K
+
+        # Per-edge endpoints (padding -1 clamped; padding rows are
+        # masked downstream via packing on edges_per_walk).
+        nodes_safe = nodes.clamp_min(0)
+        src_ids = nodes_safe[:, :-1]                         # [NK, L-1]
+        tgt_ids = nodes_safe[:, 1:]                          # [NK, L-1]
+
+        # Approach 2: E lookups detached. BCE gradient stops here.
+        src_embs = self.E(src_ids).detach()                  # [NK, L-1, d_emb]
+        tgt_embs = self.E(tgt_ids).detach()                  # [NK, L-1, d_emb]
+
+        # Per-edge Δt. timestamps[:, p] for p in [0, lens-2] is the
+        # edge (nodes[p], nodes[p+1]) timestamp; position lens-1 is the
+        # INT64_MAX seed sentinel (sliced out by [:, :-1]). Padding
+        # positions carry -1, which yields a large dt — masked out via
+        # pack_padded_sequence on edges_per_walk.
+        delta_t = (float(t_now) - timestamps[:, :-1].float()).clamp_min(0.0)
+        delta_t_norm = delta_t / max(T_train, 1.0)
+        time_enc = self.time2vec(delta_t_norm)               # [NK, L-1, d_te]
+
+        # Hop from seed: edge at position p has hop = lens-1 - p.
+        # hop=1 → edge directly into seed; hop=L-1 → oldest edge.
+        edge_positions = torch.arange(L - 1, device=device).unsqueeze(0)  # [1, L-1]
+        hop_per_edge = (lens.unsqueeze(1) - 1 - edge_positions).clamp(
+            min=1, max=self.max_walk_len,
+        )
+        hop_enc = self.hop_emb(hop_per_edge)                 # [NK, L-1, d_he]
+
+        parts = [src_embs, tgt_embs]
+        if self.d_ef > 0:
+            if edge_feats is not None:
+                parts.append(edge_feats)
+            else:
+                # Dataset has no per-edge features at runtime even
+                # though the encoder was configured for d_ef > 0.
+                # Substitute zeros so the MLP_edge input shape is
+                # stable across batches.
+                parts.append(torch.zeros(
+                    NK, L - 1, self.d_ef, device=device,
+                ))
+        parts.extend([time_enc, hop_enc])
+        edge_input = torch.cat(parts, dim=-1)                # [NK, L-1, d_edge_in]
+        edge_repr = self.mlp_edge(edge_input)                # [NK, L-1, d_edge]
+
+        # GRU over real edges (mask padding via packing on edges_per_walk).
+        edges_per_walk = (lens - 1).clamp_min(0)
+        nonempty = edges_per_walk > 0
+
+        h_walk = torch.zeros(NK, self.d_walk, device=device)
+        if bool(nonempty.any()):
+            packed = torch.nn.utils.rnn.pack_padded_sequence(
+                edge_repr[nonempty],
+                lengths=edges_per_walk[nonempty].cpu(),
+                batch_first=True,
+                enforce_sorted=False,
+            )
+            _, h_final = self.gru(packed)                    # [1, NK_nonempty, d_walk]
+            h_walk[nonempty] = h_final[-1]
+
+        walk_aggregate = h_walk.view(N, K, self.d_walk).mean(dim=1)  # [N, d_walk]
+
+        e_seed = self.E(seeds).detach()                      # [N, d_emb]
+
+        h_seed = self.mlp_seed(
+            torch.cat([e_seed, walk_aggregate], dim=-1),
+        )                                                    # [N, d_emb]
+        return h_seed
+
+
+def lookup_h_seed(
+    h_seed: torch.Tensor,
+    seeds_sorted: torch.Tensor,
+    node_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Row-index h_seed by node id. seeds_sorted must be ascending
+    (guaranteed when produced by np.unique). Caller is responsible
+    for ensuring every node_id is present in seeds_sorted."""
+    rows = torch.searchsorted(seeds_sorted, node_ids)
+    return h_seed[rows]
