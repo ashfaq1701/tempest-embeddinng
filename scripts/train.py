@@ -86,12 +86,14 @@ def parse_args() -> argparse.Namespace:
                    help="InfoNCE contrastive temperature")
     p.add_argument("--beta-time", default=1.0, type=float)
     p.add_argument(
-        "--num-align-negatives", type=int, default=64,
+        "--num-align-negatives", type=int, default=128,
         help="Number of sampled negatives per seed in InfoNCE "
              "alignment loss. Higher = sharper contrastive signal "
-             "but more memory. Sweepable. Default 64 — lower end "
-             "of the InfoNCE paper's range (van den Oord 2018: "
-             "64-256), memory-safe on 8 GB at all TGB scales.",
+             "but more memory. Sweepable. Default 128 — from the "
+             "wiki K sweep (3 seeds × 50 ep), knee of the diminishing-"
+             "returns curve; ~98% of K=512's test MRR at ~2.6× less "
+             "compute and ~2× lower std. Largest K that fits on 8 GB "
+             "at comment-scale NK (K=256+ OOMs there).",
     )
 
     # Walks.

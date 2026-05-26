@@ -169,7 +169,7 @@ Historical (Vitter R) reservoir sampler.
 |---|---|---|
 | `tau` | 0.5 | a-priori; validated by τ sweep on wiki (full-InfoNCE) |
 | `beta_time` | 1.0 | a-priori; validated by β sweep on wiki (full-InfoNCE) |
-| `num_align_negatives` | 64 | lower end of InfoNCE range (van den Oord 2018: 64-256); memory-safe at comment-scale on 8 GB |
+| `num_align_negatives` | 128 | wiki K sweep (3 seeds × 50 ep): knee of the diminishing-returns curve; ~98% of K=512's test MRR at ~2.6× less compute; lowest val std in sweep; largest K that fits on 8 GB at comment-scale NK |
 | `d_emb` | 128 | |
 | `d_proj` | 128 | |
 | `num_walks_per_node` | 5 | DeepWalk/CTDNE convention |

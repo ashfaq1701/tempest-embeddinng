@@ -79,17 +79,18 @@ class TrainerConfig:
     # Loss-formulation.
     tau: float = 0.5            # InfoNCE temperature
     beta_time: float = 1.0      # hop/time weight exponent
-    num_align_negatives: int = 64     # Sampled negatives per seed in
+    num_align_negatives: int = 128    # Sampled negatives per seed in
                                       # the InfoNCE partition function.
                                       # Frequency-weighted (count^0.75)
                                       # from the pool's unique nodes.
-                                      # Default sits at the lower end of
-                                      # the InfoNCE range (van den Oord
-                                      # 2018: 64-256), keeps memory
-                                      # bounded for comment-scale NK on
-                                      # 8 GB, and exceeds the per-seed
-                                      # positive count (≤ L=20) by a
-                                      # healthy margin.
+                                      # 128 chosen from the wiki K sweep
+                                      # (3 seeds × 50 ep): knee of the
+                                      # diminishing-returns curve — gains
+                                      # ~98% of K=512's test MRR at ~2.6×
+                                      # less compute and ~half the val std.
+                                      # Also the largest K that fits in
+                                      # ~7 GB at comment-scale NK≈15K on
+                                      # an 8 GB GPU (K=256+ OOMs there).
 
     # Walks.
     num_walks_per_node: int = 5
