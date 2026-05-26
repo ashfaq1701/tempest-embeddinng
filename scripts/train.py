@@ -102,6 +102,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--walk-bias", default="ExponentialWeight", type=str)
     p.add_argument("--start-bias", default="Uniform", type=str)
 
+    # Walk encoder (feature-flagged; default OFF). Produces h_seed
+    # consumed by the LINK HEAD only. InfoNCE alignment_loss is
+    # unchanged. Encoder learns ONLY from BCE; E lookups inside the
+    # encoder are detached so BCE does not reach E via the encoder.
+    p.add_argument(
+        "--use-walk-encoder", action="store_true",
+        help="Enable the walk encoder for the link head. h_seed "
+             "(per-edge MLP + GRU + mean-pool + MLP_seed) replaces "
+             "E[seed] at link_head inputs only. InfoNCE remains on E. "
+             "Default OFF.",
+    )
+    p.add_argument("--d-te",   default=32,  type=int, help="time2vec dim")
+    p.add_argument("--d-he",   default=16,  type=int, help="hop embedding dim")
+    p.add_argument("--d-edge", default=128, type=int, help="per-edge representation dim")
+    p.add_argument("--d-walk", default=128, type=int, help="GRU hidden / walk representation dim")
+
     # Negatives.
     p.add_argument("--num-neg-per-pos", default=10, type=int)
     p.add_argument("--hist-neg-ratio", default=0.5, type=float)
@@ -201,6 +217,13 @@ def main() -> Dict[str, Any]:
         if loaded.node_feat is not None
         else None
     )
+    # Edge feature dim is dataset-specific (None if absent). Only used
+    # by the walk encoder when enabled; harmless otherwise.
+    d_edge_feat = (
+        int(loaded.train.edge_feat.shape[1])
+        if loaded.train.edge_feat is not None
+        else None
+    )
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  directed:      {is_directed}  ({directed_provenance})")
@@ -247,6 +270,7 @@ def main() -> Dict[str, Any]:
         dst_pool=dst_pool,
         t_train_span=T_train,
         d_node_feat=d_node_feat,
+        d_edge_feat=d_edge_feat,
 
         d_emb=args.d_emb,
         d_proj=args.d_proj,
@@ -259,6 +283,12 @@ def main() -> Dict[str, Any]:
         max_walk_len=args.max_walk_len,
         walk_bias=args.walk_bias,
         start_bias=args.start_bias,
+
+        use_walk_encoder=args.use_walk_encoder,
+        d_te=args.d_te,
+        d_he=args.d_he,
+        d_edge=args.d_edge,
+        d_walk=args.d_walk,
 
         num_neg_per_pos=args.num_neg_per_pos,
         hist_neg_ratio=args.hist_neg_ratio,
@@ -295,11 +325,18 @@ def main() -> Dict[str, Any]:
     n_Pt = sum(p.numel() for p in trainer.p_target.parameters())
     n_Pc = sum(p.numel() for p in trainer.p_context.parameters())
     n_H = sum(p.numel() for p in trainer.link_head.parameters())
+    n_W = (
+        sum(p.numel() for p in trainer.walk_encoder.parameters())
+        if trainer.walk_encoder is not None
+        else 0
+    )
     print(f"  embedding_table: {n_E:>12,}")
     print(f"  p_target:        {n_Pt:>12,}")
     print(f"  p_context:       {n_Pc:>12,}")
     print(f"  link_head:       {n_H:>12,}")
-    print(f"  TOTAL trainable: {n_E + n_Pt + n_Pc + n_H:>12,}")
+    if trainer.walk_encoder is not None:
+        print(f"  walk_encoder:    {n_W:>12,}")
+    print(f"  TOTAL trainable: {n_E + n_Pt + n_Pc + n_H + n_W:>12,}")
 
     # ─── Train ─────────────────────────────────────────────────────
     print("\n=== Training ===")

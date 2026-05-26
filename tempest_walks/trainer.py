@@ -59,6 +59,7 @@ from .negatives import (
     UniformNegativeSampler,
 )
 from .utils import make_lr_lambda
+from .walk_encoder import WalkEncoder, lookup_h_seed
 from .walks import WalkGenerator
 
 
@@ -71,6 +72,10 @@ class TrainerConfig:
     dst_pool: np.ndarray
     t_train_span: float
     d_node_feat: Optional[int] = None
+    d_edge_feat: Optional[int] = None       # dataset's per-edge feature
+                                            # dim; None if absent. Only
+                                            # consulted by the walk
+                                            # encoder when enabled.
 
     # Model.
     d_emb: int = 128
@@ -97,6 +102,18 @@ class TrainerConfig:
     max_walk_len: int = 20
     walk_bias: str = "ExponentialWeight"
     start_bias: str = "Uniform"
+
+    # Walk encoder for the LINK HEAD only (feature-flagged; default
+    # OFF). When enabled, h_seed (encoder output) replaces E[seed] at
+    # the link head. InfoNCE alignment_loss is UNCHANGED and continues
+    # to operate on E + projection heads. Encoder is trained ONLY by
+    # BCE; E lookups inside the encoder are detached so BCE does not
+    # reach E via the encoder.
+    use_walk_encoder: bool = False
+    d_te: int = 32           # time2vec dim
+    d_he: int = 16           # hop emb dim
+    d_edge: int = 128        # per-edge representation dim
+    d_walk: int = 128        # GRU hidden / per-walk representation dim
 
     # Negatives (training).
     num_neg_per_pos: int = 10
@@ -182,6 +199,24 @@ class Trainer:
             num_walks_per_node=config.num_walks_per_node,
         )
 
+        # Optional walk encoder (link-head-only path; default OFF).
+        # When enabled, h_seed (encoder output) replaces E[seed] at
+        # the link head only. InfoNCE alignment_loss is unchanged.
+        if config.use_walk_encoder:
+            d_ef = config.d_edge_feat if config.d_edge_feat is not None else 0
+            self.walk_encoder: Optional[WalkEncoder] = WalkEncoder(
+                embedding_table=self.embedding_table,
+                d_emb=config.d_emb,
+                d_ef=d_ef,
+                d_te=config.d_te,
+                d_he=config.d_he,
+                d_edge=config.d_edge,
+                d_walk=config.d_walk,
+                max_walk_len=config.max_walk_len,
+            ).to(self.device)
+        else:
+            self.walk_encoder = None
+
         # Negative samplers (training).
         if config.hist_neg_ratio > 0:
             self.neg_sampler_train: NegativeSampler = HistoricalNegativeSampler(
@@ -209,6 +244,8 @@ class Trainer:
             + list(self.p_context.parameters())
             + list(self.link_head.parameters())
         )
+        if self.walk_encoder is not None:
+            params += list(self.walk_encoder.parameters())
         self.optimizer = torch.optim.Adam(
             params,
             lr=config.lr,
@@ -270,18 +307,31 @@ class Trainer:
     # allocations stay under a fixed budget.
     _EVAL_SCORE_CHUNK = 50_000
 
-    def _score_pairs(self, u_ids: torch.Tensor, v_ids: torch.Tensor) -> torch.Tensor:
-        """Score [P] (u, v) pairs through E + link_head. Undirected eval
+    def _score_pairs(
+        self,
+        u_ids: torch.Tensor,
+        v_ids: torch.Tensor,
+        h_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Score [P] (u, v) pairs through link_head. Inputs come from
+        the walk encoder's per-batch h_cache=(h_seed, seeds_sorted)
+        when the encoder is on, else from raw E. Undirected eval
         symmetrises by averaging forward(u, v) + forward(v, u). Used at
         eval (no_grad context); training has its own inline path with
-        .detach().
+        the encoder/detach branching.
 
         Chunks internally to bound peak GPU memory regardless of P.
         """
+        def _lookup(ids: torch.Tensor) -> torch.Tensor:
+            if h_cache is not None:
+                h_seed, seeds_sorted = h_cache
+                return lookup_h_seed(h_seed, seeds_sorted, ids)
+            return self.embedding_table(ids)
+
         P = u_ids.shape[0]
         if P <= self._EVAL_SCORE_CHUNK:
-            e_u = self.embedding_table(u_ids)
-            e_v = self.embedding_table(v_ids)
+            e_u = _lookup(u_ids)
+            e_v = _lookup(v_ids)
             logits = self.link_head(e_u, e_v)
             if not self.config.is_directed:
                 logits = 0.5 * (logits + self.link_head(e_v, e_u))
@@ -290,8 +340,8 @@ class Trainer:
         out_parts = []
         for start in range(0, P, self._EVAL_SCORE_CHUNK):
             end = min(start + self._EVAL_SCORE_CHUNK, P)
-            e_u = self.embedding_table(u_ids[start:end])
-            e_v = self.embedding_table(v_ids[start:end])
+            e_u = _lookup(u_ids[start:end])
+            e_v = _lookup(v_ids[start:end])
             logits = self.link_head(e_u, e_v)
             if not self.config.is_directed:
                 logits = 0.5 * (logits + self.link_head(e_v, e_u))
@@ -305,7 +355,7 @@ class Trainer:
     def _train_step(self, batch: Batch) -> Dict[str, float]:
         device = self.device
 
-        # Step 1: walks from PRE-INGEST state.
+        # Step 1: walks from PRE-INGEST state, for InfoNCE.
         # Walk seeds always span both endpoints. Tempest's walk sampler
         # respects edge direction internally — on directed graphs, walks
         # from a source follow outgoing edges, walks from a target follow
@@ -318,6 +368,8 @@ class Trainer:
         # Step 2: InfoNCE contrastive alignment over batched walks.
         # The softmax denominator over all batch contexts is the
         # anti-collapse mechanism (replaces Wang-Isola uniformity).
+        # Strict separation of concerns: this loss never sees the walk
+        # encoder; it operates on E + projection heads only.
         t_now = int(batch.t_max)
         l_align = alignment_loss(
             embedding_table=self.embedding_table,
@@ -335,19 +387,43 @@ class Trainer:
         # Step 3: link-pred negatives from PRE-OBSERVE reservoir.
         neg_src, neg_tgt = self.neg_sampler_train.sample(batch)
         B = len(batch.src)
-        K = neg_src.shape[1]
+        K_neg = neg_src.shape[1]
         all_u = np.concatenate([batch.src, neg_src.reshape(-1).astype(np.int64)])
         all_v = np.concatenate([batch.tgt, neg_tgt.reshape(-1).astype(np.int64)])
         u_t = torch.from_numpy(all_u).long().to(device)
         v_t = torch.from_numpy(all_v).long().to(device)
 
-        # Step 4: link logits with DETACHED E (stop-grad on E for BCE).
-        e_u = self.embedding_table(u_t).detach()
-        e_v = self.embedding_table(v_t).detach()
-        logits = self.link_head(e_u, e_v)
+        # Step 4: link logits.
+        if self.walk_encoder is not None:
+            # Encoder path. Sample a SECOND walks batch covering every
+            # node the link head will score (positives' src/tgt plus
+            # negative destinations). The InfoNCE walk batch above is
+            # untouched. Encoder reads detached E internally so BCE
+            # cannot reach E via this path; encoder learns ONLY from
+            # BCE. link_head consumes h_u, h_v (NOT detached) so BCE
+            # gradient flows: link_head ← (h_u, h_v) ← encoder.
+            link_seeds_np = np.unique(np.concatenate([
+                batch.src,
+                batch.tgt,
+                neg_tgt.reshape(-1).astype(np.int64),
+            ]))
+            walks_link = self.walk_gen.walks_for_nodes(link_seeds_np)
+            h_seed = self.walk_encoder(
+                walks_link, t_now=t_now, T_train=self.config.t_train_span,
+            )                                                 # [N_link, d_emb]
+            seeds_sorted = walks_link.seeds.to(device).long()
+            h_u = lookup_h_seed(h_seed, seeds_sorted, u_t)
+            h_v = lookup_h_seed(h_seed, seeds_sorted, v_t)
+            logits = self.link_head(h_u, h_v)
+        else:
+            # Baseline path: detached E inputs.
+            e_u = self.embedding_table(u_t).detach()
+            e_v = self.embedding_table(v_t).detach()
+            logits = self.link_head(e_u, e_v)
+
         labels = torch.cat([
             torch.ones(B, device=device),
-            torch.zeros(B * K, device=device),
+            torch.zeros(B * K_neg, device=device),
         ])
         l_bce = F.binary_cross_entropy_with_logits(logits, labels)
 
@@ -384,12 +460,17 @@ class Trainer:
         batches: Iterable[Batch],
         sample_pct: float = 1.0,
     ) -> float:
-        """Streaming eval. Walks NOT sampled; reservoir NOT updated.
-        Tempest state advances via post-scoring add_edges."""
+        """Streaming eval. Reservoir NOT updated. Tempest state advances
+        via post-scoring add_edges. When the walk encoder is on, walks
+        ARE sampled per batch — needed to derive h_seed for every node
+        the link head scores — but Tempest's ingestion still happens
+        only after scoring (strict-causal preserved)."""
         self.embedding_table.eval()
         self.p_target.eval()
         self.p_context.eval()
         self.link_head.eval()
+        if self.walk_encoder is not None:
+            self.walk_encoder.eval()
 
         total = 0.0
         n = 0
@@ -428,26 +509,54 @@ class Trainer:
                 # TGB-supplied per-positive negative destinations.
                 neg_src_list, neg_tgt_list = evaluator.sample_negatives(score_batch)
 
-                # Positive scores in one shot.
-                pos_u = torch.from_numpy(score_batch.src.astype(np.int64)).to(self.device)
-                pos_v = torch.from_numpy(score_batch.tgt.astype(np.int64)).to(self.device)
-                pos_logits = self._score_pairs(pos_u, pos_v).cpu().numpy()
-
-                # Flatten all negatives across positives, score in one shot.
+                # Flatten negatives once — needed BEFORE encoding so the
+                # h_cache covers every node the link head will score.
                 counts = [int(arr.shape[0]) for arr in neg_tgt_list]
                 if sum(counts) > 0:
-                    flat_neg_u = np.concatenate(
+                    flat_neg_u_np = np.concatenate(
                         [
                             np.full(counts[i], int(score_batch.src[i]), dtype=np.int64)
                             for i in range(B)
                         ]
                     )
-                    flat_neg_v = np.concatenate(
+                    flat_neg_v_np = np.concatenate(
                         [nt.astype(np.int64) for nt in neg_tgt_list]
                     )
-                    neg_u_t = torch.from_numpy(flat_neg_u).to(self.device)
-                    neg_v_t = torch.from_numpy(flat_neg_v).to(self.device)
-                    neg_logits = self._score_pairs(neg_u_t, neg_v_t).cpu().numpy()
+                else:
+                    flat_neg_u_np = None
+                    flat_neg_v_np = None
+
+                # Build the walk-encoder h_seed cache for this eval
+                # batch (only when encoder is on).
+                h_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+                if self.walk_encoder is not None:
+                    parts = [
+                        score_batch.src.astype(np.int64),
+                        score_batch.tgt.astype(np.int64),
+                    ]
+                    if flat_neg_u_np is not None:
+                        parts.append(flat_neg_u_np)
+                        parts.append(flat_neg_v_np)
+                    all_nodes = np.unique(np.concatenate(parts))
+                    walks_eval = self.walk_gen.walks_for_nodes(all_nodes)
+                    h_seed_eval = self.walk_encoder(
+                        walks_eval,
+                        t_now=int(score_batch.t_max),
+                        T_train=self.config.t_train_span,
+                    )
+                    seeds_sorted_eval = walks_eval.seeds.to(self.device).long()
+                    h_cache = (h_seed_eval, seeds_sorted_eval)
+
+                # Positive scores in one shot.
+                pos_u = torch.from_numpy(score_batch.src.astype(np.int64)).to(self.device)
+                pos_v = torch.from_numpy(score_batch.tgt.astype(np.int64)).to(self.device)
+                pos_logits = self._score_pairs(pos_u, pos_v, h_cache=h_cache).cpu().numpy()
+
+                # Score negatives.
+                if flat_neg_u_np is not None:
+                    neg_u_t = torch.from_numpy(flat_neg_u_np).to(self.device)
+                    neg_v_t = torch.from_numpy(flat_neg_v_np).to(self.device)
+                    neg_logits = self._score_pairs(neg_u_t, neg_v_t, h_cache=h_cache).cpu().numpy()
                 else:
                     neg_logits = np.empty(0, dtype=np.float64)
 
@@ -481,18 +590,23 @@ class Trainer:
         }
 
     def _snapshot(self) -> Dict[str, Any]:
-        return {
+        snap = {
             "embedding_table": self._cpu_state_dict(self.embedding_table),
             "p_target":        self._cpu_state_dict(self.p_target),
             "p_context":       self._cpu_state_dict(self.p_context),
             "link_head":       self._cpu_state_dict(self.link_head),
         }
+        if self.walk_encoder is not None:
+            snap["walk_encoder"] = self._cpu_state_dict(self.walk_encoder)
+        return snap
 
     def _restore(self, snap: Dict[str, Any]) -> None:
         self.embedding_table.load_state_dict(snap["embedding_table"])
         self.p_target.load_state_dict(snap["p_target"])
         self.p_context.load_state_dict(snap["p_context"])
         self.link_head.load_state_dict(snap["link_head"])
+        if self.walk_encoder is not None and "walk_encoder" in snap:
+            self.walk_encoder.load_state_dict(snap["walk_encoder"])
 
     def _re_ingest_train(self, train_batches_factory) -> None:
         """Reset Tempest, re-ingest all training edges. Used before
@@ -543,6 +657,8 @@ class Trainer:
             self.p_target.train()
             self.p_context.train()
             self.link_head.train()
+            if self.walk_encoder is not None:
+                self.walk_encoder.train()
 
             t0 = time.time()
             sums = {"align": 0.0, "bce": 0.0, "total": 0.0}
