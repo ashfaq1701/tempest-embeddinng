@@ -60,7 +60,7 @@ from .negatives import (
 )
 from .utils import make_lr_lambda
 from .walk_encoder import WalkEncoder, lookup_h_seed
-from .walks import WalkGenerator
+from .walks import WalkGenerator, slice_walks_by_seeds
 
 
 @dataclass
@@ -355,27 +355,52 @@ class Trainer:
     def _train_step(self, batch: Batch) -> Dict[str, float]:
         device = self.device
 
-        # Step 1: walks from PRE-INGEST state, for InfoNCE.
-        # Walk seeds always span both endpoints. Tempest's walk sampler
-        # respects edge direction internally — on directed graphs, walks
-        # from a source follow outgoing edges, walks from a target follow
-        # incoming edges. The structural difference between src-walks and
-        # tgt-walks captures directedness implicitly; explicit branching
-        # on is_directed at the seed-selection step adds nothing.
-        seeds_np = np.unique(np.concatenate([batch.src, batch.tgt]))
-        walks = self.walk_gen.walks_for_nodes(seeds_np)
+        # Step A: align seeds = unique(src ∪ tgt). Walk seeds always
+        # span both endpoints. Tempest respects edge direction
+        # internally — on directed graphs, walks from a source follow
+        # outgoing edges, walks from a target follow incoming edges.
+        # The structural difference between src-walks and tgt-walks
+        # captures directedness implicitly; explicit branching on
+        # is_directed at the seed-selection step adds nothing.
+        align_seeds_np = np.unique(np.concatenate([batch.src, batch.tgt]))
 
-        # Step 2: InfoNCE contrastive alignment over batched walks.
-        # The softmax denominator over all batch contexts is the
-        # anti-collapse mechanism (replaces Wang-Isola uniformity).
-        # Strict separation of concerns: this loss never sees the walk
-        # encoder; it operates on E + projection heads only.
+        # Step B: link-pred negatives from PRE-OBSERVE reservoir.
+        # Sampled now so the encoder path (when on) can fold neg_tgt
+        # into the single Tempest walk sample below.
+        neg_src, neg_tgt = self.neg_sampler_train.sample(batch)
+        B = len(batch.src)
+        K_neg = neg_src.shape[1]
+
+        # Step C: walks from PRE-INGEST state.
+        # Encoder ON: ONE Tempest call for all_seeds = unique(src ∪ tgt
+        # ∪ neg_tgt). The (src ∪ tgt) subset is sliced out for InfoNCE
+        # so alignment_loss sees the same shape it always has, while
+        # the encoder consumes the full set for h_seed.
+        # Encoder OFF: only (src ∪ tgt) walks are needed; sample those
+        # directly (baseline behavior preserved bit-for-bit).
+        if self.walk_encoder is not None:
+            all_seeds_np = np.unique(np.concatenate([
+                align_seeds_np,
+                neg_tgt.reshape(-1).astype(np.int64),
+            ]))
+            walks_all = self.walk_gen.walks_for_nodes(all_seeds_np)
+            walks_align = slice_walks_by_seeds(walks_all, align_seeds_np)
+        else:
+            walks_all = None
+            walks_align = self.walk_gen.walks_for_nodes(align_seeds_np)
         t_now = int(batch.t_max)
+
+        # Step D: InfoNCE contrastive alignment over (src ∪ tgt) walks.
+        # The softmax denominator over batch contexts ∪ sampled negs
+        # is the anti-collapse mechanism (replaces Wang-Isola
+        # uniformity). Strict separation of concerns: alignment_loss
+        # never sees the walk encoder; it operates on E + projection
+        # heads only.
         l_align = alignment_loss(
             embedding_table=self.embedding_table,
             p_target=self.p_target,
             p_context=self.p_context,
-            walks=walks,
+            walks=walks_align,
             t_now=t_now,
             T_train=self.config.t_train_span,
             beta=self.config.beta_time,
@@ -384,39 +409,28 @@ class Trainer:
             num_align_negatives=self.config.num_align_negatives,
         )
 
-        # Step 3: link-pred negatives from PRE-OBSERVE reservoir.
-        neg_src, neg_tgt = self.neg_sampler_train.sample(batch)
-        B = len(batch.src)
-        K_neg = neg_src.shape[1]
+        # Step E: link head logits.
         all_u = np.concatenate([batch.src, neg_src.reshape(-1).astype(np.int64)])
         all_v = np.concatenate([batch.tgt, neg_tgt.reshape(-1).astype(np.int64)])
         u_t = torch.from_numpy(all_u).long().to(device)
         v_t = torch.from_numpy(all_v).long().to(device)
 
-        # Step 4: link logits.
         if self.walk_encoder is not None:
-            # Encoder path. Sample a SECOND walks batch covering every
-            # node the link head will score (positives' src/tgt plus
-            # negative destinations). The InfoNCE walk batch above is
-            # untouched. Encoder reads detached E internally so BCE
-            # cannot reach E via this path; encoder learns ONLY from
-            # BCE. link_head consumes h_u, h_v (NOT detached) so BCE
-            # gradient flows: link_head ← (h_u, h_v) ← encoder.
-            link_seeds_np = np.unique(np.concatenate([
-                batch.src,
-                batch.tgt,
-                neg_tgt.reshape(-1).astype(np.int64),
-            ]))
-            walks_link = self.walk_gen.walks_for_nodes(link_seeds_np)
+            # Encoder consumes the full walks_all; the resulting h_seed
+            # is indexed by node id (via the sorted walks_all.seeds and
+            # torch.searchsorted) to extract h_u, h_v for the link head.
+            # See walk_encoder.py for the gradient routing — whether E
+            # receives BCE gradient depends on the .detach() inside the
+            # encoder's E lookups (an experimental knob).
             h_seed = self.walk_encoder(
-                walks_link, t_now=t_now, T_train=self.config.t_train_span,
-            )                                                 # [N_link, d_emb]
-            seeds_sorted = walks_link.seeds.to(device).long()
+                walks_all, t_now=t_now, T_train=self.config.t_train_span,
+            )                                                 # [N_all, d_emb]
+            seeds_sorted = walks_all.seeds.to(device).long()
             h_u = lookup_h_seed(h_seed, seeds_sorted, u_t)
             h_v = lookup_h_seed(h_seed, seeds_sorted, v_t)
             logits = self.link_head(h_u, h_v)
         else:
-            # Baseline path: detached E inputs.
+            # Baseline path: detached E inputs (stop-grad on E for BCE).
             e_u = self.embedding_table(u_t).detach()
             e_v = self.embedding_table(v_t).detach()
             logits = self.link_head(e_u, e_v)

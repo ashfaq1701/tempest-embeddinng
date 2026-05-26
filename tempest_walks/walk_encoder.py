@@ -146,10 +146,11 @@ class WalkEncoder(nn.Module):
         src_ids = nodes_safe[:, :-1]                         # [NK, L-1]
         tgt_ids = nodes_safe[:, 1:]                          # [NK, L-1]
 
-        # E lookups detached. BCE gradient stops here; E is trained
-        # exclusively by InfoNCE in losses.py.
-        src_embs = self.E(src_ids).detach()                  # [NK, L-1, d_emb]
-        tgt_embs = self.E(tgt_ids).detach()                  # [NK, L-1, d_emb]
+        # EXPERIMENT: gradient flow into E enabled (no .detach()).
+        # BCE now also trains E via the encoder, in addition to
+        # InfoNCE. Loosens the strict separation of concerns.
+        src_embs = self.E(src_ids)                           # [NK, L-1, d_emb]
+        tgt_embs = self.E(tgt_ids)                           # [NK, L-1, d_emb]
 
         # Per-edge Δt. timestamps[:, p] for p in [0, lens-2] is the
         # edge (nodes[p], nodes[p+1]) timestamp; position lens-1 is
@@ -199,7 +200,7 @@ class WalkEncoder(nn.Module):
 
         walk_aggregate = h_walk.view(N, K, self.d_walk).mean(dim=1)  # [N, d_walk]
 
-        e_seed = self.E(seeds).detach()                      # [N, d_emb]
+        e_seed = self.E(seeds)                               # [N, d_emb]
 
         h_seed = self.mlp_seed(
             torch.cat([e_seed, walk_aggregate], dim=-1),

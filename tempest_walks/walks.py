@@ -58,6 +58,48 @@ class WalkData(NamedTuple):
     K: int                           # walks per seed
 
 
+def slice_walks_by_seeds(walks: WalkData, subset_seeds: np.ndarray) -> WalkData:
+    """Return a WalkData containing only the K-row blocks for the
+    subset_seeds, preserving the K-contiguous grouping invariant.
+
+    Used to feed InfoNCE alignment_loss a strict (src ∪ tgt) slice of
+    a larger (src ∪ tgt ∪ neg_tgt) walk batch sampled in ONE Tempest
+    call per training step. The slice is tensor-indexed; the new
+    WalkData carries the subset's sorted seeds at .seeds and the same
+    per-seed K, so the downstream "rows [i*K, (i+1)*K) belong to
+    seeds[i]" invariant continues to hold.
+
+    Preconditions (callers' responsibility — not re-checked here):
+      - walks.seeds is sorted ascending (the convention from
+        walks_for_nodes when called with np.unique output).
+      - subset_seeds is sorted ascending AND is a subset of walks.seeds.
+
+    No separate node_id → row_index map is stored: walks.seeds is
+    already a sorted node-id index, so torch.searchsorted finds each
+    subset seed's block in O(log N) without a dict/tensor lookup table.
+    """
+    K = walks.K
+    subset_t = torch.from_numpy(np.ascontiguousarray(subset_seeds, dtype=np.int64))
+    # Position of each subset seed within walks.seeds.
+    idx_in_all = torch.searchsorted(walks.seeds, subset_t)            # [N_sub]
+    # Per-seed K rows: idx_in_all[i] * K + [0..K-1], flattened to [N_sub*K].
+    row_offsets = torch.arange(K, dtype=torch.long)
+    row_idx = (idx_in_all.unsqueeze(1) * K + row_offsets.unsqueeze(0)).reshape(-1)
+
+    return WalkData(
+        nodes=walks.nodes[row_idx],
+        timestamps=walks.timestamps[row_idx],
+        lens=walks.lens[row_idx],
+        edge_feats=(
+            walks.edge_feats[row_idx]
+            if walks.edge_feats is not None
+            else None
+        ),
+        seeds=subset_t,
+        K=K,
+    )
+
+
 class WalkGenerator:
     def __init__(
         self,
