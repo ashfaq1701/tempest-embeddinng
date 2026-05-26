@@ -70,7 +70,7 @@ def alignment_loss(
     beta: float = 1.0,
     tau: float = 0.5,
     node_feat: Optional[torch.Tensor] = None,     # [num_nodes, d_nf] or None
-    num_align_negatives: int = 64,
+    num_align_negatives: int = 128,
 ) -> torch.Tensor:
     """InfoNCE contrastive alignment over batched walks.
 
