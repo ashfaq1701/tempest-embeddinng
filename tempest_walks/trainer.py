@@ -53,13 +53,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from .data import Batch
 from .evaluator import Evaluator
 from .losses import alignment_loss
-from .model import (
-    CrossAttentionLinkHead,
-    EmbeddingTable,
-    HybridLinkHead,
-    LinkHead,
-    ProjectionHead,
-)
+from .model import EmbeddingTable, LinkHead, ProjectionHead
 from .negatives import (
     HistoricalNegativeSampler,
     NegativeSampler,
@@ -126,22 +120,6 @@ class TrainerConfig:
                                         # AND the final MLP_seed concat.
                                         # Makes h_seed purely
                                         # neighbourhood-derived.
-    link_head_type: str = "standard"   # "standard" -> link_head(e_u, e_v)
-                                       #   when encoder OFF, or
-                                       #   link_head(h_u, h_v) when ON.
-                                       # "hybrid"   -> link_head accepts
-                                       #   concat([E[v].detach(), h_v])
-                                       #   per side; ONLY valid when
-                                       #   encoder is ON. Tests whether
-                                       #   augmenting h with E at the
-                                       #   link head helps vs replacing.
-                                       # "cross_attn" -> cross-attention
-                                       #   link head over per-seed
-                                       #   walk-token banks. Encoder
-                                       #   must be ON and arch='attn'
-                                       #   (token bank is exposed only
-                                       #   by AttentionWalkEncoder).
-    link_head_n_heads: int = 4         # cross_attn-only: # attn heads
     d_te: int = 32           # time2vec dim
     d_he: int = 16           # hop emb dim
     d_edge: int = 128        # per-edge representation dim
@@ -219,34 +197,7 @@ class Trainer:
             d_proj=config.d_proj,
             d_node_feat=config.d_node_feat,
         ).to(self.device)
-        # Link head dispatch.
-        if config.link_head_type == "standard":
-            self.link_head: nn.Module = LinkHead(d_emb=config.d_emb).to(self.device)
-        elif config.link_head_type == "hybrid":
-            if not config.use_walk_encoder:
-                raise ValueError(
-                    "link_head_type='hybrid' requires use_walk_encoder=True "
-                    "(hybrid head consumes BOTH E[v] and h_v per side)."
-                )
-            self.link_head = HybridLinkHead(d_emb=config.d_emb).to(self.device)
-        elif config.link_head_type == "cross_attn":
-            if not config.use_walk_encoder:
-                raise ValueError(
-                    "link_head_type='cross_attn' requires use_walk_encoder=True"
-                )
-            if config.encoder_arch != "attn":
-                raise ValueError(
-                    "link_head_type='cross_attn' requires encoder_arch='attn' "
-                    "(token bank is only exposed by AttentionWalkEncoder)."
-                )
-            self.link_head = CrossAttentionLinkHead(
-                d_emb=config.d_emb, n_heads=config.link_head_n_heads,
-            ).to(self.device)
-        else:
-            raise ValueError(
-                f"Unknown link_head_type: {config.link_head_type!r} "
-                f"(expected 'standard', 'hybrid', or 'cross_attn')."
-            )
+        self.link_head = LinkHead(d_emb=config.d_emb).to(self.device)
 
         # Walk sampler.
         self.walk_gen = WalkGenerator(
@@ -395,78 +346,41 @@ class Trainer:
         self,
         u_ids: torch.Tensor,
         v_ids: torch.Tensor,
-        h_cache: Optional[Dict[str, torch.Tensor]] = None,
+        h_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Score [P] (u, v) pairs through link_head. Inputs come from
-        the walk encoder's per-batch h_cache (a dict carrying h_seed
-        and, for cross_attn, also tokens + token_mask) when the encoder
-        is on, else from raw E. Undirected eval symmetrises by
-        averaging forward(u, v) + forward(v, u). Used at eval (no_grad
-        context); training has its own inline path with the encoder /
-        detach branching.
+        the walk encoder's per-batch h_cache=(h_seed, seeds_sorted)
+        when the encoder is on, else from raw E. Undirected eval
+        symmetrises by averaging forward(u, v) + forward(v, u). Used at
+        eval (no_grad context); training has its own inline path with
+        the encoder/detach branching.
 
         Chunks internally to bound peak GPU memory regardless of P.
         """
-        cross_attn = (
-            h_cache is not None
-            and self.config.link_head_type == "cross_attn"
-        )
-
         def _lookup(ids: torch.Tensor) -> torch.Tensor:
-            """Standard / hybrid path: return one tensor per side, then
-            link_head(e_u, e_v). Not used in cross_attn (which needs
-            per-pair token banks)."""
             if h_cache is not None:
-                h_seed = h_cache["h_seed"]
-                seeds_sorted = h_cache["seeds_sorted"]
-                h = lookup_h_seed(h_seed, seeds_sorted, ids)
-                if self.config.link_head_type == "hybrid":
-                    e = self.embedding_table(ids)
-                    return torch.cat([e, h], dim=-1)
-                return h
+                h_seed, seeds_sorted = h_cache
+                return lookup_h_seed(h_seed, seeds_sorted, ids)
             return self.embedding_table(ids)
 
-        def _score_chunk_cross_attn(u_chunk, v_chunk):
-            h_seed = h_cache["h_seed"]
-            seeds_sorted = h_cache["seeds_sorted"]
-            tokens = h_cache["tokens"]
-            token_mask = h_cache["token_mask"]
-            h_u = lookup_h_seed(h_seed, seeds_sorted, u_chunk)
-            h_v = lookup_h_seed(h_seed, seeds_sorted, v_chunk)
-            u_rows = torch.searchsorted(seeds_sorted, u_chunk)
-            v_rows = torch.searchsorted(seeds_sorted, v_chunk)
-            u_tok = tokens[u_rows]
-            u_msk = token_mask[u_rows]
-            v_tok = tokens[v_rows]
-            v_msk = token_mask[v_rows]
-            logits = self.link_head(h_u, h_v, u_tok, u_msk, v_tok, v_msk)
-            if not self.config.is_directed:
-                logits = 0.5 * (
-                    logits
-                    + self.link_head(h_v, h_u, v_tok, v_msk, u_tok, u_msk)
-                )
-            return logits
-
-        def _score_chunk_pointwise(u_chunk, v_chunk):
-            e_u = _lookup(u_chunk)
-            e_v = _lookup(v_chunk)
+        P = u_ids.shape[0]
+        if P <= self._EVAL_SCORE_CHUNK:
+            e_u = _lookup(u_ids)
+            e_v = _lookup(v_ids)
             logits = self.link_head(e_u, e_v)
             if not self.config.is_directed:
                 logits = 0.5 * (logits + self.link_head(e_v, e_u))
             return logits
 
-        score_chunk = (
-            _score_chunk_cross_attn if cross_attn else _score_chunk_pointwise
-        )
-
-        P = u_ids.shape[0]
-        if P <= self._EVAL_SCORE_CHUNK:
-            return score_chunk(u_ids, v_ids)
-
         out_parts = []
         for start in range(0, P, self._EVAL_SCORE_CHUNK):
             end = min(start + self._EVAL_SCORE_CHUNK, P)
-            out_parts.append(score_chunk(u_ids[start:end], v_ids[start:end]))
+            e_u = _lookup(u_ids[start:end])
+            e_v = _lookup(v_ids[start:end])
+            logits = self.link_head(e_u, e_v)
+            if not self.config.is_directed:
+                logits = 0.5 * (logits + self.link_head(e_v, e_u))
+            out_parts.append(logits)
         return torch.cat(out_parts, dim=0)
 
     # ──────────────────────────────────────────────────────────────────
@@ -537,46 +451,19 @@ class Trainer:
         v_t = torch.from_numpy(all_v).long().to(device)
 
         if self.walk_encoder is not None:
-            # Encoder consumes the full walks_all. For cross_attn the
-            # encoder additionally returns a per-seed token bank
-            # (only AttentionWalkEncoder supports this — enforced at
-            # __init__).
-            need_tokens = self.config.link_head_type == "cross_attn"
-            if need_tokens:
-                h_seed, tokens_all, token_mask_all = self.walk_encoder(
-                    walks_all,
-                    t_now=t_now,
-                    T_train=self.config.t_train_span,
-                    return_tokens=True,
-                )
-            else:
-                h_seed = self.walk_encoder(
-                    walks_all, t_now=t_now, T_train=self.config.t_train_span,
-                )                                            # [N_all, d_emb]
+            # Encoder consumes the full walks_all; the resulting h_seed
+            # is indexed by node id (via the sorted walks_all.seeds and
+            # torch.searchsorted) to extract h_u, h_v for the link head.
+            # See walk_encoder.py for the gradient routing — whether E
+            # receives BCE gradient depends on the .detach() inside the
+            # encoder's E lookups (an experimental knob).
+            h_seed = self.walk_encoder(
+                walks_all, t_now=t_now, T_train=self.config.t_train_span,
+            )                                                 # [N_all, d_emb]
             seeds_sorted = walks_all.seeds.to(device).long()
             h_u = lookup_h_seed(h_seed, seeds_sorted, u_t)
             h_v = lookup_h_seed(h_seed, seeds_sorted, v_t)
-            if self.config.link_head_type == "hybrid":
-                # Augment with detached E to preserve "BCE does not reach
-                # E" — E provides identity prior as a frozen value; h
-                # carries BCE gradient through the encoder.
-                e_u = self.embedding_table(u_t).detach()
-                e_v = self.embedding_table(v_t).detach()
-                eh_u = torch.cat([e_u, h_u], dim=-1)
-                eh_v = torch.cat([e_v, h_v], dim=-1)
-                logits = self.link_head(eh_u, eh_v)
-            elif self.config.link_head_type == "cross_attn":
-                # Gather per-pair token banks via the same searchsorted
-                # idx (h_seed row index == token-bank row index).
-                u_rows = torch.searchsorted(seeds_sorted, u_t)
-                v_rows = torch.searchsorted(seeds_sorted, v_t)
-                u_tok = tokens_all[u_rows]                   # [P, T, d]
-                u_mask = token_mask_all[u_rows]              # [P, T]
-                v_tok = tokens_all[v_rows]
-                v_mask = token_mask_all[v_rows]
-                logits = self.link_head(h_u, h_v, u_tok, u_mask, v_tok, v_mask)
-            else:
-                logits = self.link_head(h_u, h_v)
+            logits = self.link_head(h_u, h_v)
         else:
             # Baseline path: detached E inputs (stop-grad on E for BCE).
             e_u = self.embedding_table(u_t).detach()
@@ -688,10 +575,9 @@ class Trainer:
                     flat_neg_u_np = None
                     flat_neg_v_np = None
 
-                # Build the walk-encoder cache for this eval batch
-                # (only when encoder is on). For cross_attn the cache
-                # also carries (tokens, token_mask).
-                h_cache: Optional[Dict[str, torch.Tensor]] = None
+                # Build the walk-encoder h_seed cache for this eval
+                # batch (only when encoder is on).
+                h_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
                 if self.walk_encoder is not None:
                     parts = [
                         score_batch.src.astype(np.int64),
@@ -702,28 +588,13 @@ class Trainer:
                         parts.append(flat_neg_v_np)
                     all_nodes = np.unique(np.concatenate(parts))
                     walks_eval = self.walk_gen.walks_for_nodes(all_nodes)
-                    if self.config.link_head_type == "cross_attn":
-                        h_seed_eval, tokens_eval, token_mask_eval = self.walk_encoder(
-                            walks_eval,
-                            t_now=int(score_batch.t_max),
-                            T_train=self.config.t_train_span,
-                            return_tokens=True,
-                        )
-                    else:
-                        h_seed_eval = self.walk_encoder(
-                            walks_eval,
-                            t_now=int(score_batch.t_max),
-                            T_train=self.config.t_train_span,
-                        )
-                        tokens_eval = None
-                        token_mask_eval = None
+                    h_seed_eval = self.walk_encoder(
+                        walks_eval,
+                        t_now=int(score_batch.t_max),
+                        T_train=self.config.t_train_span,
+                    )
                     seeds_sorted_eval = walks_eval.seeds.to(self.device).long()
-                    h_cache = {
-                        "h_seed": h_seed_eval,
-                        "seeds_sorted": seeds_sorted_eval,
-                        "tokens": tokens_eval,
-                        "token_mask": token_mask_eval,
-                    }
+                    h_cache = (h_seed_eval, seeds_sorted_eval)
 
                 # Positive scores in one shot.
                 pos_u = torch.from_numpy(score_batch.src.astype(np.int64)).to(self.device)
