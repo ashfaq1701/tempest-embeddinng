@@ -140,15 +140,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", default=1e-4, type=float)
     p.add_argument("--batch-size", default=2000, type=int)
     p.add_argument(
-        "--eval-batch-size", default=None, type=int,
+        "--eval-batch-size", default=200, type=int,
         help="Batch size for val/test eval batches. Per-eval-batch the "
-             "link head scores `eval_batch_size * (1 + K)` pairs where K is "
-             "TGB's negatives-per-positive (wiki=999, review=100, "
+             "link head scores `eval_batch_size * (1 + K)` pairs where K "
+             "is TGB's negatives-per-positive (wiki=999, review=100, "
              "coin=20, comment=20). The full pair tensor must fit in one "
-             "link_head forward; target ~50k pairs total → set 50 for "
-             "wiki, 500 for review, 2500 for coin/comment. Defaults to "
-             "--batch-size (back-compat) which only fits for low-K "
-             "datasets; wiki requires explicit setting.",
+             "link_head forward; target ~50k pairs total. Default 200 "
+             "fits review/coin/comment comfortably; wiki (K=999) needs "
+             "--eval-batch-size 50 explicitly.",
     )
     p.add_argument("--num-epochs", default=50, type=int)
     p.add_argument("--early-stop-patience", default=0, type=int)
@@ -227,21 +226,18 @@ def main() -> Dict[str, Any]:
     # ─── Build batch factories ─────────────────────────────────────
     # create_batches consumes a SplitData and yields Batches in
     # chronological order. We wrap it in a lambda so the trainer can
-    # re-iterate the split each epoch. Eval can use a different
-    # batch size than train — the eval-side per-batch pair count
-    # blows up as eval_batch_size * (1 + K) for TGB's pregenerated
-    # negatives, so it's a memory-fitting knob distinct from train.
-    eval_batch_size = (
-        args.eval_batch_size if args.eval_batch_size is not None else args.batch_size
-    )
+    # re-iterate the split each epoch. Eval uses a separate batch
+    # size from train — the eval-side per-batch pair count blows up
+    # as eval_batch_size * (1 + K) for TGB's pregenerated negatives,
+    # so it's a memory-fitting knob distinct from train.
     train_batches_factory = (
         lambda: create_batches(loaded.train, args.batch_size)
     )
     val_batches_factory = (
-        lambda: create_batches(loaded.val, eval_batch_size)
+        lambda: create_batches(loaded.val, args.eval_batch_size)
     )
     test_batches_factory = (
-        lambda: create_batches(loaded.test, eval_batch_size)
+        lambda: create_batches(loaded.test, args.eval_batch_size)
     )
 
     # ─── Build evaluators ──────────────────────────────────────────
