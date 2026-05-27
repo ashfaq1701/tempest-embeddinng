@@ -146,11 +146,10 @@ class WalkEncoder(nn.Module):
         src_ids = nodes_safe[:, :-1]                         # [NK, L-1]
         tgt_ids = nodes_safe[:, 1:]                          # [NK, L-1]
 
-        # EXPERIMENT: gradient flow into E enabled (no .detach()).
-        # BCE now also trains E via the encoder, in addition to
-        # InfoNCE. Loosens the strict separation of concerns.
-        src_embs = self.E(src_ids)                           # [NK, L-1, d_emb]
-        tgt_embs = self.E(tgt_ids)                           # [NK, L-1, d_emb]
+        # E lookups detached. BCE gradient stops here; E is trained
+        # exclusively by InfoNCE in losses.py.
+        src_embs = self.E(src_ids).detach()                  # [NK, L-1, d_emb]
+        tgt_embs = self.E(tgt_ids).detach()                  # [NK, L-1, d_emb]
 
         # Per-edge Δt. timestamps[:, p] for p in [0, lens-2] is the
         # edge (nodes[p], nodes[p+1]) timestamp; position lens-1 is
@@ -200,11 +199,206 @@ class WalkEncoder(nn.Module):
 
         walk_aggregate = h_walk.view(N, K, self.d_walk).mean(dim=1)  # [N, d_walk]
 
-        e_seed = self.E(seeds)                               # [N, d_emb]
+        e_seed = self.E(seeds).detach()                      # [N, d_emb]
 
         h_seed = self.mlp_seed(
             torch.cat([e_seed, walk_aggregate], dim=-1),
         )                                                    # [N, d_emb]
+        return h_seed
+
+
+class AttentionWalkEncoder(nn.Module):
+    """Self-attention variant of WalkEncoder. Replaces the GRU with a
+    multi-head self-attention block over the L-1 edge tokens of each
+    walk. Mean-pool over K walks; concat with E[seed] and MLP_seed —
+    same output shape as WalkEncoder.
+
+    Args mirror WalkEncoder; adds:
+        n_heads: attention heads (default 4).
+        n_layers: transformer-encoder layers (default 1).
+        exclude_seed: if True, the encoder is rendered purely
+            neighbourhood-derived — the seed's E[seed] is NOT folded
+            into the last edge's tgt_emb (replaced by a learned
+            [SEED] marker) and the final MLP_seed does not concat
+            E[seed]. h_seed then depends only on walk-edge content.
+
+    Gradient routing: same as WalkEncoder — E lookups detached, BCE
+    is the only supervisor.
+    """
+
+    def __init__(
+        self,
+        embedding_table,
+        d_emb: int,
+        d_ef: int,
+        d_te: int = 32,
+        d_he: int = 16,
+        d_edge: int = 128,
+        d_walk: int = 128,
+        max_walk_len: int = 20,
+        n_heads: int = 4,
+        n_layers: int = 1,
+        exclude_seed: bool = False,
+    ):
+        super().__init__()
+        # d_walk must equal d_edge for the attention path (the
+        # transformer's residual stream needs a single width).
+        assert d_walk == d_edge, (
+            f"AttentionWalkEncoder requires d_walk == d_edge "
+            f"(got {d_walk} vs {d_edge}); pass --d-edge equal to --d-walk."
+        )
+        self.E = embedding_table
+        self.d_emb = d_emb
+        self.d_ef = d_ef
+        self.d_te = d_te
+        self.d_he = d_he
+        self.d_edge = d_edge
+        self.d_walk = d_walk
+        self.max_walk_len = max_walk_len
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.exclude_seed = exclude_seed
+
+        self.time2vec = Time2Vec(d_te)
+        self.hop_emb = nn.Embedding(max_walk_len + 1, d_he)
+
+        d_edge_in = 2 * d_emb + d_ef + d_te + d_he
+        self.mlp_edge = nn.Sequential(
+            nn.Linear(d_edge_in, d_edge),
+            nn.GELU(),
+            nn.Linear(d_edge, d_edge),
+        )
+
+        # nn.TransformerEncoder with norm_first for stable training
+        # (pre-LN; standard practice for small datasets).
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_edge,
+            nhead=n_heads,
+            dim_feedforward=4 * d_edge,
+            dropout=0.0,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        if exclude_seed:
+            # [SEED] marker replaces tgt_emb at the to-seed edge so the
+            # seed's identity is opaque to the encoder. Output MLP gets
+            # walk_aggregate only (no E[seed] concat).
+            self.seed_marker = nn.Parameter(torch.randn(d_emb))
+            self.mlp_seed = nn.Sequential(
+                nn.Linear(d_walk, d_emb),
+                nn.GELU(),
+                nn.Linear(d_emb, d_emb),
+            )
+        else:
+            self.seed_marker = None
+            self.mlp_seed = nn.Sequential(
+                nn.Linear(d_emb + d_walk, d_emb),
+                nn.GELU(),
+                nn.Linear(d_emb, d_emb),
+            )
+
+    def forward(
+        self,
+        walks: WalkData,
+        t_now: float,
+        T_train: float,
+    ) -> torch.Tensor:
+        """Returns h_seed: [N, d_emb], row i = encoded rep of walks.seeds[i]."""
+        device = self.E.E.weight.device
+        nodes = walks.nodes.to(device).long()
+        timestamps = walks.timestamps.to(device).long()
+        edge_feats = (
+            walks.edge_feats.to(device).float()
+            if walks.edge_feats is not None
+            else None
+        )
+        lens = walks.lens.to(device).long()
+        seeds = walks.seeds.to(device).long()
+        K = walks.K
+        NK, L = nodes.shape
+        N = NK // K
+
+        nodes_safe = nodes.clamp_min(0)
+        src_ids = nodes_safe[:, :-1]                         # [NK, L-1]
+        tgt_ids = nodes_safe[:, 1:]                          # [NK, L-1]
+
+        src_embs = self.E(src_ids).detach()                  # [NK, L-1, d_emb]
+        tgt_embs = self.E(tgt_ids).detach()                  # [NK, L-1, d_emb]
+
+        # Exclude_seed: replace E[seed] EVERYWHERE it appears in the
+        # walk (last-edge tgt by contract, but also any interior cycle
+        # back to the seed) with a learned [SEED] marker. The encoder
+        # then cannot see the seed's E[seed] value through ANY walk
+        # position — its identity is conveyed only by the fact that
+        # walks were sampled FROM the seed (purely neighbourhood-
+        # derived h).
+        edges_per_walk = (lens - 1).clamp_min(0)             # [NK]
+        if self.exclude_seed:
+            seeds_per_row = seeds.repeat_interleave(K)       # [NK]
+            seed_mask_src = src_ids == seeds_per_row.unsqueeze(1)  # [NK, L-1]
+            seed_mask_tgt = tgt_ids == seeds_per_row.unsqueeze(1)  # [NK, L-1]
+            seed_marker_b = self.seed_marker.view(1, 1, -1).expand(NK, L - 1, -1)
+            src_embs = torch.where(
+                seed_mask_src.unsqueeze(-1), seed_marker_b, src_embs,
+            )
+            tgt_embs = torch.where(
+                seed_mask_tgt.unsqueeze(-1), seed_marker_b, tgt_embs,
+            )
+
+        # Per-edge Δt / hop / edge-feat assembly (unchanged from GRU encoder).
+        delta_t = (float(t_now) - timestamps[:, :-1].float()).clamp_min(0.0)
+        delta_t_norm = delta_t / max(T_train, 1.0)
+        time_enc = self.time2vec(delta_t_norm)               # [NK, L-1, d_te]
+
+        edge_positions = torch.arange(L - 1, device=device).unsqueeze(0)
+        hop_per_edge = (lens.unsqueeze(1) - 1 - edge_positions).clamp(
+            min=1, max=self.max_walk_len,
+        )
+        hop_enc = self.hop_emb(hop_per_edge)                 # [NK, L-1, d_he]
+
+        parts = [src_embs, tgt_embs]
+        if self.d_ef > 0:
+            if edge_feats is not None:
+                parts.append(edge_feats)
+            else:
+                parts.append(torch.zeros(NK, L - 1, self.d_ef, device=device))
+        parts.extend([time_enc, hop_enc])
+        edge_input = torch.cat(parts, dim=-1)
+        edge_repr = self.mlp_edge(edge_input)                # [NK, L-1, d_edge]
+
+        # Padding mask for attention: True at positions to IGNORE.
+        # Position p is valid iff p < edges_per_walk.
+        positions = torch.arange(L - 1, device=device).unsqueeze(0)      # [1, L-1]
+        key_padding_mask = positions >= edges_per_walk.unsqueeze(1)      # [NK, L-1]
+        # Rows with zero edges have an all-True mask, which would make
+        # softmax produce NaN. Run transformer only on nonempty rows.
+        nonempty = edges_per_walk > 0
+        attn_out = torch.zeros_like(edge_repr)
+        if bool(nonempty.any()):
+            ne_repr = edge_repr[nonempty]
+            ne_mask = key_padding_mask[nonempty]
+            attn_out[nonempty] = self.transformer(
+                ne_repr, src_key_padding_mask=ne_mask,
+            )
+
+        # Per-walk h_walk = the LAST valid edge's attended representation.
+        # Mirrors the GRU's "final hidden state after the most recent
+        # edge into the seed" semantics.
+        h_walk = torch.zeros(NK, self.d_walk, device=device)
+        if bool(nonempty.any()):
+            ne_idx = nonempty.nonzero(as_tuple=True)[0]
+            last_idx = edges_per_walk[ne_idx] - 1                        # [NK_ne]
+            h_walk[ne_idx] = attn_out[ne_idx, last_idx]                  # [NK_ne, d_walk]
+
+        walk_aggregate = h_walk.view(N, K, self.d_walk).mean(dim=1)      # [N, d_walk]
+
+        if self.exclude_seed:
+            h_seed = self.mlp_seed(walk_aggregate)
+        else:
+            e_seed = self.E(seeds).detach()
+            h_seed = self.mlp_seed(torch.cat([e_seed, walk_aggregate], dim=-1))
         return h_seed
 
 

@@ -46,6 +46,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -59,7 +60,7 @@ from .negatives import (
     UniformNegativeSampler,
 )
 from .utils import make_lr_lambda
-from .walk_encoder import WalkEncoder, lookup_h_seed
+from .walk_encoder import AttentionWalkEncoder, WalkEncoder, lookup_h_seed
 from .walks import WalkGenerator, slice_walks_by_seeds
 
 
@@ -110,6 +111,15 @@ class TrainerConfig:
     # BCE; E lookups inside the encoder are detached so BCE does not
     # reach E via the encoder.
     use_walk_encoder: bool = False
+    encoder_arch: str = "gru"       # "gru" (default) or "attn"
+    encoder_n_heads: int = 4        # attn-only: # of attention heads
+    encoder_n_layers: int = 1       # attn-only: # of transformer layers
+    encoder_exclude_seed: bool = False  # attn-only: drop E[seed] from
+                                        # both the last-edge tgt slot
+                                        # (replaced by a [SEED] marker)
+                                        # AND the final MLP_seed concat.
+                                        # Makes h_seed purely
+                                        # neighbourhood-derived.
     d_te: int = 32           # time2vec dim
     d_he: int = 16           # hop emb dim
     d_edge: int = 128        # per-edge representation dim
@@ -204,16 +214,41 @@ class Trainer:
         # the link head only. InfoNCE alignment_loss is unchanged.
         if config.use_walk_encoder:
             d_ef = config.d_edge_feat if config.d_edge_feat is not None else 0
-            self.walk_encoder: Optional[WalkEncoder] = WalkEncoder(
-                embedding_table=self.embedding_table,
-                d_emb=config.d_emb,
-                d_ef=d_ef,
-                d_te=config.d_te,
-                d_he=config.d_he,
-                d_edge=config.d_edge,
-                d_walk=config.d_walk,
-                max_walk_len=config.max_walk_len,
-            ).to(self.device)
+            if config.encoder_arch == "gru":
+                if config.encoder_exclude_seed:
+                    raise ValueError(
+                        "encoder_exclude_seed is only supported by "
+                        "encoder_arch='attn'."
+                    )
+                self.walk_encoder: Optional[nn.Module] = WalkEncoder(
+                    embedding_table=self.embedding_table,
+                    d_emb=config.d_emb,
+                    d_ef=d_ef,
+                    d_te=config.d_te,
+                    d_he=config.d_he,
+                    d_edge=config.d_edge,
+                    d_walk=config.d_walk,
+                    max_walk_len=config.max_walk_len,
+                ).to(self.device)
+            elif config.encoder_arch == "attn":
+                self.walk_encoder = AttentionWalkEncoder(
+                    embedding_table=self.embedding_table,
+                    d_emb=config.d_emb,
+                    d_ef=d_ef,
+                    d_te=config.d_te,
+                    d_he=config.d_he,
+                    d_edge=config.d_edge,
+                    d_walk=config.d_walk,
+                    max_walk_len=config.max_walk_len,
+                    n_heads=config.encoder_n_heads,
+                    n_layers=config.encoder_n_layers,
+                    exclude_seed=config.encoder_exclude_seed,
+                ).to(self.device)
+            else:
+                raise ValueError(
+                    f"Unknown encoder_arch: {config.encoder_arch!r} "
+                    f"(expected 'gru' or 'attn')."
+                )
         else:
             self.walk_encoder = None
 
