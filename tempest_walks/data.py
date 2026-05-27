@@ -28,37 +28,17 @@ class Loaded(NamedTuple):
     name: str                   # TGB name (for the Evaluator)
     eval_metric: str            # e.g. "mrr"
     max_node_count: int
-    is_directed: bool
     node_feat: Optional[np.ndarray]
 
 
-# Datasets known to be undirected (bipartite or otherwise). The
-# check normalises by stripping any "-vN" version suffix, so
-# "tgbl-wiki", "tgbl-wiki-v2", "tgbl-wiki-v3" all match — TGB's
-# versioning bumps refresh negatives / fix data issues but do
-# not change graph orientation.
-_UNDIRECTED_BASE_NAMES = {
-    "tgbl-wiki",
-    "tgbl-review",
-    "tgbl-subreddit",
-    "tgbl-lastfm",
-}
-
-
 def _strip_version_suffix(name: str) -> str:
-    """Drop trailing '-v<digits>' from a TGB dataset name."""
+    """Drop trailing '-v<digits>' from a TGB dataset name. Used to
+    convert user-facing names ('tgbl-review-v2') into the TGB
+    registry key ('tgbl-review'); the unstripped form raises 'Dataset
+    not supported' inside TGB."""
     # E.g., 'tgbl-wiki-v2' -> 'tgbl-wiki'; 'tgbl-coin' unchanged.
     import re
     return re.sub(r"-v\d+$", "", name)
-
-
-def default_is_directed(name: str) -> bool:
-    """Default directedness for known TGB datasets, ignoring version
-    suffix. Returns True if the dataset isn't on the known-undirected
-    list — but callers should expose an explicit override (the
-    knowledge here is a default, not authoritative)."""
-    base = _strip_version_suffix(name)
-    return base not in _UNDIRECTED_BASE_NAMES
 
 
 def load_tgb(name: str, root: str = "datasets") -> Loaded:
@@ -109,7 +89,6 @@ def load_tgb(name: str, root: str = "datasets") -> Loaded:
         name=tgb_name,
         eval_metric=str(dataset.eval_metric),
         max_node_count=int(max(sources.max(), destinations.max())) + 1,
-        is_directed=default_is_directed(name),
         node_feat=node_feat,
     )
 
