@@ -176,3 +176,125 @@ Historical (Vitter R) reservoir sampler.
 | `max_walk_len` | 20 | |
 | `lr` | 1e-3 | wiki seed-42 A/B (sampled-neg K=64): lr=1e-3 → val 0.4594 vs lr=1e-2 → 0.4301 |
 | `batch_size` | 2000 | |
+
+---
+
+## Walk encoder ablation on tgbl-wiki (2026-05-27)
+
+Five-stage investigation of the walk encoder design space on
+tgbl-wiki (low surprise = 0.108 — most test endpoints have history,
+so E[v] alone is informative). **Encoder design intent: produce a
+useful h_v on cold-start endpoints where E[v] is near random init.**
+This dataset is the wrong workload for the encoder's value; the test
+is whether the encoder is at least NEUTRAL when its target audience
+(cold nodes) is the minority.
+
+All runs: seed=42 × 50 ep, K=128 sampled negs, walks K=5 L=20.
+
+### Stage A: ATTN encoder + standard link head (clip=0.5)
+Replace GRU with single-layer multi-head self-attention (4 heads,
+pre-LN, batch_first) over walk edges. Last-valid-edge pooling.
+Same `mlp_seed(concat[E[seed], walk_aggregate])` output.
+Gradient clipping required (`max_grad_norm=0.5`): at clip=1.0 the
+transformer diverged catastrophically (bce → 52303). 1.5M params
+(encoder), trains stably with clip.
+
+Best: ep44 val 0.4543 / test 0.4020.
+
+### Stage B: ATTN + exclude_seed
+Not run — Stage A landed below GRU encoder; Stage B is a variant
+of an already-losing architecture and the data-driven branch was
+to test link-head changes instead. The encoder/test code IS in
+place (`encoder_exclude_seed` flag; tests pin it to mask E[seed]
+everywhere the seed appears in the walk).
+
+### Stage C: GRU encoder + hybrid link head (no bilinear)
+HybridLinkHead consumes BOTH `E[v].detach()` and `h_v` for each
+side — wider input (2·d_emb), same 6-channel pair-MLP, bilinear
+DROPPED (n.Bilinear's weight-gradient at d=256 materialises a
+[P, 1, 256, 256] = 5.6 GB intermediate that OOMs the 8 GB GPU).
+Tests "augment vs replace at the link head".
+
+Best: ep47 val 0.4612 / test 0.4121.
+
+### Stage D: ATTN encoder + cross-attention link head
+Cross-attention over per-seed walk-token banks (h_u/h_v as single
+queries against the other side's token banks; concat + MLP score).
+Token-bank gather forced bs=1000 (bs=2000 OOMs). Train chunking
+at chunk=2000 to keep per-pair scoring under budget.
+
+Stopped at ep15: val 0.064 — 6× below baseline ep15 (~0.36).
+Cross-attn head not converging at this scale; killed.
+
+### Stage 0: Baseline (no encoder)
+Same config minus encoder. `link_head(E[u].detach(), E[v].detach())`.
+
+Best: ep34 val **0.4933** / test **0.4712**.
+
+### Summary table
+
+All on wiki, bs=2000 (Stage D bs=1000), lr=1e-2, warmup-cap=50
+(D=100), seed=42 × 50ep:
+
+| Encoder | Link head | Best val | Best test | Δ baseline val |
+|---|---|---|---|---|
+| **OFF (baseline)** | standard (E only) | **0.4933** | **0.4712** | — |
+| GRU, detached | standard (h_v) | 0.4687 | 0.4187 | −0.025 |
+| GRU, detached | hybrid (E + h_v) | 0.4612 | 0.4121 | −0.032 |
+| ATTN, clip=0.5 | standard (h_v) | 0.4543 | 0.4020 | −0.039 |
+| ATTN, clip=0.5 | cross_attn (tokens) | (killed @ep15, 0.064) | — | severe |
+
+### Findings (Q1–Q5)
+
+**Q1 — encoder helping or hurting?** Hurting on wiki at every config
+(−0.025 to −0.039 val). No encoder variant matches, let alone beats,
+the baseline.
+
+**Q2 — why?** Wiki surprise is 0.108: ~89% of test endpoints are
+historical (E[v] is well-trained by InfoNCE). For these endpoints,
+replacing or augmenting E with encoder-derived h_v INJECTS NOISE
+because the encoder's BCE-only supervision can't shape h_v as
+cleanly as InfoNCE shapes E. The encoder's value is on the cold
+~11%, but the win there is dominated by the loss on the warm 89%.
+
+**Q3 — better encoder?** Attention is NOT better than GRU. ATTN
+needs grad clipping (clip ≤ 0.5; clip=1.0 diverges). At its best
+config, ATTN lands 0.014 val BELOW GRU. The transformer's extra
+expressivity has nothing useful to learn from on a dataset where
+the encoder shouldn't be the dominant signal.
+
+**Q4 — more info in link head?** Hybrid (E + h) does NOT recover
+baseline. The MLP can't fully ignore h's noise — feeding h
+alongside E still drags the score down (−0.032 val vs baseline).
+The link-head architecture isn't the bottleneck; the encoder's
+output quality is.
+
+**Q5 — cross-attention?** No, on wiki at our scale. Cross-attn
+between token banks doesn't converge competitively — at ep15
+val 0.064 vs baseline 0.376. The head has too many params for
+BCE-only supervision to shape from a cold start; even given more
+epochs, the gap is too large to close.
+
+### What this DOES NOT say
+
+The encoder's value is **on cold-start nodes**, which tgbl-wiki
+barely tests (11% of pairs). The right validation set is **tgbl-
+review** (surprise 0.987) where the encoder must produce useful
+h_v for endpoints with no training E[v]. That experiment is
+deferred. The tonight conclusion: on the warm-pair-dominated wiki,
+no encoder variant within the GRU/ATTN/hybrid/cross_attn family
+helps — but the family was never designed to help on wiki.
+
+### Code state
+
+All code paths are committed and tested. The encoder is feature-
+flagged (`--use-walk-encoder` OFF by default); all heads / encoders
+are dispatch-selectable from CLI. Tests pin invariants:
+  - tests/test_attention_encoder.py (5)
+  - tests/test_hybrid_link_head.py (3)
+  - tests/test_cross_attn_link_head.py (5)
+  - tests/test_slice_walks.py (4) — shared infra
+  - tests/test_walk_contract.py (5) — Tempest contract
+  - tests/test_vitter_r_uniformity.py (1)
+
+Logs at `logs/overnight/` (gitignored).
