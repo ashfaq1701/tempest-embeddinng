@@ -288,12 +288,7 @@ class HybridLinkHead(nn.Module):
         if d_hidden is None:
             d_hidden = d
 
-        # No bilinear here — at d=2*d_emb=256, nn.Bilinear's backward
-        # materialises a [batch, 1, d, d] = [22000, 1, 256, 256] = 5.6 GB
-        # intermediate that OOMs the 8 GB GPU. The 6-channel pair-MLP
-        # below is expressive enough; LinkHead's bilinear was an
-        # add-on inductive bias at d=128 where the [B, 1, 128, 128]
-        # intermediate is 1.4 GB and still fits.
+        self.bilinear = nn.Bilinear(d, d, 1)
 
         self.mlp = nn.Sequential(
             nn.Linear(6 * d, 4 * d_hidden),
@@ -307,6 +302,7 @@ class HybridLinkHead(nn.Module):
 
     def forward(self, eh_u: torch.Tensor, eh_v: torch.Tensor) -> torch.Tensor:
         """Returns logits, shape eh_u.shape[:-1]."""
+        score_bilin = self.bilinear(eh_u, eh_v).squeeze(-1)
         pair_feats = torch.cat(
             [
                 eh_u,
@@ -318,4 +314,5 @@ class HybridLinkHead(nn.Module):
             ],
             dim=-1,
         )
-        return self.mlp(pair_feats).squeeze(-1)
+        score_mlp = self.mlp(pair_feats).squeeze(-1)
+        return score_bilin + score_mlp
