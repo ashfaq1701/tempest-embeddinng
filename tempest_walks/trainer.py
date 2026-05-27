@@ -265,21 +265,17 @@ class Trainer:
             f"{batches_per_epoch} batches)"
         )
 
-    # Per-batch pair count at eval is bs * (1 + K) where K is the
-    # number of TGB-pregenerated negatives per positive — and K is
-    # dataset-dependent: tgbl-wiki K=999, tgbl-review K=100, tgbl-coin
-    # K=20, tgbl-comment K=20 (verified from the cached val_ns pickles).
-    # Worst case at bs=2000 is wiki: ~2M pairs/batch. LinkHead's
-    # pair_feats concat alone is 6*d_emb*4 bytes per pair (3 KB at
-    # d_emb=128) — 6 GB at 2M pairs. Plus nn.Bilinear's [P, 1, d, d]
-    # backward intermediate is much worse. Chunk the score so per-call
-    # allocations stay under a fixed budget.
-    _EVAL_SCORE_CHUNK = 50_000
-
     def _score_pairs(self, u_ids: torch.Tensor, v_ids: torch.Tensor) -> torch.Tensor:
-        """Score [P] (u, v) pairs through E + link_head. Used at eval
-        (no_grad context); training has its own inline path with
-        .detach().
+        """Score [P] (u, v) pairs through E + link_head in a single
+        link_head call. Used at eval (no_grad context); training has
+        its own inline path with .detach().
+
+        Memory-fitting is the CALLER's responsibility — set
+        --eval-batch-size so that eval_batch_size * (1 + K) stays
+        within the link head's per-call memory budget (target ~50k
+        pairs at d_emb=128 on an 8 GB GPU). With TGB's K values
+        (wiki=999, review=100, coin=20, comment=20), safe
+        eval_batch_size values are ~50 / ~500 / ~2500 / ~2500.
 
         Scoring is task-directional regardless of is_directed: TGB's
         eval protocol ranks alternative DESTINATIONS for a fixed src
@@ -291,22 +287,10 @@ class Trainer:
         symmetric / bipartite. is_directed remains meaningful inside
         the WalkGenerator (Tempest walk-direction semantics depend on
         graph topology); it just doesn't belong on this code path.
-
-        Chunks internally to bound peak GPU memory regardless of P.
         """
-        P = u_ids.shape[0]
-        if P <= self._EVAL_SCORE_CHUNK:
-            e_u = self.embedding_table(u_ids)
-            e_v = self.embedding_table(v_ids)
-            return self.link_head(e_u, e_v)
-
-        out_parts = []
-        for start in range(0, P, self._EVAL_SCORE_CHUNK):
-            end = min(start + self._EVAL_SCORE_CHUNK, P)
-            e_u = self.embedding_table(u_ids[start:end])
-            e_v = self.embedding_table(v_ids[start:end])
-            out_parts.append(self.link_head(e_u, e_v))
-        return torch.cat(out_parts, dim=0)
+        e_u = self.embedding_table(u_ids)
+        e_v = self.embedding_table(v_ids)
+        return self.link_head(e_u, e_v)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
