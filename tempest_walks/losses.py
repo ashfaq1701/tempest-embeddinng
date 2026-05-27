@@ -71,6 +71,7 @@ def alignment_loss(
     tau: float = 0.5,
     node_feat: Optional[torch.Tensor] = None,     # [num_nodes, d_nf] or None
     num_align_negatives: int = 128,
+    loss_form: str = "l2_dist",                   # "l2_dist" | "cosine"
 ) -> torch.Tensor:
     """InfoNCE contrastive alignment over batched walks.
 
@@ -134,8 +135,15 @@ def alignment_loss(
     p_ctx_own_walks = p_ctx.view(NK, L, d_proj)                   # [NK, L, d_proj]
 
     # ── Sim to positives: own walk only ──────────────────────────
-    sq_dist_pos = ((p_seed.unsqueeze(1) - p_ctx_own_walks) ** 2).sum(dim=-1)
-    sim_pos = -sq_dist_pos / tau                                  # [NK, L]
+    if loss_form == "l2_dist":
+        sq_dist_pos = ((p_seed.unsqueeze(1) - p_ctx_own_walks) ** 2).sum(dim=-1)
+        sim_pos = -sq_dist_pos / tau                              # [NK, L]
+    elif loss_form == "cosine":
+        sim_pos = (p_seed.unsqueeze(1) * p_ctx_own_walks).sum(dim=-1) / tau
+    else:
+        raise ValueError(
+            f"unknown loss_form: {loss_form!r} (expected 'l2_dist' | 'cosine')"
+        )
     sim_pos = sim_pos.masked_fill(~is_context, _INVALID_SIM)
 
     # ── Sampled negatives ────────────────────────────────────────
@@ -171,8 +179,11 @@ def alignment_loss(
     p_neg = p_neg.view(NK, num_align_negatives, d_proj)           # [NK, R, d_proj]
 
     # ── Sim to sampled negatives ─────────────────────────────────
-    sq_dist_neg = ((p_seed.unsqueeze(1) - p_neg) ** 2).sum(dim=-1)
-    sim_neg = -sq_dist_neg / tau                                  # [NK, R]
+    if loss_form == "l2_dist":
+        sq_dist_neg = ((p_seed.unsqueeze(1) - p_neg) ** 2).sum(dim=-1)
+        sim_neg = -sq_dist_neg / tau                              # [NK, R]
+    else:  # cosine
+        sim_neg = (p_seed.unsqueeze(1) * p_neg).sum(dim=-1) / tau
 
     # ── Partition function: log Z_i over positives ∪ negatives ───
     sim_combined = torch.cat([sim_pos, sim_neg], dim=1)           # [NK, L + R]

@@ -84,10 +84,17 @@ class ProjectionHead(nn.Module):
         d_proj: int,
         d_node_feat: Optional[int] = None,
         d_hidden: Optional[int] = None,
+        projection_norm: str = "l2",
     ):
         super().__init__()
         if d_hidden is None:
             d_hidden = d_proj
+        if projection_norm not in ("l2", "layernorm", "none"):
+            raise ValueError(
+                f"unknown projection_norm: {projection_norm!r} "
+                f"(expected 'l2' | 'layernorm' | 'none')"
+            )
+        self.projection_norm = projection_norm
 
         self.has_nf = d_node_feat is not None
 
@@ -111,12 +118,16 @@ class ProjectionHead(nn.Module):
             nn.Linear(d_hidden, d_proj),
         )
 
+        if projection_norm == "layernorm":
+            self.final_layernorm = nn.LayerNorm(d_proj)
+
     def forward(
         self,
         e: torch.Tensor,
         node_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Returns L2-normalised projection, shape e.shape[:-1] + [d_proj]."""
+        """Returns the projection at the configured normalisation,
+        shape e.shape[:-1] + [d_proj]."""
         if self.has_nf and node_feat is None:
             raise ValueError("ProjectionHead has NF channel but no NF passed")
         if not self.has_nf and node_feat is not None:
@@ -128,7 +139,11 @@ class ProjectionHead(nn.Module):
 
         z = torch.cat(branches, dim=-1)
         out = self.merge(z)
-        return F.normalize(out, p=2, dim=-1, eps=1e-12)
+        if self.projection_norm == "l2":
+            return F.normalize(out, p=2, dim=-1, eps=1e-12)
+        if self.projection_norm == "layernorm":
+            return self.final_layernorm(out)
+        return out
 
 
 class LinkHead(nn.Module):
