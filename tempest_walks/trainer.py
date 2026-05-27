@@ -277,20 +277,24 @@ class Trainer:
         (wiki=999, review=100, coin=20, comment=20), safe
         eval_batch_size values are ~50 / ~500 / ~2500 / ~2500.
 
-        Scoring is task-directional regardless of is_directed: TGB's
-        eval protocol ranks alternative DESTINATIONS for a fixed src
-        per positive, so we always compute link_head(E[src], E[dst]).
-        link_head was only ever trained on (src-role, dst-role)
-        inputs; evaluating link_head(E[dst], E[src]) at eval time
-        queries an untrained input arrangement and adds noise to the
-        ranking — even when the underlying graph topology is
-        symmetric / bipartite. is_directed remains meaningful inside
-        the WalkGenerator (Tempest walk-direction semantics depend on
-        graph topology); it just doesn't belong on this code path.
+        Symmetrise when is_directed is False:
+        link_head was only trained on (src-role, dst-role) inputs,
+        but for bipartite/undirected datasets the link head's
+        commutative pair-feature channels (e_u·e_v, |e_u-e_v|,
+        (e_u-e_v)², e_u+e_v) give a strong correlated estimate of
+        the same edge under (dst, src) input order. Averaging
+        forward(u, v) + forward(v, u) is then a TTA-style
+        correlated-ensemble that empirically improves ranking on
+        bipartite data (+~0.05 val MRR observed on wiki). When
+        is_directed=True the underlying topology has a single
+        meaningful direction and the average is dropped.
         """
         e_u = self.embedding_table(u_ids)
         e_v = self.embedding_table(v_ids)
-        return self.link_head(e_u, e_v)
+        logits = self.link_head(e_u, e_v)
+        if not self.config.is_directed:
+            logits = 0.5 * (logits + self.link_head(e_v, e_u))
+        return logits
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step

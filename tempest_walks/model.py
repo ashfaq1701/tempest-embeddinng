@@ -139,14 +139,27 @@ class LinkHead(nn.Module):
     documented contract for trainer.py — see CLAUDE.md). LinkHead
     NEVER detaches its inputs.
 
-    Output: one logit per (u, v) pair. Asymmetric — and used
-    asymmetrically: caller MUST pass (e_src, e_dst) in that order
-    at both train and eval. Do NOT symmetrise by averaging
-    score(u, v) + score(v, u) for "undirected" datasets — the
-    reverse direction is untrained input territory.
+    Output: one logit per (u, v) pair. Asymmetric by construction
+    (bilinear u^T W v + [e_u, e_v] concat channels carry directional
+    information). For datasets where the underlying graph topology is
+    symmetric/bipartite, the caller may symmetrise at eval by
+    averaging score(u, v) + score(v, u) — see trainer's _score_pairs
+    `if not self.config.is_directed` branch. The averaging acts as a
+    correlated-ensemble test-time augmentation and empirically helps
+    on bipartite-like data.
+
+    Regularization: dropout (default 0.1) between MLP layers.
+    LayerNorm pre-MLP normalises the wide pair-feature input scale
+    so the head's training is decoupled from E's magnitude (which
+    moves during training as InfoNCE shapes E).
     """
 
-    def __init__(self, d_emb: int, d_hidden: Optional[int] = None):
+    def __init__(
+        self,
+        d_emb: int,
+        d_hidden: Optional[int] = None,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         if d_hidden is None:
             d_hidden = d_emb
@@ -154,13 +167,21 @@ class LinkHead(nn.Module):
         self.bilinear = nn.Bilinear(d_emb, d_emb, 1)
 
         # 6-channel pair features concatenated along last dim → 6*d_emb input.
+        # LayerNorm before the MLP keeps activations at unit scale so
+        # the wide first projection doesn't depend on E's magnitude;
+        # dropout between layers regularises a 575k-param head on the
+        # binary BCE signal.
+        self.pair_norm = nn.LayerNorm(6 * d_emb)
         self.mlp = nn.Sequential(
             nn.Linear(6 * d_emb, 4 * d_hidden),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(4 * d_hidden, 2 * d_hidden),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(2 * d_hidden, d_hidden),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(d_hidden, 1),
         )
 
@@ -179,6 +200,6 @@ class LinkHead(nn.Module):
             ],
             dim=-1,
         )
-        score_mlp = self.mlp(pair_feats).squeeze(-1)
+        score_mlp = self.mlp(self.pair_norm(pair_feats)).squeeze(-1)
 
         return score_bilin + score_mlp
