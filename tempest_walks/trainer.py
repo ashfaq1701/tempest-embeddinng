@@ -4,7 +4,8 @@ Single Trainer class. Per-batch ordering:
 
   TRAINING:
     1. walks = walk_gen.walks_for_nodes(seeds)       ← pre-ingest state
-       seeds = unique(B_src ∪ B_tgt)
+       seeds = unique(B_tgt)               if is_directed
+       seeds = unique(B_src ∪ B_tgt)       if undirected
     2. L_align = alignment_loss(walks, τ)            ← InfoNCE scalar
     3. neg = neg_sampler.sample(batch)               ← pre-observe state
     4. logits = link_head(E[u].detach(), E[v].detach()) for pos + neg
@@ -304,13 +305,18 @@ class Trainer:
         device = self.device
 
         # Step 1: walks from PRE-INGEST state.
-        # Walk seeds always span both endpoints. Tempest's walk sampler
-        # respects edge direction internally — on directed graphs, walks
-        # from a source follow outgoing edges, walks from a target follow
-        # incoming edges. The structural difference between src-walks and
-        # tgt-walks captures directedness implicitly; explicit branching
-        # on is_directed at the seed-selection step adds nothing.
-        seeds_np = np.unique(np.concatenate([batch.src, batch.tgt]))
+        # Seed selection depends on directedness:
+        #  - undirected: seeds = unique(src ∪ tgt). Both endpoints are
+        #    symmetric roles; walking from either captures the local
+        #    neighbourhood equally.
+        #  - directed:   seeds = unique(tgt). TGB ranks candidate dsts
+        #    given a fixed src, so the dst side is what gets scored;
+        #    walking from the dst follows its incoming-edge history,
+        #    which is the predictive signal for "which dst did src hit".
+        if self.config.is_directed:
+            seeds_np = np.unique(batch.tgt)
+        else:
+            seeds_np = np.unique(np.concatenate([batch.src, batch.tgt]))
         walks = self.walk_gen.walks_for_nodes(seeds_np)
 
         # Step 2: InfoNCE contrastive alignment over batched walks.
