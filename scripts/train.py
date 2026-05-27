@@ -18,7 +18,7 @@ Hyperparameters exposed at CLI (and their grouping):
                   --monitor-sample-pct
 
 Derived from the dataset (not exposed):
-  num_nodes, is_directed, is_bipartite, dst_pool, d_node_feat,
+  num_nodes, is_directed, dst_pool, d_node_feat,
   T_train (= max(train.ts) - min(train.ts)).
 """
 
@@ -42,7 +42,7 @@ from tempest_walks.data import Loaded, create_batches, load_tgb
 from tempest_walks.evaluator import Evaluator
 from tempest_walks.negatives import TGBNegativeSampler
 from tempest_walks.trainer import Trainer, TrainerConfig
-from tempest_walks.utils import derive_t_train, detect_bipartite, seed_all
+from tempest_walks.utils import derive_t_train, seed_all
 
 
 def parse_args() -> argparse.Namespace:
@@ -188,7 +188,6 @@ def main() -> Dict[str, Any]:
     # Derived dataset constants.
     num_nodes = loaded.max_node_count
     is_directed = args.is_directed
-    is_bipartite = detect_bipartite(loaded.train)
     dst_pool = np.unique(loaded.train.destinations).astype(np.int32)
     T_train = derive_t_train(loaded.train.timestamps)
     d_node_feat = (
@@ -199,7 +198,6 @@ def main() -> Dict[str, Any]:
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  directed:      {is_directed}  (--is-directed)")
-    print(f"  bipartite:     {is_bipartite}")
     print(f"  dst_pool:      {len(dst_pool):,} unique destinations")
     print(f"  T_train:       {T_train:.0f}")
     print(f"  train edges:   {len(loaded.train.sources):,}")
@@ -241,7 +239,6 @@ def main() -> Dict[str, Any]:
     config = TrainerConfig(
         num_nodes=num_nodes,
         is_directed=is_directed,
-        is_bipartite=is_bipartite,
         dst_pool=dst_pool,
         t_train_span=T_train,
         d_node_feat=d_node_feat,

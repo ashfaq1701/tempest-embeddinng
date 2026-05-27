@@ -70,7 +70,6 @@ class TrainerConfig:
     # Dataset-derived (passed in by train.py).
     num_nodes: int
     is_directed: bool
-    is_bipartite: bool
     dst_pool: np.ndarray
     t_train_span: float
     d_node_feat: Optional[int] = None

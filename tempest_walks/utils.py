@@ -9,7 +9,6 @@ Contents:
     - seed_all(seed)              — seed Python/numpy/torch RNGs.
   Dataset derivation:
     - derive_t_train(train_ts)    — span of training timestamps.
-    - detect_bipartite(train_split) — src/dst disjointness check.
   LR schedule:
     - make_lr_lambda(warmup_steps, decay_steps, lr_min_ratio)
                                   — closure for LambdaLR that does
@@ -60,17 +59,6 @@ def derive_t_train(train_ts: np.ndarray) -> float:
     if span <= 0:
         raise ValueError(f"Non-positive T_train: {span}")
     return span
-
-
-def detect_bipartite(train_split) -> bool:
-    """A graph is bipartite (under the link-pred convention) iff the
-    set of source IDs and the set of destination IDs are disjoint.
-    Holds for tgbl-wiki (users→pages), tgbl-review (users→items),
-    tgbl-subreddit (users→subreddits). Fails for tgbl-coin / tgbl-flight
-    / tgbl-comment where any node can be either endpoint."""
-    src_set = set(np.unique(train_split.sources).tolist())
-    dst_set = set(np.unique(train_split.destinations).tolist())
-    return src_set.isdisjoint(dst_set)
 
 
 # ──────────────────────────────────────────────────────────────────────
