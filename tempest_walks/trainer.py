@@ -101,6 +101,8 @@ class TrainerConfig:
     max_walk_len: int = 20
     walk_bias: str = "ExponentialWeight"
     start_bias: str = "Uniform"
+    max_time_capacity: int = -1     # Tempest sliding-window eviction
+                                    # in raw timestamp units; -1 = unbounded.
 
     # Negatives (training).
     num_neg_per_pos: int = 10
@@ -186,6 +188,7 @@ class Trainer:
             start_bias=config.start_bias,
             max_walk_len=config.max_walk_len,
             num_walks_per_node=config.num_walks_per_node,
+            max_time_capacity=config.max_time_capacity,
         )
 
         # Negative samplers (training).
