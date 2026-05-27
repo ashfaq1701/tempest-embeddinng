@@ -169,6 +169,14 @@ class TrainerConfig:
     weight_decay: float = 1e-4
     num_epochs: int = 50
     early_stop_patience: int = 0
+    max_grad_norm: Optional[float] = None   # if set, clip global grad
+                                            # norm at this value before
+                                            # optimizer.step(). Required
+                                            # for stable training with
+                                            # the attention encoder
+                                            # (transformers diverge
+                                            # without clipping at lr=1e-2);
+                                            # harmless for other configs.
 
     # System.
     seed: int = 42
@@ -593,6 +601,11 @@ class Trainer:
         l_total = l_align + l_bce
         self.optimizer.zero_grad(set_to_none=True)
         l_total.backward()
+        if self.config.max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(
+                (p for group in self.optimizer.param_groups for p in group["params"]),
+                max_norm=self.config.max_grad_norm,
+            )
         self.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
