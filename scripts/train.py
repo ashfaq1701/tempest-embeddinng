@@ -132,6 +132,23 @@ def parse_args() -> argparse.Namespace:
              "(replaced by a learned [SEED] marker) AND the final "
              "MLP_seed concat. h_seed becomes purely neighbourhood-derived.",
     )
+    p.add_argument(
+        "--link-head-type",
+        choices=["standard", "hybrid", "cross_attn"],
+        default="standard",
+        help="Link-head input scheme: 'standard' = link_head(h_u, h_v) "
+             "with encoder ON or link_head(E[u].detach(), E[v].detach()) "
+             "baseline. 'hybrid' = link_head(concat[E[u].detach(), h_u], "
+             "concat[E[v].detach(), h_v]) — augments h with E at the head "
+             "instead of replacing. 'cross_attn' = cross-attention link "
+             "head over per-seed walk-token banks (requires "
+             "--encoder-arch attn). 'hybrid' / 'cross_attn' require "
+             "--use-walk-encoder.",
+    )
+    p.add_argument(
+        "--link-head-n-heads", default=4, type=int,
+        help="cross_attn-only: number of cross-attention heads",
+    )
 
     # Negatives.
     p.add_argument("--num-neg-per-pos", default=10, type=int)
@@ -304,6 +321,8 @@ def main() -> Dict[str, Any]:
         encoder_n_heads=args.encoder_n_heads,
         encoder_n_layers=args.encoder_n_layers,
         encoder_exclude_seed=args.encoder_exclude_seed,
+        link_head_type=args.link_head_type,
+        link_head_n_heads=args.link_head_n_heads,
         d_te=args.d_te,
         d_he=args.d_he,
         d_edge=args.d_edge,

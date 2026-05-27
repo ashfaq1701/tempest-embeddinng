@@ -304,8 +304,16 @@ class AttentionWalkEncoder(nn.Module):
         walks: WalkData,
         t_now: float,
         T_train: float,
-    ) -> torch.Tensor:
-        """Returns h_seed: [N, d_emb], row i = encoded rep of walks.seeds[i]."""
+        return_tokens: bool = False,
+    ):
+        """Returns h_seed: [N, d_emb], row i = encoded rep of walks.seeds[i].
+
+        If return_tokens=True, returns (h_seed, tokens, token_mask)
+        where tokens is [N, K*(L-1), d_walk] (flattened per-edge
+        attended reps across the K walks of each seed) and token_mask
+        is [N, K*(L-1)] (True at valid edges, False at within-walk
+        padding). Used by cross-attention-style link heads.
+        """
         device = self.E.E.weight.device
         nodes = walks.nodes.to(device).long()
         timestamps = walks.timestamps.to(device).long()
@@ -399,7 +407,21 @@ class AttentionWalkEncoder(nn.Module):
         else:
             e_seed = self.E(seeds).detach()
             h_seed = self.mlp_seed(torch.cat([e_seed, walk_aggregate], dim=-1))
-        return h_seed
+
+        if not return_tokens:
+            return h_seed
+
+        # Token bank for cross-attention link heads. Tokens are the
+        # attended per-edge representations flattened across the K
+        # walks of each seed. token_mask is True at valid edges only,
+        # so downstream attention can mask within-walk padding.
+        d = attn_out.shape[-1]
+        tokens = attn_out.view(N, K, L - 1, d).reshape(N, K * (L - 1), d)
+        positions_tok = torch.arange(L - 1, device=device).view(1, 1, -1)
+        edges_per_walk_2d = edges_per_walk.view(N, K, 1)
+        per_walk_valid = positions_tok < edges_per_walk_2d
+        token_mask = per_walk_valid.reshape(N, K * (L - 1))
+        return h_seed, tokens, token_mask
 
 
 def lookup_h_seed(
