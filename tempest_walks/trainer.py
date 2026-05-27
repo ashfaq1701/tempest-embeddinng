@@ -421,29 +421,38 @@ class Trainer:
 
                 # TGB-supplied per-positive negative destinations.
                 neg_src_list, neg_tgt_list = evaluator.sample_negatives(score_batch)
-
-                # Positive scores in one shot.
-                pos_u = torch.from_numpy(score_batch.src.astype(np.int64)).to(self.device)
-                pos_v = torch.from_numpy(score_batch.tgt.astype(np.int64)).to(self.device)
-                pos_logits = self._score_pairs(pos_u, pos_v).cpu().numpy()
-
-                # Flatten all negatives across positives, score in one shot.
                 counts = [int(arr.shape[0]) for arr in neg_tgt_list]
+
+                # Build a single (u, v) tensor pair carrying both
+                # positives and flattened negatives, then score in ONE
+                # link_head call. Layout: indices [0, B) are positives;
+                # indices [B, B + sum(counts)) are negatives in the
+                # same per-positive grouping (cursor walks them).
+                # Mirrors the train-side merge (positives + negatives
+                # scored together) instead of two separate forwards.
+                pos_u_np = score_batch.src.astype(np.int64)
+                pos_v_np = score_batch.tgt.astype(np.int64)
                 if sum(counts) > 0:
-                    flat_neg_u = np.concatenate(
+                    flat_neg_u_np = np.concatenate(
                         [
                             np.full(counts[i], int(score_batch.src[i]), dtype=np.int64)
                             for i in range(B)
                         ]
                     )
-                    flat_neg_v = np.concatenate(
+                    flat_neg_v_np = np.concatenate(
                         [nt.astype(np.int64) for nt in neg_tgt_list]
                     )
-                    neg_u_t = torch.from_numpy(flat_neg_u).to(self.device)
-                    neg_v_t = torch.from_numpy(flat_neg_v).to(self.device)
-                    neg_logits = self._score_pairs(neg_u_t, neg_v_t).cpu().numpy()
+                    all_u_np = np.concatenate([pos_u_np, flat_neg_u_np])
+                    all_v_np = np.concatenate([pos_v_np, flat_neg_v_np])
                 else:
-                    neg_logits = np.empty(0, dtype=np.float64)
+                    all_u_np = pos_u_np
+                    all_v_np = pos_v_np
+
+                all_u = torch.from_numpy(all_u_np).to(self.device)
+                all_v = torch.from_numpy(all_v_np).to(self.device)
+                all_logits = self._score_pairs(all_u, all_v).cpu().numpy()
+                pos_logits = all_logits[:B]
+                neg_logits = all_logits[B:]
 
                 cursor = 0
                 for i in range(B):
