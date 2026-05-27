@@ -116,22 +116,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--d-te",   default=32,  type=int, help="time2vec dim")
     p.add_argument("--d-he",   default=16,  type=int, help="hop embedding dim")
     p.add_argument("--d-edge", default=128, type=int, help="per-edge representation dim")
-    p.add_argument("--d-walk", default=128, type=int, help="GRU/attn hidden / walk representation dim")
-    p.add_argument(
-        "--encoder-arch", choices=["gru", "attn"], default="gru",
-        help="Walk encoder backbone: 'gru' (default) or 'attn' "
-             "(transformer self-attention over walk edges).",
-    )
-    p.add_argument("--encoder-n-heads",  default=4, type=int,
-                   help="attn-only: number of self-attention heads")
-    p.add_argument("--encoder-n-layers", default=1, type=int,
-                   help="attn-only: number of transformer-encoder layers")
-    p.add_argument(
-        "--encoder-exclude-seed", action="store_true",
-        help="attn-only: drop E[seed] from both the last-edge tgt slot "
-             "(replaced by a learned [SEED] marker) AND the final "
-             "MLP_seed concat. h_seed becomes purely neighbourhood-derived.",
-    )
+    p.add_argument("--d-walk", default=128, type=int, help="GRU hidden / walk representation dim")
 
     # Negatives.
     p.add_argument("--num-neg-per-pos", default=10, type=int)
@@ -300,10 +285,6 @@ def main() -> Dict[str, Any]:
         start_bias=args.start_bias,
 
         use_walk_encoder=args.use_walk_encoder,
-        encoder_arch=args.encoder_arch,
-        encoder_n_heads=args.encoder_n_heads,
-        encoder_n_layers=args.encoder_n_layers,
-        encoder_exclude_seed=args.encoder_exclude_seed,
         d_te=args.d_te,
         d_he=args.d_he,
         d_edge=args.d_edge,
