@@ -186,14 +186,6 @@ def parse_args() -> argparse.Namespace:
              "full decay is hit only at num_epochs = horizon.",
     )
     p.add_argument("--weight-decay", default=1e-4, type=float)
-    p.add_argument(
-        "--max-grad-norm", default=None, type=float,
-        help="If set, clip global gradient norm at this value before "
-             "optimizer.step(). Required for stable training with the "
-             "attention encoder (transformers diverge at lr=1e-2 without "
-             "clipping); harmless for other configs. Recommended 1.0 "
-             "with --encoder-arch attn.",
-    )
     p.add_argument("--batch-size", default=2000, type=int)
     p.add_argument("--num-epochs", default=50, type=int)
     p.add_argument("--early-stop-patience", default=0, type=int)
@@ -346,7 +338,6 @@ def main() -> Dict[str, Any]:
         warmup_steps_cap=args.warmup_steps_cap,
         decay_horizon_epochs=args.decay_horizon_epochs,
         weight_decay=args.weight_decay,
-        max_grad_norm=args.max_grad_norm,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 
