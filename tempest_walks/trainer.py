@@ -397,7 +397,17 @@ class Trainer:
     # concat. At 1000 TGB negs/pos and bs=2000, N reaches 2M, which
     # OOMs an 8 GB GPU at d_emb=128. Chunk the score so per-call
     # allocations stay under a fixed budget.
-    _EVAL_SCORE_CHUNK = 50_000
+    #
+    # Note on the bilinear: nn.Bilinear(d, d, 1) materialises a
+    # [chunk, d, d] intermediate during forward. For HybridLinkHead
+    # (d_input = 2*d_emb = 256), 50k * 256 * 256 * 4 B = 13 GB →
+    # OOM. 10k keeps the peak at ~2.6 GB even for the hybrid head.
+    #
+    # CrossAttentionLinkHead's MultiheadAttention packs q+k+v as
+    # [chunk, T, 3*d] = ~chunk*95*384*4 B which is 730 MB at 5k.
+    # Train accumulates multiple chunks' activations before backward
+    # → must chunk small (2k) to fit on 8 GB GPU.
+    _EVAL_SCORE_CHUNK = 2_000
 
     def _score_pairs(
         self,
@@ -574,15 +584,42 @@ class Trainer:
                 eh_v = torch.cat([e_v, h_v], dim=-1)
                 logits = self.link_head(eh_u, eh_v)
             elif self.config.link_head_type == "cross_attn":
-                # Gather per-pair token banks via the same searchsorted
-                # idx (h_seed row index == token-bank row index).
-                u_rows = torch.searchsorted(seeds_sorted, u_t)
-                v_rows = torch.searchsorted(seeds_sorted, v_t)
-                u_tok = tokens_all[u_rows]                   # [P, T, d]
-                u_mask = token_mask_all[u_rows]              # [P, T]
-                v_tok = tokens_all[v_rows]
-                v_mask = token_mask_all[v_rows]
-                logits = self.link_head(h_u, h_v, u_tok, u_mask, v_tok, v_mask)
+                # Chunk per-pair scoring: gathering [P, T, d] token
+                # banks for both sides of P=22000 pairs is ~2 GB and
+                # OOMs at bs=2000 on 8 GB. Chunking keeps peak under
+                # ~600 MB without changing semantics (gradients
+                # accumulate across chunks via autograd).
+                P = u_t.shape[0]
+                chunk = self._EVAL_SCORE_CHUNK
+                if P <= chunk:
+                    u_rows = torch.searchsorted(seeds_sorted, u_t)
+                    v_rows = torch.searchsorted(seeds_sorted, v_t)
+                    u_tok = tokens_all[u_rows]
+                    u_mask = token_mask_all[u_rows]
+                    v_tok = tokens_all[v_rows]
+                    v_mask = token_mask_all[v_rows]
+                    logits = self.link_head(h_u, h_v, u_tok, u_mask, v_tok, v_mask)
+                else:
+                    out_parts = []
+                    for start in range(0, P, chunk):
+                        end = min(start + chunk, P)
+                        u_chunk = u_t[start:end]
+                        v_chunk = v_t[start:end]
+                        u_rows = torch.searchsorted(seeds_sorted, u_chunk)
+                        v_rows = torch.searchsorted(seeds_sorted, v_chunk)
+                        u_tok = tokens_all[u_rows]
+                        u_mask = token_mask_all[u_rows]
+                        v_tok = tokens_all[v_rows]
+                        v_mask = token_mask_all[v_rows]
+                        h_u_chunk = h_u[start:end]
+                        h_v_chunk = h_v[start:end]
+                        out_parts.append(
+                            self.link_head(
+                                h_u_chunk, h_v_chunk,
+                                u_tok, u_mask, v_tok, v_mask,
+                            )
+                        )
+                    logits = torch.cat(out_parts, dim=0)
             else:
                 logits = self.link_head(h_u, h_v)
         else:
