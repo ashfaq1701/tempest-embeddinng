@@ -265,10 +265,14 @@ class Trainer:
             f"{batches_per_epoch} batches)"
         )
 
-    # LinkHead.pair_feats has 6 * d_emb columns and 4 bytes/float, so
-    # a batch of N pairs allocates N * 6 * d_emb * 4 bytes at the
-    # concat. At 1000 TGB negs/pos and bs=2000, N reaches 2M, which
-    # OOMs an 8 GB GPU at d_emb=128. Chunk the score so per-call
+    # Per-batch pair count at eval is bs * (1 + K) where K is the
+    # number of TGB-pregenerated negatives per positive — and K is
+    # dataset-dependent: tgbl-wiki K=999, tgbl-review K=100, tgbl-coin
+    # K=20, tgbl-comment K=20 (verified from the cached val_ns pickles).
+    # Worst case at bs=2000 is wiki: ~2M pairs/batch. LinkHead's
+    # pair_feats concat alone is 6*d_emb*4 bytes per pair (3 KB at
+    # d_emb=128) — 6 GB at 2M pairs. Plus nn.Bilinear's [P, 1, d, d]
+    # backward intermediate is much worse. Chunk the score so per-call
     # allocations stay under a fixed budget.
     _EVAL_SCORE_CHUNK = 50_000
 
