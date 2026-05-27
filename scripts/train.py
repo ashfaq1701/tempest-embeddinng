@@ -286,15 +286,17 @@ def main() -> Dict[str, Any]:
     trainer = Trainer(config=config, node_feat=loaded.node_feat, device=device)
 
     print("\n=== Parameter counts ===")
-    n_E = sum(p.numel() for p in trainer.embedding_table.parameters())
+    n_Et = sum(p.numel() for p in trainer.embedding_table_t.parameters())
+    n_Ec = sum(p.numel() for p in trainer.embedding_table_c.parameters())
     n_Pt = sum(p.numel() for p in trainer.p_target.parameters())
     n_Pc = sum(p.numel() for p in trainer.p_context.parameters())
     n_H = sum(p.numel() for p in trainer.link_head.parameters())
-    print(f"  embedding_table: {n_E:>12,}")
-    print(f"  p_target:        {n_Pt:>12,}")
-    print(f"  p_context:       {n_Pc:>12,}")
-    print(f"  link_head:       {n_H:>12,}")
-    print(f"  TOTAL trainable: {n_E + n_Pt + n_Pc + n_H:>12,}")
+    print(f"  embedding_table_t: {n_Et:>12,}")
+    print(f"  embedding_table_c: {n_Ec:>12,}")
+    print(f"  p_target:          {n_Pt:>12,}")
+    print(f"  p_context:         {n_Pc:>12,}")
+    print(f"  link_head:         {n_H:>12,}")
+    print(f"  TOTAL trainable:   {n_Et + n_Ec + n_Pt + n_Pc + n_H:>12,}")
 
     # ─── Train ─────────────────────────────────────────────────────
     print("\n=== Training ===")

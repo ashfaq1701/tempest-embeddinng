@@ -1,39 +1,45 @@
 """Model components: embedding table, projection heads, link head.
 
-Three classes, no shared state:
+Three classes, no shared state. Trainer instantiates the
+EmbeddingTable twice (E_t target-role, E_c context-role) and
+wires them per role into the loss and link head.
 
 EmbeddingTable
   - Single nn.Embedding(num_nodes, d_emb).
-  - Lookup-only. Trained by InfoNCE contrastive alignment through
-    the projection heads.
+  - Lookup-only. Used both for E_t and E_c (two independent
+    instances on the Trainer). Trained by InfoNCE contrastive
+    alignment through the projection heads.
 
 ProjectionHead
   - Conditional architecture based on node-feature availability:
       E only   → MLP on E
       E + NF   → MLP on E + MLP on NF, concat, merge MLP
   - Output is L2-normalised via F.normalize(..., p=2, dim=-1, eps=1e-12).
-  - Two instances: P_target (for seed/downstream nodes) and
-    P_context (for walk-internal/upstream nodes), each with its own
-    parameters. Both heads have the same architecture.
+  - Two instances: P_target (consumes E_t for seeds) and
+    P_context (consumes E_c for walk-internal positives + sampled
+    negatives), each with its own parameters. Both heads have the
+    same architecture.
   - Edge features were tested and consistently underperformed the
     no-EF baseline; the EF channel has been removed.
 
 LinkHead
-  - score(u, v) = bilinear(E(u), E(v)) + small_MLP(pair_features(u, v))
-    bilinear  = E(u)^T W E(v) + b   (one learnable matrix)
+  - score(u, v) = bilinear(E_c[u], E_t[v]) + small_MLP(pair_features)
+    bilinear  = E_c[u]^T W E_t[v] + b   (one learnable matrix)
     MLP input = 6-channel pair features
-                [E(u), E(v), E(u)*E(v), |E(u)-E(v)|,
-                 (E(u)-E(v))^2, E(u)+E(v)]
-  - Inputs are raw E lookups. Stop-gradient on E is the CALLER's
-    responsibility (call with e_u.detach(), e_v.detach() in
-    trainer.py); LinkHead never detaches internally.
+                [E_c[u], E_t[v], E_c[u]·E_t[v], |E_c[u]-E_t[v]|,
+                 (E_c[u]-E_t[v])², E_c[u]+E_t[v]]
+  - Caller passes (e_src, e_dst) — i.e. the source-role row first
+    (E_c lookup) and the destination-role row second (E_t lookup).
+    Stop-gradient on the tables is the caller's responsibility
+    (call .detach() in trainer.py); LinkHead never detaches
+    internally.
   - No node features, no edge features, no time features at scoring.
-  - Asymmetric by construction AND used asymmetrically: training
-    only ever feeds (src-role, dst-role), and TGB's eval ranks
-    candidate dsts given fixed src. The caller MUST always pass
-    (e_src, e_dst) in that order — do NOT average forward(u, v) and
-    forward(v, u) for "undirected" datasets; the reverse direction
-    is untrained input territory and adds noise to the ranking.
+  - Asymmetric by construction. On directed datasets the caller
+    issues ONE call with (E_c[src], E_t[dst]). On undirected
+    datasets the caller symmetrises by averaging that with
+    (E_c[dst], E_t[src]) — both at training and at eval. The two
+    orderings read different rows of E_t/E_c so this is a real
+    two-view average, not a TTA shim.
 """
 
 from typing import Optional
@@ -134,26 +140,28 @@ class ProjectionHead(nn.Module):
 class LinkHead(nn.Module):
     """Link-prediction scorer: bilinear + 6-channel pair MLP.
 
-    Input: raw E[u], E[v]. The caller must pass `e_u.detach()` /
-    `e_v.detach()` if stop-grad on E is desired (this is the
-    documented contract for trainer.py — see CLAUDE.md). LinkHead
-    NEVER detaches its inputs.
+    Input contract: the caller passes (e_src, e_dst) — i.e. the
+    source-role embedding first, the destination-role embedding
+    second. Under the two-table design, that means E_c[u] then
+    E_t[v]. The caller is also responsible for stop-grad: pass
+    `.detach()`'d inputs if E_t/E_c should not receive gradient
+    from the BCE path. LinkHead never detaches.
 
-    Output: one logit per (u, v) pair. Asymmetric by construction
-    (bilinear u^T W v + [e_u, e_v] concat channels carry directional
-    information). For datasets where the underlying graph topology is
-    symmetric/bipartite, the caller may symmetrise at eval by
-    averaging score(u, v) + score(v, u) — see trainer's _score_pairs
-    `if not self.config.is_directed` branch. The averaging acts as a
-    correlated-ensemble test-time augmentation and empirically helps
-    on bipartite-like data.
+    Output: one logit per (src, dst) pair. Asymmetric by
+    construction (bilinear u^T W v + [e_u, e_v] concat channels
+    carry directional information). For undirected datasets the
+    caller symmetrises by averaging score(E_c[u], E_t[v]) and
+    score(E_c[v], E_t[u]) — see trainer's _train_step (BCE) and
+    _score_pairs (eval), which share the same rule. The two
+    orderings read different rows of E_t and E_c, so this is a
+    genuine two-view average, not a TTA shim.
 
     No internal regularisation (no dropout, no LayerNorm). A
     dropout-0.1 + pre-MLP LayerNorm variant was A/B'd on a 50ep
-    tgbl-wiki run and did not improve over plain (best val 0.4391
-    vs 0.4933 baseline-with-symmetrize) — those layers were
-    suspected to be hurting, so this is the no-regularisation
-    head.
+    tgbl-wiki single-table run and did not improve over plain
+    (best val 0.4391 vs 0.4933 baseline-with-symmetrize) — those
+    layers were suspected to be hurting, so this is the
+    no-regularisation head.
     """
 
     def __init__(

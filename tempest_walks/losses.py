@@ -3,15 +3,20 @@
 InfoNCE contrastive alignment for walk-supervised temporal node
 embeddings, with sampled-negative partition function.
 
-alignment_loss(E, P_target, P_context, walks, ...,
+alignment_loss(E_t, E_c, P_target, P_context, walks, ...,
                num_align_negatives)
   - InfoNCE contrastive loss over batched walks.
+  - Two embedding tables, one per role:
+      E_t  — target-role (walk seeds, walked-into nodes)
+      E_c  — context-role (walk-internal positives + sampled negatives)
+    Each table holds |V| × d_emb parameters; gradient flow per
+    table is disjoint, so a node's two role-vectors stay independent.
   - For each seed s_i with positive contexts {n_p^+ : p in walk i}:
 
         L_i = - (Σ_p w[i,p] · log p(n_p^+ | s_i)) / (Σ_p w[i,p])
 
-        log p(n_p^+ | s_i) =  -‖P_target(E(s_i)) - P_context(E(n_p^+))‖² / τ
-                            - log Σ_j exp(-‖P_target(E(s_i)) - P_context(E(n_j))‖² / τ)
+        log p(n_p^+ | s_i) =  -‖P_target(E_t(s_i)) - P_context(E_c(n_p^+))‖² / τ
+                            - log Σ_j exp(-‖P_target(E_t(s_i)) - P_context(E_c(n_j))‖² / τ)
 
     where j ranges over (positives of seed i) ∪ (per-seed sampled
     negatives drawn from the pool's unique-node frequency
@@ -30,8 +35,9 @@ matches standard SimCLR/CLIP practice. No exclusion masking.
 Returns a standard graph-attached scalar tensor. The trainer
 combines it with the BCE term and calls .backward() once.
 
-Link BCE remains a separate term computed in the trainer using a
-detached embedding (stop-grad on E for BCE).
+Link BCE remains a separate term computed in the trainer:
+source-side reads E_c, destination-side reads E_t, both detached
+(stop-grad on the embedding tables for the BCE path).
 """
 
 from typing import Optional
@@ -61,7 +67,8 @@ _SAMPLING_EXPONENT = 0.75
 
 
 def alignment_loss(
-    embedding_table,                              # EmbeddingTable
+    embedding_table_t,                            # EmbeddingTable — target role (seeds)
+    embedding_table_c,                            # EmbeddingTable — context role (positives + negs)
     p_target,                                     # ProjectionHead — seed/downstream
     p_context,                                    # ProjectionHead — walk-internal/upstream
     walks: WalkData,
@@ -83,7 +90,7 @@ def alignment_loss(
     Returns the scalar mean loss over seeds-with-positives as a
     graph-attached tensor. The caller is responsible for backward.
     """
-    device = embedding_table.E.weight.device
+    device = embedding_table_t.E.weight.device
     nodes = walks.nodes.to(device).long()                         # [NK, L]
     timestamps = walks.timestamps.to(device).long()               # [NK, L]
     lens = walks.lens.to(device).long()                           # [NK]
@@ -117,9 +124,9 @@ def alignment_loss(
     # [NK, L, d_proj] so per-seed-own-walk positives can be sliced
     # by indexing — no [NK, M] sim matrix is built.
     seed_per_row = seeds_t.repeat_interleave(K)                   # [NK]
-    e_seed = embedding_table(seed_per_row)                        # [NK, d_emb]
+    e_seed = embedding_table_t(seed_per_row)                      # [NK, d_emb]
     nodes_safe = nodes.clamp_min(0)                               # [NK, L]
-    e_ctx_flat = embedding_table(nodes_safe.reshape(-1))          # [M, d_emb]
+    e_ctx_flat = embedding_table_c(nodes_safe.reshape(-1))        # [M, d_emb]
 
     if node_feat is not None:
         nf_seed = node_feat[seed_per_row]                         # [NK, d_nf]
@@ -162,7 +169,7 @@ def alignment_loss(
     )                                                             # [NK, R]
 
     # Project the sampled negatives through P_context.
-    e_neg = embedding_table(sampled_neg_node_ids.reshape(-1))     # [NK·R, d_emb]
+    e_neg = embedding_table_c(sampled_neg_node_ids.reshape(-1))   # [NK·R, d_emb]
     if node_feat is not None:
         nf_neg = node_feat[sampled_neg_node_ids.reshape(-1)]
         p_neg = p_context(e_neg, node_feat=nf_neg)

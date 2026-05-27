@@ -14,15 +14,17 @@ InfoNCE contrastive loss + a separate BCE link head.
 `tempest_walks/losses.py` — `alignment_loss(...)`
 
 InfoNCE contrastive alignment over batched temporal random walks
-with **sampled-negative** partition function. For each seed `s_i`
-with positive contexts `{n_p^+ : p ∈ [0, lens_i − 2]}` (positions
-of walk i, with the seed itself at position `lens_i − 1`):
+with **sampled-negative** partition function. Two embedding tables
+are wired by role: `E_t` for the seed (target-role lookup),
+`E_c` for the contexts and sampled negatives (context-role lookup).
+Gradient flow per table is disjoint. For each seed `s_i` with
+positive contexts `{n_p^+ : p ∈ [0, lens_i − 2]}`:
 
 ```
 L_i      = -(Σ_p w[i,p] · log p(n_p^+ | s_i)) / (Σ_p w[i,p])
 log p(n | s_i)
-         = -‖p_t(s_i) - p_c(n)‖² / τ
-           - log Σ_j exp(-‖p_t(s_i) - p_c(n_j)‖² / τ)
+         = -‖P_target(E_t[s_i]) - P_context(E_c[n])‖² / τ
+           - log Σ_j exp(-‖P_target(E_t[s_i]) - P_context(E_c[n_j])‖² / τ)
 L_total  = mean_i (L_i for i with at least one valid positive)
 ```
 
@@ -55,32 +57,46 @@ not re-swept under sampled-neg yet.
 `tempest_walks/trainer.py` — strict-causal per-batch ordering:
 
 1. `walks = walk_gen.walks_for_nodes(seeds)`  — pre-ingest
-2. `L_align = alignment_loss(...)`             — InfoNCE scalar
+   seeds = `unique(B_tgt)` if directed, else `unique(B_src ∪ B_tgt)`.
+2. `L_align = alignment_loss(E_t, E_c, ...)`   — InfoNCE scalar
 3. `neg = neg_sampler.sample(batch)`           — pre-observe
-4. Build link BCE on **detached** embeddings: `link_head(E[u].detach(), E[v].detach())`
+4. Build link BCE role-consistently:
+   - directed: `link_head(E_c[src].detach(), E_t[dst].detach())`
+   - undirected: average the directed call with
+     `link_head(E_c[dst].detach(), E_t[src].detach())`.
 5. `L_total = L_align + L_bce`
 6. `optimizer.zero_grad(set_to_none=True); L_total.backward(); optimizer.step()`
 7. `neg_sampler.observe(...)`                  — post-scoring
 8. `walk_gen.add_edges(...)`                   — post-scoring, last
 
-`E` is detached on the BCE path so the single backward routes
-alignment-side gradients to `E + p_target + p_context` and BCE
-gradients to `link_head` only.
+`E_t` and `E_c` are detached on the BCE path so the single backward
+routes alignment-side gradients to `E_t + E_c + p_target + p_context`
+and BCE gradients to `link_head` only.
+
+Eval scores pairs with the exact same role assignment and the
+exact same symmetrise-or-not rule — `_score_pairs` reuses the
+training-side formula so the train/eval scoring is identical.
 
 ### Model components
 
 `tempest_walks/model.py`:
 
-- `EmbeddingTable`     single `nn.Embedding(num_nodes, d_emb)`.
+- `EmbeddingTable`     `nn.Embedding(num_nodes, d_emb)`. Trainer
+                       instantiates two: `E_t` (target-role,
+                       walk-seeds / link-pred destinations) and
+                       `E_c` (context-role, walk-internal positives,
+                       sampled negatives, link-pred sources).
 - `ProjectionHead`     conditional architecture (E-only or
                        E + node-features). Two instances:
-                       `P_target` for seeds, `P_context` for
-                       walk-internal nodes. L2-normalised output.
+                       `P_target` consumes `E_t`, `P_context`
+                       consumes `E_c`. L2-normalised output.
                        Edge features were tested earlier and
                        consistently underperformed the no-EF
                        baseline; the EF channel is removed.
-- `LinkHead`           bilinear + 6-channel pair-MLP. Caller's
-                       responsibility to detach E on inputs.
+- `LinkHead`           bilinear + 6-channel pair-MLP. Input
+                       contract is (e_src, e_dst) — i.e.
+                       (E_c[u], E_t[v]). Caller detaches both
+                       tables on the BCE path.
 
 ---
 

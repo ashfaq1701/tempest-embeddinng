@@ -6,9 +6,14 @@ Single Trainer class. Per-batch ordering:
     1. walks = walk_gen.walks_for_nodes(seeds)       ← pre-ingest state
        seeds = unique(B_tgt)               if is_directed
        seeds = unique(B_src ∪ B_tgt)       if undirected
-    2. L_align = alignment_loss(walks, τ)            ← InfoNCE scalar
+    2. L_align = alignment_loss(E_t, E_c, ...)       ← InfoNCE scalar
+       Seed lookup → E_t; context + negative lookups → E_c.
     3. neg = neg_sampler.sample(batch)               ← pre-observe state
-    4. logits = link_head(E[u].detach(), E[v].detach()) for pos + neg
+    4. Link logits, role-consistent:
+         is_directed:    link_head(E_c[src].detach(), E_t[dst].detach())
+         undirected:     average of both orderings:
+                         link_head(E_c[u].detach(), E_t[v].detach())
+                       + link_head(E_c[v].detach(), E_t[u].detach())
        L_bce = BCE(logits, [1×B, 0×B*K])
     5. L_total = L_align + L_bce
     6. optimizer.zero_grad(set_to_none=True); L_total.backward(); optimizer.step()
@@ -17,10 +22,10 @@ Single Trainer class. Per-batch ordering:
 
   EVAL (within torch.no_grad()):
     1. neg_dst_list = tgb_neg_sampler.sample(batch)  ← per-positive negs
-    2. Score positives and negatives via link_head(E[u], E[v]) —
-       task-directional regardless of is_directed (TGB protocol
-       ranks candidate dsts given fixed src; link_head was only
-       trained on the (src-role, dst-role) input arrangement).
+    2. Score positives and negatives role-consistently: source-side
+       reads E_c, destination-side reads E_t. Undirected datasets
+       symmetrise (two link_head calls with swapped role assignment,
+       averaged) — train and eval share the exact same scoring rule.
     3. evaluator.score_to_metric(pos, neg) per positive (TGB MRR).
     4. walk_gen.add_edges(batch)                     ← Tempest state
                                                        carries forward.
@@ -158,7 +163,16 @@ class Trainer:
             self.node_feat = None
 
         # Model.
-        self.embedding_table = EmbeddingTable(
+        # Two role-specialised embedding tables. E_t holds target-role
+        # (walk-seed / link-prediction destination) embeddings; E_c
+        # holds context-role (walk-internal positives, sampled
+        # negatives, link-prediction source) embeddings. Disjoint
+        # gradient flow per table so each row specialises to one role.
+        self.embedding_table_t = EmbeddingTable(
+            num_nodes=config.num_nodes,
+            d_emb=config.d_emb,
+        ).to(self.device)
+        self.embedding_table_c = EmbeddingTable(
             num_nodes=config.num_nodes,
             d_emb=config.d_emb,
         ).to(self.device)
@@ -206,7 +220,8 @@ class Trainer:
         # (BCE) comes from the .detach() at the BCE call site, NOT from
         # separate optimisers.
         params = (
-            list(self.embedding_table.parameters())
+            list(self.embedding_table_t.parameters())
+            + list(self.embedding_table_c.parameters())
             + list(self.p_target.parameters())
             + list(self.p_context.parameters())
             + list(self.link_head.parameters())
@@ -266,35 +281,42 @@ class Trainer:
         )
 
     def _score_pairs(self, u_ids: torch.Tensor, v_ids: torch.Tensor) -> torch.Tensor:
-        """Score [P] (u, v) pairs through E + link_head in a single
-        link_head call. Used at eval (no_grad context); training has
-        its own inline path with .detach().
+        """Score [P] (u, v) pairs role-consistently. Used at eval
+        (no_grad context); training has its own inline path with
+        .detach(). Both paths score with the same rule.
+
+        Role assignment:
+          source-side (u)     → E_c
+          destination-side (v) → E_t
 
         Memory-fitting is the CALLER's responsibility — set
         --eval-batch-size so that eval_batch_size * (1 + K) stays
         within the link head's per-call memory budget (target ~50k
         pairs at d_emb=128 on an 8 GB GPU). With TGB's K values
         (wiki=999, review=100, coin=20, comment=20), safe
-        eval_batch_size values are ~50 / ~500 / ~2500 / ~2500.
+        eval_batch_size values are ~50 / ~500 / ~2500 / ~2500 —
+        the same as the single-table head (undirected already cost
+        two link_head calls under the prior symmetrise-at-eval rule).
 
-        Symmetrise when is_directed is False:
-        link_head was only trained on (src-role, dst-role) inputs,
-        but for bipartite/undirected datasets the link head's
-        commutative pair-feature channels (e_u·e_v, |e_u-e_v|,
-        (e_u-e_v)², e_u+e_v) give a strong correlated estimate of
-        the same edge under (dst, src) input order. Averaging
-        forward(u, v) + forward(v, u) is then a TTA-style
-        correlated-ensemble that empirically improves ranking on
-        bipartite data (+~0.05 val MRR observed on wiki). When
-        is_directed=True the underlying topology has a single
-        meaningful direction and the average is dropped.
+        Symmetrise when is_directed is False: average the score of
+        (u as source, v as destination) with (v as source, u as
+        destination). The two orderings read different rows of E_t
+        and E_c, so this is a genuine two-view average; under
+        directed topology only the (src, dst) ordering carries
+        meaning, so a single call suffices.
         """
-        e_u = self.embedding_table(u_ids)
-        e_v = self.embedding_table(v_ids)
-        logits = self.link_head(e_u, e_v)
-        if not self.config.is_directed:
-            logits = 0.5 * (logits + self.link_head(e_v, e_u))
-        return logits
+        if self.config.is_directed:
+            e_u_c = self.embedding_table_c(u_ids)
+            e_v_t = self.embedding_table_t(v_ids)
+            return self.link_head(e_u_c, e_v_t)
+
+        e_u_c = self.embedding_table_c(u_ids)
+        e_v_t = self.embedding_table_t(v_ids)
+        e_v_c = self.embedding_table_c(v_ids)
+        e_u_t = self.embedding_table_t(u_ids)
+        return 0.5 * (
+            self.link_head(e_u_c, e_v_t) + self.link_head(e_v_c, e_u_t)
+        )
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
@@ -323,7 +345,8 @@ class Trainer:
         # anti-collapse mechanism (replaces Wang-Isola uniformity).
         t_now = int(batch.t_max)
         l_align = alignment_loss(
-            embedding_table=self.embedding_table,
+            embedding_table_t=self.embedding_table_t,
+            embedding_table_c=self.embedding_table_c,
             p_target=self.p_target,
             p_context=self.p_context,
             walks=walks,
@@ -344,10 +367,18 @@ class Trainer:
         u_t = torch.from_numpy(all_u).long().to(device)
         v_t = torch.from_numpy(all_v).long().to(device)
 
-        # Step 4: link logits with DETACHED E (stop-grad on E for BCE).
-        e_u = self.embedding_table(u_t).detach()
-        e_v = self.embedding_table(v_t).detach()
-        logits = self.link_head(e_u, e_v)
+        # Step 4: link logits, role-consistent. Source side reads E_c,
+        # destination side reads E_t. Both detached (stop-grad on the
+        # embedding tables for the BCE path; BCE updates the link
+        # head only). For undirected we symmetrise on the training
+        # side too — train and eval use the exact same scoring rule.
+        e_src_c = self.embedding_table_c(u_t).detach()
+        e_dst_t = self.embedding_table_t(v_t).detach()
+        logits = self.link_head(e_src_c, e_dst_t)
+        if not self.config.is_directed:
+            e_src_t = self.embedding_table_t(u_t).detach()
+            e_dst_c = self.embedding_table_c(v_t).detach()
+            logits = 0.5 * (logits + self.link_head(e_dst_c, e_src_t))
         labels = torch.cat([
             torch.ones(B, device=device),
             torch.zeros(B * K, device=device),
@@ -389,7 +420,8 @@ class Trainer:
     ) -> float:
         """Streaming eval. Walks NOT sampled; reservoir NOT updated.
         Tempest state advances via post-scoring add_edges."""
-        self.embedding_table.eval()
+        self.embedding_table_t.eval()
+        self.embedding_table_c.eval()
         self.p_target.eval()
         self.p_context.eval()
         self.link_head.eval()
@@ -494,14 +526,16 @@ class Trainer:
 
     def _snapshot(self) -> Dict[str, Any]:
         return {
-            "embedding_table": self._cpu_state_dict(self.embedding_table),
-            "p_target":        self._cpu_state_dict(self.p_target),
-            "p_context":       self._cpu_state_dict(self.p_context),
-            "link_head":       self._cpu_state_dict(self.link_head),
+            "embedding_table_t": self._cpu_state_dict(self.embedding_table_t),
+            "embedding_table_c": self._cpu_state_dict(self.embedding_table_c),
+            "p_target":          self._cpu_state_dict(self.p_target),
+            "p_context":         self._cpu_state_dict(self.p_context),
+            "link_head":         self._cpu_state_dict(self.link_head),
         }
 
     def _restore(self, snap: Dict[str, Any]) -> None:
-        self.embedding_table.load_state_dict(snap["embedding_table"])
+        self.embedding_table_t.load_state_dict(snap["embedding_table_t"])
+        self.embedding_table_c.load_state_dict(snap["embedding_table_c"])
         self.p_target.load_state_dict(snap["p_target"])
         self.p_context.load_state_dict(snap["p_context"])
         self.link_head.load_state_dict(snap["link_head"])
@@ -551,7 +585,8 @@ class Trainer:
             if isinstance(self.neg_sampler_train, HistoricalNegativeSampler):
                 self.neg_sampler_train.reset()
 
-            self.embedding_table.train()
+            self.embedding_table_t.train()
+            self.embedding_table_c.train()
             self.p_target.train()
             self.p_context.train()
             self.link_head.train()
