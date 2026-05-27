@@ -16,8 +16,10 @@ Single Trainer class. Per-batch ordering:
 
   EVAL (within torch.no_grad()):
     1. neg_dst_list = tgb_neg_sampler.sample(batch)  ← per-positive negs
-    2. Score positives and negatives via link_head(E[u], E[v]).
-       Undirected eval: average forward(u, v) + forward(v, u).
+    2. Score positives and negatives via link_head(E[u], E[v]) —
+       task-directional regardless of is_directed (TGB protocol
+       ranks candidate dsts given fixed src; link_head was only
+       trained on the (src-role, dst-role) input arrangement).
     3. evaluator.score_to_metric(pos, neg) per positive (TGB MRR).
     4. walk_gen.add_edges(batch)                     ← Tempest state
                                                        carries forward.
@@ -271,10 +273,20 @@ class Trainer:
     _EVAL_SCORE_CHUNK = 50_000
 
     def _score_pairs(self, u_ids: torch.Tensor, v_ids: torch.Tensor) -> torch.Tensor:
-        """Score [P] (u, v) pairs through E + link_head. Undirected eval
-        symmetrises by averaging forward(u, v) + forward(v, u). Used at
-        eval (no_grad context); training has its own inline path with
+        """Score [P] (u, v) pairs through E + link_head. Used at eval
+        (no_grad context); training has its own inline path with
         .detach().
+
+        Scoring is task-directional regardless of is_directed: TGB's
+        eval protocol ranks alternative DESTINATIONS for a fixed src
+        per positive, so we always compute link_head(E[src], E[dst]).
+        link_head was only ever trained on (src-role, dst-role)
+        inputs; evaluating link_head(E[dst], E[src]) at eval time
+        queries an untrained input arrangement and adds noise to the
+        ranking — even when the underlying graph topology is
+        symmetric / bipartite. is_directed remains meaningful inside
+        the WalkGenerator (Tempest walk-direction semantics depend on
+        graph topology); it just doesn't belong on this code path.
 
         Chunks internally to bound peak GPU memory regardless of P.
         """
@@ -282,20 +294,14 @@ class Trainer:
         if P <= self._EVAL_SCORE_CHUNK:
             e_u = self.embedding_table(u_ids)
             e_v = self.embedding_table(v_ids)
-            logits = self.link_head(e_u, e_v)
-            if not self.config.is_directed:
-                logits = 0.5 * (logits + self.link_head(e_v, e_u))
-            return logits
+            return self.link_head(e_u, e_v)
 
         out_parts = []
         for start in range(0, P, self._EVAL_SCORE_CHUNK):
             end = min(start + self._EVAL_SCORE_CHUNK, P)
             e_u = self.embedding_table(u_ids[start:end])
             e_v = self.embedding_table(v_ids[start:end])
-            logits = self.link_head(e_u, e_v)
-            if not self.config.is_directed:
-                logits = 0.5 * (logits + self.link_head(e_v, e_u))
-            out_parts.append(logits)
+            out_parts.append(self.link_head(e_u, e_v))
         return torch.cat(out_parts, dim=0)
 
     # ──────────────────────────────────────────────────────────────────

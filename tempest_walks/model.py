@@ -28,8 +28,12 @@ LinkHead
     responsibility (call with e_u.detach(), e_v.detach() in
     trainer.py); LinkHead never detaches internally.
   - No node features, no edge features, no time features at scoring.
-  - Asymmetric by construction. Undirected eval averages
-    forward(u, v) and forward(v, u) at the caller.
+  - Asymmetric by construction AND used asymmetrically: training
+    only ever feeds (src-role, dst-role), and TGB's eval ranks
+    candidate dsts given fixed src. The caller MUST always pass
+    (e_src, e_dst) in that order — do NOT average forward(u, v) and
+    forward(v, u) for "undirected" datasets; the reverse direction
+    is untrained input territory and adds noise to the ranking.
 """
 
 from typing import Optional
@@ -135,8 +139,11 @@ class LinkHead(nn.Module):
     documented contract for trainer.py — see CLAUDE.md). LinkHead
     NEVER detaches its inputs.
 
-    Output: one logit per (u, v) pair. Asymmetric — undirected eval
-    must average score(u, v) and score(v, u) at the caller.
+    Output: one logit per (u, v) pair. Asymmetric — and used
+    asymmetrically: caller MUST pass (e_src, e_dst) in that order
+    at both train and eval. Do NOT symmetrise by averaging
+    score(u, v) + score(v, u) for "undirected" datasets — the
+    reverse direction is untrained input territory.
     """
 
     def __init__(self, d_emb: int, d_hidden: Optional[int] = None):
