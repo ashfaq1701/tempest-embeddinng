@@ -70,11 +70,30 @@ def parse_args() -> argparse.Namespace:
     # Model.
     p.add_argument("--d-emb", default=128, type=int)
     p.add_argument("--d-proj", default=128, type=int)
+    p.add_argument(
+        "--projection-norm",
+        choices=["l2", "layernorm", "none"],
+        default="none",
+        help="Normalisation applied at the ProjectionHead output. "
+             "none (default) = raw MLP output (grad-clipped at 1.0 in "
+             "trainer). Validated as winner on tgbl-wiki 50ep seed=42: "
+             "val 0.4556 vs l2's 0.4289 (+0.027). "
+             "l2 = unit sphere (SimCLR/CLIP convention). "
+             "layernorm = per-feature normalisation.",
+    )
 
     # Loss.
     p.add_argument("--tau", default=0.5, type=float,
                    help="InfoNCE contrastive temperature")
     p.add_argument("--beta-time", default=1.0, type=float)
+    p.add_argument(
+        "--loss-form",
+        choices=["l2_dist", "cosine"],
+        default="l2_dist",
+        help="Similarity computation in InfoNCE alignment loss. "
+             "l2_dist (default) = -||p_t - p_c||²/τ. "
+             "cosine = <p_t, p_c>/τ.",
+    )
     p.add_argument(
         "--num-align-negatives", type=int, default=128,
         help="Number of sampled negatives per seed in InfoNCE "
@@ -91,6 +110,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-walk-len", default=20, type=int)
     p.add_argument("--walk-bias", default="ExponentialWeight", type=str)
     p.add_argument("--start-bias", default="Uniform", type=str)
+    p.add_argument(
+        "--max-time-capacity", default=-1, type=int,
+        help="Tempest sliding-window eviction in raw timestamp units. "
+             "Tempest tracks the max ingested timestamp and removes any "
+             "edge with ts < (latest - max_time_capacity) on every "
+             "add_multiple_edges call. -1 = unbounded (keep all ingested "
+             "edges until walk_gen.reset() at epoch boundary).",
+    )
 
     # Negatives.
     p.add_argument("--num-neg-per-pos", default=10, type=int)
@@ -245,15 +272,18 @@ def main() -> Dict[str, Any]:
 
         d_emb=args.d_emb,
         d_proj=args.d_proj,
+        projection_norm=args.projection_norm,
 
         tau=args.tau,
         beta_time=args.beta_time,
+        loss_form=args.loss_form,
         num_align_negatives=args.num_align_negatives,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,
         walk_bias=args.walk_bias,
         start_bias=args.start_bias,
+        max_time_capacity=args.max_time_capacity,
 
         num_neg_per_pos=args.num_neg_per_pos,
         hist_neg_ratio=args.hist_neg_ratio,

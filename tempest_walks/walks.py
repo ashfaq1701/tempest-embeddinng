@@ -68,17 +68,25 @@ class WalkGenerator:
         max_walk_len: int = 20,
         num_walks_per_node: int = 5,
         timescale_bound: int = 300,
+        max_time_capacity: int = -1,
     ):
         # shuffle_walk_order=False is non-negotiable: the K-contiguous
         # row grouping is what every downstream caller assumes. If a
         # future Tempest version drops this kwarg, the call below will
         # raise and the architecture must be rebuilt around the new
         # layout; do NOT silently proceed.
+        #
+        # max_time_capacity: sliding-window eviction in raw timestamp
+        # units. Tempest tracks the max ingested timestamp and removes
+        # any edge with ts < (latest - max_time_capacity) on every
+        # add_multiple_edges call. -1 = unbounded (keep every ingested
+        # edge until walk_gen.reset() at epoch boundary).
         self.trw = TemporalRandomWalk(
             is_directed=is_directed,
             use_gpu=use_gpu,
             enable_weight_computation=True,
             timescale_bound=timescale_bound,
+            max_time_capacity=max_time_capacity,
             shuffle_walk_order=False,
         )
         self.walk_bias = walk_bias

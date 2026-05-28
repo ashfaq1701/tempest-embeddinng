@@ -77,10 +77,18 @@ class TrainerConfig:
     # Model.
     d_emb: int = 128
     d_proj: int = 128
+    projection_norm: str = "none"   # "l2" | "layernorm" | "none"
+                                    # "none" validated as winner on tgbl-wiki
+                                    # 50ep seed=42 single-seed sweep: val
+                                    # 0.4556 vs l2's 0.4289 (+0.027). Off-
+                                    # sphere l2_dist sim uses both projection
+                                    # direction AND magnitude as signal; grad
+                                    # clip at 1.0 keeps magnitudes bounded.
 
     # Loss-formulation.
     tau: float = 0.5            # InfoNCE temperature
     beta_time: float = 1.0      # hop/time weight exponent
+    loss_form: str = "l2_dist"  # "l2_dist" | "cosine"
     num_align_negatives: int = 128    # Sampled negatives per seed in
                                       # the InfoNCE partition function.
                                       # Frequency-weighted (count^0.75)
@@ -99,6 +107,8 @@ class TrainerConfig:
     max_walk_len: int = 20
     walk_bias: str = "ExponentialWeight"
     start_bias: str = "Uniform"
+    max_time_capacity: int = -1     # Tempest sliding-window eviction
+                                    # in raw timestamp units; -1 = unbounded.
 
     # Negatives (training).
     num_neg_per_pos: int = 10
@@ -166,11 +176,13 @@ class Trainer:
             d_emb=config.d_emb,
             d_proj=config.d_proj,
             d_node_feat=config.d_node_feat,
+            projection_norm=config.projection_norm,
         ).to(self.device)
         self.p_context = ProjectionHead(
             d_emb=config.d_emb,
             d_proj=config.d_proj,
             d_node_feat=config.d_node_feat,
+            projection_norm=config.projection_norm,
         ).to(self.device)
         self.link_head = LinkHead(d_emb=config.d_emb).to(self.device)
 
@@ -182,6 +194,7 @@ class Trainer:
             start_bias=config.start_bias,
             max_walk_len=config.max_walk_len,
             num_walks_per_node=config.num_walks_per_node,
+            max_time_capacity=config.max_time_capacity,
         )
 
         # Negative samplers (training).
@@ -333,6 +346,7 @@ class Trainer:
             tau=self.config.tau,
             node_feat=self.node_feat,
             num_align_negatives=self.config.num_align_negatives,
+            loss_form=self.config.loss_form,
         )
 
         # Step 3: link-pred negatives from PRE-OBSERVE reservoir.
@@ -355,9 +369,19 @@ class Trainer:
         l_bce = F.binary_cross_entropy_with_logits(logits, labels)
 
         # Step 5 + 6: total loss + single backward + step.
+        # When projection_norm is "none", projections are unconstrained
+        # and gradients can blow up under the contrastive loss. Clip
+        # the global grad norm to 1.0 so training stays stable; under
+        # l2 or layernorm the bound is implicit in the projection and
+        # clipping is a no-op cost.
         l_total = l_align + l_bce
         self.optimizer.zero_grad(set_to_none=True)
         l_total.backward()
+        if self.config.projection_norm == "none":
+            torch.nn.utils.clip_grad_norm_(
+                [p for g in self.optimizer.param_groups for p in g["params"]],
+                max_norm=1.0,
+            )
         self.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()

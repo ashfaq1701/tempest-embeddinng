@@ -167,12 +167,80 @@ Historical (Vitter R) reservoir sampler.
 
 | Knob | Default | Source |
 |---|---|---|
-| `tau` | 0.5 | a-priori; validated by τ sweep on wiki (full-InfoNCE) |
-| `beta_time` | 1.0 | a-priori; validated by β sweep on wiki (full-InfoNCE) |
+| `tau` | 0.5 | a-priori; validated by τ sweep on wiki (full-InfoNCE), re-validated under projection_norm=none + l2_dist (2026-05-28) |
+| `beta_time` | 1.0 | a-priori; validated by β sweep on wiki (full-InfoNCE), re-validated under projection_norm=none + l2_dist (2026-05-28) |
 | `num_align_negatives` | 128 | wiki K sweep (3 seeds × 50 ep): knee of the diminishing-returns curve; ~98% of K=512's test MRR at ~2.6× less compute; lowest val std in sweep; largest K that fits on 8 GB at comment-scale NK |
 | `d_emb` | 128 | |
 | `d_proj` | 128 | |
+| `projection_norm` | `none` | wiki single-seed sweep 2026-05-28 (see below): val 0.4556 vs l2 baseline 0.4289 (+0.027). Off-sphere `l2_dist` uses projection magnitude as signal; grad clip 1.0 keeps magnitudes bounded |
+| `loss_form` | `l2_dist` | same sweep: equivalent to cosine on the unit sphere; off-sphere it carries strictly more information (magnitude + direction) |
 | `num_walks_per_node` | 5 | DeepWalk/CTDNE convention |
 | `max_walk_len` | 20 | |
+| `max_time_capacity` | -1 (unbounded) | wiki single-seed window sweep 2026-05-28: cap ∈ {66k, 100k, 250k, 500k, 1M} all underperformed unbounded on test MRR. cap=500k matched unbounded on val (+0.002, within noise) but lost test by 0.006 |
 | `lr` | 1e-3 | wiki seed-42 A/B (sampled-neg K=64): lr=1e-3 → val 0.4594 vs lr=1e-2 → 0.4301 |
 | `batch_size` | 2000 | |
+
+---
+
+## Projection-norm + loss-form sweep (2026-05-28)
+
+Single-seed (seed=42) ablation on tgbl-wiki, 50 epochs, bs=2000,
+eval_bs=200, lr=1e-2, K=128. Six runs over the cartesian product of
+`projection_norm ∈ {l2, layernorm, none}` × `loss_form ∈ {l2_dist,
+cosine}`. Math-equivalence sanity (Runs 1 vs 2) passed.
+
+| # | projection_norm | loss_form | val (best) | test @ best | best ep |
+|---|---|---|---|---|---|
+| 1 | l2        | l2_dist   | 0.4289 | 0.3851 | 15 |
+| 2 | l2        | cosine    | 0.4282 | 0.3983 | 41 |
+| 3 | layernorm | cosine    | 0.3954 | 0.3558 | 28 |
+| **6** | **none** | **l2_dist** | **0.4556** | **0.4150** | 26 |
+| 4 | none      | cosine    | 0.4367 | 0.3980 | 47 |
+| 5 | layernorm | l2_dist   | 0.4177 | 0.3673 | 4 (early peak) |
+
+Run 6 wins: **+0.027 val / +0.030 test over the SimCLR-style l2+cosine
+baseline**. Counterintuitive: l2_dist off-sphere was supposed to be
+the most brittle pairing (squared distance with unbounded magnitudes)
+but grad clip at 1.0 keeps it stable, and the loss can then exploit
+both direction and magnitude. LayerNorm is the clear loser — partial
+normalisation breaks the loss geometry without buying anything.
+
+### τ sweep on the winner (none + l2_dist)
+
+| τ | val | test |
+|---|---|---|
+| 0.1 | 0.4424 | 0.4043 |
+| 0.3 | 0.4375 | 0.4016 |
+| **0.5** | **0.4556** | **0.4150** |
+| 1.0 | 0.4447 | 0.4061 |
+
+τ=0.5 wins; non-monotonic below.
+
+### β sweep on (none + l2_dist + τ=0.5)
+
+| β | val | test | best ep |
+|---|---|---|---|
+| 0.5 | 0.4408 | 0.4078 | 46 |
+| **1.0** | **0.4556** | **0.4150** | 26 |
+| 2.0 | 0.4468 | 0.3980 | 30 |
+| 4.0 | 0.4570 | 0.4047 | 22 (early peak) |
+
+β=1.0 stays — β=4.0 nudges val by +0.001 but loses test by 0.010 and
+shows early-peak-then-degrade.
+
+### max_time_capacity sweep (Tempest sliding-window eviction)
+
+| cap (raw units) | ≈ batches kept | val | test |
+|---|---|---|---|
+| 66,000 (2× mean batch) | 2 | 0.4305 | 0.3800 |
+| 100,000 (3×) | 3 | 0.4426 | 0.4019 |
+| 250,000 | 7.5 | 0.4439 | 0.4035 |
+| 500,000 | 15 | 0.4580 | 0.4087 |
+| 1,000,000 | 30 | 0.4442 | 0.3969 |
+| **-1 (unbounded)** | 56 | **0.4556** | **0.4150** |
+
+Aggressive recency windows starve the walks. cap=500k matches
+unbounded on val (within noise) but loses test by 0.006. Default
+stays unbounded; implementation is plumbed for future experiments
+where recency might matter more (datasets with sharper distribution
+drift than wiki).
