@@ -17,7 +17,6 @@ class Batch(NamedTuple):
     tgt: np.ndarray
     ts: np.ndarray
     edge_feat: Optional[np.ndarray]
-    t_max: int
 
 
 class Loaded(NamedTuple):
@@ -127,5 +126,4 @@ def _slice(split: SplitData, start: int, end: int) -> Batch:
         tgt=split.destinations[start:end],
         ts=split.timestamps[start:end],
         edge_feat=ef,
-        t_max=int(split.timestamps[end - 1]),
     )
