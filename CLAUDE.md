@@ -172,8 +172,8 @@ Historical (Vitter R) reservoir sampler.
 | `num_align_negatives` | 128 | wiki K sweep (3 seeds × 50 ep): knee of the diminishing-returns curve; ~98% of K=512's test MRR at ~2.6× less compute; lowest val std in sweep; largest K that fits on 8 GB at comment-scale NK |
 | `d_emb` | 128 | |
 | `d_proj` | 128 | |
-| `projection_norm` | `none` | wiki single-seed sweep 2026-05-28 (see below): val 0.4556 vs l2 baseline 0.4289 (+0.027). Off-sphere `l2_dist` uses projection magnitude as signal; grad clip 1.0 keeps magnitudes bounded |
-| `loss_form` | `l2_dist` | same sweep: equivalent to cosine on the unit sphere; off-sphere it carries strictly more information (magnitude + direction) |
+| ProjectionHead output | raw merge MLP output (no norm) | wiki single-seed sweep 2026-05-28 (see below): val 0.4556 vs L2-normed baseline 0.4289 (+0.027). Off-sphere L2-distance sim uses projection magnitude as signal; global grad-norm clip at 1.0 in trainer keeps magnitudes bounded. Hardcoded — not a CLI knob |
+| Alignment sim | `-‖p_t − p_c‖² / τ` (L2-distance) | same sweep: equivalent to cosine on the unit sphere; off-sphere it carries strictly more information (magnitude + direction). Hardcoded — not a CLI knob |
 | `num_walks_per_node` | 5 | DeepWalk/CTDNE convention |
 | `max_walk_len` | 20 | |
 | `max_time_capacity` | -1 (unbounded) | wiki single-seed window sweep 2026-05-28: cap ∈ {66k, 100k, 250k, 500k, 1M} all underperformed unbounded on test MRR. cap=500k matched unbounded on val (+0.002, within noise) but lost test by 0.006 |

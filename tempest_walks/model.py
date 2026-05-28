@@ -11,7 +11,9 @@ ProjectionHead
   - Conditional architecture based on node-feature availability:
       E only   → MLP on E
       E + NF   → MLP on E + MLP on NF, concat, merge MLP
-  - Output is L2-normalised via F.normalize(..., p=2, dim=-1, eps=1e-12).
+  - Output is the raw merge MLP output (no L2 norm, no LayerNorm).
+    The contrastive loss uses squared L2 distance directly so both
+    direction and magnitude of the projection carry signal.
   - Two instances: P_target (for seed/downstream nodes) and
     P_context (for walk-internal/upstream nodes), each with its own
     parameters. Both heads have the same architecture.
@@ -40,7 +42,6 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class EmbeddingTable(nn.Module):
@@ -67,11 +68,19 @@ class ProjectionHead(nn.Module):
         d_node_feat is not None).
       - Concat the active sub-MLP outputs along the last dim.
       - Merge MLP mixes back to d_proj.
-      - Output is L2-normalised on the unit sphere.
+      - Output is the raw merge MLP output (no L2/LayerNorm). The
+        contrastive loss uses the squared L2 distance directly, so
+        both projection direction AND magnitude carry signal.
+        Gradient stability comes from the global grad-norm clip
+        at 1.0 in trainer.py.
 
     Two instances are typically constructed: P_target (for
     seed/downstream nodes) and P_context (for walk-internal/upstream
     nodes), each with its own parameters.
+
+    Validated against L2-norm-on-output + cosine-loss and against
+    LayerNorm-on-output on tgbl-wiki 50ep seed=42: raw output +
+    L2-distance wins by +0.027 val vs the SimCLR-style baseline.
 
     Edge features were tested and consistently underperformed the
     no-EF baseline (val 0.397 no-EF vs ≤ 0.355 for every EF
@@ -84,17 +93,10 @@ class ProjectionHead(nn.Module):
         d_proj: int,
         d_node_feat: Optional[int] = None,
         d_hidden: Optional[int] = None,
-        projection_norm: str = "l2",
     ):
         super().__init__()
         if d_hidden is None:
             d_hidden = d_proj
-        if projection_norm not in ("l2", "layernorm", "none"):
-            raise ValueError(
-                f"unknown projection_norm: {projection_norm!r} "
-                f"(expected 'l2' | 'layernorm' | 'none')"
-            )
-        self.projection_norm = projection_norm
 
         self.has_nf = d_node_feat is not None
 
@@ -118,16 +120,12 @@ class ProjectionHead(nn.Module):
             nn.Linear(d_hidden, d_proj),
         )
 
-        if projection_norm == "layernorm":
-            self.final_layernorm = nn.LayerNorm(d_proj)
-
     def forward(
         self,
         e: torch.Tensor,
         node_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Returns the projection at the configured normalisation,
-        shape e.shape[:-1] + [d_proj]."""
+        """Returns the raw merge MLP projection, shape e.shape[:-1] + [d_proj]."""
         if self.has_nf and node_feat is None:
             raise ValueError("ProjectionHead has NF channel but no NF passed")
         if not self.has_nf and node_feat is not None:
@@ -138,12 +136,7 @@ class ProjectionHead(nn.Module):
             branches.append(self.nf_mlp(node_feat))
 
         z = torch.cat(branches, dim=-1)
-        out = self.merge(z)
-        if self.projection_norm == "l2":
-            return F.normalize(out, p=2, dim=-1, eps=1e-12)
-        if self.projection_norm == "layernorm":
-            return self.final_layernorm(out)
-        return out
+        return self.merge(z)
 
 
 class LinkHead(nn.Module):
