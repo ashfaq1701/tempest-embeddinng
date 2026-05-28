@@ -6,14 +6,16 @@ management logic — for parameter sweeps, invoke this script
 repeatedly with different CLI args.
 
 Hyperparameters exposed at CLI (and their grouping):
-  Dataset:        --dataset, --tgb-root
+  Dataset:        --dataset, --tgb-root, --is-directed
   Model:          --d-emb, --d-proj
-  Loss:           --tau, --beta-time, --num-align-negatives
+  Loss:           --tau-align, --tau-link, --beta-time,
+                  --num-align-negatives, --k-train
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias,
-                  --start-bias
-  Negatives:      --num-neg-per-pos, --hist-neg-ratio, --reservoir-size
-  Optimisation:   --lr, --weight-decay, --batch-size, --num-epochs,
-                  --early-stop-patience
+                  --start-bias, --max-time-capacity
+  Negatives:      --hist-neg-ratio, --reservoir-size
+  Optimisation:   --lr, --lr-min, --warmup-fraction, --warmup-steps-cap,
+                  --decay-horizon-epochs, --weight-decay, --batch-size,
+                  --eval-batch-size, --num-epochs, --early-stop-patience
   System:         --seed, --use-gpu, --use-gpu-tempest
 
 Derived from the dataset (not exposed):
@@ -72,8 +74,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--d-proj", default=128, type=int)
 
     # Loss.
-    p.add_argument("--tau", default=0.5, type=float,
-                   help="InfoNCE contrastive temperature")
+    p.add_argument(
+        "--tau-align", default=0.5, type=float,
+        help="InfoNCE alignment temperature (walks-side contrastive).",
+    )
+    p.add_argument(
+        "--tau-link", default=1.0, type=float,
+        help="Link-prediction softmax-CE temperature (per-query "
+             "ranking loss). Default 1.0 — pending a sweep.",
+    )
     p.add_argument("--beta-time", default=1.0, type=float)
     p.add_argument(
         "--num-align-negatives", type=int, default=128,
@@ -84,6 +93,14 @@ def parse_args() -> argparse.Namespace:
              "returns curve; ~98% of K=512's test MRR at ~2.6× less "
              "compute and ~2× lower std. Largest K that fits on 8 GB "
              "at comment-scale NK (K=256+ OOMs there).",
+    )
+    p.add_argument(
+        "--k-train", type=int, default=100,
+        help="Per-query training negatives for the ranking link "
+             "loss. The link head sees [B, 1+K_train] candidates "
+             "per query; positive at column 0. Larger K_train means "
+             "harder per-query competition and stronger ranking "
+             "gradients, at proportional compute cost.",
     )
 
     # Walks.
@@ -101,7 +118,6 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Negatives.
-    p.add_argument("--num-neg-per-pos", default=10, type=int)
     p.add_argument("--hist-neg-ratio", default=0.5, type=float)
     p.add_argument("--reservoir-size", default=32, type=int)
 
@@ -136,16 +152,22 @@ def parse_args() -> argparse.Namespace:
              "full decay is hit only at num_epochs = horizon.",
     )
     p.add_argument("--weight-decay", default=1e-4, type=float)
-    p.add_argument("--batch-size", default=2000, type=int)
+    p.add_argument(
+        "--batch-size", default=500, type=int,
+        help="Train batch size. Under the per-query ranking link "
+             "loss each batch does B*(1+K_train) link_head forwards. "
+             "Default 500 keeps the per-step compute envelope "
+             "comparable to historical baselines.",
+    )
     p.add_argument(
         "--eval-batch-size", default=200, type=int,
-        help="Batch size for val/test eval batches. Per-eval-batch the "
-             "link head scores `eval_batch_size * (1 + K)` pairs where K "
-             "is TGB's negatives-per-positive (wiki=999, review=100, "
-             "coin=20, comment=20). The full pair tensor must fit in one "
-             "link_head forward; target ~50k pairs total. Default 200 "
-             "fits review/coin/comment comfortably; wiki (K=999) needs "
-             "--eval-batch-size 50 explicitly.",
+        help="Batch size for val/test eval batches. The link head "
+             "materialises tensors of shape [eval_batch_size, 1+K_eval, "
+             "d_emb] where K_eval is TGB's per-positive negative count "
+             "(wiki=999, review=100, coin=20, comment=20). Comfortable "
+             "values at d_emb=128 on 8 GB: wiki ~25-50, review ~200-500, "
+             "coin/comment ~2000+. Default 200 fits review/coin/comment; "
+             "wiki needs --eval-batch-size 25-50 explicitly.",
     )
     p.add_argument("--num-epochs", default=50, type=int)
     p.add_argument("--early-stop-patience", default=0, type=int)
@@ -255,9 +277,11 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
         d_proj=args.d_proj,
 
-        tau=args.tau,
+        tau_align=args.tau_align,
+        tau_link=args.tau_link,
         beta_time=args.beta_time,
         num_align_negatives=args.num_align_negatives,
+        K_train=args.k_train,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,
@@ -265,7 +289,6 @@ def main() -> Dict[str, Any]:
         start_bias=args.start_bias,
         max_time_capacity=args.max_time_capacity,
 
-        num_neg_per_pos=args.num_neg_per_pos,
         hist_neg_ratio=args.hist_neg_ratio,
         reservoir_size=args.reservoir_size,
 

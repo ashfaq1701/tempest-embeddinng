@@ -26,16 +26,18 @@ LinkHead
     MLP input = 6-channel pair features
                 [E(u), E(v), E(u)*E(v), |E(u)-E(v)|,
                  (E(u)-E(v))^2, E(u)+E(v)]
-  - Inputs are raw E lookups. Stop-gradient on E is the CALLER's
-    responsibility (call with e_u.detach(), e_v.detach() in
-    trainer.py); LinkHead never detaches internally.
+  - Per-query batched: inputs are [B, 1+K, d_emb], output is
+    [B, 1+K] logits. Column 0 holds the positive candidate at
+    training; columns 1..K are negatives sharing the same query
+    source.
+  - Stop-gradient on E is the CALLER's responsibility (call with
+    e_u.detach(), e_v.detach() in trainer.py); LinkHead never
+    detaches internally.
   - No node features, no edge features, no time features at scoring.
-  - Asymmetric by construction AND used asymmetrically: training
-    only ever feeds (src-role, dst-role), and TGB's eval ranks
-    candidate dsts given fixed src. The caller MUST always pass
-    (e_src, e_dst) in that order — do NOT average forward(u, v) and
-    forward(v, u) for "undirected" datasets; the reverse direction
-    is untrained input territory and adds noise to the ranking.
+  - Asymmetric by construction. For undirected datasets the caller
+    symmetrises by averaging forward(e_u, e_v) with
+    forward(e_v, e_u); applied at both training and eval so the
+    two paths share the exact same scoring rule.
 """
 
 from typing import Optional
@@ -142,26 +144,25 @@ class ProjectionHead(nn.Module):
 class LinkHead(nn.Module):
     """Link-prediction scorer: bilinear + 6-channel pair MLP.
 
-    Input: raw E[u], E[v]. The caller must pass `e_u.detach()` /
-    `e_v.detach()` if stop-grad on E is desired (this is the
-    documented contract for trainer.py — see CLAUDE.md). LinkHead
-    NEVER detaches its inputs.
+    Input contract: `e_u` and `e_v` of shape `[B, 1+K, d_emb]` where
+    column 0 is the positive candidate and columns 1..K are the K
+    negatives, all sharing the same query row's source. Returns
+    logits of shape `[B, 1+K]`. nn.Bilinear and nn.Linear broadcast
+    over the leading two dims; no flat-input mode.
 
-    Output: one logit per (u, v) pair. Asymmetric by construction
-    (bilinear u^T W v + [e_u, e_v] concat channels carry directional
-    information). For datasets where the underlying graph topology is
-    symmetric/bipartite, the caller may symmetrise at eval by
-    averaging score(u, v) + score(v, u) — see trainer's _score_pairs
-    `if not self.config.is_directed` branch. The averaging acts as a
-    correlated-ensemble test-time augmentation and empirically helps
-    on bipartite-like data.
+    The caller is responsible for stop-grad on the embedding table
+    (pass `.detach()`'d inputs); LinkHead never detaches.
 
-    No internal regularisation (no dropout, no LayerNorm). A
-    dropout-0.1 + pre-MLP LayerNorm variant was A/B'd on a 50ep
-    tgbl-wiki run and did not improve over plain (best val 0.4391
-    vs 0.4933 baseline-with-symmetrize) — those layers were
-    suspected to be hurting, so this is the no-regularisation
-    head.
+    Asymmetric by construction (bilinear u^T W v + concat channels
+    carry directional info). For undirected datasets the caller
+    symmetrises by averaging `link_head(e_u, e_v)` with
+    `link_head(e_v, e_u)` — both at training and at eval. The two
+    orderings read different rows of E so it's a genuine two-view
+    average, not a TTA shim.
+
+    No internal regularisation (no dropout, no LayerNorm) —
+    dropout-0.1 + pre-MLP LayerNorm A/B on a 50ep tgbl-wiki run
+    did not improve over plain.
     """
 
     def __init__(
@@ -187,7 +188,7 @@ class LinkHead(nn.Module):
         )
 
     def forward(self, e_u: torch.Tensor, e_v: torch.Tensor) -> torch.Tensor:
-        """Returns logits, shape e_u.shape[:-1] (no trailing dim)."""
+        """e_u, e_v: [B, 1+K, d_emb]. Returns logits [B, 1+K]."""
         score_bilin = self.bilinear(e_u, e_v).squeeze(-1)
 
         pair_feats = torch.cat(

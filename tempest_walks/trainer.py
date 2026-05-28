@@ -6,22 +6,25 @@ Single Trainer class. Per-batch ordering:
     1. walks = walk_gen.walks_for_nodes(seeds)       ← pre-ingest state
        seeds = unique(B_tgt)               if is_directed
        seeds = unique(B_src ∪ B_tgt)       if undirected
-    2. L_align = alignment_loss(walks, τ)            ← InfoNCE scalar
+    2. L_align = alignment_loss(walks, tau_align)    ← InfoNCE scalar
     3. neg = neg_sampler.sample(batch)               ← pre-observe state
-    4. logits = link_head(E[u].detach(), E[v].detach()) for pos + neg
-       L_bce = BCE(logits, [1×B, 0×B*K])
-    5. L_total = L_align + L_bce
+       neg_tgt: [B, K_train]
+    4. candidates_v = [pos_v | neg_tgt]              ← [B, 1+K_train]
+       logits = link_head(E[u].detach(), E[v].detach())  ← [B, 1+K_train]
+                (undirected: 0.5 × (link_head(u,v) + link_head(v,u)))
+       L_link = CE(logits / tau_link, target=zeros(B))
+    5. L_total = L_align + L_link
     6. optimizer.zero_grad(set_to_none=True); L_total.backward(); optimizer.step()
     7. neg_sampler.observe(B_src, B_tgt)             ← post-scoring
     8. walk_gen.add_edges(B_src, B_tgt, B_ts, B_ef)  ← post-scoring, last
 
   EVAL (within torch.no_grad()):
     1. neg_dst_list = tgb_neg_sampler.sample(batch)  ← per-positive negs
-    2. Score positives and negatives via link_head(E[u], E[v]) —
-       task-directional regardless of is_directed (TGB protocol
-       ranks candidate dsts given fixed src; link_head was only
-       trained on the (src-role, dst-role) input arrangement).
-    3. evaluator.score_to_metric(pos, neg) per positive (TGB MRR).
+    2. Score per-query: candidates_v = [pos_v | neg_v_padded_to_max_K]
+       → logits [B, 1+max_K] via link_head (undirected symmetrise
+       matches the training rule).
+    3. evaluator.score_to_metric(logits[i,0], logits[i,1:1+K_i]) per
+       positive (TGB MRR).
     4. walk_gen.add_edges(batch)                     ← Tempest state
                                                        carries forward.
     NOTE: reservoir not updated, walks not sampled at eval.
@@ -79,7 +82,8 @@ class TrainerConfig:
     d_proj: int = 128
 
     # Loss-formulation.
-    tau: float = 0.5            # InfoNCE temperature
+    tau_align: float = 0.5      # InfoNCE alignment temperature
+    tau_link: float = 1.0       # Softmax-CE link-prediction temperature
     beta_time: float = 1.0      # hop/time weight exponent
     num_align_negatives: int = 128    # Sampled negatives per seed in
                                       # the InfoNCE partition function.
@@ -93,6 +97,9 @@ class TrainerConfig:
                                       # Also the largest K that fits in
                                       # ~7 GB at comment-scale NK≈15K on
                                       # an 8 GB GPU (K=256+ OOMs there).
+    K_train: int = 100          # Per-query training negatives. The link
+                                # head sees [B, 1+K_train] candidates per
+                                # query; positive at column 0.
 
     # Walks.
     num_walks_per_node: int = 5
@@ -103,7 +110,6 @@ class TrainerConfig:
                                     # in raw timestamp units; -1 = unbounded.
 
     # Negatives (training).
-    num_neg_per_pos: int = 10
     hist_neg_ratio: float = 0.5
     reservoir_size: int = 32
 
@@ -183,11 +189,14 @@ class Trainer:
             max_time_capacity=config.max_time_capacity,
         )
 
-        # Negative samplers (training).
+        # Negative samplers (training). The sampler's per-positive
+        # negative count is K_train under the new per-query ranking
+        # protocol — sampler's internal `num_neg_per_pos` kwarg
+        # name stays the same (sampler API is unchanged).
         if config.hist_neg_ratio > 0:
             self.neg_sampler_train: NegativeSampler = HistoricalNegativeSampler(
                 num_nodes=config.num_nodes,
-                num_neg_per_pos=config.num_neg_per_pos,
+                num_neg_per_pos=config.K_train,
                 hist_ratio=config.hist_neg_ratio,
                 reservoir_size=config.reservoir_size,
                 dst_pool=config.dst_pool,
@@ -195,15 +204,15 @@ class Trainer:
             )
         else:
             self.neg_sampler_train = UniformNegativeSampler(
-                num_neg_per_pos=config.num_neg_per_pos,
+                num_neg_per_pos=config.K_train,
                 dst_pool=config.dst_pool,
                 seed=config.seed,
             )
 
         # Single optimiser over all trainable parameters. The decoupling
         # between E-training (InfoNCE alignment) and link-head training
-        # (BCE) comes from the .detach() at the BCE call site, NOT from
-        # separate optimisers.
+        # (per-query softmax CE) comes from the .detach() at the link
+        # call site, NOT from separate optimisers.
         params = (
             list(self.embedding_table.parameters())
             + list(self.p_target.parameters())
@@ -264,36 +273,37 @@ class Trainer:
             f"{batches_per_epoch} batches)"
         )
 
-    def _score_pairs(self, u_ids: torch.Tensor, v_ids: torch.Tensor) -> torch.Tensor:
-        """Score [P] (u, v) pairs through E + link_head in a single
-        link_head call. Used at eval (no_grad context); training has
-        its own inline path with .detach().
+    def _score_query(
+        self,
+        u_ids: torch.Tensor,
+        candidates_v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-query scoring for eval (no_grad context).
 
-        Memory-fitting is the CALLER's responsibility — set
-        --eval-batch-size so that eval_batch_size * (1 + K) stays
-        within the link head's per-call memory budget (target ~50k
-        pairs at d_emb=128 on an 8 GB GPU). With TGB's K values
-        (wiki=999, review=100, coin=20, comment=20), safe
-        eval_batch_size values are ~50 / ~500 / ~2500 / ~2500.
+        u_ids:        [B]               — query source nodes
+        candidates_v: [B, 1+K_eval]     — column 0 = positive dst,
+                                          columns 1..K = TGB negatives
+        Returns:       [B, 1+K_eval]    — logits per candidate.
 
-        Symmetrise when is_directed is False:
-        link_head was only trained on (src-role, dst-role) inputs,
-        but for bipartite/undirected datasets the link head's
-        commutative pair-feature channels (e_u·e_v, |e_u-e_v|,
-        (e_u-e_v)², e_u+e_v) give a strong correlated estimate of
-        the same edge under (dst, src) input order. Averaging
-        forward(u, v) + forward(v, u) is then a TTA-style
-        correlated-ensemble that empirically improves ranking on
-        bipartite data (+~0.05 val MRR observed on wiki). When
-        is_directed=True the underlying topology has a single
-        meaningful direction and the average is dropped.
+        Memory: the link head's forward materialises tensors of shape
+        [B, 1+K_eval, d_emb]. Budget eval-batch-size accordingly. With
+        TGB's K values (wiki=999, review=100, coin=20, comment=20),
+        comfortable eval_batch_size values are ~25-50 / ~200-500 /
+        ~2000+ / ~2000+ at d_emb=128 on an 8 GB GPU.
+
+        Symmetrisation matches the training rule: undirected datasets
+        average link_head(E[u], E[v]) with link_head(E[v], E[u]) so
+        train and eval score by the exact same formula; directed
+        datasets do one call.
         """
-        e_u = self.embedding_table(u_ids)
-        e_v = self.embedding_table(v_ids)
-        logits = self.link_head(e_u, e_v)
-        if not self.config.is_directed:
-            logits = 0.5 * (logits + self.link_head(e_v, e_u))
-        return logits
+        candidates_u = u_ids.unsqueeze(1).expand_as(candidates_v)
+        e_u = self.embedding_table(candidates_u)
+        e_v = self.embedding_table(candidates_v)
+        if self.config.is_directed:
+            return self.link_head(e_u, e_v)
+        return 0.5 * (
+            self.link_head(e_u, e_v) + self.link_head(e_v, e_u)
+        )
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
@@ -330,35 +340,51 @@ class Trainer:
             t_min=self.config.t_min,
             T_train=self.config.T_train,
             beta=self.config.beta_time,
-            tau=self.config.tau,
+            tau_align=self.config.tau_align,
             node_feat=self.node_feat,
             num_align_negatives=self.config.num_align_negatives,
         )
 
-        # Step 3: link-pred negatives from PRE-OBSERVE reservoir.
-        neg_src, neg_tgt = self.neg_sampler_train.sample(batch)
+        # Step 3: per-query negatives. Sampler returns [B, K_train]
+        # grouped output; no flattening — the link head consumes the
+        # whole candidate matrix directly. The sampler's neg_src is
+        # ignored (we re-derive candidates_u from batch.src).
+        _, neg_tgt = self.neg_sampler_train.sample(batch)
         B = len(batch.src)
-        K = neg_src.shape[1]
-        all_u = np.concatenate([batch.src, neg_src.reshape(-1).astype(np.int64)])
-        all_v = np.concatenate([batch.tgt, neg_tgt.reshape(-1).astype(np.int64)])
-        u_t = torch.from_numpy(all_u).long().to(device)
-        v_t = torch.from_numpy(all_v).long().to(device)
+        K = neg_tgt.shape[1]
 
-        # Step 4: link logits with DETACHED E (stop-grad on E for BCE).
-        e_u = self.embedding_table(u_t).detach()
-        e_v = self.embedding_table(v_t).detach()
-        logits = self.link_head(e_u, e_v)
-        labels = torch.cat([
-            torch.ones(B, device=device),
-            torch.zeros(B * K, device=device),
-        ])
-        l_bce = F.binary_cross_entropy_with_logits(logits, labels)
+        # Step 4: build [B, 1+K] candidate matrix with positive at
+        # column 0, then score the whole batch in one forward and
+        # apply softmax CE with target=0 per row (Bruch et al. 2019
+        # — upper-bounds 1 − MRR).
+        src_t = torch.from_numpy(batch.src).long().to(device)        # [B]
+        pos_v_t = torch.from_numpy(batch.tgt).long().to(device)      # [B]
+        neg_v_t = torch.from_numpy(
+            np.ascontiguousarray(neg_tgt, dtype=np.int64),
+        ).to(device)                                                 # [B, K]
+
+        candidates_v = torch.cat(
+            [pos_v_t.unsqueeze(1), neg_v_t], dim=1,
+        )                                                            # [B, 1+K]
+        candidates_u = src_t.unsqueeze(1).expand(B, 1 + K)           # [B, 1+K]
+
+        e_u = self.embedding_table(candidates_u).detach()            # [B, 1+K, d]
+        e_v = self.embedding_table(candidates_v).detach()            # [B, 1+K, d]
+        if self.config.is_directed:
+            logits = self.link_head(e_u, e_v)                        # [B, 1+K]
+        else:
+            logits = 0.5 * (
+                self.link_head(e_u, e_v) + self.link_head(e_v, e_u)
+            )                                                        # [B, 1+K]
+
+        target = torch.zeros(B, dtype=torch.long, device=device)
+        l_link = F.cross_entropy(logits / self.config.tau_link, target)
 
         # Step 5 + 6: total loss + single backward + step.
         # Projections are unbounded (no L2 norm or LayerNorm at the
         # head); the contrastive loss can blow up gradient magnitudes,
         # so clip the global grad norm to 1.0 to keep training stable.
-        l_total = l_align + l_bce
+        l_total = l_align + l_link
         self.optimizer.zero_grad(set_to_none=True)
         l_total.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -379,7 +405,7 @@ class Trainer:
 
         return {
             "align": float(l_align.detach()),
-            "bce": float(l_bce.detach()),
+            "link": float(l_link.detach()),
             "total": float(l_total.detach()),
             "lr": float(self.optimizer.param_groups[0]["lr"]),
         }
@@ -404,9 +430,7 @@ class Trainer:
         n = 0
         with torch.no_grad():
             for batch in batches:
-                score_batch = batch
-
-                B = len(score_batch.src)
+                B = len(batch.src)
                 if B == 0:
                     # Still advance Tempest state with the FULL batch (strict-causal).
                     self.walk_gen.add_edges(
@@ -415,49 +439,41 @@ class Trainer:
                     continue
 
                 # TGB-supplied per-positive negative destinations.
-                neg_src_list, neg_tgt_list = evaluator.sample_negatives(score_batch)
+                # neg_tgt_list[i] is a 1D array of negative dsts for
+                # positive i; counts may differ across i (boundaries
+                # of TGB's negative sets), so we pad to max_K and
+                # slice per-row downstream.
+                _, neg_tgt_list = evaluator.sample_negatives(batch)
                 counts = [int(arr.shape[0]) for arr in neg_tgt_list]
+                max_K = max(counts) if counts else 0
 
-                # Build a single (u, v) tensor pair carrying both
-                # positives and flattened negatives, then score in ONE
-                # link_head call. Layout: indices [0, B) are positives;
-                # indices [B, B + sum(counts)) are negatives in the
-                # same per-positive grouping (cursor walks them).
-                # Mirrors the train-side merge (positives + negatives
-                # scored together) instead of two separate forwards.
-                pos_u_np = score_batch.src.astype(np.int64)
-                pos_v_np = score_batch.tgt.astype(np.int64)
-                if sum(counts) > 0:
-                    flat_neg_u_np = np.concatenate(
-                        [
-                            np.full(counts[i], int(score_batch.src[i]), dtype=np.int64)
-                            for i in range(B)
-                        ]
-                    )
-                    flat_neg_v_np = np.concatenate(
-                        [nt.astype(np.int64) for nt in neg_tgt_list]
-                    )
-                    all_u_np = np.concatenate([pos_u_np, flat_neg_u_np])
-                    all_v_np = np.concatenate([pos_v_np, flat_neg_v_np])
-                else:
-                    all_u_np = pos_u_np
-                    all_v_np = pos_v_np
+                # candidates_v: [B, 1 + max_K] int64.
+                # Column 0 = positive dst; columns 1..1+K_i = negatives;
+                # padded columns repeat the positive (safe lookup; the
+                # scores for padded columns are never read because the
+                # per-row slice uses K_i).
+                pos_v_np = batch.tgt.astype(np.int64)
+                cand_v_np = np.tile(pos_v_np[:, None], (1, 1 + max_K))
+                for i in range(B):
+                    K_i = counts[i]
+                    if K_i > 0:
+                        cand_v_np[i, 1 : 1 + K_i] = (
+                            neg_tgt_list[i].astype(np.int64)
+                        )
 
-                all_u = torch.from_numpy(all_u_np).to(self.device)
-                all_v = torch.from_numpy(all_v_np).to(self.device)
-                all_logits = self._score_pairs(all_u, all_v).cpu().numpy()
-                pos_logits = all_logits[:B]
-                neg_logits = all_logits[B:]
+                u_ids = torch.from_numpy(
+                    batch.src.astype(np.int64),
+                ).to(self.device)                                  # [B]
+                candidates_v = torch.from_numpy(cand_v_np).to(self.device)
+                logits = self._score_query(u_ids, candidates_v).cpu().numpy()
 
-                cursor = 0
                 for i in range(B):
                     K_i = counts[i]
                     m = evaluator.score_to_metric(
-                        float(pos_logits[i]),
-                        neg_logits[cursor : cursor + K_i],
+                        float(logits[i, 0]),
+                        logits[i, 1 : 1 + K_i],
                     )
                     total += m
-                    cursor += K_i
                 n += B
 
                 # Strict-causal: advance Tempest with the FULL batch.
@@ -533,7 +549,7 @@ class Trainer:
             self.link_head.train()
 
             t0 = time.time()
-            sums = {"align": 0.0, "bce": 0.0, "total": 0.0}
+            sums = {"align": 0.0, "link": 0.0, "total": 0.0}
             n_batches = 0
             for batch in train_batches_factory():
                 metrics = self._train_step(batch)
@@ -545,7 +561,7 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"align={sums['align']/max(n_batches,1):.4f}  "
-                f"bce={sums['bce']/max(n_batches,1):.4f}  "
+                f"link={sums['link']/max(n_batches,1):.4f}  "
                 f"train {train_dt:.1f}s"
             )
 

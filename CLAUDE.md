@@ -11,19 +11,28 @@ InfoNCE contrastive loss + a separate BCE link head.
 
 ### Loss
 
+Two terms summed: an InfoNCE alignment loss on the walks side
+(updates `E`, projection heads) and a per-query softmax cross-
+entropy ranking loss on the link side (updates the link head only).
+The link loss replaces per-pair BCE: Bruch et al. (ICTIR 2019)
+show that softmax-CE with binary relevance and one positive per
+query upper-bounds (1 − MRR) and (1 − NDCG); plain BCE has no
+such bound. Since TGB evaluates on MRR over per-query candidate
+sets, the training objective now directly targets the eval metric.
+
+#### Alignment (InfoNCE)
+
 `tempest_walks/losses.py` — `alignment_loss(...)`
 
-InfoNCE contrastive alignment over batched temporal random walks
-with **sampled-negative** partition function. For each seed `s_i`
-with positive contexts `{n_p^+ : p ∈ [0, lens_i − 2]}` (positions
-of walk i, with the seed itself at position `lens_i − 1`):
+For each seed `s_i` with positive contexts `{n_p^+ : p ∈ [0, lens_i − 2]}`
+(positions of walk i, with the seed itself at position `lens_i − 1`):
 
 ```
 L_i      = -(Σ_p w[i,p] · log p(n_p^+ | s_i)) / (Σ_p w[i,p])
 log p(n | s_i)
-         = -‖p_t(s_i) - p_c(n)‖² / τ
-           - log Σ_j exp(-‖p_t(s_i) - p_c(n_j)‖² / τ)
-L_total  = mean_i (L_i for i with at least one valid positive)
+         = -‖p_t(s_i) - p_c(n)‖² / tau_align
+           - log Σ_j exp(-‖p_t(s_i) - p_c(n_j)‖² / tau_align)
+L_align  = mean_i (L_i for i with at least one valid positive)
 ```
 
 `j` ranges over **(positives of seed i)** ∪ **(per-seed sampled
@@ -54,10 +63,31 @@ gradient weight whichever batch it's drawn in (no `t_now` drift).
 Larger β biases the loss toward later edges within the training
 window.
 
-Defaults: `τ = 0.5`, `β = 1.0` — `τ` validated under the current
-projection_norm=none + l2_dist setup; β was validated under the
-older `(1 + Δt/T_train)^(-β)` formulation, semantics differ so
-a fresh β sweep would be reasonable.
+Defaults: `tau_align = 0.5`, `β = 1.0` — tau validated under the
+current projection_norm=none + l2_dist setup; β was validated
+under the older `(1 + Δt/T_train)^(-β)` formulation, semantics
+differ so a fresh β sweep would be reasonable.
+
+#### Link prediction (per-query softmax CE)
+
+For each batch positive `(u_i, v_i^+)` the negative sampler
+returns K_train negatives sharing source `u_i`. Build a
+candidate matrix with the positive at column 0:
+
+```
+candidates_v: [B, 1+K_train] = [v^+, v^{(1)}, ..., v^{(K_train)}]
+candidates_u: [B, 1+K_train] = u broadcast across columns
+logits       = link_head(E[candidates_u].detach(),
+                         E[candidates_v].detach())     # [B, 1+K_train]
+L_link       = F.cross_entropy(logits / tau_link,
+                               target=zeros(B))
+```
+
+For undirected datasets, symmetrise:
+`logits = 0.5 × (link_head(E[u], E[v]) + link_head(E[v], E[u]))`,
+applied identically at training and eval.
+
+Defaults: `tau_link = 1.0` (pending sweep), `K_train = 100`.
 
 ### Trainer
 
@@ -65,16 +95,18 @@ a fresh β sweep would be reasonable.
 
 1. `walks = walk_gen.walks_for_nodes(seeds)`  — pre-ingest
 2. `L_align = alignment_loss(...)`             — InfoNCE scalar
-3. `neg = neg_sampler.sample(batch)`           — pre-observe
-4. Build link BCE on **detached** embeddings: `link_head(E[u].detach(), E[v].detach())`
-5. `L_total = L_align + L_bce`
+3. `neg_tgt = neg_sampler.sample(batch)`       — pre-observe; [B, K_train]
+4. Build `candidates_v = [pos_v | neg_tgt]` [B, 1+K_train]; score
+   through link_head on detached embeddings → logits [B, 1+K_train].
+   `L_link = CE(logits / tau_link, target=zeros(B))`.
+5. `L_total = L_align + L_link`
 6. `optimizer.zero_grad(set_to_none=True); L_total.backward(); optimizer.step()`
 7. `neg_sampler.observe(...)`                  — post-scoring
 8. `walk_gen.add_edges(...)`                   — post-scoring, last
 
-`E` is detached on the BCE path so the single backward routes
-alignment-side gradients to `E + p_target + p_context` and BCE
-gradients to `link_head` only.
+`E` is detached on the link path so the single backward routes
+alignment-side gradients to `E + p_target + p_context` and
+ranking gradients to `link_head` only.
 
 ### Model components
 
@@ -176,18 +208,21 @@ Historical (Vitter R) reservoir sampler.
 
 | Knob | Default | Source |
 |---|---|---|
-| `tau` | 0.5 | a-priori; validated by τ sweep on wiki (full-InfoNCE), re-validated under projection_norm=none + l2_dist (2026-05-28) |
+| `tau_align` | 0.5 | a-priori; validated by τ sweep on wiki (full-InfoNCE), re-validated under projection_norm=none + l2_dist (2026-05-28) |
+| `tau_link` | 1.0 | a-priori; pending a sweep on the new ranking link loss |
 | `beta_time` | 1.0 | a-priori; validated by β sweep on wiki (full-InfoNCE), re-validated under projection_norm=none + l2_dist (2026-05-28) |
 | `num_align_negatives` | 128 | wiki K sweep (3 seeds × 50 ep): knee of the diminishing-returns curve; ~98% of K=512's test MRR at ~2.6× less compute; lowest val std in sweep; largest K that fits on 8 GB at comment-scale NK |
+| `K_train` | 100 | ranking-loss convention (DPR-style, RotatE); larger K_train means harder per-query competition and stronger ranking gradients, at proportional compute cost |
 | `d_emb` | 128 | |
 | `d_proj` | 128 | |
 | ProjectionHead output | raw merge MLP output (no norm) | wiki single-seed sweep 2026-05-28 (see below): val 0.4556 vs L2-normed baseline 0.4289 (+0.027). Off-sphere L2-distance sim uses projection magnitude as signal; global grad-norm clip at 1.0 in trainer keeps magnitudes bounded. Hardcoded — not a CLI knob |
-| Alignment sim | `-‖p_t − p_c‖² / τ` (L2-distance) | same sweep: equivalent to cosine on the unit sphere; off-sphere it carries strictly more information (magnitude + direction). Hardcoded — not a CLI knob |
+| Alignment sim | `-‖p_t − p_c‖² / tau_align` (L2-distance) | same sweep: equivalent to cosine on the unit sphere; off-sphere it carries strictly more information (magnitude + direction). Hardcoded — not a CLI knob |
+| Link loss | per-query softmax CE over [B, 1+K_train] candidates | replaces per-pair BCE; upper-bounds 1 − MRR (Bruch et al., ICTIR 2019). Hardcoded — not a CLI knob |
 | `num_walks_per_node` | 5 | DeepWalk/CTDNE convention |
 | `max_walk_len` | 20 | |
 | `max_time_capacity` | -1 (unbounded) | wiki single-seed window sweep 2026-05-28: cap ∈ {66k, 100k, 250k, 500k, 1M} all underperformed unbounded on test MRR. cap=500k matched unbounded on val (+0.002, within noise) but lost test by 0.006 |
 | `lr` | 1e-3 | wiki seed-42 A/B (sampled-neg K=64): lr=1e-3 → val 0.4594 vs lr=1e-2 → 0.4301 |
-| `batch_size` | 2000 | |
+| `batch_size` | 500 | rebalanced for B*(1+K_train) candidate forwards per step under the ranking protocol |
 
 ---
 

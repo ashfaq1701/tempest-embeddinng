@@ -10,8 +10,8 @@ alignment_loss(E, P_target, P_context, walks, ...,
 
         L_i = - (Σ_p w[i,p] · log p(n_p^+ | s_i)) / (Σ_p w[i,p])
 
-        log p(n_p^+ | s_i) =  -‖P_target(E(s_i)) - P_context(E(n_p^+))‖² / τ
-                            - log Σ_j exp(-‖P_target(E(s_i)) - P_context(E(n_j))‖² / τ)
+        log p(n_p^+ | s_i) =  -‖P_target(E(s_i)) - P_context(E(n_p^+))‖² / tau_align
+                            - log Σ_j exp(-‖P_target(E(s_i)) - P_context(E(n_j))‖² / tau_align)
 
     where j ranges over (positives of seed i) ∪ (per-seed sampled
     negatives drawn from the pool's unique-node frequency
@@ -32,10 +32,13 @@ same seed) are accepted. Per-sample bias is small (~3%) and
 matches standard SimCLR/CLIP practice. No exclusion masking.
 
 Returns a standard graph-attached scalar tensor. The trainer
-combines it with the BCE term and calls .backward() once.
+combines it with the per-query ranking link loss and calls
+.backward() once.
 
-Link BCE remains a separate term computed in the trainer using a
-detached embedding (stop-grad on E for BCE).
+The link-prediction term is a separate softmax cross-entropy
+computed in the trainer over [B, 1+K_train] candidates per
+query (positive at column 0), with detached embeddings so the
+link loss updates only the link head.
 """
 
 from typing import Optional
@@ -72,7 +75,7 @@ def alignment_loss(
     t_min: int,
     T_train: float,
     beta: float = 1.0,
-    tau: float = 0.5,
+    tau_align: float = 0.5,
     node_feat: Optional[torch.Tensor] = None,     # [num_nodes, d_nf] or None
     num_align_negatives: int = 128,
 ) -> torch.Tensor:
@@ -151,7 +154,7 @@ def alignment_loss(
 
     # ── Sim to positives: own walk only ──────────────────────────
     sq_dist_pos = ((p_seed.unsqueeze(1) - p_ctx_own_walks) ** 2).sum(dim=-1)
-    sim_pos = -sq_dist_pos / tau                                  # [NK, L]
+    sim_pos = -sq_dist_pos / tau_align                            # [NK, L]
     sim_pos = sim_pos.masked_fill(~is_context, _INVALID_SIM)
 
     # ── Sampled negatives ────────────────────────────────────────
@@ -188,7 +191,7 @@ def alignment_loss(
 
     # ── Sim to sampled negatives ─────────────────────────────────
     sq_dist_neg = ((p_seed.unsqueeze(1) - p_neg) ** 2).sum(dim=-1)
-    sim_neg = -sq_dist_neg / tau                                  # [NK, R]
+    sim_neg = -sq_dist_neg / tau_align                            # [NK, R]
 
     # ── Partition function: log Z_i over positives ∪ negatives ───
     sim_combined = torch.cat([sim_pos, sim_neg], dim=1)           # [NK, L + R]
