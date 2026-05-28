@@ -244,3 +244,26 @@ unbounded on val (within noise) but loses test by 0.006. Default
 stays unbounded; implementation is plumbed for future experiments
 where recency might matter more (datasets with sharper distribution
 drift than wiki).
+
+### Grad clip ablation (2026-05-28)
+
+The trainer applies `torch.nn.utils.clip_grad_norm_(..., max_norm=1.0)`
+unconditionally after `backward()`. Tested whether the clip was
+costing useful magnitude signal under `projection_norm=none`:
+
+|  | val (best) | test @ best | best ep |
+|---|---|---|---|
+| **With clip (Run 6)** | **0.4556** | **0.4150** | 26 |
+| Without clip | 0.4380 | 0.3933 | 32 |
+
+Without the clip, **align loss spiked from 4.71 at ep1 to 5.56 at
+ep2** (Run 6 dropped 4.68 → 4.30) — one batch's unbounded gradient
+overshot, the next batch's loss surface was degraded. The model
+recovered within an epoch but the spike left a persistent **+0.045
+align gap** that never closed, translating to −0.018 val / −0.022
+test at convergence.
+
+Grad clip is load-bearing under unbounded projections. The clip is
+not "compressing useful magnitude information into noise" — it's
+suppressing destructive gradient overshoots that the unit-sphere
+constraint would have prevented implicitly. Keep `max_norm=1.0`.
