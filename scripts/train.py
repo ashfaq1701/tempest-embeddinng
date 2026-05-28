@@ -18,6 +18,7 @@ Hyperparameters exposed at CLI (and their grouping):
 
 Derived from the dataset (not exposed):
   num_nodes, is_directed, dst_pool, d_node_feat,
+  t_min (= min(train.ts)),
   T_train (= max(train.ts) - min(train.ts)).
 """
 
@@ -194,6 +195,7 @@ def main() -> Dict[str, Any]:
     num_nodes = loaded.max_node_count
     is_directed = args.is_directed
     dst_pool = np.unique(loaded.train.destinations).astype(np.int32)
+    t_min = int(loaded.train.timestamps.min())
     T_train = derive_t_train(loaded.train.timestamps)
     d_node_feat = (
         int(loaded.node_feat.shape[1])
@@ -204,6 +206,7 @@ def main() -> Dict[str, Any]:
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  directed:      {is_directed}  (--is-directed)")
     print(f"  dst_pool:      {len(dst_pool):,} unique destinations")
+    print(f"  t_min:         {t_min}")
     print(f"  T_train:       {T_train:.0f}")
     print(f"  train edges:   {len(loaded.train.sources):,}")
     print(f"  val edges:     {len(loaded.val.sources):,}")
@@ -245,7 +248,8 @@ def main() -> Dict[str, Any]:
         num_nodes=num_nodes,
         is_directed=is_directed,
         dst_pool=dst_pool,
-        t_train_span=T_train,
+        t_min=t_min,
+        T_train=T_train,
         d_node_feat=d_node_feat,
 
         d_emb=args.d_emb,

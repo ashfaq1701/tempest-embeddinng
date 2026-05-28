@@ -16,9 +16,13 @@ alignment_loss(E, P_target, P_context, walks, ...,
     where j ranges over (positives of seed i) ∪ (per-seed sampled
     negatives drawn from the pool's unique-node frequency
     distribution^0.75). Word2Vec convention.
-  - Hop/time weights w(K_hop, Δt) = 1/K_hop + (1 + Δt/T_train)^(-β)
-    multiply each positive's log-prob. Padding and seed slots are
-    masked out via a very-negative similarity (-1e9).
+  - Hop/time weights w(K_hop, t_edge) = 1/K_hop + \tilde t_e ** β
+    where \tilde t_e = (t_edge - t_min) / T_train ∈ [0, 1] is the
+    edge's absolute position in the training span. The weight is
+    FIXED per edge — the same (seed, context) pair gets the same
+    gradient weight in every batch (no t_now drift). Padding and
+    seed slots are masked out downstream via a very-negative
+    similarity (-1e9).
   - The softmax denominator does what Wang-Isola uniformity did
     (push seed projections away from non-positive contexts), but
     with task-relevant negatives sampled by frequency.
@@ -65,7 +69,7 @@ def alignment_loss(
     p_target,                                     # ProjectionHead — seed/downstream
     p_context,                                    # ProjectionHead — walk-internal/upstream
     walks: WalkData,
-    t_now: int,
+    t_min: int,
     T_train: float,
     beta: float = 1.0,
     tau: float = 0.5,
@@ -105,11 +109,23 @@ def alignment_loss(
     if not bool(ctx_valid_mask.any()):
         return torch.zeros((), device=device, requires_grad=True)
 
-    # Hop/time weights (positive everywhere since w_hop > 0 always).
+    # Hop/time weights. Time component is a FIXED per-edge weight
+    # tied to the edge's absolute position in the training span,
+    # so the same (seed, context) pair gets the same gradient
+    # weight every time it's drawn (no t_now drift across batches).
+    # \tilde t_e = (t_edge - t_min) / T_train ∈ [0, 1]
+    # w_time     = \tilde t_e ** beta
+    # Larger β biases toward later edges within the training window.
+    # The clamp_min(0) covers padding (-1) and clamp_max(1) covers
+    # the seed-slot INT64_MAX sentinel; both positions are masked
+    # out downstream via is_context, so the clamped weights never
+    # contribute to the loss.
     hop_dist = (lens.unsqueeze(1) - 1 - positions).clamp_min(1).float()  # [NK, L]
-    dt = (float(t_now) - timestamps.float()).clamp_min(0.0)       # [NK, L]
-    dt_norm = dt / max(T_train, 1.0)
-    w = 1.0 / hop_dist + (1.0 + dt_norm).pow(-beta)               # [NK, L]
+    edge_t_norm = (
+        (timestamps - t_min).clamp_min(0).float() / max(T_train, 1.0)
+    ).clamp(max=1.0)                                              # [NK, L]
+    w_time = edge_t_norm.pow(beta)
+    w = 1.0 / hop_dist + w_time                                   # [NK, L]
 
     # ── Projections ──────────────────────────────────────────────
     # Seeds and per-walk contexts are computed via the projection

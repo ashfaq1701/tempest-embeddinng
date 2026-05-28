@@ -70,7 +70,8 @@ class TrainerConfig:
     num_nodes: int
     is_directed: bool
     dst_pool: np.ndarray
-    t_train_span: float
+    t_min: int                          # min timestamp of the train split
+    T_train: float                      # train-split span (t_max - t_min)
     d_node_feat: Optional[int] = None
 
     # Model.
@@ -319,14 +320,15 @@ class Trainer:
         # Step 2: InfoNCE contrastive alignment over batched walks.
         # The softmax denominator over all batch contexts is the
         # anti-collapse mechanism (replaces Wang-Isola uniformity).
-        t_now = int(batch.t_max)
+        # Time weight is FIXED per edge via (t_min, T_train) from the
+        # train split — no t_now reference, no drift across batches.
         l_align = alignment_loss(
             embedding_table=self.embedding_table,
             p_target=self.p_target,
             p_context=self.p_context,
             walks=walks,
-            t_now=t_now,
-            T_train=self.config.t_train_span,
+            t_min=self.config.t_min,
+            T_train=self.config.T_train,
             beta=self.config.beta_time,
             tau=self.config.tau,
             node_feat=self.node_feat,

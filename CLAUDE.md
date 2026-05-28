@@ -43,12 +43,21 @@ negatives).
 Hop/time weights on positives:
 
 ```
-w(K_hop, Δt) = 1/K_hop + (1 + Δt/T_train)^(-β)
+w(K_hop, t_edge) = 1/K_hop + \tilde t_e ** β
+\tilde t_e      = (t_edge − t_min) / T_train     ∈ [0, 1]
 ```
 
-Defaults: `τ = 0.5`, `β = 1.0` — empirically validated on wiki
-under full-pool InfoNCE; expected to transfer to sampled-neg but
-not re-swept under sampled-neg yet.
+`t_min` and `T_train` are computed once from the training split
+at data load and stored on `TrainerConfig`. The recency weight is
+FIXED per edge — the same (seed, context) pair gets the same
+gradient weight whichever batch it's drawn in (no `t_now` drift).
+Larger β biases the loss toward later edges within the training
+window.
+
+Defaults: `τ = 0.5`, `β = 1.0` — `τ` validated under the current
+projection_norm=none + l2_dist setup; β was validated under the
+older `(1 + Δt/T_train)^(-β)` formulation, semantics differ so
+a fresh β sweep would be reasonable.
 
 ### Trainer
 
