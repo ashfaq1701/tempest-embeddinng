@@ -32,14 +32,13 @@ Epoch boundary:
   - neg_sampler.reset() (if Historical)
   - Model parameters and optimiser state are NOT reset.
 
-Final test eval:
-  - walk_gen.reset() then re-ingest training edges so Tempest reflects
-    "all of training" before val/test scoring begins.
-
 Early stop:
   - Snapshot best-val model + projection + head state_dicts.
-  - Restore before final eval.
+  - Restore best-val weights at end of training.
   - Optimiser state not snapshotted (not needed after training stops).
+  - The reported `best_val_mrr` / `best_test_mrr` are the snapshot
+    values at the best-val epoch (test scored only on new-best
+    epochs to save eval time).
 """
 
 import copy
@@ -129,10 +128,6 @@ class TrainerConfig:
     seed: int = 42
     use_gpu: bool = False
     use_gpu_tempest: bool = False    # independent from use_gpu
-
-    # Eval.
-    monitor_sample_pct: float = 1.0
-    skip_final_full_eval: bool = False
 
 
 class Trainer:
@@ -395,7 +390,6 @@ class Trainer:
         self,
         evaluator: Evaluator,
         batches: Iterable[Batch],
-        sample_pct: float = 1.0,
     ) -> float:
         """Streaming eval. Walks NOT sampled; reservoir NOT updated.
         Tempest state advances via post-scoring add_edges."""
@@ -408,27 +402,7 @@ class Trainer:
         n = 0
         with torch.no_grad():
             for batch in batches:
-                B_full = len(batch.src)
-                if 0.0 < sample_pct < 1.0:
-                    n_keep = max(1, int(B_full * sample_pct))
-                    keep_idx = np.random.choice(B_full, size=n_keep, replace=False)
-                    score_batch = Batch(
-                        src=batch.src[keep_idx],
-                        tgt=batch.tgt[keep_idx],
-                        ts=batch.ts[keep_idx],
-                        edge_feat=(
-                            batch.edge_feat[keep_idx]
-                            if batch.edge_feat is not None
-                            else None
-                        ),
-                        t_max=(
-                            int(batch.ts[keep_idx].max())
-                            if len(keep_idx) > 0
-                            else batch.t_max
-                        ),
-                    )
-                else:
-                    score_batch = batch
+                score_batch = batch
 
                 B = len(score_batch.src)
                 if B == 0:
@@ -516,15 +490,6 @@ class Trainer:
         self.p_context.load_state_dict(snap["p_context"])
         self.link_head.load_state_dict(snap["link_head"])
 
-    def _re_ingest_train(self, train_batches_factory) -> None:
-        """Reset Tempest, re-ingest all training edges. Used before
-        final val/test eval so Tempest state matches post-training."""
-        self.walk_gen.reset()
-        for batch in train_batches_factory():
-            self.walk_gen.add_edges(
-                batch.src, batch.tgt, batch.ts, batch.edge_feat,
-            )
-
     # ──────────────────────────────────────────────────────────────────
     # Train loop
     # ──────────────────────────────────────────────────────────────────
@@ -539,7 +504,6 @@ class Trainer:
     ) -> Dict[str, Any]:
         n_epochs = self.config.num_epochs
         patience = self.config.early_stop_patience
-        sample_pct = self.config.monitor_sample_pct
 
         # Set up the LR scheduler. We need batches_per_epoch which
         # we compute by exhausting the factory once (cheap — counts
@@ -585,9 +549,7 @@ class Trainer:
 
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()
-                val_metric = self._eval(
-                    val_evaluator, val_batches_factory(), sample_pct,
-                )
+                val_metric = self._eval(val_evaluator, val_batches_factory())
                 eval_dt = time.time() - t1
                 per_epoch_val.append(val_metric)
 
@@ -602,7 +564,7 @@ class Trainer:
                         and test_batches_factory is not None
                     ):
                         test_metric = self._eval(
-                            test_evaluator, test_batches_factory(), sample_pct,
+                            test_evaluator, test_batches_factory(),
                         )
                         best_test = test_metric
                         per_epoch_test.append(test_metric)
@@ -627,20 +589,6 @@ class Trainer:
                 f"  restored best weights from epoch {best_epoch} "
                 f"(val {best_val:.4f}, test {best_test:.4f})"
             )
-
-        if (
-            not self.config.skip_final_full_eval
-            and val_evaluator is not None
-            and val_batches_factory is not None
-        ):
-            print("=== Final full eval ===")
-            self._re_ingest_train(train_batches_factory)
-            final_val = self._eval(val_evaluator, val_batches_factory(), 1.0)
-            print(f"  val MRR: {final_val:.4f}")
-            if test_evaluator is not None and test_batches_factory is not None:
-                final_test = self._eval(test_evaluator, test_batches_factory(), 1.0)
-                print(f"  test MRR: {final_test:.4f}")
-                best_val, best_test = final_val, final_test
 
         return {
             "stopped_at_epoch": best_epoch if best_snap is not None else n_epochs,

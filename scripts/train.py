@@ -14,8 +14,7 @@ Hyperparameters exposed at CLI (and their grouping):
   Negatives:      --num-neg-per-pos, --hist-neg-ratio, --reservoir-size
   Optimisation:   --lr, --weight-decay, --batch-size, --num-epochs,
                   --early-stop-patience
-  System:         --seed, --use-gpu, --skip-final-full-eval,
-                  --monitor-sample-pct
+  System:         --seed, --use-gpu, --use-gpu-tempest
 
 Derived from the dataset (not exposed):
   num_nodes, is_directed, dst_pool, d_node_feat,
@@ -164,8 +163,6 @@ def parse_args() -> argparse.Namespace:
              "collide with PyTorch's allocator on small GPUs; default "
              "off, enable only if you have headroom.",
     )
-    p.add_argument("--skip-final-full-eval", action="store_true")
-    p.add_argument("--monitor-sample-pct", default=1.0, type=float)
 
     return p.parse_args()
 
@@ -280,8 +277,6 @@ def main() -> Dict[str, Any]:
         seed=args.seed,
         use_gpu=args.use_gpu,
         use_gpu_tempest=args.use_gpu_tempest,
-        skip_final_full_eval=args.skip_final_full_eval,
-        monitor_sample_pct=args.monitor_sample_pct,
     )
 
     print("\n=== Config ===")
