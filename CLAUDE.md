@@ -188,6 +188,51 @@ walk-through:
   derive its mask from `lens` directly (e.g.
   `mask = arange(L) < lens.unsqueeze(1)`).
 
+### Forward_In_Time variant — verified 2026-05-29
+
+The codebase only uses `Backward_In_Time`. The forward direction
+is the mirror image; recorded here so a future caller doesn't
+have to re-probe it.
+
+Walk direction: `"Forward_In_Time"`. Seed at position 0;
+chronologically later successor at position `lens-1`.
+
+Sentinel:
+  - `timestamps[i, 0]` = `INT64_MIN` (= `-(1 << 63)`, the
+    arithmetic mirror of `INT64_MAX`). The seed has no
+    incoming edge in this walk.
+  - **Note**: Backward uses `INT64_MAX`; Forward uses
+    `INT64_MIN`. Any direction-agnostic mask must accept both.
+
+Alignment: for `p ∈ [1, lens[i]-1]`, `timestamps[i, p]` is the
+timestamp of the edge `(nodes[i, p-1], nodes[i, p])` — i.e. the
+edge INTO `nodes[p]`, not the edge OUT of it. This is also the
+mirror of the Backward convention (where `timestamps[i, p]` is
+the edge between `nodes[i, p]` and `nodes[i, p+1]`).
+Verified 52/52 valid `(u, v, t)` tuples match an ingested edge
+under this rule on tgbl-wiki.
+
+Seed slot `p = 0`:
+  - `nodes[i, 0]` = seed (matches `seeds[i // K]`)
+  - `timestamps[i, 0]` = `INT64_MIN` sentinel
+  - `edge_feats` row 0 exists in shape (since edge_feats has
+    `L-1` columns, indexed 0..L-2), but it carries no real
+    edge if the seed has no predecessor. A consumer should
+    skip it.
+
+Padding (`p >= lens[i]`): same as Backward — `nodes` and
+`timestamps` both `-1`, `edge_feats` rows all-zero.
+
+Implications for a forward-walk consumer:
+  - `is_context = positions > 0` masks the seed slot at the
+    left, instead of `positions < lens-1` at the right.
+  - The walk encoder's per-position edge feature attaches
+    `edge_feats[p-1]` (the edge INTO `nodes[p]`) instead of
+    `edge_feats[p]` (the edge OUT of `nodes[p]`).
+  - Time-weight code that depends on Δt or `(t_edge − t_min) /
+    T_train` is unchanged — the timestamp value still carries
+    the same semantics, just attached at a different slot.
+
 ---
 
 ## Tests
