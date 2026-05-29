@@ -59,6 +59,7 @@ def alignment_loss(
     beta: float = 1.0,
     tau_align: float = 0.5,
     node_feat: Optional[torch.Tensor] = None,     # [num_nodes, d_nf] or None
+    walk_direction: str = "Backward_In_Time",
 ) -> torch.Tensor:
     """InfoNCE contrastive alignment over batched walks with a
     full unique-batch-node partition.
@@ -71,9 +72,26 @@ def alignment_loss(
         ‖a - b‖² = ‖a‖² + ‖b‖² - 2⟨a, b⟩
     to avoid the [NK, V_unique, d_proj] broadcast intermediate.
 
+    walk_direction selects which side of the walk the seed sits on:
+      "Backward_In_Time" — seed at lens-1, contexts at p < lens-1,
+                           hop_dist = lens-1 - p.
+      "Forward_In_Time"  — seed at 0,      contexts at 0 < p < lens,
+                           hop_dist = p.
+    Time/timestamp handling is the same in both — `t_min` and
+    `T_train` are global and direction-independent; the only
+    direction-specific bit on the time side is which slot holds the
+    sentinel (INT64_MAX for Backward, INT64_MIN for Forward), and
+    that slot is masked out via is_context regardless.
+
     Returns the scalar mean loss over seeds-with-positives as a
     graph-attached tensor. The caller is responsible for backward.
     """
+    if walk_direction not in ("Backward_In_Time", "Forward_In_Time"):
+        raise ValueError(
+            f"unknown walk_direction: {walk_direction!r} "
+            f"(expected 'Backward_In_Time' | 'Forward_In_Time')"
+        )
+
     device = embedding_table.E.weight.device
     nodes = walks.nodes.to(device).long()                         # [NK, L]
     timestamps = walks.timestamps.to(device).long()               # [NK, L]
@@ -83,11 +101,19 @@ def alignment_loss(
     NK, L = nodes.shape
     M = NK * L
 
-    # Valid context positions: p ∈ [0, lens - 2]. Position lens-1 is
-    # the seed (excluded), positions >= lens are padding.
+    # Valid context positions branch by direction (CLAUDE.md walk
+    # contracts). Backward: seed at lens-1, contexts at p < lens-1.
+    # Forward:  seed at 0,      contexts at 0 < p < lens.
+    # Hop distance to seed is symmetric: |seed_pos - p|, clamp_min(1).
     positions = torch.arange(L, device=device).unsqueeze(0)       # [1, L]
-    seed_pos = (lens - 1).unsqueeze(1)                            # [NK, 1]
-    is_context = positions < seed_pos                             # [NK, L]
+    if walk_direction == "Backward_In_Time":
+        is_context = positions < (lens - 1).unsqueeze(1)          # [NK, L]
+        hop_dist = (
+            (lens - 1).unsqueeze(1) - positions
+        ).clamp_min(1).float()                                    # [NK, L]
+    else:  # Forward_In_Time
+        is_context = (positions > 0) & (positions < lens.unsqueeze(1))
+        hop_dist = positions.clamp_min(1).float().expand(NK, L)
     ctx_valid_mask = is_context.reshape(M)                        # [M]
 
     # Degenerate batch: no walk has any valid context position. Happens
@@ -96,14 +122,11 @@ def alignment_loss(
     if not bool(ctx_valid_mask.any()):
         return torch.zeros((), device=device, requires_grad=True)
 
-    # Hop/time weights. Time component is a FIXED per-edge weight
-    # tied to the edge's absolute position in the training span,
-    # so the same (seed, context) pair gets the same gradient
-    # weight every time it's drawn (no t_now drift across batches).
-    # The clamp_min(0) covers padding (-1) and clamp_max(1) covers
-    # the seed-slot INT64_MAX sentinel; both positions are masked
-    # out downstream via w_pos = w * is_context.
-    hop_dist = (lens.unsqueeze(1) - 1 - positions).clamp_min(1).float()  # [NK, L]
+    # Time component is a FIXED per-edge weight tied to the edge's
+    # absolute position in the training span (no t_now drift). The
+    # clamp covers padding (-1) and both directional seed-slot
+    # sentinels (INT64_MAX for Backward, INT64_MIN for Forward) —
+    # those positions are masked out downstream via w_pos.
     edge_t_norm = (
         (timestamps - t_min).clamp_min(0).float() / max(T_train, 1.0)
     ).clamp(max=1.0)                                              # [NK, L]

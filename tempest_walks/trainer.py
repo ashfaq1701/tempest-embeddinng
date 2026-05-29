@@ -3,10 +3,13 @@
 Single Trainer class. Per-batch ordering:
 
   TRAINING:
-    1. walks = walk_gen.walks_for_nodes(seeds)       ← pre-ingest state
-       seeds = unique(B_tgt)               if is_directed
-       seeds = unique(B_src ∪ B_tgt)       if undirected
-    2. L_align = alignment_loss(walks, tau_align)    ← InfoNCE scalar
+    1. Two directional walk samplings:
+         walks_bwd = walk_gen.walks_for_nodes(unique(B_tgt), "Backward_In_Time")
+         walks_fwd = walk_gen.walks_for_nodes(unique(B_src), "Forward_In_Time")
+       Both from PRE-INGEST state.
+    2. L_align = alignment_loss(walks_bwd, "Backward_In_Time")
+              + alignment_loss(walks_fwd, "Forward_In_Time")
+       Each uses the full unique-batch-node pool partition.
     3. neg = neg_sampler.sample(batch)               ← pre-observe state
        neg_tgt: [B, K_train]
     4. candidates_v = [pos_v | neg_tgt]              ← [B, 1+K_train]
@@ -317,36 +320,52 @@ class Trainer:
         device = self.device
 
         # Step 1: walks from PRE-INGEST state.
-        # Seed selection depends on directedness:
-        #  - undirected: seeds = unique(src ∪ tgt). Both endpoints are
-        #    symmetric roles; walking from either captures the local
-        #    neighbourhood equally.
-        #  - directed:   seeds = unique(tgt). TGB ranks candidate dsts
-        #    given a fixed src, so the dst side is what gets scored;
-        #    walking from the dst follows its incoming-edge history,
-        #    which is the predictive signal for "which dst did src hit".
-        if self.config.is_directed:
-            seeds_np = np.unique(batch.tgt)
-        else:
-            seeds_np = np.unique(np.concatenate([batch.src, batch.tgt]))
-        walks = self.walk_gen.walks_for_nodes(seeds_np)
+        # TWO directional samplings per batch:
+        #  - Backward from B_tgt: seed at lens-1, contexts are predecessors.
+        #    Answers "what led to this tgt" — the (predictive of dst|src)
+        #    history accumulated up to t.
+        #  - Forward from B_src: seed at 0, contexts are successors.
+        #    Answers "what does this src lead to" — predictive of dst|src
+        #    via the src's own outgoing-edge future. The Tempest mirror
+        #    contract is verified in CLAUDE.md.
+        # Both signals point at the eval task and are complementary.
+        seeds_bwd_np = np.unique(batch.tgt)
+        seeds_fwd_np = np.unique(batch.src)
+        walks_bwd = self.walk_gen.walks_for_nodes(
+            seeds_bwd_np, walk_direction="Backward_In_Time",
+        )
+        walks_fwd = self.walk_gen.walks_for_nodes(
+            seeds_fwd_np, walk_direction="Forward_In_Time",
+        )
 
-        # Step 2: InfoNCE contrastive alignment over batched walks.
-        # The softmax denominator over all batch contexts is the
-        # anti-collapse mechanism (replaces Wang-Isola uniformity).
-        # Time weight is FIXED per edge via (t_min, T_train) from the
-        # train split — no t_now reference, no drift across batches.
-        l_align = alignment_loss(
+        # Step 2: Two InfoNCE alignment calls, summed. Each uses its
+        # own walks and the corresponding direction. Time weight is
+        # FIXED per edge via (t_min, T_train) from the train split.
+        l_align_bwd = alignment_loss(
             embedding_table=self.embedding_table,
             p_target=self.p_target,
             p_context=self.p_context,
-            walks=walks,
+            walks=walks_bwd,
             t_min=self.config.t_min,
             T_train=self.config.T_train,
             beta=self.config.beta_time,
             tau_align=self.config.tau_align,
             node_feat=self.node_feat,
+            walk_direction="Backward_In_Time",
         )
+        l_align_fwd = alignment_loss(
+            embedding_table=self.embedding_table,
+            p_target=self.p_target,
+            p_context=self.p_context,
+            walks=walks_fwd,
+            t_min=self.config.t_min,
+            T_train=self.config.T_train,
+            beta=self.config.beta_time,
+            tau_align=self.config.tau_align,
+            node_feat=self.node_feat,
+            walk_direction="Forward_In_Time",
+        )
+        l_align = l_align_bwd + l_align_fwd
 
         # Step 3: per-query negatives. Sampler returns [B, K_train]
         # grouped output; no flattening — the link head consumes the

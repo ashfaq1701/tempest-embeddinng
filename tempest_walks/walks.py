@@ -108,8 +108,17 @@ class WalkGenerator:
         """Ingest a batch of edges. STRICT-CAUSAL: call AFTER scoring."""
         self.trw.add_multiple_edges(src, tgt, ts, edge_features=edge_feat)
 
-    def walks_for_nodes(self, seeds: np.ndarray) -> WalkData:
-        """Sample backward walks for the given seed nodes from the CURRENT state.
+    def walks_for_nodes(
+        self,
+        seeds: np.ndarray,
+        walk_direction: str = "Backward_In_Time",
+    ) -> WalkData:
+        """Sample walks for the given seed nodes from the CURRENT state.
+
+        walk_direction:
+          "Backward_In_Time" — seed at position lens-1 (default).
+          "Forward_In_Time"  — seed at position 0 (Tempest mirror;
+                                contract verified, see CLAUDE.md).
 
         Returns a WalkData with walks grouped K-per-seed in input order:
         rows [i*K, (i+1)*K) contain seeds[i]'s K walks.
@@ -121,7 +130,7 @@ class WalkGenerator:
             walk_bias=self.walk_bias,
             initial_edge_bias=self.start_bias,
             num_walks_per_node=self.num_walks_per_node,
-            walk_direction="Backward_In_Time",
+            walk_direction=walk_direction,
         )
 
         # Fail loud if Tempest's edge_feats shape no longer matches the
