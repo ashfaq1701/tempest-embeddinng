@@ -1,44 +1,36 @@
 """Loss functions.
 
 InfoNCE contrastive alignment for walk-supervised temporal node
-embeddings, with sampled-negative partition function.
+embeddings, with FULL-pool partition function over the unique
+nodes appearing in the batch's walks.
 
-alignment_loss(E, P_target, P_context, walks, ...,
-               num_align_negatives)
+alignment_loss(E, P_target, P_context, walks, ...)
   - InfoNCE contrastive loss over batched walks.
   - For each seed s_i with positive contexts {n_p^+ : p in walk i}:
 
         L_i = - (Σ_p w[i,p] · log p(n_p^+ | s_i)) / (Σ_p w[i,p])
 
         log p(n_p^+ | s_i) =  -‖P_target(E(s_i)) - P_context(E(n_p^+))‖² / tau_align
-                            - log Σ_j exp(-‖P_target(E(s_i)) - P_context(E(n_j))‖² / tau_align)
+                            - log Σ_{n ∈ pool} count(n) · exp(-‖P_target(E(s_i)) - P_context(E(n))‖² / tau_align)
 
-    where j ranges over (positives of seed i) ∪ (per-seed sampled
-    negatives drawn from the pool's unique-node frequency
-    distribution^0.75). Word2Vec convention.
-  - Hop/time weights w(K_hop, t_edge) = 1/K_hop + \tilde t_e ** β
-    where \tilde t_e = (t_edge - t_min) / T_train ∈ [0, 1] is the
+    The pool is the set of UNIQUE node ids appearing at any valid
+    context position across the batch (excludes padding sentinels
+    and the seed slot at lens-1). Each pool entry is weighted by
+    its in-batch occurrence count (linear in frequency — closed-
+    form equivalent of multinomial sampling under the same
+    distribution, with zero sampling variance). False-negative
+    bias from the seed's own positives lying in the pool is
+    accepted (standard SimCLR/CLIP convention).
+
+  - Hop/time weights w(K_hop, t_edge) = 1/K_hop + \\tilde t_e ** β
+    where \\tilde t_e = (t_edge - t_min) / T_train ∈ [0, 1] is the
     edge's absolute position in the training span. The weight is
     FIXED per edge — the same (seed, context) pair gets the same
-    gradient weight in every batch (no t_now drift). Padding and
-    seed slots are masked out downstream via a very-negative
-    similarity (-1e9).
-  - The softmax denominator does what Wang-Isola uniformity did
-    (push seed projections away from non-positive contexts), but
-    with task-relevant negatives sampled by frequency.
-
-False negatives (sampled nodes that happen to be positives of the
-same seed) are accepted. Per-sample bias is small (~3%) and
-matches standard SimCLR/CLIP practice. No exclusion masking.
+    gradient weight in every batch (no t_now drift).
 
 Returns a standard graph-attached scalar tensor. The trainer
 combines it with the per-query ranking link loss and calls
 .backward() once.
-
-The link-prediction term is a separate softmax cross-entropy
-computed in the trainer over [B, 1+K_train] candidates per
-query (positive at column 0), with detached embeddings so the
-link loss updates only the link head.
 """
 
 from typing import Optional
@@ -48,11 +40,6 @@ import torch
 from .walks import WalkData
 
 
-# Sim value for invalid (padding/seed-slot) pool entries. Chosen so
-# exp(_INVALID_SIM) ≈ 0 in float32 but not -inf — prevents NaN when
-# every entry in a row is invalid (e.g. a walk with zero contexts).
-_INVALID_SIM = -1e9
-
 # Threshold for treating a seed as having no valid positives. Seeds
 # whose weight sum is below this are excluded from the loss mean.
 # The same threshold is used in the denominator clamp for numerical
@@ -60,11 +47,6 @@ _INVALID_SIM = -1e9
 # excluded from the mean is also exactly the seed whose denominator
 # would otherwise be artificially inflated by the clamp.
 _SEED_VALID_THRESHOLD = 1e-9
-
-# Frequency-weighting exponent for negative sampling, applied to
-# unique-node counts. Word2Vec convention; balances sampling
-# popular and rare nodes.
-_SAMPLING_EXPONENT = 0.75
 
 
 def alignment_loss(
@@ -77,15 +59,17 @@ def alignment_loss(
     beta: float = 1.0,
     tau_align: float = 0.5,
     node_feat: Optional[torch.Tensor] = None,     # [num_nodes, d_nf] or None
-    num_align_negatives: int = 128,
 ) -> torch.Tensor:
-    """InfoNCE contrastive alignment over batched walks.
+    """InfoNCE contrastive alignment over batched walks with a
+    full unique-batch-node partition.
 
-    Partition function runs over (per-seed positives ∪ per-seed
-    sampled negatives). Negatives are drawn from the pool's unique-
-    node distribution weighted by count^0.75 (Word2Vec convention).
-    False-negative bias is accepted (small, ~3% per sample) — matches
-    standard SimCLR/CLIP practice.
+    The partition function for each seed runs over every unique node
+    id that appears at any valid (non-padding, non-seed-slot) walk
+    position in the batch. Each pool node is projected once via
+    P_context; the [NK, V_unique] sim matrix is then materialised
+    via the polar-decomposition identity
+        ‖a - b‖² = ‖a‖² + ‖b‖² - 2⟨a, b⟩
+    to avoid the [NK, V_unique, d_proj] broadcast intermediate.
 
     Returns the scalar mean loss over seeds-with-positives as a
     graph-attached tensor. The caller is responsible for backward.
@@ -97,7 +81,7 @@ def alignment_loss(
     seeds_t = walks.seeds.to(device).long()                       # [N]
     K = walks.K
     NK, L = nodes.shape
-    M = NK * L                                                    # pool size
+    M = NK * L
 
     # Valid context positions: p ∈ [0, lens - 2]. Position lens-1 is
     # the seed (excluded), positions >= lens are padding.
@@ -116,13 +100,9 @@ def alignment_loss(
     # tied to the edge's absolute position in the training span,
     # so the same (seed, context) pair gets the same gradient
     # weight every time it's drawn (no t_now drift across batches).
-    # \tilde t_e = (t_edge - t_min) / T_train ∈ [0, 1]
-    # w_time     = \tilde t_e ** beta
-    # Larger β biases toward later edges within the training window.
     # The clamp_min(0) covers padding (-1) and clamp_max(1) covers
     # the seed-slot INT64_MAX sentinel; both positions are masked
-    # out downstream via is_context, so the clamped weights never
-    # contribute to the loss.
+    # out downstream via w_pos = w * is_context.
     hop_dist = (lens.unsqueeze(1) - 1 - positions).clamp_min(1).float()  # [NK, L]
     edge_t_norm = (
         (timestamps - t_min).clamp_min(0).float() / max(T_train, 1.0)
@@ -130,72 +110,66 @@ def alignment_loss(
     w_time = edge_t_norm.pow(beta)
     w = 1.0 / hop_dist + w_time                                   # [NK, L]
 
+    # ── Unique node pool from VALID context positions ────────────
+    # Excludes padding (-1, clamped to 0 above) and the seed slot.
+    # Each unique node is projected through P_context exactly once;
+    # the sim matrix scores every seed against every pool node.
+    # Counts of in-batch occurrences weight the partition linearly
+    # (closed-form equivalent of multinomial sampling under the
+    # count distribution).
+    nodes_safe = nodes.clamp_min(0)                               # [NK, L]
+    valid_nodes = nodes_safe.reshape(M)[ctx_valid_mask]           # [V_total]
+    unique_nodes, inverse_idx_valid, counts = torch.unique(
+        valid_nodes, return_inverse=True, return_counts=True,
+    )                                                              # [V_unique]
+    log_w_pool = torch.log(counts.float().clamp_min(1.0))         # [V_unique]
+
+    # pool_idx[i, p] = column index into unique_nodes for the node
+    # at walk position (i, p). Invalid positions get 0 here but are
+    # masked out of the loss via w_pos.
+    pool_idx_flat = torch.zeros(M, dtype=torch.long, device=device)
+    pool_idx_flat[ctx_valid_mask] = inverse_idx_valid
+    pool_idx = pool_idx_flat.view(NK, L)                          # [NK, L]
+
     # ── Projections ──────────────────────────────────────────────
-    # Seeds and per-walk contexts are computed via the projection
-    # heads. The pool projection p_ctx_pool is then reshaped to
-    # [NK, L, d_proj] so per-seed-own-walk positives can be sliced
-    # by indexing — no [NK, M] sim matrix is built.
     seed_per_row = seeds_t.repeat_interleave(K)                   # [NK]
     e_seed = embedding_table(seed_per_row)                        # [NK, d_emb]
-    nodes_safe = nodes.clamp_min(0)                               # [NK, L]
-    e_ctx_flat = embedding_table(nodes_safe.reshape(-1))          # [M, d_emb]
+    e_pool = embedding_table(unique_nodes)                        # [V_unique, d_emb]
 
     if node_feat is not None:
-        nf_seed = node_feat[seed_per_row]                         # [NK, d_nf]
-        nf_ctx_flat = node_feat[nodes_safe.reshape(-1)]           # [M, d_nf]
+        nf_seed = node_feat[seed_per_row]
+        nf_pool = node_feat[unique_nodes]
         p_seed = p_target(e_seed, node_feat=nf_seed)              # [NK, d_proj]
-        p_ctx = p_context(e_ctx_flat, node_feat=nf_ctx_flat)      # [M, d_proj]
+        p_pool = p_context(e_pool, node_feat=nf_pool)             # [V_unique, d_proj]
     else:
         p_seed = p_target(e_seed)                                 # [NK, d_proj]
-        p_ctx = p_context(e_ctx_flat)                             # [M, d_proj]
+        p_pool = p_context(e_pool)                                # [V_unique, d_proj]
 
-    d_proj = p_seed.shape[-1]
-    p_ctx_own_walks = p_ctx.view(NK, L, d_proj)                   # [NK, L, d_proj]
+    # ── Sim matrix seed × pool, polar-decomposition form ─────────
+    # ‖p_seed - p_pool‖² = ‖p_seed‖² + ‖p_pool‖² - 2 ⟨p_seed, p_pool⟩
+    # Materialises [NK, V_unique] but never the [NK, V_unique, d_proj]
+    # broadcast intermediate.
+    sq_seed = (p_seed * p_seed).sum(dim=-1, keepdim=True)         # [NK, 1]
+    sq_pool = (p_pool * p_pool).sum(dim=-1).unsqueeze(0)          # [1, V_unique]
+    inner = p_seed @ p_pool.t()                                   # [NK, V_unique]
+    sq_dist = (sq_seed + sq_pool - 2.0 * inner).clamp_min(0.0)
+    sim_pool = -sq_dist / tau_align                               # [NK, V_unique]
 
-    # ── Sim to positives: own walk only ──────────────────────────
-    sq_dist_pos = ((p_seed.unsqueeze(1) - p_ctx_own_walks) ** 2).sum(dim=-1)
-    sim_pos = -sq_dist_pos / tau_align                            # [NK, L]
-    sim_pos = sim_pos.masked_fill(~is_context, _INVALID_SIM)
+    # ── Partition: log Z_i over the full pool, count-weighted ───
+    # Adds log(count_j) to each per-node sim before logsumexp.
+    # Numerator is left UNWEIGHTED (raw sim_pool gathered for the
+    # positive) — the positive is already counted once per occurrence
+    # in the loss via w_pos, no need to double-amplify it via the
+    # partition weight too.
+    log_Z = torch.logsumexp(
+        sim_pool + log_w_pool.unsqueeze(0), dim=1,
+    )                                                              # [NK]
 
-    # ── Sampled negatives ────────────────────────────────────────
-    # Build the unique-node frequency distribution over the VALID
-    # context positions in the pool (excludes padding and seed slots).
-    valid_nodes = nodes.reshape(M)[ctx_valid_mask]                # [V_total]
-    unique_nodes, counts = torch.unique(valid_nodes, return_counts=True)
-    sampling_weights = counts.float().pow(_SAMPLING_EXPONENT)     # [V_unique]
-
-    # Sample NK × num_align_negatives integer indices into unique_nodes
-    # via inverse-CDF sampling. torch.multinomial on CUDA fails at
-    # large num_samples (kernel-launch limits); searchsorted on a
-    # normalised cumulative distribution has the same distributional
-    # semantics with no launch-size cap.
-    cum_weights = sampling_weights.cumsum(0)                      # [V_unique]
-    cum_weights = cum_weights / cum_weights[-1]                   # normalised to [0, 1]
-    total_samples = NK * num_align_negatives
-    u = torch.rand(total_samples, device=device)
-    flat_neg_idx = torch.searchsorted(cum_weights, u).clamp(
-        max=unique_nodes.shape[0] - 1,
-    )                                                             # [NK * R]
-    sampled_neg_node_ids = unique_nodes[flat_neg_idx].view(
-        NK, num_align_negatives,
-    )                                                             # [NK, R]
-
-    # Project the sampled negatives through P_context.
-    e_neg = embedding_table(sampled_neg_node_ids.reshape(-1))     # [NK·R, d_emb]
-    if node_feat is not None:
-        nf_neg = node_feat[sampled_neg_node_ids.reshape(-1)]
-        p_neg = p_context(e_neg, node_feat=nf_neg)
-    else:
-        p_neg = p_context(e_neg)
-    p_neg = p_neg.view(NK, num_align_negatives, d_proj)           # [NK, R, d_proj]
-
-    # ── Sim to sampled negatives ─────────────────────────────────
-    sq_dist_neg = ((p_seed.unsqueeze(1) - p_neg) ** 2).sum(dim=-1)
-    sim_neg = -sq_dist_neg / tau_align                            # [NK, R]
-
-    # ── Partition function: log Z_i over positives ∪ negatives ───
-    sim_combined = torch.cat([sim_pos, sim_neg], dim=1)           # [NK, L + R]
-    log_Z = torch.logsumexp(sim_combined, dim=1)                  # [NK]
+    # ── Per-position positive sim, gathered from sim_pool ───────
+    # For each (seed i, walk position p), the positive's sim is
+    # sim_pool[i, pool_idx[i, p]]. Invalid positions get pool_idx=0,
+    # whose sim is real but is zero-weighted by w_pos below.
+    sim_pos = sim_pool.gather(dim=1, index=pool_idx)              # [NK, L]
     log_p_pos = sim_pos - log_Z.unsqueeze(1)                      # [NK, L]
 
     # ── Per-seed weighted-average cross-entropy ──────────────────

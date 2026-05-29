@@ -52,6 +52,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+from prodigyopt import Prodigy
 from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
@@ -85,18 +86,6 @@ class TrainerConfig:
     tau_align: float = 0.5      # InfoNCE alignment temperature
     tau_link: float = 1.0       # Softmax-CE link-prediction temperature
     beta_time: float = 1.0      # hop/time weight exponent
-    num_align_negatives: int = 128    # Sampled negatives per seed in
-                                      # the InfoNCE partition function.
-                                      # Frequency-weighted (count^0.75)
-                                      # from the pool's unique nodes.
-                                      # 128 chosen from the wiki K sweep
-                                      # (3 seeds × 50 ep): knee of the
-                                      # diminishing-returns curve — gains
-                                      # ~98% of K=512's test MRR at ~2.6×
-                                      # less compute and ~half the val std.
-                                      # Also the largest K that fits in
-                                      # ~7 GB at comment-scale NK≈15K on
-                                      # an 8 GB GPU (K=256+ OOMs there).
     K_train: int = 100          # Per-query training negatives. The link
                                 # head sees [B, 1+K_train] candidates per
                                 # query; positive at column 0.
@@ -219,10 +208,20 @@ class Trainer:
             + list(self.p_context.parameters())
             + list(self.link_head.parameters())
         )
-        self.optimizer = torch.optim.Adam(
+        # Prodigy: hyperparameter-free adaptive optimiser. Internally
+        # estimates the optimal step-size; the `lr` arg is a multiplier
+        # on the discovered scale and should be left at 1.0. The
+        # cosine warmup+decay LambdaLR below still modulates the
+        # effective step (schedule shape applies on top of Prodigy's
+        # discovered d_k). decouple=True gives AdamW-style weight decay.
+        # safeguard_warmup=True keeps d_k from over-shooting before the
+        # warmup phase has produced meaningful gradient statistics.
+        self.optimizer = Prodigy(
             params,
-            lr=config.lr,
+            lr=1.0,
             weight_decay=config.weight_decay,
+            decouple=True,
+            safeguard_warmup=True,
         )
 
         # LR scheduler is set up at the start of train() once we know
@@ -245,7 +244,14 @@ class Trainer:
         (5 ep — stays near peak) from full runs (50 ep — completes
         decay).
         """
-        peak_lr = float(self.config.lr)
+        # Prodigy treats `lr` as a multiplier on its internally
+        # discovered step-size d_k. The cosine LambdaLR rides on top
+        # of that multiplier — peak=1.0 leaves Prodigy free to scale
+        # by its discovery, while the schedule shape (warmup +
+        # cosine to a small ratio) anneals the multiplier near end
+        # of training. lr_min_ratio is computed against peak=1.0,
+        # so config.lr_min is interpreted directly as the floor.
+        peak_lr = 1.0
         lr_min = float(self.config.lr_min)
 
         decay_steps = self.config.decay_horizon_epochs * max(batches_per_epoch, 1)
@@ -255,8 +261,6 @@ class Trainer:
         )
         warmup_steps = max(warmup_steps, 1)
 
-        # Set optimizer base lr to peak so the lambda returns a [0, 1]
-        # scaling factor relative to peak.
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = peak_lr
             param_group["initial_lr"] = peak_lr
@@ -266,8 +270,8 @@ class Trainer:
         self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
         self._global_step = 0
         print(
-            f"  LR schedule: peak={peak_lr:.2e}, min={lr_min:.2e}, "
-            f"warmup={warmup_steps} steps, "
+            f"  LR schedule (Prodigy multiplier): peak={peak_lr:.2e}, "
+            f"min={lr_min:.2e}, warmup={warmup_steps} steps, "
             f"decay_horizon={decay_steps} steps "
             f"({self.config.decay_horizon_epochs} epochs × "
             f"{batches_per_epoch} batches)"
@@ -342,7 +346,6 @@ class Trainer:
             beta=self.config.beta_time,
             tau_align=self.config.tau_align,
             node_feat=self.node_feat,
-            num_align_negatives=self.config.num_align_negatives,
         )
 
         # Step 3: per-query negatives. Sampler returns [B, K_train]
@@ -381,16 +384,9 @@ class Trainer:
         l_link = F.cross_entropy(logits / self.config.tau_link, target)
 
         # Step 5 + 6: total loss + single backward + step.
-        # Projections are unbounded (no L2 norm or LayerNorm at the
-        # head); the contrastive loss can blow up gradient magnitudes,
-        # so clip the global grad norm to 1.0 to keep training stable.
         l_total = l_align + l_link
         self.optimizer.zero_grad(set_to_none=True)
         l_total.backward()
-        torch.nn.utils.clip_grad_norm_(
-            [p for g in self.optimizer.param_groups for p in g["params"]],
-            max_norm=1.0,
-        )
         self.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()

@@ -9,7 +9,7 @@ Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root, --is-directed
   Model:          --d-emb, --d-proj
   Loss:           --tau-align, --tau-link, --beta-time,
-                  --num-align-negatives, --k-train
+                  --k-train
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias,
                   --start-bias, --max-time-capacity
   Negatives:      --hist-neg-ratio, --reservoir-size
@@ -84,16 +84,6 @@ def parse_args() -> argparse.Namespace:
              "ranking loss). Default 1.0 — pending a sweep.",
     )
     p.add_argument("--beta-time", default=1.0, type=float)
-    p.add_argument(
-        "--num-align-negatives", type=int, default=128,
-        help="Number of sampled negatives per seed in InfoNCE "
-             "alignment loss. Higher = sharper contrastive signal "
-             "but more memory. Sweepable. Default 128 — from the "
-             "wiki K sweep (3 seeds × 50 ep), knee of the diminishing-"
-             "returns curve; ~98% of K=512's test MRR at ~2.6× less "
-             "compute and ~2× lower std. Largest K that fits on 8 GB "
-             "at comment-scale NK (K=256+ OOMs there).",
-    )
     p.add_argument(
         "--k-train", type=int, default=100,
         help="Per-query training negatives for the ranking link "
@@ -280,7 +270,6 @@ def main() -> Dict[str, Any]:
         tau_align=args.tau_align,
         tau_link=args.tau_link,
         beta_time=args.beta_time,
-        num_align_negatives=args.num_align_negatives,
         K_train=args.k_train,
 
         num_walks_per_node=args.num_walks_per_node,

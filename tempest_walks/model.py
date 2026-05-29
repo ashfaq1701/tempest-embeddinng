@@ -44,6 +44,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class EmbeddingTable(nn.Module):
@@ -127,7 +128,7 @@ class ProjectionHead(nn.Module):
         e: torch.Tensor,
         node_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Returns the raw merge MLP projection, shape e.shape[:-1] + [d_proj]."""
+        """Returns L2-normalised projection on the unit sphere."""
         if self.has_nf and node_feat is None:
             raise ValueError("ProjectionHead has NF channel but no NF passed")
         if not self.has_nf and node_feat is not None:
@@ -138,7 +139,8 @@ class ProjectionHead(nn.Module):
             branches.append(self.nf_mlp(node_feat))
 
         z = torch.cat(branches, dim=-1)
-        return self.merge(z)
+        out = self.merge(z)
+        return F.normalize(out, p=2, dim=-1, eps=1e-12)
 
 
 class LinkHead(nn.Module):
