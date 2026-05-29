@@ -75,8 +75,22 @@ def alignment_loss(
     walk_direction selects which side of the walk the seed sits on:
       "Backward_In_Time" — seed at lens-1, contexts at p < lens-1,
                            hop_dist = lens-1 - p.
+                           "Closest" position (highest 1/K_hop weight)
+                           is the LATEST predecessor — coincides with
+                           highest w_time. The two weights compound,
+                           biasing toward "recent past neighbours."
       "Forward_In_Time"  — seed at 0,      contexts at 0 < p < lens,
-                           hop_dist = p.
+                           hop_dist = lens-1 - p (NOT p).
+                           "Closest" position is the LATEST forward
+                           successor (position lens-1) — coincides
+                           with highest w_time. With hop_dist = p
+                           (an earlier convention), the two weights
+                           cancelled because position 1 is OLD
+                           in calendar time. The lens-1 - p form
+                           mirrors the backward semantics: both
+                           weights agree, biasing toward the latest
+                           forward edge of the seed (most predictive
+                           of the next link).
     Time/timestamp handling is the same in both — `t_min` and
     `T_train` are global and direction-independent; the only
     direction-specific bit on the time side is which slot holds the
@@ -113,7 +127,13 @@ def alignment_loss(
         ).clamp_min(1).float()                                    # [NK, L]
     else:  # Forward_In_Time
         is_context = (positions > 0) & (positions < lens.unsqueeze(1))
-        hop_dist = positions.clamp_min(1).float().expand(NK, L)
+        # K_hop = lens-1 - p (mirror of Backward) so the latest forward
+        # edge (position lens-1) is "closest" to seed in the loss sense.
+        # Compounds with w_time (which also peaks at the latest edges)
+        # rather than cancelling — see docstring for the rationale.
+        hop_dist = (
+            (lens - 1).unsqueeze(1) - positions
+        ).clamp_min(1).float()                                    # [NK, L]
     ctx_valid_mask = is_context.reshape(M)                        # [M]
 
     # Degenerate batch: no walk has any valid context position. Happens
