@@ -163,7 +163,16 @@ class Trainer:
             d_proj=config.d_proj,
             d_node_feat=config.d_node_feat,
         ).to(self.device)
-        self.p_context = ProjectionHead(
+        # Separate context projection per walk direction so each
+        # captures direction-specific context geometry. p_target is
+        # shared across directions (seeds project the same way
+        # regardless of which side they were sampled from).
+        self.p_context_backward = ProjectionHead(
+            d_emb=config.d_emb,
+            d_proj=config.d_proj,
+            d_node_feat=config.d_node_feat,
+        ).to(self.device)
+        self.p_context_forward = ProjectionHead(
             d_emb=config.d_emb,
             d_proj=config.d_proj,
             d_node_feat=config.d_node_feat,
@@ -208,7 +217,8 @@ class Trainer:
         params = (
             list(self.embedding_table.parameters())
             + list(self.p_target.parameters())
-            + list(self.p_context.parameters())
+            + list(self.p_context_backward.parameters())
+            + list(self.p_context_forward.parameters())
             + list(self.link_head.parameters())
         )
         # Prodigy: hyperparameter-free adaptive optimiser. Internally
@@ -344,7 +354,7 @@ class Trainer:
         l_align_bwd = alignment_loss(
             embedding_table=self.embedding_table,
             p_target=self.p_target,
-            p_context=self.p_context,
+            p_context=self.p_context_backward,
             walks=walks_bwd,
             t_min=self.config.t_min,
             T_train=self.config.T_train,
@@ -356,7 +366,7 @@ class Trainer:
         l_align_fwd = alignment_loss(
             embedding_table=self.embedding_table,
             p_target=self.p_target,
-            p_context=self.p_context,
+            p_context=self.p_context_forward,
             walks=walks_fwd,
             t_min=self.config.t_min,
             T_train=self.config.T_train,
@@ -438,7 +448,8 @@ class Trainer:
         Tempest state advances via post-scoring add_edges."""
         self.embedding_table.eval()
         self.p_target.eval()
-        self.p_context.eval()
+        self.p_context_backward.eval()
+        self.p_context_forward.eval()
         self.link_head.eval()
 
         total = 0.0
@@ -513,14 +524,16 @@ class Trainer:
         return {
             "embedding_table": self._cpu_state_dict(self.embedding_table),
             "p_target":        self._cpu_state_dict(self.p_target),
-            "p_context":       self._cpu_state_dict(self.p_context),
+            "p_context_backward": self._cpu_state_dict(self.p_context_backward),
+            "p_context_forward":  self._cpu_state_dict(self.p_context_forward),
             "link_head":       self._cpu_state_dict(self.link_head),
         }
 
     def _restore(self, snap: Dict[str, Any]) -> None:
         self.embedding_table.load_state_dict(snap["embedding_table"])
         self.p_target.load_state_dict(snap["p_target"])
-        self.p_context.load_state_dict(snap["p_context"])
+        self.p_context_backward.load_state_dict(snap["p_context_backward"])
+        self.p_context_forward.load_state_dict(snap["p_context_forward"])
         self.link_head.load_state_dict(snap["link_head"])
 
     # ──────────────────────────────────────────────────────────────────
@@ -560,7 +573,8 @@ class Trainer:
 
             self.embedding_table.train()
             self.p_target.train()
-            self.p_context.train()
+            self.p_context_backward.train()
+            self.p_context_forward.train()
             self.link_head.train()
 
             t0 = time.time()
