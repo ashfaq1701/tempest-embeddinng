@@ -11,9 +11,9 @@ ProjectionHead
   - Conditional architecture based on node-feature availability:
       E only   → MLP on E
       E + NF   → MLP on E + MLP on NF, concat, merge MLP
-  - Output is the raw merge MLP output (no L2 norm, no LayerNorm).
-    The contrastive loss uses squared L2 distance directly so both
-    direction and magnitude of the projection carry signal.
+  - Output is L2-normalised onto the unit sphere via
+    F.normalize(.., p=2, dim=-1). The alignment loss is squared L2
+    distance, which on the sphere equals 2 - 2*cos.
   - Two instances: P_target (for seed/downstream nodes) and
     P_context (for walk-internal/upstream nodes), each with its own
     parameters. Both heads have the same architecture.
@@ -71,19 +71,16 @@ class ProjectionHead(nn.Module):
         d_node_feat is not None).
       - Concat the active sub-MLP outputs along the last dim.
       - Merge MLP mixes back to d_proj.
-      - Output is the raw merge MLP output (no L2/LayerNorm). The
-        contrastive loss uses the squared L2 distance directly, so
-        both projection direction AND magnitude carry signal.
-        Gradient stability comes from the global grad-norm clip
-        at 1.0 in trainer.py.
+      - Output is L2-normalised onto the unit sphere via
+        F.normalize(.., p=2, dim=-1).
+
+    The alignment loss is squared L2 distance, which on the unit
+    sphere equals 2 - 2*cos — a monotone transform of cosine, so
+    L2-norm + l2_dist is equivalent to cosine sim up to a constant.
 
     Two instances are typically constructed: P_target (for
     seed/downstream nodes) and P_context (for walk-internal/upstream
     nodes), each with its own parameters.
-
-    Validated against L2-norm-on-output + cosine-loss and against
-    LayerNorm-on-output on tgbl-wiki 50ep seed=42: raw output +
-    L2-distance wins by +0.027 val vs the SimCLR-style baseline.
 
     Edge features were tested and consistently underperformed the
     no-EF baseline (val 0.397 no-EF vs ≤ 0.355 for every EF

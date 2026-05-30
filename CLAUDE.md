@@ -256,11 +256,11 @@ Historical (Vitter R) reservoir sampler.
 | `tau_align` | 0.5 | a-priori; validated by τ sweep on wiki (full-InfoNCE), re-validated under projection_norm=none + l2_dist (2026-05-28) |
 | `tau_link` | 1.0 | a-priori; pending a sweep on the new ranking link loss |
 | `beta_time` | 1.0 | a-priori; validated by β sweep on wiki (full-InfoNCE), re-validated under projection_norm=none + l2_dist (2026-05-28) |
-| `num_align_negatives` | 128 | wiki K sweep (3 seeds × 50 ep): knee of the diminishing-returns curve; ~98% of K=512's test MRR at ~2.6× less compute; lowest val std in sweep; largest K that fits on 8 GB at comment-scale NK |
+| Alignment pool | full unique-batch-node, count-weighted partition | Replaces the earlier `num_align_negatives` sampled-K partition. Closed-form equivalent of multinomial sampling under the count distribution, with zero sampling variance. Hardcoded — not a CLI knob |
 | `K_train` | 100 | ranking-loss convention (DPR-style, RotatE); larger K_train means harder per-query competition and stronger ranking gradients, at proportional compute cost |
 | `d_emb` | 128 | |
 | `d_proj` | 128 | |
-| ProjectionHead output | raw merge MLP output (no norm) | wiki single-seed sweep 2026-05-28 (see below): val 0.4556 vs L2-normed baseline 0.4289 (+0.027). Off-sphere L2-distance sim uses projection magnitude as signal; global grad-norm clip at 1.0 in trainer keeps magnitudes bounded. Hardcoded — not a CLI knob |
+| ProjectionHead output | L2-normalised on unit sphere | reverted from "no norm" (winning 2026-05-28 config) to L2-norm in the Prodigy + ranking-link-loss redesign (2026-05-30 sweep; see below). On the sphere, squared L2 distance equals 2-2*cos, so the alignment loss is cosine-equivalent up to a constant. Hardcoded — not a CLI knob |
 | Alignment sim | `-‖p_t − p_c‖² / tau_align` (L2-distance) | same sweep: equivalent to cosine on the unit sphere; off-sphere it carries strictly more information (magnitude + direction). Hardcoded — not a CLI knob |
 | Link loss | per-query softmax CE over [B, 1+K_train] candidates | replaces per-pair BCE; upper-bounds 1 − MRR (Bruch et al., ICTIR 2019). Hardcoded — not a CLI knob |
 | `num_walks_per_node` | 5 | DeepWalk/CTDNE convention |
@@ -356,3 +356,93 @@ Grad clip is load-bearing under unbounded projections. The clip is
 not "compressing useful magnitude information into noise" — it's
 suppressing destructive gradient overshoots that the unit-sphere
 constraint would have prevented implicitly. Keep `max_norm=1.0`.
+
+---
+
+## 9-variant fwd+bwd / picker / 1/K_hop sweep (2026-05-30)
+
+Single-seed (seed=42) sweep on tgbl-wiki, 50 ep, bs=500, Prodigy(lr=1.0),
+L2-norm projections, no grad clip, full-pool count-weighted alignment,
+K_train=300, tau_align=0.5, tau_link=1.0. Runs span three branches:
+`feature/ranking-link-loss` (canonical, single bwd), `feature/forward-
+backward-walks` (fwd+bwd, shared `p_context`), `feature/split-context-
+projections` (fwd+bwd, split `p_context_fwd`/`p_context_bwd`, +66k params).
+
+The fwd+bwd branches add a Forward_In_Time walk batch alongside the
+default Backward_In_Time one and sum both alignment losses. K_hop fix
+= use `K_hop = lens-1-p` on the fwd direction so the latest forward
+edge gets the highest `1/K_hop` weight (mirror of bwd; the earlier
+`K_hop = p` form cancelled `1/K_hop` against `w_time` because position
+1 is OLD in calendar time).
+
+Picker scheme axis. "default" = bwd: start=Uniform walk=ExpW; fwd:
+start=Uniform walk=ExpW. "per-direction" = bwd: start=ExpW walk=ExpIdx;
+fwd: start=Uniform walk=ExpW. Run E (single bwd, start=ExpW walk=ExpW)
+isolates the start-bias swap on bwd only.
+
+1/K_hop axis. With: `w = 1/K_hop + w_time^β`. Without (F, G, H):
+`w = w_time^β` only.
+
+| Run | Branch | Dir | p_ctx | bwd pickers | K_hop fix | 1/K_hop | val | test |
+|---|---|---|---|---|---|---|---|---|
+| 0   | rank-link-loss | bwd | (single) | Uniform/ExpW | n/a | ✓ | 0.4981 | **0.4525** |
+| 1   | fwd-bwd        | both | shared  | Uniform/ExpW | no  | ✓ | 0.4942 | 0.4487 |
+| 2   | split-ctx      | both | split   | Uniform/ExpW | no  | ✓ | 0.4899 | 0.4461 |
+| A2  | fwd-bwd        | both | shared  | Uniform/ExpW | yes | ✓ | 0.4952 | 0.4463 |
+| B2  | split-ctx      | both | split   | Uniform/ExpW | yes | ✓ | 0.4999 | 0.4486 |
+| E   | rank-link-loss | bwd | (single) | ExpW/ExpW    | n/a | ✓ | **0.5003** | 0.4472 |
+| C   | fwd-bwd        | both | shared  | ExpW/ExpIdx  | yes | ✓ | 0.4983 | 0.4361 |
+| D   | split-ctx      | both | split   | ExpW/ExpIdx  | yes | ✓ | 0.4936 | 0.4464 |
+| F   | rank-link-loss | bwd | (single) | ExpW/ExpW    | n/a | — | 0.4912 | 0.4463 |
+| G   | fwd-bwd        | both | shared  | ExpW/ExpIdx  | yes | — | 0.4915 | **0.4586** |
+| H   | split-ctx      | both | split   | ExpW/ExpIdx  | yes | — | 0.4961 | 0.4520 |
+
+### Read
+
+**Val** lives in a tight band [0.4899, 0.5003] — span 0.0104, all within
+the ±0.01 noise window. Test spreads wider [0.4361, 0.4586] — span
+0.0225, three real groups.
+
+**fwd+bwd walks** (1, 2, A2, B2) buy nothing over baseline by themselves.
+B2 (val 0.4999) ties baseline within noise on val but loses test by
+0.004. The K_hop fix (lens-1-p on fwd) gives A2 a +0.001/+0.000 nudge
+vs Run 1 — within noise.
+
+**Split p_context** (2, B2, D, H) doesn't justify its +66k params. The
+best of the split family (B2) ties baseline on val and trails on test;
+H is the one bright spot at test 0.4520 ≈ baseline.
+
+**Per-direction pickers** (ExpIdx walk-bias on bwd; C vs A2, D vs B2):
+val flat (C +0.003), test consistently *lost* 0.002–0.010. The
+ExpIdx walk-bias doesn't help on this dataset; the ExpW-start swap
+on bwd (clean isolation in E vs 0) is also tied / slight test hit.
+
+**1/K_hop ablation** is the structural surprise:
+- F (single bwd): val −0.007, test −0.001 vs E parent — small regression.
+- G (fwd+bwd shared): val −0.007, test **+0.022** vs C parent, and
+  **+0.006 vs baseline test** — the highest test of all 11 runs.
+- H (fwd+bwd split): val **+0.002**, test **+0.006** vs D parent;
+  ties baseline test.
+
+Pattern: under single-bwd, `1/K_hop` carries small useful signal.
+Under fwd+bwd, dropping `1/K_hop` *helps* — likely because the
+duplicated walk sampling already supplies position-locality signal,
+and `1/K_hop` over-weights near-seed contexts to no extra benefit.
+
+### Recommendation
+
+Within ±0.01 → simpler wins. **Baseline (Run 0) is the recommended
+ship config**: val 0.4981 (within 0.002 of leader E), test 0.4525
+(highest among "settled" non-G runs), no added complexity. The
+sweep has falsified fwd+bwd walks, split `p_context`, per-direction
+pickers, and the ExpIdx walk-bias on bwd as standalone improvements.
+
+**Open hypothesis worth multi-seed verification**: G's test 0.4586
+(+0.006 over baseline) under "fwd+bwd + no 1/K_hop". Needs ≥ 3 seeds
+to separate from variance before committing — single-seed at this
+noise level is suggestive, not conclusive. A clean follow-up is
+"fwd+bwd shared + default pickers + no 1/K_hop" (isolates the
+no-1/K_hop change from the picker swap).
+
+Log paths under `logs/ranking_link/wiki_seed42_{run0,run1,...,runH}_*.log`;
+canonical CSV at `logs/experiments_summary.csv`.
