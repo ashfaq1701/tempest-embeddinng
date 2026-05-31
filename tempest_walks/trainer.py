@@ -93,7 +93,7 @@ class TrainerConfig:
     num_walks_per_node: int = 5
     max_walk_len: int = 20
     walk_bias: str = "ExponentialWeight"
-    start_bias: str = "Uniform"
+    start_bias: str = "ExponentialWeight"
     max_time_capacity: int = -1     # Tempest sliding-window eviction
                                     # in raw timestamp units; -1 = unbounded.
 
@@ -314,18 +314,15 @@ class Trainer:
         device = self.device
 
         # Step 1: walks from PRE-INGEST state.
-        # Seed selection depends on directedness:
-        #  - undirected: seeds = unique(src ∪ tgt). Both endpoints are
-        #    symmetric roles; walking from either captures the local
-        #    neighbourhood equally.
-        #  - directed:   seeds = unique(tgt). TGB ranks candidate dsts
-        #    given a fixed src, so the dst side is what gets scored;
-        #    walking from the dst follows its incoming-edge history,
-        #    which is the predictive signal for "which dst did src hit".
-        if self.config.is_directed:
-            seeds_np = np.unique(batch.tgt)
-        else:
-            seeds_np = np.unique(np.concatenate([batch.src, batch.tgt]))
+        # Seeds are always the unique batch targets (regardless of
+        # is_directed). TGB ranks candidate dsts given a fixed src at
+        # eval, so the dst side is what gets scored; walking only from
+        # the dst follows its incoming-edge history — the predictive
+        # signal for "which dst did src hit". The undirected variant
+        # (seeds = unique(src ∪ tgt)) gives ~2× the alignment signal
+        # per batch but did not improve test on wiki (50ep seed=42
+        # 2026-05-31 sweep).
+        seeds_np = np.unique(batch.tgt)
         walks = self.walk_gen.walks_for_nodes(seeds_np)
 
         # Step 2: InfoNCE contrastive alignment over batched walks.

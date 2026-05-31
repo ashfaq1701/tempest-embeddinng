@@ -96,7 +96,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-walks-per-node", default=5, type=int)
     p.add_argument("--max-walk-len", default=20, type=int)
     p.add_argument("--walk-bias", default="ExponentialWeight", type=str)
-    p.add_argument("--start-bias", default="Uniform", type=str)
+    p.add_argument("--start-bias", default="ExponentialWeight", type=str)
     p.add_argument(
         "--max-time-capacity", default=-1, type=int,
         help="Tempest sliding-window eviction in raw timestamp units. "
