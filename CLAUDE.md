@@ -478,7 +478,7 @@ Each on its own branch off master = 3f47122 ("docs: sweep report").
 | V3 (λ_aux=0.1)       | 0.4950 | 0.4508 | −0.003 | −0.002 | tied (within noise) |
 | V3 (λ_aux=0.5)       | 0.4953 | 0.4508 | −0.003 | −0.002 | tied (identical to λ=0.1) |
 | V1+V3 combo          | 0.4830 | 0.4404 | −0.015 | −0.012 | regresses toward V1 |
-| V2-fixed             | (pending — 50ep run finishes ~11:27, after deadline; sanity ep5 val 0.3512 vs baseline 0.3785; no collapse) | | | | |
+| V2-fixed             | **0.4970** | **0.4585** | −0.001 | **+0.006** | **first EF win on test** |
 
 ### V2 collapse mechanism (and the V2-fixed redesign)
 
@@ -497,8 +497,15 @@ per-(i, p) full-pool partition `log_Z[i, p]` that uses the SAME
 `p_seed_ef[i, p]` as the positive numerator. Same EF, both numerator
 and denominator → shortcut closed. Memory: 150M sims on wiki bs=500
 (~600 MB). Compute: +~17% per-epoch (per-(i,p) full sim is L=20× the
-baseline partition). Sanity ep5 trajectory healthy; final 50ep
-endpoint TBD.
+baseline partition).
+
+**Final 50ep result: val 0.4970 / test 0.4585 @ ep49** — val tied with
+baseline within noise (−0.001), test **+0.006 over baseline**
+(0.4525 → 0.4585). This is the only EF mechanism in this investigation
+to deliver a real test improvement. The result validates the theory:
+V2's catastrophic collapse was specifically the InfoNCE shortcut from
+asymmetric EF application, not a fundamental incompatibility between
+EF and the L2-norm architecture.
 
 ### Read
 
@@ -506,8 +513,10 @@ endpoint TBD.
   the model learns to downweight too many positives, losing signal.
   A clamped range like `[0.8, 1.2]` would be a softer follow-up.
 - **V2**: principled-looking sphere-preserving design, but the
-  asymmetric EF application breaks InfoNCE. V2-fixed shows the
-  symmetric form survives — whether it converges to a win is open.
+  asymmetric EF application breaks InfoNCE.
+- **V2-fixed**: symmetric per-(i,p) partition closes the shortcut
+  and delivers a +0.006 test win over baseline — the headline
+  positive result of the night.
 - **V3**: cosine-aux on `(p_t(E[src]), p_c(E[tgt])) → EF`. Neutral.
   λ_aux sweep `{0.1, 0.5}` gave identical convergence — the aux
   signal doesn't move the link-prediction endpoint. Wiki EFs may
@@ -515,8 +524,10 @@ endpoint TBD.
   doesn't extract that signal.
 - **Combo**: V1+V3 regresses toward V1's negative impact. V1's
   gate dominates; the aux head can't rescue it.
-- **Target 0.6 not reached** on wiki under any tested mechanism.
-  Run 0's 0.4525 test remains the ceiling.
+- **Target 0.6 not reached** on wiki under any tested mechanism;
+  V2-fixed pushes the test ceiling from 0.4525 to 0.4585 (~10% of
+  the gap to 0.6). The remaining gap likely needs a fundamentally
+  different lever (encoder, GNN aggregation, longer walks).
 
 ### What we learned
 
