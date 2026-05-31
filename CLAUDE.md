@@ -514,9 +514,11 @@ EF and the L2-norm architecture.
   A clamped range like `[0.8, 1.2]` would be a softer follow-up.
 - **V2**: principled-looking sphere-preserving design, but the
   asymmetric EF application breaks InfoNCE.
-- **V2-fixed**: symmetric per-(i,p) partition closes the shortcut
-  and delivers a +0.006 test win over baseline — the headline
-  positive result of the night.
+- **V2-fixed**: symmetric per-(i,p) partition closes the shortcut.
+  Single-seed +0.006 test over baseline (0.4525 → 0.4585) but val
+  tied (−0.001). User judgment: +0.006 single-seed is inside the
+  noise band — not enough to justify the +17% per-epoch cost or
+  the architectural complexity without multi-seed confirmation.
 - **V3**: cosine-aux on `(p_t(E[src]), p_c(E[tgt])) → EF`. Neutral.
   λ_aux sweep `{0.1, 0.5}` gave identical convergence — the aux
   signal doesn't move the link-prediction endpoint. Wiki EFs may
@@ -524,10 +526,12 @@ EF and the L2-norm architecture.
   doesn't extract that signal.
 - **Combo**: V1+V3 regresses toward V1's negative impact. V1's
   gate dominates; the aux head can't rescue it.
-- **Target 0.6 not reached** on wiki under any tested mechanism;
-  V2-fixed pushes the test ceiling from 0.4525 to 0.4585 (~10% of
-  the gap to 0.6). The remaining gap likely needs a fundamentally
-  different lever (encoder, GNN aggregation, longer walks).
+- **Working conclusion: EFs are dead weight on wiki** under all
+  five mechanisms tested. Target 0.6 unreached; V2-fixed's +0.006
+  single-seed test edge does not survive the noise threshold for
+  this project. The remaining gap to 0.6 needs a fundamentally
+  different lever (encoder, GNN aggregation, longer walks) — not
+  more EF utilization attempts.
 
 ### What we learned
 
