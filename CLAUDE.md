@@ -446,3 +446,108 @@ no-1/K_hop change from the picker swap).
 
 Log paths under `logs/ranking_link/wiki_seed42_{run0,run1,...,runH}_*.log`;
 canonical CSV at `logs/experiments_summary.csv`.
+
+---
+
+## EF utilization investigation (2026-05-31 overnight)
+
+Overnight investigation of three EF-injection mechanisms on wiki
+seed=42 single-run. Goal was to find a clean win over baseline
+Run 0 (val 0.4981 / test 0.4525). Spoiler: none of the three
+mechanisms (or their combination) broke through baseline on wiki.
+
+### Variants
+
+Each on its own branch off master = 3f47122 ("docs: sweep report").
+
+| Variant | Branch | Mechanism |
+|---|---|---|
+| V1  | `feature/ef-v1-weighted`   | EFWeightHead: `w[i,p] *= 2σ(MLP(LN(EF[p])))` — sphere-side-agnostic per-position gate on loss weight |
+| V2  | `feature/ef-v2-context`    | EF-conditioned p_context: sphere-preserving `F.normalize(p_node + α·F.normalize(MLP(EF)))` |
+| V3  | `feature/ef-v3-aux`        | EFPredHead aux loss: predict unit-normed EF direction from `(p_t(E[src]), p_c(E[tgt]))`; cosine 1−cos loss; λ_aux=0.1 |
+| combo | `feature/ef-combo-v1-v3-v2` | V1 + V3 stacked |
+| V2-fixed | `feature/ef-v2-fixed`   | EF moved to p_target with per-(i,p) symmetric partition (closes V2's InfoNCE shortcut) |
+
+### Results
+
+| Variant | val | test | Δval | Δtest | Verdict |
+|---|---|---|---|---|---|
+| **Baseline (Run 0)** | **0.4981** | **0.4525** | — | — | reference |
+| V1 (EF weight-gate)  | 0.4857 | 0.4299 | −0.012 | −0.023 | regression |
+| V2 (EF on p_context) | 0.0197 | 0.0150 | — | — | **DEGENERATE COLLAPSE** |
+| V3 (λ_aux=0.1)       | 0.4950 | 0.4508 | −0.003 | −0.002 | tied (within noise) |
+| V3 (λ_aux=0.5)       | 0.4953 | 0.4508 | −0.003 | −0.002 | tied (identical to λ=0.1) |
+| V1+V3 combo          | 0.4830 | 0.4404 | −0.015 | −0.012 | regresses toward V1 |
+| V2-fixed             | (pending — 50ep run finishes ~11:27, after deadline; sanity ep5 val 0.3512 vs baseline 0.3785; no collapse) | | | | |
+
+### V2 collapse mechanism (and the V2-fixed redesign)
+
+V2 sanity at ep2 yielded val 0.0197 / link loss 33.9 / align loss 3.9
+— catastrophic. The diagnostic was: at init, V2's per-position
+sim matches the baseline gather-path within 0.012 (the α=0.01
+perturbation is well-behaved). But during training, α grows and the
+EF-MLP learns to align `ef_proj` toward `p_seed`. Since the partition
+`log_Z` uses pool projections **without** EF, the model can drive
+`sim_pos` arbitrarily high without raising the partition. The
+asymmetric loss has a free lunch → InfoNCE shortcut → embedding
+collapse.
+
+**V2-fixed** moves the EF channel to `p_target` and computes a
+per-(i, p) full-pool partition `log_Z[i, p]` that uses the SAME
+`p_seed_ef[i, p]` as the positive numerator. Same EF, both numerator
+and denominator → shortcut closed. Memory: 150M sims on wiki bs=500
+(~600 MB). Compute: +~17% per-epoch (per-(i,p) full sim is L=20× the
+baseline partition). Sanity ep5 trajectory healthy; final 50ep
+endpoint TBD.
+
+### Read
+
+- **V1**: the gate (range [0, 2] via `2σ(MLP(EF))`) is too aggressive;
+  the model learns to downweight too many positives, losing signal.
+  A clamped range like `[0.8, 1.2]` would be a softer follow-up.
+- **V2**: principled-looking sphere-preserving design, but the
+  asymmetric EF application breaks InfoNCE. V2-fixed shows the
+  symmetric form survives — whether it converges to a win is open.
+- **V3**: cosine-aux on `(p_t(E[src]), p_c(E[tgt])) → EF`. Neutral.
+  λ_aux sweep `{0.1, 0.5}` gave identical convergence — the aux
+  signal doesn't move the link-prediction endpoint. Wiki EFs may
+  simply not predict link existence well, or this architecture
+  doesn't extract that signal.
+- **Combo**: V1+V3 regresses toward V1's negative impact. V1's
+  gate dominates; the aux head can't rescue it.
+- **Target 0.6 not reached** on wiki under any tested mechanism.
+  Run 0's 0.4525 test remains the ceiling.
+
+### What we learned
+
+1. **L2-norm projection constrains EF**: magnitude is renormalized
+   away, so EF must encode through direction only. Sphere-preserving
+   operations (slerp, `normalize(p + α·normalize(ef))`) are the right
+   primitives — but they don't guarantee InfoNCE math survives
+   (V2 vs V2-fixed).
+2. **Asymmetric loss modifications break InfoNCE**: any EF
+   contribution to the positive numerator must be matched in the
+   partition denominator, or the model finds a free-lunch shortcut.
+3. **EF prediction is decoupled from link prediction utility on
+   wiki**: V3's aux loss decreases steadily (0.75 → 0.62) but
+   doesn't carry over to val/test improvement. The aux head learns
+   EF prediction, but those gradients don't make E better at link
+   prediction.
+4. **Wiki's LIWC-style EFs may genuinely not carry link-existence
+   signal**, or this architecture's representational capacity for
+   exploiting them is exhausted. A multi-dataset replication on
+   `tgbl-coin` / `tgbl-flight` (different EF semantics) would
+   disambiguate.
+
+### Open follow-ups
+
+- V2-fixed full 50ep landing → whether the symmetric form delivers
+  any improvement over baseline.
+- V1 with clamped gate range (`[0.8, 1.2]` instead of `[0, 2]`) —
+  cheap, tests if V1's negative was over-aggression.
+- Multi-seed V3 (3 seeds × 50ep) to confirm "tied within noise"
+  is stable, not seed-42-specific.
+- Re-run on a non-wiki dataset where EFs have different semantics.
+
+Log paths: `logs/ef_experiments/wiki_seed42_v{1,2,3,1_v3_combo,
+v3_lambda_0p5,v2_fixed}_*.log`. CSV: `logs/experiments_summary.csv`.
