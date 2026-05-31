@@ -70,13 +70,18 @@ class ProjectionHead(nn.Module):
       - One sub-MLP per active input channel (E always; NF if
         d_node_feat is not None).
       - Concat the active sub-MLP outputs along the last dim.
-      - Merge MLP mixes back to d_proj.
+      - Merge MLP mixes back to d_emb.
       - Output is L2-normalised onto the unit sphere via
         F.normalize(.., p=2, dim=-1).
 
     The alignment loss is squared L2 distance, which on the unit
     sphere equals 2 - 2*cos — a monotone transform of cosine, so
     L2-norm + l2_dist is equivalent to cosine sim up to a constant.
+
+    Projection dim is fixed equal to the embedding dim. The earlier
+    d_proj knob was always set equal to d_emb in practice and only
+    added an unused degree of freedom; collapsing it removes the
+    knob without changing behaviour for any past run.
 
     Two instances are typically constructed: P_target (for
     seed/downstream nodes) and P_context (for walk-internal/upstream
@@ -90,34 +95,33 @@ class ProjectionHead(nn.Module):
     def __init__(
         self,
         d_emb: int,
-        d_proj: int,
         d_node_feat: Optional[int] = None,
         d_hidden: Optional[int] = None,
     ):
         super().__init__()
         if d_hidden is None:
-            d_hidden = d_proj
+            d_hidden = d_emb
 
         self.has_nf = d_node_feat is not None
 
         self.e_mlp = nn.Sequential(
             nn.Linear(d_emb, d_hidden),
             nn.GELU(),
-            nn.Linear(d_hidden, d_proj),
+            nn.Linear(d_hidden, d_emb),
         )
 
         if self.has_nf:
             self.nf_mlp = nn.Sequential(
                 nn.Linear(d_node_feat, d_hidden),
                 nn.GELU(),
-                nn.Linear(d_hidden, d_proj),
+                nn.Linear(d_hidden, d_emb),
             )
 
         n_branches = 1 + int(self.has_nf)
         self.merge = nn.Sequential(
-            nn.Linear(n_branches * d_proj, d_hidden),
+            nn.Linear(n_branches * d_emb, d_hidden),
             nn.GELU(),
-            nn.Linear(d_hidden, d_proj),
+            nn.Linear(d_hidden, d_emb),
         )
 
     def forward(

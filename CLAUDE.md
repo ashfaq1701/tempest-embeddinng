@@ -259,7 +259,7 @@ Historical (Vitter R) reservoir sampler.
 | Alignment pool | full unique-batch-node, count-weighted partition | Replaces the earlier `num_align_negatives` sampled-K partition. Closed-form equivalent of multinomial sampling under the count distribution, with zero sampling variance. Hardcoded — not a CLI knob |
 | `K_train` | 100 | ranking-loss convention (DPR-style, RotatE); larger K_train means harder per-query competition and stronger ranking gradients, at proportional compute cost |
 | `d_emb` | 128 | |
-| `d_proj` | 128 | |
+| `d_proj` | — | Removed; projection dim is now hardcoded to `d_emb` in ProjectionHead. The knob was always set equal to `d_emb` in practice, so collapsing it is behaviour-preserving. |
 | ProjectionHead output | L2-normalised on unit sphere | reverted from "no norm" (winning 2026-05-28 config) to L2-norm in the Prodigy + ranking-link-loss redesign (2026-05-30 sweep; see below). On the sphere, squared L2 distance equals 2-2*cos, so the alignment loss is cosine-equivalent up to a constant. Hardcoded — not a CLI knob |
 | Alignment sim | `-‖p_t − p_c‖² / tau_align` (L2-distance) | same sweep: equivalent to cosine on the unit sphere; off-sphere it carries strictly more information (magnitude + direction). Hardcoded — not a CLI knob |
 | Link loss | per-query softmax CE over [B, 1+K_train] candidates | replaces per-pair BCE; upper-bounds 1 − MRR (Bruch et al., ICTIR 2019). Hardcoded — not a CLI knob |

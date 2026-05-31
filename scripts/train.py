@@ -7,7 +7,7 @@ repeatedly with different CLI args.
 
 Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root, --is-directed
-  Model:          --d-emb, --d-proj
+  Model:          --d-emb
   Loss:           --tau-align, --tau-link, --beta-time,
                   --k-train
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias,
@@ -71,7 +71,6 @@ def parse_args() -> argparse.Namespace:
 
     # Model.
     p.add_argument("--d-emb", default=128, type=int)
-    p.add_argument("--d-proj", default=128, type=int)
 
     # Loss.
     p.add_argument(
@@ -265,7 +264,6 @@ def main() -> Dict[str, Any]:
         d_node_feat=d_node_feat,
 
         d_emb=args.d_emb,
-        d_proj=args.d_proj,
 
         tau_align=args.tau_align,
         tau_link=args.tau_link,

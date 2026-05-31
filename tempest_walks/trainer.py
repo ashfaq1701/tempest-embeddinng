@@ -80,7 +80,6 @@ class TrainerConfig:
 
     # Model.
     d_emb: int = 128
-    d_proj: int = 128
 
     # Loss-formulation.
     tau_align: float = 0.5      # InfoNCE alignment temperature
@@ -157,12 +156,10 @@ class Trainer:
         ).to(self.device)
         self.p_target = ProjectionHead(
             d_emb=config.d_emb,
-            d_proj=config.d_proj,
             d_node_feat=config.d_node_feat,
         ).to(self.device)
         self.p_context = ProjectionHead(
             d_emb=config.d_emb,
-            d_proj=config.d_proj,
             d_node_feat=config.d_node_feat,
         ).to(self.device)
         self.link_head = LinkHead(d_emb=config.d_emb).to(self.device)
