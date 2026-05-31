@@ -332,6 +332,21 @@ def main() -> Dict[str, Any]:
     print(f"  best_val_mrr:      {result['best_val_mrr']:.4f}")
     print(f"  best_test_mrr:     {result['best_test_mrr']:.4f}")
 
+    # TEMP: dump the (best-weights-restored) embedding table for analysis.
+    # Uncommitted — revert before merging or release.
+    import os
+    emb_dir = pathlib.Path("logs/embeddings")
+    emb_dir.mkdir(parents=True, exist_ok=True)
+    emb_path = emb_dir / (
+        f"{args.dataset}_seed{args.seed}_demb{args.d_emb}"
+        f"_ep{result['stopped_at_epoch']}.npy"
+    )
+    np.save(
+        emb_path,
+        trainer.embedding_table.E.weight.detach().cpu().numpy(),
+    )
+    print(f"  embedding_table:   saved to {emb_path}")
+
     return result
 
 
