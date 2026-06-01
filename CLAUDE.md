@@ -566,3 +566,100 @@ EF and the L2-norm architecture.
 
 Log paths: `logs/ef_experiments/wiki_seed42_v{1,2,3,1_v3_combo,
 v3_lambda_0p5,v2_fixed}_*.log`. CSV: `logs/experiments_summary.csv`.
+
+---
+
+## Link-head architecture variants (2026-06-01)
+
+Single-seed (seed=42) sweep on tgbl-wiki, 50 ep, bs=500, Prodigy(lr=1.0),
+L2-norm projections, K_train=300, start_bias=Uniform, warmup_steps_cap=50,
+tau_align=0.5, tau_link=1.0. Same baseline config as the canonical Run 0.
+
+Goal: test whether the current 574k-param "bilinear + 6-channel pair-MLP"
+LinkHead is carrying real signal or sitting on top of an already
+similarity-aligned `E`. Four similarity-based variants on
+`feature/link-head-variants` (branch commit `5fdf665`), each with a
+learnable temperature τ = exp(log_tau):
+
+| Variant | Form | Params |
+|---|---|---|
+| **LH-A** `inner_product`  | `(u·v) / τ`                                         | 1 |
+| **LH-B** `scaled_cosine`  | `(normalize(u) · w · normalize(v)) / τ`             | 129 |
+| **LH-C** `distmult`       | `(u · w · v) / τ`                                   | 129 |
+| **LH-D** `bilinear_only`  | `((W u) · v + b) / τ`                               | 16,386 |
+| Baseline (`pair_mlp`)     | `(u · W_bil · v + b) + MLP([u,v,u·v,|u−v|,(u−v)²,u+v])` | 574,466 |
+
+### Results
+
+| Variant | Best val | Best test | Δval | Δtest | Best ep |
+|---|---|---|---|---|---|
+| **Baseline `pair_mlp` (Run 0)** | **0.4981** | **0.4525** | — | — | — |
+| LH-A `inner_product`  | 0.1133 | 0.0972 | **−0.385** | **−0.355** | 42 |
+| LH-B `scaled_cosine`  | 0.4398 | 0.4063 | −0.058 | −0.046 | 32 |
+| LH-C `distmult`       | 0.2874 | 0.2310 | −0.211 | −0.222 | 37 |
+| LH-D `bilinear_only`  | 0.3840 | 0.3413 | −0.114 | −0.111 | 48 |
+
+### Read
+
+**Ranking:** `pair_mlp` >> `scaled_cosine` > `bilinear_only` > `distmult` >> `inner_product`.
+
+**No variant beat baseline.** The 574k-param pair-MLP is not dead
+weight. Even the most expressive variant tested (`bilinear_only`
+at 16k params) trails baseline by −0.114 val. Within ±0.01 noise
+band: none qualify. Baseline stays the recommended ship config.
+
+**The load-bearing component is L2-normalisation, not algebraic
+richness.** The clearest signal in the sweep is `scaled_cosine`
+(129 params, L2-normalises both sides) recovering ~88% of
+baseline's val while `distmult` (same 129 params, no normalisation)
+collapses to 0.287. Same scoring form (`u · w · v`); the only
+difference is the `F.normalize(·)` calls. That 0.152 val gap
+isolates the contribution of unit-sphere geometry inside the head.
+
+`bilinear_only` (16k params, no normalisation) lands between
+`distmult` and `scaled_cosine` — extra algebraic capacity recovers
+some signal vs `distmult` but cannot compensate for the missing
+normalisation. The pair-MLP's 4 hidden layers presumably learn
+implicit normalisation alongside the scoring; without it, raw-`E`
+magnitudes wreck cosine-style discrimination.
+
+**`inner_product` collapse.** Raw `E[u]·E[v]/τ` (1 param, no W, no
+normalisation) lands at val 0.11. The alignment loss only enforces
+sphere geometry on the **projections** `p_t(E)` and `p_c(E)`, not on
+`E` itself — `E` has no inner-product structure without a learned
+transform in the head. Confirms that the link path cannot bypass
+the projection layer's geometric work.
+
+### What the experiment falsifies
+
+- "The current LinkHead is overkill on top of an already similarity-
+  aligned E" — false. Removing the pair-MLP costs at least −0.11
+  val (the bilinear_only floor) and up to −0.39 val (inner_product).
+- "A simple sphere-aware head can replace the pair-MLP" — partially
+  false. `scaled_cosine` recovers most of the signal at 129 params
+  but still falls −0.058 val short; outside the ≥+0.015 ship
+  threshold and on the wrong side of zero.
+
+### What the experiment doesn't answer
+
+- Whether a **higher-capacity** similarity head (e.g., stacked FiLM
+  conditioning, mixture-of-bases bilinear, time-conditioned
+  scoring) could match or beat pair_mlp. The four variants tested
+  are *minimalist* options; the "is the embedding inner-product-
+  ready?" probe is answered (no), but the "what richer scoring
+  form is right?" question remains open.
+- Whether the pair-MLP's signal is in the **6-channel pair features**
+  (`u*v, |u−v|, (u−v)², u+v`) or in the **MLP depth**. Two cheap
+  follow-ups would isolate this: (a) bilinear + single hidden layer
+  on pair feats, (b) deep MLP on `[u, v]` concat only.
+
+### Conclusion
+
+Ship baseline (`pair_mlp`). The next architectural lever for
+exceeding baseline is unlikely to live in *simpler* heads — it
+lives in *richer* mechanisms (time-conditioned projections,
+walk-encoder integration, or pair-history features upstream).
+
+Log paths: `logs/link_head/wiki_seed42_{inner_product,scaled_cosine,
+distmult,bilinear_only}_20260601_144414.log`. Branch:
+`feature/link-head-variants` (not merged; experimental).
