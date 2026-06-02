@@ -85,6 +85,16 @@ class TrainerConfig:
     K_train: int = 100          # Per-query training negatives. The link
                                 # head sees [B, 1+K_train] candidates per
                                 # query; positive at column 0.
+    alignment_chunk_size: int = 8192
+                                # Slices the unique-pool dimension V when
+                                # computing the InfoNCE partition. Each
+                                # chunk's forward is checkpointed, so
+                                # backward peak memory is bounded by
+                                # O(NK · chunk_size) rather than O(NK · V).
+                                # When V ≤ chunk_size the loop runs once
+                                # and the behaviour reduces to the dense
+                                # path. 8192 fits wiki/coin in one chunk
+                                # and bounds review's pathological pools.
 
     # Convex-combination stationary recency weight (replaces the old
     # additive 1/K_hop + t̃^β formulation). γ ∈ [0, 1] mixes the hop
@@ -345,6 +355,7 @@ class Trainer:
             gamma_recency=self.config.gamma_recency,
             tau_align=self.config.tau_align,
             node_feat=self.node_feat,
+            chunk_size=self.config.alignment_chunk_size,
         )
 
         # Step 3: per-query negatives. Sampler returns [B, K_train]

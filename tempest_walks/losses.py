@@ -57,6 +57,7 @@ Notes:
 from typing import Optional
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from .walks import WalkData
 
@@ -74,6 +75,7 @@ def alignment_loss(
     gamma_recency: float = 0.4,
     tau_align: float = 0.5,
     node_feat: Optional[torch.Tensor] = None,
+    chunk_size: int = 8192,
 ) -> torch.Tensor:
     """Returns ℒ as a scalar graph-attached tensor. See module docstring.
 
@@ -84,6 +86,19 @@ def alignment_loss(
     reparameterisation, but the scalar was observed to collapse toward
     zero under longer runs without improving val MRR, so it's now
     frozen.
+
+    `chunk_size` slices the unique-pool dimension V when computing the
+    InfoNCE partition log Z(s_i). Forward computes log Z via streaming
+    logsumexp, and each chunk's forward is wrapped in
+    torch.utils.checkpoint.checkpoint(use_reentrant=False) so its
+    intermediates (the [NK, chunk_size] phi tensor in particular) are
+    discarded after the chunk runs and re-materialised on demand in
+    backward. Peak activation memory drops from O(NK · V) to
+    O(NK · chunk_size). When V ≤ chunk_size the loop runs once and the
+    behaviour reduces to the dense path (up to fp summation order in
+    the running max/sumexp). The positive numerator is computed
+    directly at pool_idx positions and never materialises the
+    [NK, V] tensor.
     """
     device = embedding_table.E.weight.device
     nodes = walks.nodes.to(device).long()                         # [NK, L]
@@ -164,19 +179,64 @@ def alignment_loss(
         b = p_context(e_pool)                                     # [V, d]
 
     # φ(s_i, v) = -‖a_i - b_v‖² / τ,  with ‖a-b‖² = ‖a‖² + ‖b‖² - 2 ⟨a, b⟩
+    # sq_a / sq_b are tiny and reused across chunks → compute outside the loop.
     sq_a = (a * a).sum(dim=-1, keepdim=True)                      # [NK, 1]
-    sq_b = (b * b).sum(dim=-1).unsqueeze(0)                       # [1, V]
-    inner = a @ b.t()                                             # [NK, V]
-    phi_pool = -(sq_a + sq_b - 2.0 * inner).clamp_min(0.0) / tau_align
 
-    # log Z(s_i) = logsumexp_{v ∈ U} ( α log c(v) + φ(s_i, v) )
-    log_Z = torch.logsumexp(
-        phi_pool + log_c_pool.unsqueeze(0), dim=1,
-    )                                                              # [NK]
+    # Streaming logsumexp over V in chunks of `chunk_size`. The [NK, V]
+    # phi matrix is never materialised: each chunk computes its own
+    # [NK, C] slice inside a checkpoint frame, updates the running
+    # (max, sumexp) accumulators, and discards the slice. Backward
+    # recomputes one chunk at a time.
+    V_total = b.shape[0]
+    running_max = torch.full((NK,), float("-inf"), device=device, dtype=a.dtype)
+    running_sumexp = torch.zeros(NK, device=device, dtype=a.dtype)
 
-    # φ(s_i, n_{i, p})  and  α · log c(n_{i, p})
-    phi_pos = phi_pool.gather(dim=1, index=pool_idx)              # [NK, L]
-    log_c_pos = log_c_pool[pool_idx]                              # [NK, L]
+    def _chunk_logsumexp(
+        a_in, b_chunk, log_c_chunk, sq_a_in, prev_max, prev_sumexp,
+    ):
+        # phi_chunk: [NK, C]
+        sq_b_chunk = (b_chunk * b_chunk).sum(dim=-1).unsqueeze(0)      # [1, C]
+        inner_chunk = a_in @ b_chunk.t()                               # [NK, C]
+        phi_chunk = (
+            -(sq_a_in + sq_b_chunk - 2.0 * inner_chunk).clamp_min(0.0)
+            / tau_align
+        )
+        w_chunk = phi_chunk + log_c_chunk.unsqueeze(0)                 # [NK, C]
+        chunk_max = w_chunk.max(dim=-1).values                          # [NK]
+        new_max = torch.maximum(prev_max, chunk_max)
+        # Both terms handle the -inf bootstrap safely: exp(-inf) = 0
+        # zeroes the prev_sumexp contribution on the first chunk.
+        prev_scaled = prev_sumexp * (prev_max - new_max).exp()
+        chunk_scaled = (w_chunk - new_max.unsqueeze(1)).exp().sum(dim=-1)
+        new_sumexp = prev_scaled + chunk_scaled
+        return new_max, new_sumexp
+
+    for s in range(0, V_total, chunk_size):
+        e = min(s + chunk_size, V_total)
+        running_max, running_sumexp = checkpoint(
+            _chunk_logsumexp,
+            a,
+            b[s:e],
+            log_c_pool[s:e],
+            sq_a,
+            running_max,
+            running_sumexp,
+            use_reentrant=False,
+        )
+
+    log_Z = running_max + running_sumexp.log()                     # [NK]
+
+    # Positive numerator computed directly at pool_idx — no [NK, V] tensor.
+    # b_pos[i, p] = b[pool_idx[i, p]]; invalid positions read b[0] and are
+    # masked out by w_valid downstream (same convention as the dense path).
+    pool_idx_flat_for_pos = pool_idx.reshape(-1)
+    b_pos = b[pool_idx_flat_for_pos].view(NK, L, b.shape[-1])      # [NK, L, d]
+    sq_b_pos = (b_pos * b_pos).sum(dim=-1)                         # [NK, L]
+    inner_pos = (a.unsqueeze(1) * b_pos).sum(dim=-1)               # [NK, L]
+    phi_pos = (
+        -(sq_a + sq_b_pos - 2.0 * inner_pos).clamp_min(0.0) / tau_align
+    )                                                              # [NK, L]
+    log_c_pos = log_c_pool[pool_idx]                               # [NK, L]
 
     # log p(n_{i, p} | s_i) = α · log c(n_{i, p}) + φ(s_i, n_{i, p}) - log Z(s_i)
     log_p_pos = log_c_pos + phi_pos - log_Z.unsqueeze(1)          # [NK, L]

@@ -9,7 +9,7 @@ Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root, --is-directed
   Model:          --d-emb
   Loss:           --tau-align, --tau-link, --gamma-recency,
-                  --k-train
+                  --k-train, --alignment-chunk-size
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias,
                   --start-bias, --tempest-batch-window-multiplier
   Optimisation:   --lr, --lr-min, --warmup-fraction, --warmup-steps-cap,
@@ -100,6 +100,16 @@ def parse_args() -> argparse.Namespace:
              "per query; positive at column 0. Larger K_train means "
              "harder per-query competition and stronger ranking "
              "gradients, at proportional compute cost.",
+    )
+    p.add_argument(
+        "--alignment-chunk-size", default=8192, type=int,
+        help="Slices the unique-pool dimension V when computing the "
+             "InfoNCE partition log Z. Each chunk's forward is "
+             "gradient-checkpointed, so backward peak memory is "
+             "bounded by O(NK·chunk_size) rather than O(NK·V). When "
+             "V ≤ chunk_size the loop runs once and behaviour reduces "
+             "to the dense path. Default 8192 fits wiki/coin in one "
+             "chunk and bounds review's pathological pools.",
     )
 
     # Walks.
@@ -280,6 +290,7 @@ def main() -> Dict[str, Any]:
         gamma_recency=args.gamma_recency,
         recency_scale=stats.mean_inter_arrival,
         K_train=args.k_train,
+        alignment_chunk_size=args.alignment_chunk_size,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,
