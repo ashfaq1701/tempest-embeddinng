@@ -1,11 +1,12 @@
 # Runtime dependencies.
 #
-# ┌─ IMPORTANT: install torch FIRST, with the CUDA wheel that matches
-# │  your system's NVIDIA driver. If you skip this step and just run
-# │  `pip install -r requirements.txt`, pip will resolve `torch>=2.0`
-# │  with a default wheel that may have been built against a CUDA
-# │  runtime newer than your driver supports. The training script will
-# │  then silently fall back to CPU and you'll see, at startup:
+# ┌─ IMPORTANT: torch is PINNED to 2.6.0 (the first release that ships
+# │  a cu126 wheel as a clean pairing). If you run `pip install -r
+# │  requirements.txt` without first selecting a wheel index, pip will
+# │  pull the CPU build of 2.6.0 from PyPI. To get the CUDA build that
+# │  matches your driver, install torch FIRST from the matching index,
+# │  THEN install the rest. Otherwise the training script will silently
+# │  fall back to CPU and you'll see, at startup:
 # │      UserWarning: CUDA initialization: The NVIDIA driver on your
 # │      system is too old (found version XXXXX). ...
 # │      device: cpu
@@ -16,19 +17,19 @@
 #
 #     nvidia-smi      # top-right of the header shows e.g. "CUDA Version: 12.6"
 #
-# Step 2 — install the matching torch wheel (in your venv):
+# Step 2 — install torch==2.6.0 with the matching CUDA wheel (in your venv):
 #
-#     # driver supports CUDA 12.6 (e.g. A40 + driver ≥ 560):
-#     pip install torch --index-url https://download.pytorch.org/whl/cu126
+#     # driver supports CUDA 12.6 (e.g. A40 + driver >= 560):
+#     pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu126
 #
 #     # driver supports CUDA 12.4:
-#     pip install torch --index-url https://download.pytorch.org/whl/cu124
+#     pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 #
 #     # driver supports CUDA 12.1:
-#     pip install torch --index-url https://download.pytorch.org/whl/cu121
+#     pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu121
 #
 #     # no GPU / CPU-only:
-#     pip install torch --index-url https://download.pytorch.org/whl/cpu
+#     pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
 #
 # Step 3 — install the rest:
 #
@@ -37,8 +38,15 @@
 # Step 4 — verify (one-liner; must print True + your GPU name before
 # launching scripts/train.py with --use-gpu):
 #
-#     python -c "import torch; print(torch.cuda.is_available(), \
+#     python -c "import torch; print(torch.__version__, torch.cuda.is_available(), \
 #                torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
+#
+# Expected output on a cu126 host:
+#     2.6.0+cu126 True NVIDIA A40
+#
+# If you see `2.X.Y+cu130` or any cu13x suffix, pip pulled an unpinned
+# torch from a non-matching index — re-run Step 2 with the cu126 (or
+# matching) index. The `==2.6.0` pin here is what makes that recoverable.
 #
 # ───────────────────────────────────────────────────────────────────
 # Note on py-tgb vs tgb. The Temporal Graph Benchmark library
@@ -50,7 +58,7 @@
 # space).
 
 numpy>=1.24,<3
-torch>=2.0
+torch==2.6.0
 py-tgb>=2.2.0
 temporal-random-walk>=1.8.2
 prodigyopt>=1.1
