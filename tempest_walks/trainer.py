@@ -182,10 +182,17 @@ class Trainer:
 
         # Learnable recency time constant. Stored as raw `theta`;
         # the loss applies softplus(theta) → always positive. Init
-        # from data (TrainStats.mean_inter_arrival).
+        # from data (TrainStats.mean_inter_arrival). Tensor built
+        # directly on `self.device` so the Parameter stays a leaf —
+        # `.to(device)` AFTER wrap produces a non-leaf that the
+        # optimiser refuses to register.
         self.theta_recency_scale = torch.nn.Parameter(
-            torch.tensor(float(config.recency_scale_init), dtype=torch.float32),
-        ).to(self.device)
+            torch.tensor(
+                float(config.recency_scale_init),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+        )
 
         # Walk sampler.
         self.walk_gen = WalkGenerator(
