@@ -1,14 +1,20 @@
-# Runtime dependencies. The codebase is being rebuilt from first
-# principles (see CLAUDE.md); these four packages are the stable
-# TGB-interfacing + numerical layer that survives the rewrite.
+# Runtime dependencies.
 #
 # `torch` is intentionally NOT pinned to a specific CUDA wheel here —
 # install the matching build for your GPU first from the PyTorch index,
 # e.g.
 #     pip install torch --index-url https://download.pytorch.org/whl/cu126
 # (a CPU-only wheel works too.)
+#
+# Note: the Temporal Graph Benchmark library publishes as `py-tgb` on
+# PyPI but imports as `tgb`. There is a separate, unrelated PyPI
+# package literally named `tgb` (currently 1.2.0) — do NOT install
+# that one. Pinned to >=2.2.0 because that's the version the eval
+# protocol was verified against (tgbl-wiki v2: 999 sampled negatives
+# per positive = exhaustive over the destination space).
 
 numpy>=1.24,<3
 torch>=2.0
-tgb>=1.2.0
+py-tgb>=2.2.0
 temporal-random-walk>=1.8.2
+prodigyopt>=1.1
