@@ -278,7 +278,7 @@ def main() -> Dict[str, Any]:
         tau_align=args.tau_align,
         tau_link=args.tau_link,
         gamma_recency=args.gamma_recency,
-        recency_scale=stats.median_inter_arrival,
+        recency_scale=stats.mean_inter_arrival,
         K_train=args.k_train,
 
         num_walks_per_node=args.num_walks_per_node,
