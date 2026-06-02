@@ -22,7 +22,9 @@ Derived from the dataset (not exposed):
   num_nodes, is_directed, dst_pool, d_node_feat,
   TrainStats (t_min, t_max, T_train, median_inter_arrival,
               mean_inter_arrival) — see tempest_walks/data_stats.py.
-  recency_scale defaults to TrainStats.median_inter_arrival.
+  recency_scale_init defaults to TrainStats.mean_inter_arrival;
+  the actual scale used by the loss is softplus(theta_recency_scale)
+  where theta is an nn.Parameter held by the Trainer.
 """
 
 import argparse
@@ -278,7 +280,7 @@ def main() -> Dict[str, Any]:
         tau_align=args.tau_align,
         tau_link=args.tau_link,
         gamma_recency=args.gamma_recency,
-        recency_scale=stats.mean_inter_arrival,
+        recency_scale_init=stats.mean_inter_arrival,
         K_train=args.k_train,
 
         num_walks_per_node=args.num_walks_per_node,

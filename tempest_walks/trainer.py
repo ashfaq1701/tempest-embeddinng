@@ -92,11 +92,18 @@ class TrainerConfig:
 
     # Convex-combination stationary recency weight (replaces the old
     # additive 1/K_hop + t̃^β formulation). γ ∈ [0, 1] mixes the hop
-    # profile and the recency profile (both per-row-normalised);
-    # `recency_scale` is the exponential time-constant in raw timestamp
-    # units (data-driven from the train split's median inter-arrival).
+    # profile and a learnable-time-constant recency profile.
+    # `recency_scale_init` is the INITIAL value of the recency time
+    # constant in raw timestamp units (data-driven from the train
+    # split's mean inter-arrival). At runtime the trainer holds it as
+    # `theta_recency_scale = nn.Parameter(init)`; the actual scale
+    # used inside the loss is `softplus(theta_recency_scale)`. theta
+    # receives gradient from L_align (the recency weight is its only
+    # consumer); under the no-detach link path, L_link reshapes E,
+    # which then re-shapes the gradient theta sees in subsequent
+    # batches.
     gamma_recency: float = 0.4
-    recency_scale: float = 1.0  # Plumbed in by train.py from TrainStats.
+    recency_scale_init: float = 1.0  # Plumbed in by train.py from TrainStats.
 
     # Walks.
     num_walks_per_node: int = 5
@@ -173,6 +180,13 @@ class Trainer:
         ).to(self.device)
         self.link_head = LinkHead(d_emb=config.d_emb).to(self.device)
 
+        # Learnable recency time constant. Stored as raw `theta`;
+        # the loss applies softplus(theta) → always positive. Init
+        # from data (TrainStats.mean_inter_arrival).
+        self.theta_recency_scale = torch.nn.Parameter(
+            torch.tensor(float(config.recency_scale_init), dtype=torch.float32),
+        ).to(self.device)
+
         # Walk sampler.
         self.walk_gen = WalkGenerator(
             is_directed=config.is_directed,
@@ -213,6 +227,7 @@ class Trainer:
             + list(self.p_target.parameters())
             + list(self.p_context.parameters())
             + list(self.link_head.parameters())
+            + [self.theta_recency_scale]
         )
         # Prodigy: hyperparameter-free adaptive optimiser. Internally
         # estimates the optimal step-size; the `lr` arg is a multiplier
@@ -348,7 +363,7 @@ class Trainer:
             p_target=self.p_target,
             p_context=self.p_context,
             walks=walks,
-            recency_scale=self.config.recency_scale,
+            theta_recency_scale=self.theta_recency_scale,
             gamma_recency=self.config.gamma_recency,
             tau_align=self.config.tau_align,
             node_feat=self.node_feat,
@@ -377,8 +392,13 @@ class Trainer:
         )                                                            # [B, 1+K]
         candidates_u = src_t.unsqueeze(1).expand(B, 1 + K)           # [B, 1+K]
 
-        e_u = self.embedding_table(candidates_u).detach()            # [B, 1+K, d]
-        e_v = self.embedding_table(candidates_v).detach()            # [B, 1+K, d]
+        # No detach: L_link's gradient now flows into E alongside
+        # L_align's. The pair-MLP path on E is expressive, so the link
+        # gradient on E can be large in magnitude — watch the relative
+        # decay of L_align vs L_link per epoch and add a link weight
+        # if alignment starts to lose ground.
+        e_u = self.embedding_table(candidates_u)                     # [B, 1+K, d]
+        e_v = self.embedding_table(candidates_v)                     # [B, 1+K, d]
         if self.config.is_directed:
             logits = self.link_head(e_u, e_v)                        # [B, 1+K]
         else:
@@ -560,10 +580,14 @@ class Trainer:
                 n_batches += 1
             train_dt = time.time() - t0
 
+            scale_now = float(
+                torch.nn.functional.softplus(self.theta_recency_scale.detach()).item()
+            )
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"align={sums['align']/max(n_batches,1):.4f}  "
                 f"link={sums['link']/max(n_batches,1):.4f}  "
+                f"scale={scale_now:.1f}  "
                 f"train {train_dt:.1f}s"
             )
 

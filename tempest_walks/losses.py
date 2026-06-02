@@ -70,17 +70,18 @@ def alignment_loss(
     p_target,
     p_context,
     walks: WalkData,
-    recency_scale: float,
+    theta_recency_scale: torch.Tensor,
     gamma_recency: float = 0.4,
     tau_align: float = 0.5,
     node_feat: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Returns ℒ as a scalar graph-attached tensor. See module docstring.
 
-    `recency_scale` is in raw timestamp units of the dataset (typically
-    seconds). Pass `TrainStats.median_inter_arrival` from
-    `tempest_walks.data_stats` for a data-driven default. `gamma_recency`
-    is the convex-combination weight between hop and recency profiles.
+    `theta_recency_scale` is a learnable scalar tensor (owned by the
+    Trainer). The actual recency time-constant is `softplus(theta)` —
+    always positive, no need to clamp the raw param — and the gradient
+    on `theta` flows back from L_align through the recency profile.
+    Initialised in trainer.py from `TrainStats.mean_inter_arrival`.
     """
     device = embedding_table.E.weight.device
     nodes = walks.nodes.to(device).long()                         # [NK, L]
@@ -118,9 +119,11 @@ def alignment_loss(
     # clamp_min(0) absorbs every sentinel: invalid rows get -inf
     # subtracted to -inf, then clamped to 0; mask zeros their weight.
     gap = (t_seed_edge - ts_f).clamp_min(0.0)                     # [NK, L]
-    recency_w = torch.exp(
-        -gap / max(float(recency_scale), 1.0),
-    ) * mask_f                                                     # [NK, L]
+    # scale = softplus(theta) > 0 always. clamp_min(1.0) keeps the
+    # exponent finite if theta drifts toward very small / negative
+    # values during training (softplus → 0).
+    scale = torch.nn.functional.softplus(theta_recency_scale).clamp_min(1.0)
+    recency_w = torch.exp(-gap / scale) * mask_f                  # [NK, L]
     rec_p = recency_w / recency_w.sum(dim=1, keepdim=True).clamp_min(_EPS)
 
     # Convex combination: per-row profile, sums to 1 by construction.
