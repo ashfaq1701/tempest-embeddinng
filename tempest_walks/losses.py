@@ -23,10 +23,23 @@ Energy-based conditional with μ as base measure:
     p(v | s) := c(v)^α · exp(φ(s, v)) / Z(s)
     log p(v | s) = α · log c(v) + φ(s, v) - log Z(s)
 
-Per-position weight (hop + relative-time recency):
-    K_hop(i, p) := max(1, ℓ_i - 1 - p)
-    t̃(i, p)     := clamp((t_{i, p} - t_min) / T_train, 0, 1)
-    w̃(i, p)     := 1 / K_hop(i, p) + t̃(i, p)^β
+Per-position weight (convex combination of hop and stationary recency):
+    K_hop(i, p)  := max(1, ℓ_i - 1 - p)
+    gap(i, p)    := max(0, t_seed_edge(i) - t_{i, p})            stationary
+                    where t_seed_edge(i) = max_{valid p} t_{i, p}
+                    — the timestamp of the seed's own most-recent edge,
+                    so gap is elapsed time between context p and the
+                    seed's interaction (not absolute calendar position).
+                    Window-position-invariant: a week-1 seed and a
+                    week-4 seed with the same local history get the
+                    same recency profile.
+    h_p          := normalize(1/K_hop)        — hop profile, sums to 1
+    r_p          := normalize(exp(-gap/scale)) — recency profile, sums to 1
+                    where scale = recency_scale, in raw timestamp units
+                    (data-driven: median inter-arrival of train edges).
+    w̃(i, p)      := (1 - γ) · h_p(i, p) + γ · r_p(i, p)
+                    Convex mix; γ ∈ [0, 1]. γ=0 is hop-only, γ=1 is
+                    recency-only. Per-row sum is 1 by construction.
 
 Per-row weighted negative log-likelihood:
     W_i      := Σ_p 𝟙[valid(i, p)] · w̃(i, p)
@@ -57,13 +70,18 @@ def alignment_loss(
     p_target,
     p_context,
     walks: WalkData,
-    t_min: int,
-    T_train: float,
-    beta: float = 1.0,
+    recency_scale: float,
+    gamma_recency: float = 0.4,
     tau_align: float = 0.5,
     node_feat: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Returns ℒ as a scalar graph-attached tensor. See module docstring."""
+    """Returns ℒ as a scalar graph-attached tensor. See module docstring.
+
+    `recency_scale` is in raw timestamp units of the dataset (typically
+    seconds). Pass `TrainStats.median_inter_arrival` from
+    `tempest_walks.data_stats` for a data-driven default. `gamma_recency`
+    is the convex-combination weight between hop and recency profiles.
+    """
     device = embedding_table.E.weight.device
     nodes = walks.nodes.to(device).long()                         # [NK, L]
     timestamps = walks.timestamps.to(device).long()               # [NK, L]
@@ -84,14 +102,29 @@ def alignment_loss(
 
     # K_hop(i, p) = max(1, ℓ_i - 1 - p)
     hop_dist = (lens.unsqueeze(1) - 1 - positions).clamp_min(1).float()
+    mask_f = is_context.float()                                   # [NK, L]
 
-    # t̃(i, p) = clamp((t_{i, p} - t_min) / T_train, 0, 1)
-    edge_t_norm = (
-        (timestamps - t_min).clamp_min(0).float() / max(T_train, 1.0)
-    ).clamp(max=1.0)                                              # [NK, L]
+    # Hop profile: 1/K_hop, masked, normalised per row so it sums to 1.
+    hop_w = (1.0 / hop_dist) * mask_f                             # [NK, L]
+    hop_p = hop_w / hop_w.sum(dim=1, keepdim=True).clamp_min(_EPS)
 
-    # w̃(i, p) = 1 / K_hop(i, p) + t̃(i, p)^β
-    w_tilde = 1.0 / hop_dist + edge_t_norm.pow(beta)              # [NK, L]
+    # Stationary recency: gap = t_seed_edge - t_{i, p}, ≥ 0.
+    # t_seed_edge = max of valid timestamps in the row. Masking
+    # invalid positions to -inf before .max() ensures sentinels
+    # (INT64_MAX at seed slot, -1 padding) cannot win the max.
+    ts_f = timestamps.float()
+    ts_masked = ts_f.masked_fill(~is_context, float("-inf"))
+    t_seed_edge = ts_masked.max(dim=1, keepdim=True).values       # [NK, 1]
+    # clamp_min(0) absorbs every sentinel: invalid rows get -inf
+    # subtracted to -inf, then clamped to 0; mask zeros their weight.
+    gap = (t_seed_edge - ts_f).clamp_min(0.0)                     # [NK, L]
+    recency_w = torch.exp(
+        -gap / max(float(recency_scale), 1.0),
+    ) * mask_f                                                     # [NK, L]
+    rec_p = recency_w / recency_w.sum(dim=1, keepdim=True).clamp_min(_EPS)
+
+    # Convex combination: per-row profile, sums to 1 by construction.
+    w_tilde = (1.0 - gamma_recency) * hop_p + gamma_recency * rec_p
 
     # U   = unique({ n_{i, p} : valid(i, p) })
     # c   = ( c(v) )_{v ∈ U}

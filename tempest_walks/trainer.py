@@ -71,11 +71,13 @@ from .walks import WalkGenerator
 @dataclass
 class TrainerConfig:
     # Dataset-derived (passed in by train.py).
+    # Note: t_min / T_train are no longer needed by the loss under the
+    # stationary-recency formulation — see `tempest_walks/data_stats.py`
+    # for the TrainStats bundle that carries them (plus inter-arrival
+    # statistics) for display + recency_scale derivation.
     num_nodes: int
     is_directed: bool
     dst_pool: np.ndarray
-    t_min: int                          # min timestamp of the train split
-    T_train: float                      # train-split span (t_max - t_min)
     d_node_feat: Optional[int] = None
 
     # Model.
@@ -84,10 +86,17 @@ class TrainerConfig:
     # Loss-formulation.
     tau_align: float = 0.5      # InfoNCE alignment temperature
     tau_link: float = 1.0       # Softmax-CE link-prediction temperature
-    beta_time: float = 1.0      # hop/time weight exponent
     K_train: int = 100          # Per-query training negatives. The link
                                 # head sees [B, 1+K_train] candidates per
                                 # query; positive at column 0.
+
+    # Convex-combination stationary recency weight (replaces the old
+    # additive 1/K_hop + t̃^β formulation). γ ∈ [0, 1] mixes the hop
+    # profile and the recency profile (both per-row-normalised);
+    # `recency_scale` is the exponential time-constant in raw timestamp
+    # units (data-driven from the train split's median inter-arrival).
+    gamma_recency: float = 0.4
+    recency_scale: float = 1.0  # Plumbed in by train.py from TrainStats.
 
     # Walks.
     num_walks_per_node: int = 5
@@ -328,16 +337,19 @@ class Trainer:
         # Step 2: InfoNCE contrastive alignment over batched walks.
         # The softmax denominator over all batch contexts is the
         # anti-collapse mechanism (replaces Wang-Isola uniformity).
-        # Time weight is FIXED per edge via (t_min, T_train) from the
-        # train split — no t_now reference, no drift across batches.
+        # Per-position weights are a convex combination of hop and
+        # *stationary* recency profiles: recency is measured as the
+        # elapsed gap from the seed's own most-recent edge to context
+        # p, not (t - t_min)/T_train. Window-position-invariant by
+        # construction; the loss never references the absolute training
+        # window.
         l_align = alignment_loss(
             embedding_table=self.embedding_table,
             p_target=self.p_target,
             p_context=self.p_context,
             walks=walks,
-            t_min=self.config.t_min,
-            T_train=self.config.T_train,
-            beta=self.config.beta_time,
+            recency_scale=self.config.recency_scale,
+            gamma_recency=self.config.gamma_recency,
             tau_align=self.config.tau_align,
             node_feat=self.node_feat,
         )

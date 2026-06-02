@@ -7,13 +7,14 @@ scripts/train.py stay focused on orchestration, not boilerplate.
 Contents:
   Determinism:
     - seed_all(seed)              — seed Python/numpy/torch RNGs.
-  Dataset derivation:
-    - derive_t_train(train_ts)    — span of training timestamps.
   LR schedule:
     - make_lr_lambda(warmup_steps, decay_steps, lr_min_ratio)
                                   — closure for LambdaLR that does
                                     linear warmup then cosine decay
                                     to lr_min_ratio.
+
+Dataset-derived constants now live in `tempest_walks/data_stats.py`
+(TrainStats bundle).
 """
 
 import math
@@ -43,22 +44,6 @@ def seed_all(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Dataset derivation
-# ──────────────────────────────────────────────────────────────────────
-
-
-def derive_t_train(train_ts: np.ndarray) -> float:
-    """T_train: training-span (max - min). Required > 0 — used as a
-    denominator in alignment_loss's time weighting."""
-    if train_ts.size == 0:
-        raise ValueError("Empty training timestamps; cannot derive T_train.")
-    span = float(train_ts.max() - train_ts.min())
-    if span <= 0:
-        raise ValueError(f"Non-positive T_train: {span}")
-    return span
 
 
 # ──────────────────────────────────────────────────────────────────────

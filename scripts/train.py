@@ -8,7 +8,7 @@ repeatedly with different CLI args.
 Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root, --is-directed
   Model:          --d-emb
-  Loss:           --tau-align, --tau-link, --beta-time,
+  Loss:           --tau-align, --tau-link, --gamma-recency,
                   --k-train
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias,
                   --start-bias, --max-time-capacity
@@ -20,8 +20,9 @@ Hyperparameters exposed at CLI (and their grouping):
 
 Derived from the dataset (not exposed):
   num_nodes, is_directed, dst_pool, d_node_feat,
-  t_min (= min(train.ts)),
-  T_train (= max(train.ts) - min(train.ts)).
+  TrainStats (t_min, t_max, T_train, median_inter_arrival,
+              mean_inter_arrival) — see tempest_walks/data_stats.py.
+  recency_scale defaults to TrainStats.median_inter_arrival.
 """
 
 import argparse
@@ -41,10 +42,11 @@ import numpy as np
 import torch
 
 from tempest_walks.data import Loaded, create_batches, load_tgb
+from tempest_walks.data_stats import compute_train_stats
 from tempest_walks.evaluator import Evaluator
 from tempest_walks.negatives import TGBNegativeSampler
 from tempest_walks.trainer import Trainer, TrainerConfig
-from tempest_walks.utils import derive_t_train, seed_all
+from tempest_walks.utils import seed_all
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,7 +84,15 @@ def parse_args() -> argparse.Namespace:
         help="Link-prediction softmax-CE temperature (per-query "
              "ranking loss). Default 1.0 — pending a sweep.",
     )
-    p.add_argument("--beta-time", default=1.0, type=float)
+    p.add_argument(
+        "--gamma-recency", default=0.4, type=float,
+        help="Convex-combination weight between hop and stationary-"
+             "recency profiles in the alignment-loss per-position "
+             "weight. γ=0 is hop-only; γ=1 is recency-only; default "
+             "0.4 mixes both. Recency_scale is data-driven from the "
+             "train split's median inter-arrival time and is NOT a CLI "
+             "knob — see tempest_walks/data_stats.py.",
+    )
     p.add_argument(
         "--k-train", type=int, default=100,
         help="Per-query training negatives for the ranking link "
@@ -206,8 +216,7 @@ def main() -> Dict[str, Any]:
     num_nodes = loaded.max_node_count
     is_directed = args.is_directed
     dst_pool = np.unique(loaded.train.destinations).astype(np.int32)
-    t_min = int(loaded.train.timestamps.min())
-    T_train = derive_t_train(loaded.train.timestamps)
+    stats = compute_train_stats(loaded.train.timestamps)
     d_node_feat = (
         int(loaded.node_feat.shape[1])
         if loaded.node_feat is not None
@@ -217,8 +226,11 @@ def main() -> Dict[str, Any]:
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  directed:      {is_directed}  (--is-directed)")
     print(f"  dst_pool:      {len(dst_pool):,} unique destinations")
-    print(f"  t_min:         {t_min}")
-    print(f"  T_train:       {T_train:.0f}")
+    print(f"  t_min:         {stats.t_min}")
+    print(f"  t_max:         {stats.t_max}")
+    print(f"  T_train:       {stats.T_train:.0f}")
+    print(f"  median_inter_arrival: {stats.median_inter_arrival:.1f}")
+    print(f"  mean_inter_arrival:   {stats.mean_inter_arrival:.1f}")
     print(f"  train edges:   {len(loaded.train.sources):,}")
     print(f"  val edges:     {len(loaded.val.sources):,}")
     print(f"  test edges:    {len(loaded.test.sources):,}")
@@ -259,15 +271,14 @@ def main() -> Dict[str, Any]:
         num_nodes=num_nodes,
         is_directed=is_directed,
         dst_pool=dst_pool,
-        t_min=t_min,
-        T_train=T_train,
         d_node_feat=d_node_feat,
 
         d_emb=args.d_emb,
 
         tau_align=args.tau_align,
         tau_link=args.tau_link,
-        beta_time=args.beta_time,
+        gamma_recency=args.gamma_recency,
+        recency_scale=stats.median_inter_arrival,
         K_train=args.k_train,
 
         num_walks_per_node=args.num_walks_per_node,
