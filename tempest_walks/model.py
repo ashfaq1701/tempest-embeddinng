@@ -22,7 +22,15 @@ ProjectionHead
 
 LinkHead
   - score(u, v) = bilinear(E(u), E(v)) + small_MLP(pair_features(u, v))
-    bilinear  = E(u)^T W E(v) + b   (one learnable matrix)
+    bilinear  = (W·E(u)) · E(v) + b   (Linear(d, d)·v inner product
+                                        plus scalar bias — same
+                                        expressivity as nn.Bilinear
+                                        but with a backward graph
+                                        that materialises [B, 1+K, d]
+                                        instead of [B, 1+K, d, d];
+                                        nn.Bilinear OOMs at our batch
+                                        × K_train when E is not
+                                        detached on the link path)
     MLP input = 6-channel pair features
                 [E(u), E(v), E(u)*E(v), |E(u)-E(v)|,
                  (E(u)-E(v))^2, E(u)+E(v)]
@@ -30,9 +38,9 @@ LinkHead
     [B, 1+K] logits. Column 0 holds the positive candidate at
     training; columns 1..K are negatives sharing the same query
     source.
-  - Stop-gradient on E is the CALLER's responsibility (call with
-    e_u.detach(), e_v.detach() in trainer.py); LinkHead never
-    detaches internally.
+  - E is NOT detached on the call site — L_link's gradient flows
+    back through this head into E. Joint training of E by both
+    L_align and L_link.
   - No node features, no edge features, no time features at scoring.
   - Asymmetric by construction. For undirected datasets the caller
     symmetrises by averaging forward(e_u, e_v) with
@@ -153,8 +161,10 @@ class LinkHead(nn.Module):
     logits of shape `[B, 1+K]`. nn.Bilinear and nn.Linear broadcast
     over the leading two dims; no flat-input mode.
 
-    The caller is responsible for stop-grad on the embedding table
-    (pass `.detach()`'d inputs); LinkHead never detaches.
+    E is NOT detached at the call site. L_link's gradient flows back
+    through this head into the embedding table — E is jointly trained
+    by both L_align (alignment InfoNCE) and L_link (per-query softmax
+    CE).
 
     Asymmetric by construction (bilinear u^T W v + concat channels
     carry directional info). For undirected datasets the caller

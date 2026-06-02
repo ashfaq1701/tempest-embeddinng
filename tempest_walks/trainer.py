@@ -6,12 +6,14 @@ Single Trainer class. Per-batch ordering:
     1. walks = walk_gen.walks_for_nodes(seeds)       ← pre-ingest state
        seeds = unique(B_tgt)               if is_directed
        seeds = unique(B_src ∪ B_tgt)       if undirected
-    2. L_align = alignment_loss(walks, tau_align)    ← InfoNCE scalar
+    2. L_align = alignment_loss(walks, ...)          ← InfoNCE scalar
     3. neg = neg_sampler.sample(batch)               ← pre-observe state
        neg_tgt: [B, K_train]
     4. candidates_v = [pos_v | neg_tgt]              ← [B, 1+K_train]
-       logits = link_head(E[u].detach(), E[v].detach())  ← [B, 1+K_train]
+       logits = link_head(E[u], E[v])                ← [B, 1+K_train]
                 (undirected: 0.5 × (link_head(u,v) + link_head(v,u)))
+                (E is NOT detached — L_link gradient flows back into E
+                 alongside L_align's; joint training of the embedding.)
        L_link = CE(logits / tau_link, target=zeros(B))
     5. L_total = L_align + L_link
     6. optimizer.zero_grad(set_to_none=True); L_total.backward(); optimizer.step()
@@ -46,8 +48,8 @@ Early stop:
 
 import copy
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import torch
@@ -225,10 +227,11 @@ class Trainer:
                 seed=config.seed,
             )
 
-        # Single optimiser over all trainable parameters. The decoupling
-        # between E-training (InfoNCE alignment) and link-head training
-        # (per-query softmax CE) comes from the .detach() at the link
-        # call site, NOT from separate optimisers.
+        # Single optimiser over all trainable parameters. E is jointly
+        # trained by both L_align (through projection heads) and L_link
+        # (through the link head's pair-MLP) — no detach on the link
+        # path. theta_recency_scale receives gradient only from L_align
+        # (the recency weight is its only consumer).
         params = (
             list(self.embedding_table.parameters())
             + list(self.p_target.parameters())
