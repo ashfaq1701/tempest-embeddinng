@@ -88,18 +88,15 @@ class TrainerConfig:
 
     # Convex-combination stationary recency weight (replaces the old
     # additive 1/K_hop + t̃^β formulation). γ ∈ [0, 1] mixes the hop
-    # profile and a learnable-time-constant recency profile.
-    # `recency_scale_init` is the INITIAL value of the recency time
-    # constant in raw timestamp units (data-driven from the train
-    # split's mean inter-arrival). At runtime the trainer holds it as
-    # `theta_recency_scale = nn.Parameter(init)`; the actual scale
-    # used inside the loss is `softplus(theta_recency_scale)`. theta
-    # receives gradient from L_align (the recency weight is its only
-    # consumer); under the no-detach link path, L_link reshapes E,
-    # which then re-shapes the gradient theta sees in subsequent
-    # batches.
+    # profile and a recency profile with a FROZEN time constant.
+    # `recency_scale` is the time constant in raw timestamp units
+    # (data-driven from the train split's mean inter-arrival). It used
+    # to be wrapped in softplus and treated as a learnable scalar
+    # parameter, but it consistently collapsed toward zero under longer
+    # runs — degrading the recency feature without improving val MRR —
+    # so it's now plumbed through as a constant.
     gamma_recency: float = 0.4
-    recency_scale_init: float = 1.0  # Plumbed in by train.py from TrainStats.
+    recency_scale: float = 1.0  # Plumbed in by train.py from TrainStats.
 
     # Walks.
     num_walks_per_node: int = 5
@@ -172,18 +169,14 @@ class Trainer:
         ).to(self.device)
         self.link_head = LinkHead(d_emb=config.d_emb).to(self.device)
 
-        # Learnable recency time constant. Stored as raw `theta`;
-        # the loss applies softplus(theta) → always positive. Init
-        # from data (TrainStats.mean_inter_arrival). Tensor built
-        # directly on `self.device` so the Parameter stays a leaf —
-        # `.to(device)` AFTER wrap produces a non-leaf that the
-        # optimiser refuses to register.
-        self.theta_recency_scale = torch.nn.Parameter(
-            torch.tensor(
-                float(config.recency_scale_init),
-                dtype=torch.float32,
-                device=self.device,
-            ),
+        # Frozen recency time constant. Set once from the train split's
+        # mean inter-arrival (see scripts/train.py). Stored as a plain
+        # tensor on the trainer (Trainer is not an nn.Module). No
+        # autograd: it's an input to alignment_loss, not a parameter.
+        self.recency_scale = torch.tensor(
+            float(config.recency_scale),
+            dtype=torch.float32,
+            device=self.device,
         )
 
         # Walk sampler.
@@ -212,14 +205,12 @@ class Trainer:
         # Single optimiser over all trainable parameters. E is jointly
         # trained by both L_align (through projection heads) and L_link
         # (through the link head's pair-MLP) — no detach on the link
-        # path. theta_recency_scale receives gradient only from L_align
-        # (the recency weight is its only consumer).
+        # path. recency_scale is frozen (not in this list).
         params = (
             list(self.embedding_table.parameters())
             + list(self.p_target.parameters())
             + list(self.p_context.parameters())
             + list(self.link_head.parameters())
-            + [self.theta_recency_scale]
         )
         # Prodigy: hyperparameter-free adaptive optimiser. Internally
         # estimates the optimal step-size; the `lr` arg is a multiplier
@@ -355,7 +346,7 @@ class Trainer:
             p_target=self.p_target,
             p_context=self.p_context,
             walks=walks,
-            theta_recency_scale=self.theta_recency_scale,
+            recency_scale=self.recency_scale,
             gamma_recency=self.config.gamma_recency,
             tau_align=self.config.tau_align,
             node_feat=self.node_feat,
@@ -567,9 +558,7 @@ class Trainer:
                 n_batches += 1
             train_dt = time.time() - t0
 
-            scale_now = float(
-                torch.nn.functional.softplus(self.theta_recency_scale.detach()).item()
-            )
+            scale_now = float(self.recency_scale.item())
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"align={sums['align']/max(n_batches,1):.4f}  "
