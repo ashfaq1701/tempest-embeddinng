@@ -1,17 +1,53 @@
 # Runtime dependencies.
 #
-# `torch` is intentionally NOT pinned to a specific CUDA wheel here —
-# install the matching build for your GPU first from the PyTorch index,
-# e.g.
-#     pip install torch --index-url https://download.pytorch.org/whl/cu126
-# (a CPU-only wheel works too.)
+# ┌─ IMPORTANT: install torch FIRST, with the CUDA wheel that matches
+# │  your system's NVIDIA driver. If you skip this step and just run
+# │  `pip install -r requirements.txt`, pip will resolve `torch>=2.0`
+# │  with a default wheel that may have been built against a CUDA
+# │  runtime newer than your driver supports. The training script will
+# │  then silently fall back to CPU and you'll see, at startup:
+# │      UserWarning: CUDA initialization: The NVIDIA driver on your
+# │      system is too old (found version XXXXX). ...
+# │      device: cpu
+# │  This is the most common installation pitfall on shared servers.
+# └──
 #
-# Note: the Temporal Graph Benchmark library publishes as `py-tgb` on
-# PyPI but imports as `tgb`. There is a separate, unrelated PyPI
-# package literally named `tgb` (currently 1.2.0) — do NOT install
-# that one. Pinned to >=2.2.0 because that's the version the eval
-# protocol was verified against (tgbl-wiki v2: 999 sampled negatives
-# per positive = exhaustive over the destination space).
+# Step 1 — check your driver's supported CUDA runtime:
+#
+#     nvidia-smi      # top-right of the header shows e.g. "CUDA Version: 12.6"
+#
+# Step 2 — install the matching torch wheel (in your venv):
+#
+#     # driver supports CUDA 12.6 (e.g. A40 + driver ≥ 560):
+#     pip install torch --index-url https://download.pytorch.org/whl/cu126
+#
+#     # driver supports CUDA 12.4:
+#     pip install torch --index-url https://download.pytorch.org/whl/cu124
+#
+#     # driver supports CUDA 12.1:
+#     pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+#     # no GPU / CPU-only:
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+# Step 3 — install the rest:
+#
+#     pip install -r requirements.txt
+#
+# Step 4 — verify (one-liner; must print True + your GPU name before
+# launching scripts/train.py with --use-gpu):
+#
+#     python -c "import torch; print(torch.cuda.is_available(), \
+#                torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
+#
+# ───────────────────────────────────────────────────────────────────
+# Note on py-tgb vs tgb. The Temporal Graph Benchmark library
+# publishes on PyPI as `py-tgb` but imports as `tgb`. There is a
+# separate, unrelated PyPI package literally named `tgb` (currently
+# 1.2.0) — do NOT install that one. Pinned to >=2.2.0: that's the
+# version the eval protocol was verified against (tgbl-wiki v2: 999
+# sampled negatives per positive = exhaustive over the destination
+# space).
 
 numpy>=1.24,<3
 torch>=2.0
