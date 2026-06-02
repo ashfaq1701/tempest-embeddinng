@@ -169,15 +169,10 @@ class Trainer:
         ).to(self.device)
         self.link_head = LinkHead(d_emb=config.d_emb).to(self.device)
 
-        # Frozen recency time constant. Set once from the train split's
-        # mean inter-arrival (see scripts/train.py). Stored as a plain
-        # tensor on the trainer (Trainer is not an nn.Module). No
-        # autograd: it's an input to alignment_loss, not a parameter.
-        self.recency_scale = torch.tensor(
-            float(config.recency_scale),
-            dtype=torch.float32,
-            device=self.device,
-        )
+        # Frozen recency time constant. Plain Python float — no
+        # tensor, no autograd. alignment_loss broadcasts it against
+        # the per-batch gap tensor at the use site.
+        self.recency_scale = float(config.recency_scale)
 
         # Walk sampler.
         self.walk_gen = WalkGenerator(
@@ -558,7 +553,7 @@ class Trainer:
                 n_batches += 1
             train_dt = time.time() - t0
 
-            scale_now = float(self.recency_scale.item())
+            scale_now = self.recency_scale
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"align={sums['align']/max(n_batches,1):.4f}  "

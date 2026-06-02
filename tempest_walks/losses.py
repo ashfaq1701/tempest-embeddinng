@@ -70,20 +70,20 @@ def alignment_loss(
     p_target,
     p_context,
     walks: WalkData,
-    recency_scale: torch.Tensor,
+    recency_scale: float,
     gamma_recency: float = 0.4,
     tau_align: float = 0.5,
     node_feat: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Returns ℒ as a scalar graph-attached tensor. See module docstring.
 
-    `recency_scale` is a frozen scalar tensor (owned by the Trainer,
-    not a Parameter). Its value is the recency time-constant in raw
-    timestamp units, set once from `TrainStats.mean_inter_arrival`
-    at Trainer-init. Previously this was a learnable parameter under
-    a softplus reparameterisation, but the scalar was observed to
-    collapse toward zero under longer runs without improving val MRR,
-    so it's now frozen.
+    `recency_scale` is a frozen Python float (owned by the Trainer).
+    Its value is the recency time-constant in raw timestamp units, set
+    once from `TrainStats.mean_inter_arrival` at Trainer-init.
+    Previously this was a learnable parameter under a softplus
+    reparameterisation, but the scalar was observed to collapse toward
+    zero under longer runs without improving val MRR, so it's now
+    frozen.
     """
     device = embedding_table.E.weight.device
     nodes = walks.nodes.to(device).long()                         # [NK, L]
@@ -121,10 +121,11 @@ def alignment_loss(
     # clamp_min(0) absorbs every sentinel: invalid rows get -inf
     # subtracted to -inf, then clamped to 0; mask zeros their weight.
     gap = (t_seed_edge - ts_f).clamp_min(0.0)                     # [NK, L]
-    # `recency_scale` is a frozen scalar (mean inter-arrival of the
-    # train split). clamp_min(1.0) is a numerical guard; for any real
-    # dataset the configured value sits well above the floor.
-    scale = recency_scale.clamp_min(1.0)
+    # `recency_scale` is a frozen Python float (mean inter-arrival of
+    # the train split). max(., 1.0) is a numerical guard; for any real
+    # dataset the configured value sits well above the floor. Plain
+    # float broadcasts cleanly against `gap` in the divide.
+    scale = max(recency_scale, 1.0)
     recency_w = torch.exp(-gap / scale) * mask_f                  # [NK, L]
     rec_p = recency_w / recency_w.sum(dim=1, keepdim=True).clamp_min(_EPS)
 
