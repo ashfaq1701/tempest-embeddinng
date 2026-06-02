@@ -177,7 +177,15 @@ class LinkHead(nn.Module):
         if d_hidden is None:
             d_hidden = d_emb
 
-        self.bilinear = nn.Bilinear(d_emb, d_emb, 1)
+        # Bilinear branch: u^T W v + b. Refactored from nn.Bilinear to
+        # (Linear(d, d, bias=False)(u) * v).sum(-1) + scalar_b so the
+        # backward pass materialises [B, 1+K, d] instead of the
+        # [B, 1+K, d, d] outer product nn.Bilinear's autograd builds.
+        # Same param count (d*d weight + 1 bias), same expressivity.
+        # The outer-product form OOMs at B=500, K_train=300, d=128
+        # when E is not detached on the link path (~10 GiB).
+        self.bilinear_w = nn.Linear(d_emb, d_emb, bias=False)
+        self.bilinear_b = nn.Parameter(torch.zeros(1))
 
         # 6-channel pair features concatenated along last dim → 6*d_emb input.
         self.mlp = nn.Sequential(
@@ -192,7 +200,7 @@ class LinkHead(nn.Module):
 
     def forward(self, e_u: torch.Tensor, e_v: torch.Tensor) -> torch.Tensor:
         """e_u, e_v: [B, 1+K, d_emb]. Returns logits [B, 1+K]."""
-        score_bilin = self.bilinear(e_u, e_v).squeeze(-1)
+        score_bilin = (self.bilinear_w(e_u) * e_v).sum(dim=-1) + self.bilinear_b
 
         pair_feats = torch.cat(
             [
