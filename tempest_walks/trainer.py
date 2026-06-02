@@ -116,7 +116,15 @@ class TrainerConfig:
                                     # in raw timestamp units; -1 = unbounded.
 
     # Negatives (training).
-    hist_neg_ratio: float = 0.5
+    hist_neg_ratio: float = 0.0   # 0.0 routes to UniformNegativeSampler
+                                  # (no historical negatives). On
+                                  # recurrence graphs like wiki, hist
+                                  # negatives push E[u] away from u's
+                                  # own prior destinations — directly
+                                  # against the eval signal, and now
+                                  # that detach is off this leaks into
+                                  # E itself. Default flipped to
+                                  # uniform to remove that bias.
     reservoir_size: int = 32
 
     # Optimisation.

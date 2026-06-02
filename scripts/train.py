@@ -119,7 +119,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Negatives.
-    p.add_argument("--hist-neg-ratio", default=0.5, type=float)
+    p.add_argument(
+        "--hist-neg-ratio", default=0.0, type=float,
+        help="Fraction of training negatives drawn from the historical "
+             "reservoir. 0.0 (default) → UniformNegativeSampler (no "
+             "historical negatives). On recurrence graphs (wiki) "
+             "historical negatives push E[u] away from u's own prior "
+             "destinations, which is the eval-signal direction; with "
+             "no-detach link path that bias propagates into E. Override "
+             "to non-zero to re-enable.",
+    )
     p.add_argument("--reservoir-size", default=32, type=int)
 
     # Optimisation.
