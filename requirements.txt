@@ -2,14 +2,14 @@
 #
 # ┌─ IMPORTANT: torch is PINNED to 2.7.1. This is the first PyPI default
 # │  that ships with `nvidia-cuda-runtime-cu12>=12.6`, which is what
-# │  `temporal-random-walk>=1.8.2` requires. torch 2.6.0 looks like the
+# │  `temporal-random-walk>=1.8.4` requires. torch 2.6.0 looks like the
 # │  natural "cu126" pairing but its PyPI metadata actually pins to
 # │  `nvidia-cuda-runtime-cu12==12.4.127`, which collides with the
 # │  temporal-random-walk constraint at pip-resolve time:
 # │      ERROR: Cannot install ... because these package versions have
 # │      conflicting dependencies.
 # │          torch 2.6.0 depends on nvidia-cuda-runtime-cu12==12.4.127
-# │          temporal-random-walk 1.8.2 depends on nvidia-cuda-runtime-cu12>=12.6
+# │          temporal-random-walk 1.8.4 depends on nvidia-cuda-runtime-cu12>=12.6
 # │  torch 2.7.x bundles the cu126 runtime and resolves cleanly.
 # │
 # │  If you run `pip install -r requirements.txt` without first selecting
@@ -71,5 +71,5 @@
 numpy>=1.24,<3
 torch==2.7.1
 py-tgb>=2.2.0
-temporal-random-walk>=1.8.2
+temporal-random-walk>=1.8.4
 prodigyopt>=1.1
