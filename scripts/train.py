@@ -11,7 +11,7 @@ Hyperparameters exposed at CLI (and their grouping):
   Loss:           --tau-align, --tau-link, --gamma-recency,
                   --k-train
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias,
-                  --start-bias, --max-time-capacity
+                  --start-bias, --tempest-batch-window-multiplier
   Optimisation:   --lr, --lr-min, --warmup-fraction, --warmup-steps-cap,
                   --decay-horizon-epochs, --weight-decay, --batch-size,
                   --eval-batch-size, --num-epochs, --early-stop-patience
@@ -46,7 +46,7 @@ from tempest_walks.data_stats import compute_train_stats
 from tempest_walks.evaluator import Evaluator
 from tempest_walks.negatives import TGBNegativeSampler
 from tempest_walks.trainer import Trainer, TrainerConfig
-from tempest_walks.utils import seed_all
+from tempest_walks.utils import compute_max_time_capacity, seed_all
 
 
 def parse_args() -> argparse.Namespace:
@@ -108,12 +108,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--walk-bias", default="ExponentialWeight", type=str)
     p.add_argument("--start-bias", default="ExponentialWeight", type=str)
     p.add_argument(
-        "--max-time-capacity", default=-1, type=int,
-        help="Tempest sliding-window eviction in raw timestamp units. "
-             "Tempest tracks the max ingested timestamp and removes any "
-             "edge with ts < (latest - max_time_capacity) on every "
-             "add_multiple_edges call. -1 = unbounded (keep all ingested "
-             "edges until walk_gen.reset() at epoch boundary).",
+        "--tempest-batch-window-multiplier", default=-1.0, type=float,
+        help="Tempest sliding-window cap expressed as a multiple of the "
+             "mean batch's time-span. The effective max_time_capacity "
+             "passed to Tempest is "
+             "round(multiplier * batch_size * mean_inter_arrival) — see "
+             "tempest_walks/utils.py:compute_max_time_capacity. -1.0 "
+             "(default) is the unbounded sentinel: Tempest retains all "
+             "ingested edges until walk_gen.reset() at the epoch "
+             "boundary. The multiplier interface is dataset-agnostic; "
+             "the raw window depends on the dataset's calendar density.",
     )
 
     # Optimisation.
@@ -281,7 +285,11 @@ def main() -> Dict[str, Any]:
         max_walk_len=args.max_walk_len,
         walk_bias=args.walk_bias,
         start_bias=args.start_bias,
-        max_time_capacity=args.max_time_capacity,
+        max_time_capacity=compute_max_time_capacity(
+            args.tempest_batch_window_multiplier,
+            args.batch_size,
+            stats.mean_inter_arrival,
+        ),
 
         lr=args.lr,
         lr_min=args.lr_min,
