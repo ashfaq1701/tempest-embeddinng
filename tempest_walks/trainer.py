@@ -7,7 +7,7 @@ Single Trainer class. Per-batch ordering:
        seeds = unique(B_tgt)               if is_directed
        seeds = unique(B_src ∪ B_tgt)       if undirected
     2. L_align = alignment_loss(walks, ...)          ← InfoNCE scalar
-    3. neg = neg_sampler.sample(batch)               ← pre-observe state
+    3. neg = neg_sampler.sample(batch)               ← stateless uniform
        neg_tgt: [B, K_train]
     4. candidates_v = [pos_v | neg_tgt]              ← [B, 1+K_train]
        logits = link_head(E[u], E[v])                ← [B, 1+K_train]
@@ -17,8 +17,7 @@ Single Trainer class. Per-batch ordering:
        L_link = CE(logits / tau_link, target=zeros(B))
     5. L_total = L_align + L_link
     6. optimizer.zero_grad(set_to_none=True); L_total.backward(); optimizer.step()
-    7. neg_sampler.observe(B_src, B_tgt)             ← post-scoring
-    8. walk_gen.add_edges(B_src, B_tgt, B_ts, B_ef)  ← post-scoring, last
+    7. walk_gen.add_edges(B_src, B_tgt, B_ts, B_ef)  ← post-scoring, last
 
   EVAL (within torch.no_grad()):
     1. neg_dst_list = tgb_neg_sampler.sample(batch)  ← per-positive negs
@@ -29,8 +28,7 @@ Single Trainer class. Per-batch ordering:
        positive (TGB MRR).
     4. walk_gen.add_edges(batch)                     ← Tempest state
                                                        carries forward.
-    NOTE: reservoir not updated, walks not sampled at eval.
-          Model parameters frozen.
+    NOTE: walks not sampled at eval. Model parameters frozen.
 
 Epoch boundary:
   - walk_gen.reset()
@@ -61,11 +59,7 @@ from .data import Batch
 from .evaluator import Evaluator
 from .losses import alignment_loss
 from .model import EmbeddingTable, LinkHead, ProjectionHead
-from .negatives import (
-    HistoricalNegativeSampler,
-    NegativeSampler,
-    UniformNegativeSampler,
-)
+from .negatives import UniformNegativeSampler
 from .utils import make_lr_lambda
 from .walks import WalkGenerator
 
@@ -114,18 +108,6 @@ class TrainerConfig:
     start_bias: str = "ExponentialWeight"
     max_time_capacity: int = -1     # Tempest sliding-window eviction
                                     # in raw timestamp units; -1 = unbounded.
-
-    # Negatives (training).
-    hist_neg_ratio: float = 0.0   # 0.0 routes to UniformNegativeSampler
-                                  # (no historical negatives). On
-                                  # recurrence graphs like wiki, hist
-                                  # negatives push E[u] away from u's
-                                  # own prior destinations — directly
-                                  # against the eval signal, and now
-                                  # that detach is off this leaks into
-                                  # E itself. Default flipped to
-                                  # uniform to remove that bias.
-    reservoir_size: int = 32
 
     # Optimisation.
     lr: float = 1e-3            # peak LR (after warmup). Validated on
@@ -215,25 +197,17 @@ class Trainer:
             max_time_capacity=config.max_time_capacity,
         )
 
-        # Negative samplers (training). The sampler's per-positive
-        # negative count is K_train under the new per-query ranking
-        # protocol — sampler's internal `num_neg_per_pos` kwarg
-        # name stays the same (sampler API is unchanged).
-        if config.hist_neg_ratio > 0:
-            self.neg_sampler_train: NegativeSampler = HistoricalNegativeSampler(
-                num_nodes=config.num_nodes,
-                num_neg_per_pos=config.K_train,
-                hist_ratio=config.hist_neg_ratio,
-                reservoir_size=config.reservoir_size,
-                dst_pool=config.dst_pool,
-                seed=config.seed,
-            )
-        else:
-            self.neg_sampler_train = UniformNegativeSampler(
-                num_neg_per_pos=config.K_train,
-                dst_pool=config.dst_pool,
-                seed=config.seed,
-            )
+        # Negative sampler (training). UniformNegativeSampler is the
+        # only training-side sampler: HistoricalNegativeSampler was
+        # removed because on recurrence-dominated datasets it pushes E
+        # away from the eval-signal direction (now that detach is off
+        # on the link path, the historical-negative gradient leaks into
+        # E rather than just the link head).
+        self.neg_sampler_train = UniformNegativeSampler(
+            num_neg_per_pos=config.K_train,
+            dst_pool=config.dst_pool,
+            seed=config.seed,
+        )
 
         # Single optimiser over all trainable parameters. E is jointly
         # trained by both L_align (through projection heads) and L_link
@@ -436,11 +410,7 @@ class Trainer:
             self.lr_scheduler.step()
             self._global_step += 1
 
-        # Step 7: observe positives into reservoir (post-scoring).
-        if isinstance(self.neg_sampler_train, HistoricalNegativeSampler):
-            self.neg_sampler_train.observe(batch.src, batch.tgt)
-
-        # Step 8: ingest into Tempest (LAST).
+        # Step 7: ingest into Tempest (LAST).
         self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
 
         return {
@@ -459,8 +429,8 @@ class Trainer:
         evaluator: Evaluator,
         batches: Iterable[Batch],
     ) -> float:
-        """Streaming eval. Walks NOT sampled; reservoir NOT updated.
-        Tempest state advances via post-scoring add_edges."""
+        """Streaming eval. Walks NOT sampled. Tempest state advances
+        via post-scoring add_edges."""
         self.embedding_table.eval()
         self.p_target.eval()
         self.p_context.eval()
@@ -578,10 +548,9 @@ class Trainer:
         per_epoch_test: List[float] = []
 
         for ep in range(1, n_epochs + 1):
-            # Epoch boundary: walks + reservoir reset only.
+            # Epoch boundary: walks reset only (the uniform sampler is
+            # stateless; nothing else carries over).
             self.walk_gen.reset()
-            if isinstance(self.neg_sampler_train, HistoricalNegativeSampler):
-                self.neg_sampler_train.reset()
 
             self.embedding_table.train()
             self.p_target.train()

@@ -12,7 +12,6 @@ Hyperparameters exposed at CLI (and their grouping):
                   --k-train
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias,
                   --start-bias, --max-time-capacity
-  Negatives:      --hist-neg-ratio, --reservoir-size
   Optimisation:   --lr, --lr-min, --warmup-fraction, --warmup-steps-cap,
                   --decay-horizon-epochs, --weight-decay, --batch-size,
                   --eval-batch-size, --num-epochs, --early-stop-patience
@@ -117,19 +116,6 @@ def parse_args() -> argparse.Namespace:
              "add_multiple_edges call. -1 = unbounded (keep all ingested "
              "edges until walk_gen.reset() at epoch boundary).",
     )
-
-    # Negatives.
-    p.add_argument(
-        "--hist-neg-ratio", default=0.0, type=float,
-        help="Fraction of training negatives drawn from the historical "
-             "reservoir. 0.0 (default) → UniformNegativeSampler (no "
-             "historical negatives). On recurrence graphs (wiki) "
-             "historical negatives push E[u] away from u's own prior "
-             "destinations, which is the eval-signal direction; with "
-             "no-detach link path that bias propagates into E. Override "
-             "to non-zero to re-enable.",
-    )
-    p.add_argument("--reservoir-size", default=32, type=int)
 
     # Optimisation.
     p.add_argument(
@@ -297,9 +283,6 @@ def main() -> Dict[str, Any]:
         walk_bias=args.walk_bias,
         start_bias=args.start_bias,
         max_time_capacity=args.max_time_capacity,
-
-        hist_neg_ratio=args.hist_neg_ratio,
-        reservoir_size=args.reservoir_size,
 
         lr=args.lr,
         lr_min=args.lr_min,
