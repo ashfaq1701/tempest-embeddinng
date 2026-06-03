@@ -58,7 +58,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from .data import Batch
 from .evaluator import Evaluator
 from .losses import alignment_loss
-from .model import EmbeddingTable, LinkHead, ProjectionHead
+from .model import EmbeddingTable, LinkHead
 from .negatives import UniformNegativeSampler
 from .utils import make_lr_lambda
 from .walks import WalkGenerator
@@ -74,7 +74,6 @@ class TrainerConfig:
     num_nodes: int
     is_directed: bool
     dst_pool: np.ndarray
-    d_node_feat: Optional[int] = None
 
     # Model.
     d_emb: int = 128
@@ -144,7 +143,6 @@ class Trainer:
     def __init__(
         self,
         config: TrainerConfig,
-        node_feat: Optional[np.ndarray] = None,
         device: Optional[torch.device] = None,
     ):
         self.config = config
@@ -152,30 +150,13 @@ class Trainer:
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
 
-        if node_feat is not None:
-            assert config.d_node_feat is not None, (
-                "node_feat passed but config.d_node_feat is None"
-            )
-            assert node_feat.shape == (config.num_nodes, config.d_node_feat), (
-                f"node_feat shape {node_feat.shape} != "
-                f"({config.num_nodes}, {config.d_node_feat})"
-            )
-            self.node_feat = torch.from_numpy(node_feat).float().to(self.device)
-        else:
-            self.node_feat = None
-
-        # Model.
+        # Model. The alignment loss operates directly on E rows (no
+        # projection head). When we want to fuse node / edge features
+        # we will add a fusion path that both losses share, not a
+        # learned MLP only seen by L_align.
         self.embedding_table = EmbeddingTable(
             num_nodes=config.num_nodes,
             d_emb=config.d_emb,
-        ).to(self.device)
-        self.p_target = ProjectionHead(
-            d_emb=config.d_emb,
-            d_node_feat=config.d_node_feat,
-        ).to(self.device)
-        self.p_context = ProjectionHead(
-            d_emb=config.d_emb,
-            d_node_feat=config.d_node_feat,
         ).to(self.device)
         self.link_head = LinkHead(d_emb=config.d_emb).to(self.device)
 
@@ -207,14 +188,11 @@ class Trainer:
             seed=config.seed,
         )
 
-        # Single optimiser over all trainable parameters. E is jointly
-        # trained by both L_align (through projection heads) and L_link
-        # (through the link head's pair-MLP) — no detach on the link
-        # path. recency_scale is frozen (not in this list).
+        # Single optimiser. E is jointly trained by L_align (directly
+        # — no projection heads) and L_link (through the link head's
+        # pair-MLP). recency_scale is frozen.
         params = (
             list(self.embedding_table.parameters())
-            + list(self.p_target.parameters())
-            + list(self.p_context.parameters())
             + list(self.link_head.parameters())
         )
         # Prodigy: hyperparameter-free adaptive optimiser. Internally
@@ -348,13 +326,10 @@ class Trainer:
         # window.
         l_align = alignment_loss(
             embedding_table=self.embedding_table,
-            p_target=self.p_target,
-            p_context=self.p_context,
             walks=walks,
             recency_scale=self.recency_scale,
             gamma_recency=self.config.gamma_recency,
             tau_align=self.config.tau_align,
-            node_feat=self.node_feat,
             chunk_size=self.config.alignment_chunk_size,
         )
 
@@ -429,8 +404,6 @@ class Trainer:
         """Streaming eval. Walks NOT sampled. Tempest state advances
         via post-scoring add_edges."""
         self.embedding_table.eval()
-        self.p_target.eval()
-        self.p_context.eval()
         self.link_head.eval()
 
         total = 0.0
@@ -504,15 +477,11 @@ class Trainer:
     def _snapshot(self) -> Dict[str, Any]:
         return {
             "embedding_table": self._cpu_state_dict(self.embedding_table),
-            "p_target":        self._cpu_state_dict(self.p_target),
-            "p_context":       self._cpu_state_dict(self.p_context),
             "link_head":       self._cpu_state_dict(self.link_head),
         }
 
     def _restore(self, snap: Dict[str, Any]) -> None:
         self.embedding_table.load_state_dict(snap["embedding_table"])
-        self.p_target.load_state_dict(snap["p_target"])
-        self.p_context.load_state_dict(snap["p_context"])
         self.link_head.load_state_dict(snap["link_head"])
 
     # ──────────────────────────────────────────────────────────────────
@@ -550,8 +519,6 @@ class Trainer:
             self.walk_gen.reset()
 
             self.embedding_table.train()
-            self.p_target.train()
-            self.p_context.train()
             self.link_head.train()
 
             t0 = time.time()

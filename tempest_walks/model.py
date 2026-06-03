@@ -1,24 +1,17 @@
-"""Model components: embedding table, projection heads, link head.
+"""Model components: embedding table, link head.
 
-Three classes, no shared state:
+Two classes, no shared state:
 
 EmbeddingTable
   - Single nn.Embedding(num_nodes, d_emb).
-  - Lookup-only. Trained by InfoNCE contrastive alignment through
-    the projection heads.
-
-ProjectionHead
-  - Conditional architecture based on node-feature availability:
-      E only   → MLP on E
-      E + NF   → MLP on E + MLP on NF, concat, merge MLP
-  - Output is L2-normalised onto the unit sphere via
-    F.normalize(.., p=2, dim=-1). The alignment loss is squared L2
-    distance, which on the sphere equals 2 - 2*cos.
-  - Two instances: P_target (for seed/downstream nodes) and
-    P_context (for walk-internal/upstream nodes), each with its own
-    parameters. Both heads have the same architecture.
-  - Edge features were tested and consistently underperformed the
-    no-EF baseline; the EF channel has been removed.
+  - Lookup-only. Trained DIRECTLY by InfoNCE contrastive alignment
+    on raw rows — there is no projection-head wrapper between E and
+    the loss. Both losses operate on the same embedding so there is
+    no asymmetry between what L_align optimises and what L_link
+    consumes (see the no-projection-branch result on wiki, and the
+    review/coin failure-mode analysis: a learned projection only
+    optimised by L_align introduces a representation seam against
+    a link head that reads raw E).
 
 LinkHead
   - score(u, v) = bilinear(E(u), E(v)) + small_MLP(pair_features(u, v))
@@ -52,7 +45,6 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class EmbeddingTable(nn.Module):
@@ -69,87 +61,6 @@ class EmbeddingTable(nn.Module):
     def forward(self, node_ids: torch.Tensor) -> torch.Tensor:
         """node_ids: any shape of long; returns shape + [d_emb]."""
         return self.E(node_ids)
-
-
-class ProjectionHead(nn.Module):
-    """Loss-side projection with optional node-feature channel.
-
-    Architecture:
-      - One sub-MLP per active input channel (E always; NF if
-        d_node_feat is not None).
-      - Concat the active sub-MLP outputs along the last dim.
-      - Merge MLP mixes back to d_emb.
-      - Output is L2-normalised onto the unit sphere via
-        F.normalize(.., p=2, dim=-1).
-
-    The alignment loss is squared L2 distance, which on the unit
-    sphere equals 2 - 2*cos — a monotone transform of cosine, so
-    L2-norm + l2_dist is equivalent to cosine sim up to a constant.
-
-    Projection dim is fixed equal to the embedding dim. The earlier
-    d_proj knob was always set equal to d_emb in practice and only
-    added an unused degree of freedom; collapsing it removes the
-    knob without changing behaviour for any past run.
-
-    Two instances are typically constructed: P_target (for
-    seed/downstream nodes) and P_context (for walk-internal/upstream
-    nodes), each with its own parameters.
-
-    Edge features were tested and consistently underperformed the
-    no-EF baseline (val 0.397 no-EF vs ≤ 0.355 for every EF
-    variant). The EF channel has been removed.
-    """
-
-    def __init__(
-        self,
-        d_emb: int,
-        d_node_feat: Optional[int] = None,
-        d_hidden: Optional[int] = None,
-    ):
-        super().__init__()
-        if d_hidden is None:
-            d_hidden = d_emb
-
-        self.has_nf = d_node_feat is not None
-
-        self.e_mlp = nn.Sequential(
-            nn.Linear(d_emb, d_hidden),
-            nn.GELU(),
-            nn.Linear(d_hidden, d_emb),
-        )
-
-        if self.has_nf:
-            self.nf_mlp = nn.Sequential(
-                nn.Linear(d_node_feat, d_hidden),
-                nn.GELU(),
-                nn.Linear(d_hidden, d_emb),
-            )
-
-        n_branches = 1 + int(self.has_nf)
-        self.merge = nn.Sequential(
-            nn.Linear(n_branches * d_emb, d_hidden),
-            nn.GELU(),
-            nn.Linear(d_hidden, d_emb),
-        )
-
-    def forward(
-        self,
-        e: torch.Tensor,
-        node_feat: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Returns L2-normalised projection on the unit sphere."""
-        if self.has_nf and node_feat is None:
-            raise ValueError("ProjectionHead has NF channel but no NF passed")
-        if not self.has_nf and node_feat is not None:
-            raise ValueError("ProjectionHead has no NF channel but NF was passed")
-
-        branches = [self.e_mlp(e)]
-        if self.has_nf:
-            branches.append(self.nf_mlp(node_feat))
-
-        z = torch.cat(branches, dim=-1)
-        out = self.merge(z)
-        return F.normalize(out, p=2, dim=-1, eps=1e-12)
 
 
 class LinkHead(nn.Module):

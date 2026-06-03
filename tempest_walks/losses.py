@@ -54,8 +54,6 @@ Notes:
     The caller is responsible for calling .backward() on ℒ.
 """
 
-from typing import Optional
-
 import torch
 from torch.utils.checkpoint import checkpoint
 
@@ -68,13 +66,10 @@ _EPS = 1e-9     # W_i validity threshold and denominator clamp
 
 def alignment_loss(
     embedding_table,
-    p_target,
-    p_context,
     walks: WalkData,
     recency_scale: float,
     gamma_recency: float = 0.4,
     tau_align: float = 0.5,
-    node_feat: Optional[torch.Tensor] = None,
     chunk_size: int = 8192,
 ) -> torch.Tensor:
     """Returns ℒ as a scalar graph-attached tensor. See module docstring.
@@ -163,20 +158,13 @@ def alignment_loss(
     pool_idx_flat[ctx_valid_mask] = inverse_idx_valid
     pool_idx = pool_idx_flat.view(NK, L)                          # [NK, L]
 
-    # E[s_i], E[v]  (embedding lookups)
+    # E[s_i], E[v]  (embedding lookups — no projection)
+    # The loss operates DIRECTLY on the embedding-table rows. There
+    # is no projection MLP between E and the squared-L2 similarity;
+    # gradients flow straight to embedding_table.E.weight.
     seed_per_row = seeds_t.repeat_interleave(K)                   # [NK]
-    e_seed = embedding_table(seed_per_row)                        # [NK, d]
-    e_pool = embedding_table(unique_nodes)                        # [V, d]
-
-    # a_i := P_t(E[s_i]),   b_v := P_c(E[v])    (unit-norm on the sphere)
-    if node_feat is not None:
-        nf_seed = node_feat[seed_per_row]
-        nf_pool = node_feat[unique_nodes]
-        a = p_target(e_seed, node_feat=nf_seed)                   # [NK, d]
-        b = p_context(e_pool, node_feat=nf_pool)                  # [V, d]
-    else:
-        a = p_target(e_seed)                                      # [NK, d]
-        b = p_context(e_pool)                                     # [V, d]
+    a = embedding_table(seed_per_row)                             # [NK, d]
+    b = embedding_table(unique_nodes)                             # [V, d]
 
     # φ(s_i, v) = -‖a_i - b_v‖² / τ,  with ‖a-b‖² = ‖a‖² + ‖b‖² - 2 ⟨a, b⟩
     # sq_a / sq_b are tiny and reused across chunks → compute outside the loop.

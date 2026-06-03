@@ -18,11 +18,11 @@ Hyperparameters exposed at CLI (and their grouping):
   System:         --seed, --use-gpu, --use-gpu-tempest
 
 Derived from the dataset (not exposed):
-  num_nodes, is_directed, dst_pool, d_node_feat,
+  num_nodes, is_directed, dst_pool,
   TrainStats (t_min, t_max, T_train, median_inter_arrival,
               mean_inter_arrival) — see tempest_walks/data_stats.py.
   recency_scale defaults to TrainStats.mean_inter_arrival and is
-  frozen (not learnable) — held as a plain tensor on the Trainer.
+  frozen (not learnable) — held as a plain Python float on the Trainer.
 """
 
 import argparse
@@ -227,11 +227,6 @@ def main() -> Dict[str, Any]:
     is_directed = args.is_directed
     dst_pool = np.unique(loaded.train.destinations).astype(np.int32)
     stats = compute_train_stats(loaded.train.timestamps)
-    d_node_feat = (
-        int(loaded.node_feat.shape[1])
-        if loaded.node_feat is not None
-        else None
-    )
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  directed:      {is_directed}  (--is-directed)")
@@ -244,8 +239,6 @@ def main() -> Dict[str, Any]:
     print(f"  train edges:   {len(loaded.train.sources):,}")
     print(f"  val edges:     {len(loaded.val.sources):,}")
     print(f"  test edges:    {len(loaded.test.sources):,}")
-    print(f"  has_node_feat: {loaded.node_feat is not None}"
-          + (f" (d={d_node_feat})" if d_node_feat is not None else ""))
 
     # ─── Build batch factories ─────────────────────────────────────
     # create_batches consumes a SplitData and yields Batches in
@@ -281,7 +274,6 @@ def main() -> Dict[str, Any]:
         num_nodes=num_nodes,
         is_directed=is_directed,
         dst_pool=dst_pool,
-        d_node_feat=d_node_feat,
 
         d_emb=args.d_emb,
 
@@ -324,18 +316,14 @@ def main() -> Dict[str, Any]:
             print(f"  {k}: {v}")
 
     # ─── Instantiate Trainer ───────────────────────────────────────
-    trainer = Trainer(config=config, node_feat=loaded.node_feat, device=device)
+    trainer = Trainer(config=config, device=device)
 
     print("\n=== Parameter counts ===")
     n_E = sum(p.numel() for p in trainer.embedding_table.parameters())
-    n_Pt = sum(p.numel() for p in trainer.p_target.parameters())
-    n_Pc = sum(p.numel() for p in trainer.p_context.parameters())
     n_H = sum(p.numel() for p in trainer.link_head.parameters())
     print(f"  embedding_table: {n_E:>12,}")
-    print(f"  p_target:        {n_Pt:>12,}")
-    print(f"  p_context:       {n_Pc:>12,}")
     print(f"  link_head:       {n_H:>12,}")
-    print(f"  TOTAL trainable: {n_E + n_Pt + n_Pc + n_H:>12,}")
+    print(f"  TOTAL trainable: {n_E + n_H:>12,}")
 
     # ─── Train ─────────────────────────────────────────────────────
     print("\n=== Training ===")
