@@ -10,10 +10,10 @@ Single Trainer class. Per-batch ordering:
     3. neg = neg_sampler.sample(batch)               ← stateless uniform
        neg_tgt: [B, K_train]
     4. candidates_v = [pos_v | neg_tgt]              ← [B, 1+K_train]
-       logits = link_head(E[u], E[v])                ← [B, 1+K_train]
+       logits = link_head(E[u].detach(), E[v].detach())  ← [B, 1+K_train]
                 (undirected: 0.5 × (link_head(u,v) + link_head(v,u)))
-                (E is NOT detached — L_link gradient flows back into E
-                 alongside L_align's; joint training of the embedding.)
+                E is detached — L_link trains only the link head;
+                L_align is the sole gradient path into E.
        L_link = CE(logits / tau_link, target=zeros(B))
     5. L_total = L_align + L_link
     6. optimizer.zero_grad(set_to_none=True); L_total.backward(); optimizer.step()
@@ -188,9 +188,10 @@ class Trainer:
             seed=config.seed,
         )
 
-        # Single optimiser. E is jointly trained by L_align (directly
-        # — no projection heads) and L_link (through the link head's
-        # pair-MLP). recency_scale is frozen.
+        # Single optimiser. E is trained by L_align only (directly —
+        # no projection heads); L_link sees E.detach() so only the link
+        # head's parameters receive the link-loss gradient.
+        # recency_scale is frozen.
         params = (
             list(self.embedding_table.parameters())
             + list(self.link_head.parameters())
@@ -356,13 +357,17 @@ class Trainer:
         )                                                            # [B, 1+K]
         candidates_u = src_t.unsqueeze(1).expand(B, 1 + K)           # [B, 1+K]
 
-        # No detach: L_link's gradient now flows into E alongside
-        # L_align's. The pair-MLP path on E is expressive, so the link
-        # gradient on E can be large in magnitude — watch the relative
-        # decay of L_align vs L_link per epoch and add a link weight
-        # if alignment starts to lose ground.
-        e_u = self.embedding_table(candidates_u)                     # [B, 1+K, d]
-        e_v = self.embedding_table(candidates_v)                     # [B, 1+K, d]
+        # Detach on the link path: L_link trains only the link head;
+        # E is updated exclusively by L_align (walk-supervised). Without
+        # detach, the softmax-CE over 100 random negatives drives E to
+        # memorise training (u, v⁺) pair geometry — visible as link loss
+        # collapsing far below the uniform baseline log(1+K_train) ≈ 4.62
+        # while val MRR drops monotonically from epoch 1. On
+        # high-surprise datasets (review surprise=0.987) this anti-ranks
+        # val positives because memorised seen-pair geometry has no
+        # bearing on unseen pairs.
+        e_u = self.embedding_table(candidates_u).detach()            # [B, 1+K, d]
+        e_v = self.embedding_table(candidates_v).detach()            # [B, 1+K, d]
         if self.config.is_directed:
             logits = self.link_head(e_u, e_v)                        # [B, 1+K]
         else:
