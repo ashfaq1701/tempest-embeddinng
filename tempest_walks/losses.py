@@ -23,21 +23,23 @@ Energy-based conditional with μ as base measure:
     p(v | s) := c(v)^α · exp(φ(s, v)) / Z(s)
     log p(v | s) = α · log c(v) + φ(s, v) - log Z(s)
 
-Per-position weight (convex combination of hop and walk-normalised recency):
-    K_hop(i, p)    := max(1, ℓ_i - 1 - p)
-    t_seed_edge(i) := max_{valid p} t_{i, p}    — seed's most recent edge time
-    t_oldest(i)    := min_{valid p} t_{i, p}    — walk's oldest valid edge time
-    walk_span(i)   := max(1, t_seed_edge(i) - t_oldest(i))
-    gap_norm(i, p) := (t_seed_edge(i) - t_{i, p}) / walk_span(i)   ∈ [0, 1]
-    h_p            := normalize(1/K_hop)        — hop profile, sums to 1
-    r_p            := normalize(exp(-gap_norm))  — recency profile, sums to 1
-                      Walk-normalised exponential — the scale is the walk's
-                      OWN temporal span, so the seed-adjacent position has
-                      weight 1 and the oldest predecessor has weight 1/e
-                      regardless of the walk's absolute duration.
-                      No free scale knob.
-    w̃(i, p)        := (1 - γ) · h_p(i, p) + γ · r_p(i, p)
-                      Convex mix; γ ∈ [0, 1]. Per-row sum is 1 by construction.
+Per-position weight (convex combination of hop and stationary recency):
+    K_hop(i, p)  := max(1, ℓ_i - 1 - p)
+    gap(i, p)    := max(0, t_seed_edge(i) - t_{i, p})            stationary
+                    where t_seed_edge(i) = max_{valid p} t_{i, p}
+                    — the timestamp of the seed's own most-recent edge,
+                    so gap is elapsed time between context p and the
+                    seed's interaction (not absolute calendar position).
+                    Window-position-invariant: a week-1 seed and a
+                    week-4 seed with the same local history get the
+                    same recency profile.
+    h_p          := normalize(1/K_hop)        — hop profile, sums to 1
+    r_p          := normalize(exp(-gap/scale)) — recency profile, sums to 1
+                    where scale = recency_scale, in raw timestamp units
+                    (data-driven: median inter-arrival of train edges).
+    w̃(i, p)      := (1 - γ) · h_p(i, p) + γ · r_p(i, p)
+                    Convex mix; γ ∈ [0, 1]. γ=0 is hop-only, γ=1 is
+                    recency-only. Per-row sum is 1 by construction.
 
 Per-row weighted negative log-likelihood:
     W_i      := Σ_p 𝟙[valid(i, p)] · w̃(i, p)
@@ -65,16 +67,20 @@ _EPS = 1e-9     # W_i validity threshold and denominator clamp
 def alignment_loss(
     embedding_table,
     walks: WalkData,
+    recency_scale: float,
     gamma_recency: float = 0.4,
     tau_align: float = 0.5,
     chunk_size: int = 8192,
 ) -> torch.Tensor:
     """Returns ℒ as a scalar graph-attached tensor. See module docstring.
 
-    No free recency scale knob: the within-walk recency profile is
-    normalised by each walk's own temporal span, so the seed-adjacent
-    position has weight 1 and the oldest predecessor has weight 1/e
-    regardless of how long the walk spans in raw timestamp units.
+    `recency_scale` is a frozen Python float (owned by the Trainer).
+    Its value is the recency time-constant in raw timestamp units, set
+    once from `TrainStats.mean_inter_arrival` at Trainer-init.
+    Previously this was a learnable parameter under a softplus
+    reparameterisation, but the scalar was observed to collapse toward
+    zero under longer runs without improving val MRR, so it's now
+    frozen.
 
     `chunk_size` slices the unique-pool dimension V when computing the
     InfoNCE partition log Z(s_i). Forward computes log Z via streaming
@@ -115,23 +121,22 @@ def alignment_loss(
     hop_w = (1.0 / hop_dist) * mask_f                             # [NK, L]
     hop_p = hop_w / hop_w.sum(dim=1, keepdim=True).clamp_min(_EPS)
 
-    # Per-walk recency anchors. Mask invalid positions to ±inf before
-    # the reductions so sentinels (INT64_MAX at the seed slot, -1
-    # padding) cannot win min or max.
+    # Stationary recency: gap = t_seed_edge - t_{i, p}, ≥ 0.
+    # t_seed_edge = max of valid timestamps in the row. Masking
+    # invalid positions to -inf before .max() ensures sentinels
+    # (INT64_MAX at seed slot, -1 padding) cannot win the max.
     ts_f = timestamps.float()
-    ts_masked_max = ts_f.masked_fill(~is_context, float("-inf"))
-    ts_masked_min = ts_f.masked_fill(~is_context, float("inf"))
-    t_seed_edge = ts_masked_max.max(dim=1, keepdim=True).values   # [NK, 1]
-    t_oldest = ts_masked_min.min(dim=1, keepdim=True).values      # [NK, 1]
-    # Walk-normalised gap ∈ [0, 1]: seed-adjacent → 0, oldest valid → 1.
-    # clamp_min(1) on walk_span guards single-edge walks (denominator
-    # would be 0); rec_w degenerates to 1 at the single valid slot,
-    # convex-combo falls back to pure hop after row-normalisation.
-    # clamp_min(0) on gap absorbs invalid rows (where t_seed_edge is
-    # -inf): the subtraction goes to -inf, clamped to 0, then masked.
-    walk_span = (t_seed_edge - t_oldest).clamp_min(1.0)           # [NK, 1]
-    gap_norm = ((t_seed_edge - ts_f) / walk_span).clamp_min(0.0)  # [NK, L]
-    recency_w = torch.exp(-gap_norm) * mask_f                     # [NK, L], ∈ [1/e, 1]
+    ts_masked = ts_f.masked_fill(~is_context, float("-inf"))
+    t_seed_edge = ts_masked.max(dim=1, keepdim=True).values       # [NK, 1]
+    # clamp_min(0) absorbs every sentinel: invalid rows get -inf
+    # subtracted to -inf, then clamped to 0; mask zeros their weight.
+    gap = (t_seed_edge - ts_f).clamp_min(0.0)                     # [NK, L]
+    # `recency_scale` is a frozen Python float (mean inter-arrival of
+    # the train split). max(., 1.0) is a numerical guard; for any real
+    # dataset the configured value sits well above the floor. Plain
+    # float broadcasts cleanly against `gap` in the divide.
+    scale = max(recency_scale, 1.0)
+    recency_w = torch.exp(-gap / scale) * mask_f                  # [NK, L]
     rec_p = recency_w / recency_w.sum(dim=1, keepdim=True).clamp_min(_EPS)
 
     # Convex combination: per-row profile, sums to 1 by construction.
