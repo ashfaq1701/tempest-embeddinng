@@ -10,8 +10,13 @@ Hyperparameters exposed at CLI (and their grouping):
   Model:          --d-emb
   Loss:           --tau-align, --tau-link, --gamma-recency,
                   --k-train, --alignment-chunk-size
-  Walks:          --num-walks-per-node, --max-walk-len, --walk-bias,
-                  --start-bias, --tempest-batch-window-multiplier
+  Walks:          --embedding-num-walks-per-node, --embedding-max-walk-len,
+                  --embedding-walk-bias, --embedding-start-bias,
+                  --link-pred-num-walks-per-node, --link-pred-max-walk-len,
+                  --link-pred-walk-bias, --link-pred-start-bias,
+                  --tempest-batch-window-multiplier
+                  (link-pred-* are plumbed but currently unused; reserved
+                   for a future link-prediction-side scoring path.)
   Optimisation:   --lr, --lr-min, --warmup-fraction, --warmup-steps-cap,
                   --decay-horizon-epochs, --weight-decay, --batch-size,
                   --eval-batch-size, --num-epochs, --early-stop-patience
@@ -113,10 +118,42 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Walks.
-    p.add_argument("--num-walks-per-node", default=5, type=int)
-    p.add_argument("--max-walk-len", default=20, type=int)
-    p.add_argument("--walk-bias", default="ExponentialWeight", type=str)
-    p.add_argument("--start-bias", default="ExponentialWeight", type=str)
+    # Embedding side — BACKWARD walks consumed by the alignment loss.
+    p.add_argument(
+        "--embedding-num-walks-per-node", default=5, type=int,
+        help="K for backward (embedding-side) walks.",
+    )
+    p.add_argument(
+        "--embedding-max-walk-len", default=20, type=int,
+        help="L for backward (embedding-side) walks.",
+    )
+    p.add_argument(
+        "--embedding-walk-bias", default="ExponentialWeight", type=str,
+        help="Per-hop edge bias for embedding-side walks.",
+    )
+    p.add_argument(
+        "--embedding-start-bias", default="ExponentialWeight", type=str,
+        help="Initial-edge bias for embedding-side walks.",
+    )
+    # Link-pred side — FORWARD walks reserved for a future scoring path.
+    # Plumbed end-to-end (WalkGenerator, TrainerConfig) but no Trainer
+    # caller consumes them yet.
+    p.add_argument(
+        "--link-pred-num-walks-per-node", default=5, type=int,
+        help="K for forward (link-pred-side) walks. Reserved; currently unused.",
+    )
+    p.add_argument(
+        "--link-pred-max-walk-len", default=20, type=int,
+        help="L for forward (link-pred-side) walks. Reserved; currently unused.",
+    )
+    p.add_argument(
+        "--link-pred-walk-bias", default="ExponentialWeight", type=str,
+        help="Per-hop edge bias for link-pred-side walks. Reserved.",
+    )
+    p.add_argument(
+        "--link-pred-start-bias", default="Uniform", type=str,
+        help="Initial-edge bias for link-pred-side walks. Reserved.",
+    )
     p.add_argument(
         "--tempest-batch-window-multiplier", default=-1.0, type=float,
         help="Tempest sliding-window cap expressed as a multiple of the "
@@ -293,10 +330,14 @@ def main() -> Dict[str, Any]:
         K_train=args.k_train,
         alignment_chunk_size=args.alignment_chunk_size,
 
-        num_walks_per_node=args.num_walks_per_node,
-        max_walk_len=args.max_walk_len,
-        walk_bias=args.walk_bias,
-        start_bias=args.start_bias,
+        embedding_num_walks_per_node=args.embedding_num_walks_per_node,
+        embedding_max_walk_len=args.embedding_max_walk_len,
+        embedding_walk_bias=args.embedding_walk_bias,
+        embedding_start_bias=args.embedding_start_bias,
+        link_pred_num_walks_per_node=args.link_pred_num_walks_per_node,
+        link_pred_max_walk_len=args.link_pred_max_walk_len,
+        link_pred_walk_bias=args.link_pred_walk_bias,
+        link_pred_start_bias=args.link_pred_start_bias,
         max_time_capacity=compute_max_time_capacity(
             args.tempest_batch_window_multiplier,
             args.batch_size,

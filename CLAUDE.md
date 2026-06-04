@@ -263,8 +263,10 @@ Historical (Vitter R) reservoir sampler.
 | ProjectionHead output | L2-normalised on unit sphere | reverted from "no norm" (winning 2026-05-28 config) to L2-norm in the Prodigy + ranking-link-loss redesign (2026-05-30 sweep; see below). On the sphere, squared L2 distance equals 2-2*cos, so the alignment loss is cosine-equivalent up to a constant. Hardcoded — not a CLI knob |
 | Alignment sim | `-‖p_t − p_c‖² / tau_align` (L2-distance) | same sweep: equivalent to cosine on the unit sphere; off-sphere it carries strictly more information (magnitude + direction). Hardcoded — not a CLI knob |
 | Link loss | per-query softmax CE over [B, 1+K_train] candidates | replaces per-pair BCE; upper-bounds 1 − MRR (Bruch et al., ICTIR 2019). Hardcoded — not a CLI knob |
-| `num_walks_per_node` | 5 | DeepWalk/CTDNE convention |
-| `max_walk_len` | 20 | |
+| `embedding_num_walks_per_node` | 5 | DeepWalk/CTDNE convention; backward walks for the alignment loss |
+| `embedding_max_walk_len` | 20 | backward walks for the alignment loss |
+| `link_pred_num_walks_per_node` | 5 | forward walks reserved for a future link-pred-side scoring path; currently unused |
+| `link_pred_max_walk_len` | 20 | forward walks reserved; currently unused |
 | `max_time_capacity` | -1 (unbounded) | wiki single-seed window sweep 2026-05-28: cap ∈ {66k, 100k, 250k, 500k, 1M} all underperformed unbounded on test MRR. cap=500k matched unbounded on val (+0.002, within noise) but lost test by 0.006 |
 | `lr` | 1e-3 | wiki seed-42 A/B (sampled-neg K=64): lr=1e-3 → val 0.4594 vs lr=1e-2 → 0.4301 |
 | `batch_size` | 500 | rebalanced for B*(1+K_train) candidate forwards per step under the ranking protocol |

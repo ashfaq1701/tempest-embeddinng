@@ -3,7 +3,7 @@
 Single Trainer class. Per-batch ordering:
 
   TRAINING:
-    1. walks = walk_gen.walks_for_nodes(seeds)       ← pre-ingest state
+    1. walks = walk_gen.walks_for_nodes_embedding(seeds)  ← pre-ingest state
        seeds = unique(B_tgt)               if is_directed
        seeds = unique(B_src ∪ B_tgt)       if undirected
     2. L_align = alignment_loss(walks, ...)          ← InfoNCE scalar
@@ -107,11 +107,20 @@ class TrainerConfig:
     gamma_recency: float = 0.4
     recency_scale: float = 1.0  # Plumbed in by train.py from TrainStats.
 
-    # Walks.
-    num_walks_per_node: int = 5
-    max_walk_len: int = 20
-    walk_bias: str = "ExponentialWeight"
-    start_bias: str = "ExponentialWeight"
+    # Walks. Two sides:
+    #   embedding_* — BACKWARD walks consumed by the alignment loss.
+    #                  Drives the geometry of E.
+    #   link_pred_* — FORWARD walks reserved for a future link-prediction-
+    #                  side scoring path. Plumbed end-to-end but no Trainer
+    #                  caller wires them in yet.
+    embedding_num_walks_per_node: int = 5
+    embedding_max_walk_len: int = 20
+    embedding_walk_bias: str = "ExponentialWeight"
+    embedding_start_bias: str = "ExponentialWeight"
+    link_pred_num_walks_per_node: int = 5
+    link_pred_max_walk_len: int = 20
+    link_pred_walk_bias: str = "ExponentialWeight"
+    link_pred_start_bias: str = "Uniform"
     max_time_capacity: int = -1     # Tempest sliding-window eviction
                                     # in raw timestamp units; -1 = unbounded.
 
@@ -165,14 +174,20 @@ class Trainer:
         # the per-batch gap tensor at the use site.
         self.recency_scale = float(config.recency_scale)
 
-        # Walk sampler.
+        # Walk sampler. Both directions share one Tempest instance;
+        # the embedding-side knobs drive the alignment loss, the
+        # link-pred-side knobs are plumbed but currently unused.
         self.walk_gen = WalkGenerator(
             is_directed=config.is_directed,
             use_gpu=config.use_gpu_tempest,
-            walk_bias=config.walk_bias,
-            start_bias=config.start_bias,
-            max_walk_len=config.max_walk_len,
-            num_walks_per_node=config.num_walks_per_node,
+            embedding_walk_bias=config.embedding_walk_bias,
+            embedding_start_bias=config.embedding_start_bias,
+            embedding_num_walks_per_node=config.embedding_num_walks_per_node,
+            embedding_max_walk_len=config.embedding_max_walk_len,
+            link_pred_walk_bias=config.link_pred_walk_bias,
+            link_pred_start_bias=config.link_pred_start_bias,
+            link_pred_num_walks_per_node=config.link_pred_num_walks_per_node,
+            link_pred_max_walk_len=config.link_pred_max_walk_len,
             max_time_capacity=config.max_time_capacity,
         )
 
@@ -314,7 +329,7 @@ class Trainer:
         # per batch but did not improve test on wiki (50ep seed=42
         # 2026-05-31 sweep).
         seeds_np = np.unique(batch.tgt)
-        walks = self.walk_gen.walks_for_nodes(seeds_np)
+        walks = self.walk_gen.walks_for_nodes_embedding(seeds_np)
 
         # Step 2: InfoNCE contrastive alignment over batched walks.
         # The softmax denominator over all batch contexts is the
