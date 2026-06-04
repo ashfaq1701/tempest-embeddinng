@@ -195,6 +195,15 @@ def parse_args() -> argparse.Namespace:
              "collide with PyTorch's allocator on small GPUs; default "
              "off, enable only if you have headroom.",
     )
+    p.add_argument(
+        "--export-best-embedding-table",
+        action="store_true",
+        help="After training, dump the best-val-restored embedding-table "
+             "weights to logs/embeddings/<dataset>_seed<seed>_demb<d_emb>"
+             "_ep<stopped_at_epoch>.npy. Raw float32 [num_nodes, d_emb] "
+             "array; node ids follow TGB's contiguous integer ordering. "
+             "Off by default.",
+    )
 
     return p.parse_args()
 
@@ -343,20 +352,22 @@ def main() -> Dict[str, Any]:
     print(f"  best_val_mrr:      {result['best_val_mrr']:.4f}")
     print(f"  best_test_mrr:     {result['best_test_mrr']:.4f}")
 
-    # TEMP: dump the (best-weights-restored) embedding table for analysis.
-    # Uncommitted — revert before merging or release.
-    import os
-    emb_dir = pathlib.Path("logs/embeddings")
-    emb_dir.mkdir(parents=True, exist_ok=True)
-    emb_path = emb_dir / (
-        f"{args.dataset}_seed{args.seed}_demb{args.d_emb}"
-        f"_ep{result['stopped_at_epoch']}.npy"
-    )
-    np.save(
-        emb_path,
-        trainer.embedding_table.E.weight.detach().cpu().numpy(),
-    )
-    print(f"  embedding_table:   saved to {emb_path}")
+    # Optional: dump best-val-restored embedding table for downstream
+    # analysis. Raw [num_nodes, d_emb] float32 array; node ids follow
+    # TGB's contiguous integer ordering. Gated by --export-best-
+    # embedding-table; off by default to keep runs side-effect-free.
+    if args.export_best_embedding_table:
+        emb_dir = pathlib.Path("logs/embeddings")
+        emb_dir.mkdir(parents=True, exist_ok=True)
+        emb_path = emb_dir / (
+            f"{args.dataset}_seed{args.seed}_demb{args.d_emb}"
+            f"_ep{result['stopped_at_epoch']}.npy"
+        )
+        np.save(
+            emb_path,
+            trainer.embedding_table.E.weight.detach().cpu().numpy(),
+        )
+        print(f"  embedding_table:   saved to {emb_path}")
 
     return result
 
