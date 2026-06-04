@@ -21,8 +21,8 @@ Derived from the dataset (not exposed):
   num_nodes, is_directed, dst_pool,
   TrainStats (t_min, t_max, T_train, median_inter_arrival,
               mean_inter_arrival) — see tempest_walks/data_stats.py.
-  recency_scale defaults to TrainStats.mean_inter_arrival and is
-  frozen (not learnable) — held as a plain Python float on the Trainer.
+  Within-walk recency normalises by each walk's own temporal span,
+  so the alignment loss has no free recency scale knob.
 """
 
 import argparse
@@ -280,7 +280,6 @@ def main() -> Dict[str, Any]:
         tau_align=args.tau_align,
         tau_link=args.tau_link,
         gamma_recency=args.gamma_recency,
-        recency_scale=stats.mean_inter_arrival,
         K_train=args.k_train,
         alignment_chunk_size=args.alignment_chunk_size,
 

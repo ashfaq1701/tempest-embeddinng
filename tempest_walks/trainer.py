@@ -67,10 +67,6 @@ from .walks import WalkGenerator
 @dataclass
 class TrainerConfig:
     # Dataset-derived (passed in by train.py).
-    # Note: t_min / T_train are no longer needed by the loss under the
-    # stationary-recency formulation — see `tempest_walks/data_stats.py`
-    # for the TrainStats bundle that carries them (plus inter-arrival
-    # statistics) for display + recency_scale derivation.
     num_nodes: int
     is_directed: bool
     dst_pool: np.ndarray
@@ -95,17 +91,10 @@ class TrainerConfig:
                                 # path. 8192 fits wiki/coin in one chunk
                                 # and bounds review's pathological pools.
 
-    # Convex-combination stationary recency weight (replaces the old
-    # additive 1/K_hop + t̃^β formulation). γ ∈ [0, 1] mixes the hop
-    # profile and a recency profile with a FROZEN time constant.
-    # `recency_scale` is the time constant in raw timestamp units
-    # (data-driven from the train split's mean inter-arrival). It used
-    # to be wrapped in softplus and treated as a learnable scalar
-    # parameter, but it consistently collapsed toward zero under longer
-    # runs — degrading the recency feature without improving val MRR —
-    # so it's now plumbed through as a constant.
+    # Within-walk recency: γ ∈ [0, 1] mixes a hop profile (1/K_hop) and
+    # a walk-normalised recency profile (exp(-gap/walk_span)). No free
+    # scale knob — the walk's own temporal span is the only normaliser.
     gamma_recency: float = 0.4
-    recency_scale: float = 1.0  # Plumbed in by train.py from TrainStats.
 
     # Walks.
     num_walks_per_node: int = 5
@@ -160,11 +149,6 @@ class Trainer:
         ).to(self.device)
         self.link_head = LinkHead(d_emb=config.d_emb).to(self.device)
 
-        # Frozen recency time constant. Plain Python float — no
-        # tensor, no autograd. alignment_loss broadcasts it against
-        # the per-batch gap tensor at the use site.
-        self.recency_scale = float(config.recency_scale)
-
         # Walk sampler.
         self.walk_gen = WalkGenerator(
             is_directed=config.is_directed,
@@ -191,7 +175,6 @@ class Trainer:
         # Single optimiser. E is trained by L_align only (directly —
         # no projection heads); L_link sees E.detach() so only the link
         # head's parameters receive the link-loss gradient.
-        # recency_scale is frozen.
         params = (
             list(self.embedding_table.parameters())
             + list(self.link_head.parameters())
@@ -328,7 +311,6 @@ class Trainer:
         l_align = alignment_loss(
             embedding_table=self.embedding_table,
             walks=walks,
-            recency_scale=self.recency_scale,
             gamma_recency=self.config.gamma_recency,
             tau_align=self.config.tau_align,
             chunk_size=self.config.alignment_chunk_size,
@@ -536,12 +518,10 @@ class Trainer:
                 n_batches += 1
             train_dt = time.time() - t0
 
-            scale_now = self.recency_scale
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"align={sums['align']/max(n_batches,1):.4f}  "
                 f"link={sums['link']/max(n_batches,1):.4f}  "
-                f"scale={scale_now:.1f}  "
                 f"train {train_dt:.1f}s"
             )
 

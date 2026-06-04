@@ -49,24 +49,26 @@ SimCLR / CLIP practice. An A/B confirmed that excluding them
 **hurts** val MRR (false negatives function as useful hard
 negatives).
 
-Hop/time weights on positives:
+Hop/time weights on positives (walk-normalised, no free scale knob):
 
 ```
-w(K_hop, t_edge) = 1/K_hop + \tilde t_e ** β
-\tilde t_e      = (t_edge − t_min) / T_train     ∈ [0, 1]
+walk_span(i)   = max(1, t_seed_edge(i) - t_oldest(i))
+gap_norm(i, p) = (t_seed_edge(i) - t(i, p)) / walk_span(i)   ∈ [0, 1]
+hop_p(i, p)    = (1/K_hop) / Σ_p (1/K_hop)                   ← row-normalised
+rec_p(i, p)    = exp(-gap_norm(i, p)) / Σ_p exp(-gap_norm)   ← row-normalised
+w̃(i, p)       = (1 - γ) · hop_p + γ · rec_p                 ← Σ_p w̃ = 1 per row
+
+ℒ_i  = -(Σ_p w̃ · log p_pos) / Σ_p w̃
+ℒ    = (1 / |I⁺|) · Σ_{i ∈ I⁺} ℒ_i
 ```
 
-`t_min` and `T_train` are computed once from the training split
-at data load and stored on `TrainerConfig`. The recency weight is
-FIXED per edge — the same (seed, context) pair gets the same
-gradient weight whichever batch it's drawn in (no `t_now` drift).
-Larger β biases the loss toward later edges within the training
-window.
+The recency scale is each walk's OWN temporal span: seed-adjacent
+position → weight 1, oldest predecessor → weight 1/e. Fixed e-ratio
+between extremes regardless of how long the walk spans in raw
+timestamp units. No `recency_scale`, no `beta_time`, no `t_min`/
+`T_train` plumbed through the loss.
 
-Defaults: `tau_align = 0.5`, `β = 1.0` — tau validated under the
-current projection_norm=none + l2_dist setup; β was validated
-under the older `(1 + Δt/T_train)^(-β)` formulation, semantics
-differ so a fresh β sweep would be reasonable.
+Defaults: `tau_align = 0.5`, `gamma_recency = 0.4`.
 
 #### Link prediction (per-query softmax CE)
 
@@ -255,7 +257,7 @@ Historical (Vitter R) reservoir sampler.
 |---|---|---|
 | `tau_align` | 0.5 | a-priori; validated by τ sweep on wiki (full-InfoNCE), re-validated under projection_norm=none + l2_dist (2026-05-28) |
 | `tau_link` | 1.0 | a-priori; pending a sweep on the new ranking link loss |
-| `beta_time` | 1.0 | a-priori; validated by β sweep on wiki (full-InfoNCE), re-validated under projection_norm=none + l2_dist (2026-05-28) |
+| `gamma_recency` | 0.4 | within-row convex combo of hop and walk-normalised recency profiles. Outer g(i) handles across-walk recency separately — no `recency_scale` or `beta_time` knob anywhere |
 | Alignment pool | full unique-batch-node, count-weighted partition | Replaces the earlier `num_align_negatives` sampled-K partition. Closed-form equivalent of multinomial sampling under the count distribution, with zero sampling variance. Hardcoded — not a CLI knob |
 | `K_train` | 100 | ranking-loss convention (DPR-style, RotatE); larger K_train means harder per-query competition and stronger ranking gradients, at proportional compute cost |
 | `d_emb` | 128 | |
