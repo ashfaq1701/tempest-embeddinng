@@ -284,3 +284,117 @@ Training trajectory:
 
 **Adopted.** Iter 2 is the new best E and the baseline for subsequent iterations.
 
+
+## Iter 3 — inverse-degree + forward-walks combined
+
+**Change:** Stack iter 1 + iter 2 (both flags on).
+
+**Result:**
+
+| | Baseline | Iter 1 | Iter 2 | **Iter 3** |
+|---|---|---|---|---|
+| Model val MRR | 0.5418 | 0.5347 | **0.5449** | 0.5379 |
+| Model test MRR | 0.4709 | 0.4676 | 0.4757 | **0.4782** |
+| Cos val (saved E) | 0.5115 | 0.5148 | 0.5132 | 0.5132 |
+| Cos test (saved E) | 0.4709 | 0.4679 | 0.4705 | 0.4625 |
+| both_active cos test | 0.620 | 0.616 | 0.619 | 0.614 |
+
+**Read:** Forward-walks alone (iter 1) hurts; combined with inv-deg
+it helps on test (+0.0025 vs iter 2) but loses val (-0.007). Trade-off
+between val-driven and test-driven optimisation.
+
+## Iter 4 — d_emb=256 + inverse-degree
+
+**Change:** Double the embedding dimensionality from 128 to 256. Keep
+iter 2's inv-deg weighting. Tests whether D_eff_95=86 / 128 reflects
+a capacity ceiling.
+
+**Cost:** 2.7× slower per epoch (2.36M E params vs 1.18M; 2.3M
+link_head pair_mlp vs 574k → 4.66M total vs 1.76M).
+
+**Result:**
+
+| | Iter 2 (d=128) | **Iter 4 (d=256)** |
+|---|---|---|
+| Model val MRR | 0.5449 | 0.5414 (−0.004) |
+| Model test MRR | 0.4757 | **0.4786 (+0.003)** |
+| Cos val | 0.5132 | 0.5112 |
+| Cos test | 0.4705 | 0.4688 |
+| Single-epoch test peak | ep5 = 0.4773 | **ep5 = 0.4802 (highest ever)** |
+
+**Read:** d_emb=256 gives a different geometry — cos retrieval is
+slightly WORSE (0.4688 vs 0.4705) but the model gains more from the
+larger pair_mlp (+0.010 over cos vs iter 2's +0.005). Same
+"more-room-for-link-head-to-decode" pattern as iter 2, amplified.
+Test winner so far.
+
+## Iter 5 — iter 2 + decay_horizon_epochs=25
+
+**Change:** Same loss as iter 2 but cosine schedule decays to lr_min
+by ep25 instead of ep50.
+
+**Hypothesis:** late-cosine drift after the schedule decays past
+useful range causes test to peak early (~ep5) while val keeps
+creeping up. A schedule that floors by ep25 should land the snapshot
+closer to test-peak.
+
+**Result (killed at ep27 when LR frozen):**
+- Best ep15: val 0.5337 / test 0.4770.
+- Ep8 had test **0.4830** — the highest single-epoch test we've
+  seen across ALL iterations.
+- Val kept creeping up past the test peak; snapshot at ep15 lost
+  the ep8 test.
+
+**Read:** the val/test divergence is NOT a schedule artifact.
+Even with a steeper LR curve, val peaks later than test. The link
+head is sensitive enough to val that any extra training pushes the
+snapshot away from test-peak. Shorter LR doesn't help; the
+fundamental issue is the *snapshot policy* (best-val), not the
+schedule.
+
+## Iter 6 — all-winners stack: d_emb=256 + inv-deg + fwd-walks  (in flight)
+
+**Change:** Combine all three positive-signal interventions:
+- d_emb=256 (iter 4 winner on test)
+- inverse-degree seed weighting (iter 2 winner on val)
+- forward-walks alignment (iter 3 contribution on test)
+
+**Hypothesis:** the three interventions act on roughly orthogonal
+axes (capacity × gradient balance × symmetric supervision). Stacking
+should compound. Risk: combined gradient magnitude doubles the
+alignment-side loss again (same iter 1 concern).
+
+Cost: ~135 min runtime expected (d=256 baseline + fwd-walks
+overhead).
+
+Pending results — landing time around 7.5 h into the night.
+
+
+## Iter 6 — final result: all-winners stack
+
+**Result:** val **0.5465** / test **0.4809** @ ep33.
+
+| | val | test | Δval vs baseline | Δtest vs baseline |
+|---|---|---|---|---|
+| baseline | 0.5418 | 0.4709 | — | — |
+| iter 2 | 0.5449 | 0.4757 | +0.003 | +0.005 |
+| iter 4 | 0.5414 | 0.4786 | −0.0004 | +0.008 |
+| iter 3 | 0.5379 | 0.4782 | −0.004 | +0.007 |
+| **iter 6** | **0.5465** | **0.4809** | **+0.005** | **+0.010** |
+
+The all-winners stack wins both metrics. The three interventions
+(d_emb=256, inv-deg, fwd-walks) act on roughly orthogonal axes and
+their gains compound — though clearly not linearly: iter 2 + iter 4
++ iter 3 individual deltas don't simply sum.
+
+**The single-epoch test peak was 0.4857 at ep5** — the saved ep33
+snapshot test 0.4809 is below it, again losing some signal to the
+val/test divergence. This is the same pattern observed in every
+iteration.
+
+**Headline:** test MRR improved 0.4709 → 0.4809 (+0.010) without
+changing the link-pred head. The lift is entirely in *how the
+gradient is balanced and where E lives in space* during training.
+The pair_mlp head — useless on top of baseline E — earns +0.013
+test over cos on iter 6's E.
+

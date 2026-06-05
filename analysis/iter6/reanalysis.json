@@ -1,0 +1,41 @@
+{
+  "emb_path": "logs/embeddings/tgbl-wiki_seed42_demb256_iter6_allwinners_ep33.npy",
+  "n_active": 7475,
+  "n_total": 9227,
+  "active_norm_mean": 1.5993304252624512,
+  "inactive_norm_mean": 0.319503515958786,
+  "val": {
+    "n_edges": 23621,
+    "mrr_cos": 0.5102760916156855,
+    "mrr_negl2": 0.5165107709764165,
+    "mrr_dot": 0.4932633704753153,
+    "margin_mean": 0.6128079405029307,
+    "margin_P10": -0.02352236397564411,
+    "margin_P90": 0.9950555562973022,
+    "mrr_cos_both_active": 0.6569067994587966,
+    "fraction_both_active": 0.7753270394987511,
+    "mrr_cos_ind_u_only": 0.004992703798951491,
+    "fraction_ind_u_only": 0.10329791287413742,
+    "mrr_cos_ind_v_only": 0.002850318653077773,
+    "fraction_ind_v_only": 0.08162228525464629,
+    "mrr_cos_ind_both": 0.005285221654025475,
+    "fraction_ind_both": 0.03975276237246518
+  },
+  "test": {
+    "n_edges": 23621,
+    "mrr_cos": 0.46834651379573644,
+    "mrr_negl2": 0.4702861471552029,
+    "mrr_dot": 0.45138312190673263,
+    "margin_mean": 0.5667162057989107,
+    "margin_P10": -0.04127700626850128,
+    "margin_P90": 0.994784414768219,
+    "mrr_cos_both_active": 0.6160261257470023,
+    "fraction_both_active": 0.7573345751661656,
+    "mrr_cos_ind_u_only": 0.012639404224353761,
+    "fraction_ind_u_only": 0.11248465348630456,
+    "mrr_cos_ind_v_only": 0.0023864869743025984,
+    "fraction_ind_v_only": 0.0779814571779349,
+    "mrr_cos_ind_both": 0.0038465797649555405,
+    "fraction_ind_both": 0.05219931416959485
+  }
+}
