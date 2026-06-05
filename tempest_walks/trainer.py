@@ -142,6 +142,10 @@ class TrainerConfig:
     link_head_d_K: int = 16
     link_head_d_pos: int = 96
     link_head_d_direct: int = 64
+    link_head_chunk_c: int = 0     # 0 = OFF (default). >0 = chunk size for
+                                   # the candidate dim inside the walk
+                                   # tower's per-position MLP. Pure memory
+                                   # knob; loss/gradient unchanged.
     # Dataset-derived (plumbed by train.py from TrainStats); the head
     # uses them to normalise the per-position time gap.
     t_min: int = 0
@@ -206,6 +210,7 @@ class Trainer:
             d_K=int(config.link_head_d_K),
             d_pos=int(config.link_head_d_pos),
             d_direct=int(config.link_head_d_direct),
+            chunk_C=int(config.link_head_chunk_c),
         ).to(self.device)
         # Dataset anchors for the head's time-feature normalisation.
         self.t_min = int(config.t_min)
@@ -398,7 +403,7 @@ class Trainer:
                 direction=dir_key,
                 t_query_per_u=t_query_t,
                 t_min=self.t_min,
-                T_train=self.T_train,
+                mean_inter_arrival=self.recency_scale,
                 embedding_table=self.embedding_table,
                 time_encoder=self.link_head.time_encoder,
                 device=self.device,

@@ -226,6 +226,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--link-head-d-pos",    default=96, type=int)
     p.add_argument("--link-head-d-direct", default=64, type=int)
     p.add_argument(
+        "--link-head-chunk-c", default=0, type=int,
+        help="0 (default) = no chunking; pass a positive N to enable "
+             "candidate-dim chunking inside the walk tower with chunk "
+             "size N. Pure memory knob; loss/gradient are identical "
+             "to non-chunked. Smaller N → less peak memory but more "
+             "kernel launches per step.",
+    )
+    p.add_argument(
         "--tempest-batch-window-multiplier", default=-1.0, type=float,
         help="Tempest sliding-window cap expressed as a multiple of the "
              "mean batch's time-span. The effective max_time_capacity "
@@ -423,6 +431,7 @@ def main() -> Dict[str, Any]:
         link_head_d_K=args.link_head_d_K,
         link_head_d_pos=args.link_head_d_pos,
         link_head_d_direct=args.link_head_d_direct,
+        link_head_chunk_c=args.link_head_chunk_c,
         max_time_capacity=compute_max_time_capacity(
             args.tempest_batch_window_multiplier,
             args.batch_size,

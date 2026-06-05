@@ -36,6 +36,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 # ---------------------------------------------------------------------
@@ -58,8 +59,15 @@ class TimeEncoder(nn.Module):
         self.d_T = 4 + 2 * n_omega
 
     def forward(self, gap_norm: torch.Tensor) -> torch.Tensor:
-        """gap_norm shape [...]. Output [..., d_T]."""
-        g = gap_norm.clamp(0.0, 1.0)
+        """gap_norm shape [...]. Output [..., d_T].
+
+        Under the Option B normalisation (`log1p(gap / MIA)`), gap_norm
+        can exceed 1 (on wiki it reaches ~11.9 at eval); the encoder no
+        longer clamps. The high-frequency sin/cos channels become
+        aliased for g >> 1 — the head's effective resolution comes from
+        the four raw features and the low-frequency sinusoid.
+        """
+        g = gap_norm.clamp_min(0.0)
         raw = torch.stack(
             [g, torch.exp(-g), g * g, torch.log1p(g)], dim=-1
         )
@@ -97,7 +105,16 @@ class WalkTower(nn.Module):
         d_K: int = 16,
         d_pos: int = 96,
         d_T: int = 12,
+        chunk_C: int = 0,
     ):
+        # chunk_C: candidates processed per inner loop. 0 (default) =
+        # OFF, whole candidate dim runs in a single tensor (caller
+        # must size the batch to fit GPU memory). When > 0 (and < C),
+        # the forward chunks over C; intermediates per chunk are
+        # wrapped in torch.utils.checkpoint so they're freed between
+        # chunks and re-materialised at backward. Math (loss,
+        # gradient, optimizer step) is identical to the un-chunked
+        # path; only wall-clock changes (~2-3× slower per step).
         super().__init__()
         if sim_primitives == "hadamard_absdiff":
             self.sim_dim = 2 * d_emb
@@ -108,6 +125,7 @@ class WalkTower(nn.Module):
         self.sim_primitives = sim_primitives
         self.use_K = use_K
         self.use_t = use_t
+        self.chunk_C = int(chunk_C)
 
         in_dim = self.sim_dim
         if use_K:
@@ -124,26 +142,68 @@ class WalkTower(nn.Module):
         self.d_pos = d_pos
         self.out_dim = 2 * d_pos  # max + mean over positions
 
-    def _sim(
-        self, E_walks: torch.Tensor, E_v: torch.Tensor,
+    def _chunk_sim(
+        self, E_walks: torch.Tensor, E_v_chunk: torch.Tensor,
     ) -> torch.Tensor:
-        """Per-(B, C, W, L) similarity primitives. Output last dim = sim_dim."""
-        # E_walks [B, W, L, d] → [B, 1, W, L, d]
-        # E_v     [B, C, d]    → [B, C, 1, 1, d]
+        """Per-(B, chunk_C, W, L) similarity primitives. Output last
+        dim = sim_dim. Same math as a single broadcast over C; chunked
+        for memory."""
+        # E_walks [B, W, L, d]   → [B, 1, W, L, d]
+        # E_v_chunk [B, chunk, d] → [B, chunk, 1, 1, d]
         Ew = E_walks.unsqueeze(1)
-        Ev = E_v.unsqueeze(2).unsqueeze(3)
+        Ev = E_v_chunk.unsqueeze(2).unsqueeze(3)
         if self.sim_primitives == "hadamard_absdiff":
             had = Ev * Ew
             absd = (Ev - Ew).abs()
-            return torch.cat([had, absd], dim=-1)  # [B, C, W, L, 2d]
-        else:  # cosine_only
-            eps = 1e-6
-            num = (Ev * Ew).sum(-1, keepdim=True)
-            den = (
-                Ev.norm(dim=-1, keepdim=True).clamp_min(eps)
-                * Ew.norm(dim=-1, keepdim=True).clamp_min(eps)
+            return torch.cat([had, absd], dim=-1)
+        # cosine_only
+        eps = 1e-6
+        num = (Ev * Ew).sum(-1, keepdim=True)
+        den = (
+            Ev.norm(dim=-1, keepdim=True).clamp_min(eps)
+            * Ew.norm(dim=-1, keepdim=True).clamp_min(eps)
+        )
+        return num / den
+
+    def _process_chunk(
+        self,
+        E_walks: torch.Tensor,
+        mask: torch.Tensor,
+        K_idx: torch.Tensor,
+        t_feat: torch.Tensor,
+        E_v_chunk: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute the per-(u, v) walk-pooled vector for a chunk of
+        candidates. Returns [B, chunk_C, 2·d_pos]."""
+        B, W, L, _ = E_walks.shape
+        chunk = E_v_chunk.shape[1]
+
+        sim = self._chunk_sim(E_walks, E_v_chunk)  # [B, chunk, W, L, sim_dim]
+        feat_parts = [sim]
+        if self.use_K:
+            Ke = self.K_emb(K_idx)  # [B, W, L, d_K]
+            feat_parts.append(
+                Ke.unsqueeze(1).expand(B, chunk, W, L, Ke.shape[-1])
             )
-            return num / den  # [B, C, W, L, 1]
+        if self.use_t:
+            feat_parts.append(
+                t_feat.unsqueeze(1).expand(B, chunk, W, L, t_feat.shape[-1])
+            )
+        feat = torch.cat(feat_parts, dim=-1)
+        h = self.per_pos_mlp(feat)  # [B, chunk, W, L, d_pos]
+        m = mask.unsqueeze(1).unsqueeze(-1).float()  # [B, 1, W, L, 1]
+
+        h_neg = h.masked_fill(m == 0, float("-inf"))
+        h_max = h_neg.max(dim=3).values  # [B, chunk, W, d_pos]
+        h_max = torch.where(
+            torch.isinf(h_max), torch.zeros_like(h_max), h_max,
+        )
+        h_sum = (h * m).sum(dim=3)
+        m_sum = m.sum(dim=3).clamp_min(1.0)
+        h_mean = h_sum / m_sum
+
+        h_walk = torch.cat([h_max, h_mean], dim=-1)  # [B, chunk, W, 2·d_pos]
+        return h_walk.mean(dim=2)  # [B, chunk, 2·d_pos]
 
     def forward(
         self,
@@ -153,47 +213,34 @@ class WalkTower(nn.Module):
         t_feat: torch.Tensor,
         E_v: torch.Tensor,
     ) -> torch.Tensor:
-        B, W, L, _ = E_walks.shape
         C = E_v.shape[1]
-
-        sim = self._sim(E_walks, E_v)  # [B, C, W, L, sim_dim]
-        feat_parts = [sim]
-        if self.use_K:
-            Ke = self.K_emb(K_idx)  # [B, W, L, d_K]
-            feat_parts.append(
-                Ke.unsqueeze(1).expand(B, C, W, L, Ke.shape[-1])
-            )
-        if self.use_t:
-            feat_parts.append(
-                t_feat.unsqueeze(1).expand(B, C, W, L, t_feat.shape[-1])
-            )
-        feat = torch.cat(feat_parts, dim=-1)
-
-        h = self.per_pos_mlp(feat)  # [B, C, W, L, d_pos]
-        m = mask.unsqueeze(1).unsqueeze(-1).float()  # [B, 1, W, L, 1]
-
-        # Max-pool over positions (mask-aware).
-        h_neg = h.masked_fill(m == 0, float("-inf"))
-        h_max = h_neg.max(dim=3).values  # [B, C, W, d_pos]
-        # All-padded walks → max returns -inf; zero them.
-        h_max = torch.where(
-            torch.isinf(h_max), torch.zeros_like(h_max), h_max,
-        )
-
-        # Mean-pool over positions (mask-aware).
-        h_sum = (h * m).sum(dim=3)  # [B, C, W, d_pos]
-        m_sum = m.sum(dim=3).clamp_min(1.0)  # [B, 1, W, 1]
-        h_mean = h_sum / m_sum
-
-        # Per-walk vector.
-        h_walk = torch.cat([h_max, h_mean], dim=-1)  # [B, C, W, 2·d_pos]
-
-        # Mean-pool over walks. We assume each walk row is structurally
-        # valid (Tempest may return empty walks for an unseen seed; if
-        # _every_ row is empty, h_max=0 and h_mean=0 → h_walk=0, the
-        # mean is 0 — head reduces to the direct channel via the final
-        # MLP).
-        return h_walk.mean(dim=2)  # [B, C, 2·d_pos]
+        if self.chunk_C <= 0 or self.chunk_C >= C:
+            return self._process_chunk(E_walks, mask, K_idx, t_feat, E_v)
+        # Chunked path. Each chunk's forward is wrapped in
+        # torch.utils.checkpoint so its intermediates (sim cube, MLP
+        # activations) are dropped after the chunk runs and
+        # re-materialised on demand in backward. Without this, all
+        # chunks' intermediates stay alive until the global backward
+        # → defeats the memory benefit of chunking.
+        out_parts = []
+        for c0 in range(0, C, self.chunk_C):
+            c1 = min(c0 + self.chunk_C, C)
+            E_v_chunk = E_v[:, c0:c1]
+            if self.training and torch.is_grad_enabled():
+                out_parts.append(
+                    checkpoint(
+                        self._process_chunk,
+                        E_walks, mask, K_idx, t_feat, E_v_chunk,
+                        use_reentrant=False,
+                    )
+                )
+            else:
+                out_parts.append(
+                    self._process_chunk(
+                        E_walks, mask, K_idx, t_feat, E_v_chunk,
+                    )
+                )
+        return torch.cat(out_parts, dim=1)  # [B, C, 2·d_pos]
 
 
 # ---------------------------------------------------------------------
@@ -264,6 +311,7 @@ class LinkPredHeadV2(nn.Module):
         d_K: int = 16,
         d_pos: int = 96,
         d_direct: int = 64,
+        chunk_C: int = 0,
     ):
         super().__init__()
         if direction not in ("forward", "backward", "both"):
@@ -281,6 +329,7 @@ class LinkPredHeadV2(nn.Module):
                 sim_primitives=sim_primitives,
                 use_K=use_K_channel, use_t=use_time_channel,
                 d_K=d_K, d_pos=d_pos, d_T=self.time_encoder.d_T,
+                chunk_C=chunk_C,
             )
             if direction in ("forward", "both"):
                 self.tower_fwd = WalkTower(**shared_kwargs)
