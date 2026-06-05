@@ -189,6 +189,42 @@ def parse_args() -> argparse.Namespace:
     # always on. Iter 6 analysis (analysis/REPORT.md) established both
     # as load-bearing improvements over baseline (test +0.010 combined);
     # there is no scenario where either should be off, so no CLI knob.
+
+    # LinkPredHeadV2 — walk-mediated link-pred head. Flags scope the
+    # ablation sweep designed in analysis/REPORT.md §9; once a winning
+    # config emerges they will be collapsed into hardcoded defaults on
+    # the post-experiment cleanup branch.
+    p.add_argument(
+        "--link-head-direction", default="both", type=str,
+        choices=("forward", "backward", "both"),
+        help="Walk direction(s) the v2 link head consumes.",
+    )
+    p.add_argument(
+        "--link-head-sim-primitives", default="hadamard_absdiff", type=str,
+        choices=("hadamard_absdiff", "cosine_only"),
+        help="Per-position similarity primitives between E[v] and E[w_i].",
+    )
+    p.add_argument(
+        "--link-head-no-time-channel", action="store_true",
+        help="Strip the per-position time feature (ablation V1).",
+    )
+    p.add_argument(
+        "--link-head-no-K-channel", action="store_true",
+        help="Strip the per-position K (hop) embedding (ablation V2).",
+    )
+    p.add_argument(
+        "--link-head-no-direct", action="store_true",
+        help="Strip the direct (E[u], E[v]) bypass channel.",
+    )
+    p.add_argument(
+        "--link-head-direct-only", action="store_true",
+        help="Drop the walk towers entirely; head reduces to per-dim "
+             "MLP on (E[u], E[v]). Ablation V3 — null hypothesis "
+             "for the walk-mediated path.",
+    )
+    p.add_argument("--link-head-d-K",      default=16, type=int)
+    p.add_argument("--link-head-d-pos",    default=96, type=int)
+    p.add_argument("--link-head-d-direct", default=64, type=int)
     p.add_argument(
         "--tempest-batch-window-multiplier", default=-1.0, type=float,
         help="Tempest sliding-window cap expressed as a multiple of the "
@@ -376,6 +412,17 @@ def main() -> Dict[str, Any]:
         link_pred_backward_walk_bias=args.link_pred_backward_walk_bias,
         link_pred_backward_start_bias=args.link_pred_backward_start_bias,
         train_deg=_compute_train_deg(loaded),
+        t_min=stats.t_min,
+        T_train=stats.T_train,
+        link_head_direction=args.link_head_direction,
+        link_head_sim_primitives=args.link_head_sim_primitives,
+        link_head_use_time_channel=not args.link_head_no_time_channel,
+        link_head_use_K_channel=not args.link_head_no_K_channel,
+        link_head_use_direct=not args.link_head_no_direct,
+        link_head_direct_only=args.link_head_direct_only,
+        link_head_d_K=args.link_head_d_K,
+        link_head_d_pos=args.link_head_d_pos,
+        link_head_d_direct=args.link_head_d_direct,
         max_time_capacity=compute_max_time_capacity(
             args.tempest_batch_window_multiplier,
             args.batch_size,
