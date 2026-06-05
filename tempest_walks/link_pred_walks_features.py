@@ -13,16 +13,21 @@ The head wants, per (B, W, L):
     K_idx      [B, W, L]         hop distance from seed (≥ 0)
     t_feat     [B, W, L, d_T]    TimeEncoder(gap_norm)
 
-Time normalisation (Option A — pure linear):
-  gap_norm := (gap / T_full).clamp(0, 1)
+Time normalisation (Option B — log compression):
+  gap_norm := (log1p(gap) / log1p(T_full)).clamp(0, 1)
   - Non-seed positions: gap = t_query - t_edge_p   (≥ 0 by strict causality)
   - Seed positions:     gap = t_query - t_min      (the override; gives
                                                     the head a "where in
                                                     data lifetime" signal)
-  T_full = (t_max_full - t_min) covers train + val + test, so
-  gap_norm ∈ [0, 1] under both regimes and the TimeEncoder operates
-  in its designed range. Switch to Option B by replacing the inner
-  expression with `log1p(raw_gap) / log1p(T_full)`.
+  T_full = (t_max_full - t_min) covers train + val + test.
+
+  Why log over linear: at training the typical edge gap is small
+  relative to T_full, so linear gap/T_full bunches most positions
+  near 0 (~0.005-0.035 on wiki). log1p spreads them across the
+  full [0, 1] range (~0.25-0.52 for the same gaps), giving the
+  per-position MLP usable resolution. Verified empirically in the
+  V0_fwd 2ep bake-off: Option B leads Option A by +0.009 val and
+  +0.016 test at ep2 with otherwise-identical config.
 
 Padding positions are masked AND get a safe placeholder value
 (gap_norm=0, K_idx=0, E_walks=0).
@@ -94,22 +99,20 @@ def make_head_inputs(
     else:
         seed_pos = torch.zeros_like(lens)
 
-    # Option A — pure linear: gap_norm = (gap / T_full).clamp(0, 1).
-    # Switch to Option B by replacing the two `_norm_fn` lines with
-    #   log1p(raw_gap) / log1p(T_full).
+    # Option B — log compression: gap_norm = log1p(gap) / log1p(T_full).
     Tf = max(float(T_full), 1.0)
+    Tf_log = float(torch.log1p(torch.tensor(Tf)).item())
     t_query = t_query_per_u.to(device).long().view(B, 1, 1).expand_as(nodes)
-    # Bound raw_gap to T_full so the forward-seed-slot INT64_MIN
-    # subtraction overflow (which produces a huge positive number)
+    # Bound raw_gap to T_full so forward-seed-slot INT64_MIN overflow
     # can't pollute autograd before the seed override fires.
     raw_gap = (t_query - ts).clamp(min=0).clamp(max=int(Tf)).float()
-    gap_norm = (raw_gap / Tf).clamp(0.0, 1.0)
+    gap_norm = (torch.log1p(raw_gap) / Tf_log).clamp(0.0, 1.0)
 
     # Seed override.
     seed_oh = torch.zeros_like(nodes, dtype=torch.bool)
     seed_oh.scatter_(2, seed_pos.unsqueeze(-1), True)
     seed_gap = (t_query_per_u.to(device).long() - t_min).clamp(min=0).float()
-    seed_gap_norm = (seed_gap / Tf).clamp(0.0, 1.0).view(B, 1, 1)
+    seed_gap_norm = (torch.log1p(seed_gap) / Tf_log).clamp(0.0, 1.0).view(B, 1, 1)
     gap_norm = torch.where(
         seed_oh & valid, seed_gap_norm.expand_as(gap_norm), gap_norm,
     )
