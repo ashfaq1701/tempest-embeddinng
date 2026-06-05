@@ -16,8 +16,9 @@ Hyperparameters exposed at CLI (and their grouping):
                   --link-pred-forward-walk-bias, --link-pred-forward-start-bias,
                   --link-pred-backward-walk-bias, --link-pred-backward-start-bias,
                   --tempest-batch-window-multiplier
-                  (link-pred-forward-* are consumed by --enable-forward-alignment;
-                   link-pred-backward-* are plumbed but currently unused.)
+                  (link-pred-forward-* are consumed by the always-on
+                   forward-alignment term; link-pred-backward-* are
+                   plumbed but currently unused.)
   Optimisation:   --lr, --lr-min, --warmup-fraction, --warmup-steps-cap,
                   --decay-horizon-epochs, --weight-decay, --batch-size,
                   --eval-batch-size, --num-epochs, --early-stop-patience
@@ -184,22 +185,10 @@ def parse_args() -> argparse.Namespace:
         "--link-pred-backward-start-bias", default="ExponentialWeight", type=str,
         help="Initial-edge bias for BACKWARD link-pred-side walks.",
     )
-    p.add_argument(
-        "--enable-forward-alignment", action="store_true",
-        help="Add a symmetric InfoNCE alignment term using forward "
-             "walks sampled from batch SOURCES (in addition to the "
-             "default backward walks from batch TARGETS). The forward "
-             "walks reuse the --link-pred-* knobs. Densifies source-"
-             "side embedding gradient — phase-6 analysis showed low-"
-             "degree source nodes drive 15 pct of test-edge hardness.",
-    )
-    p.add_argument(
-        "--inverse-degree-seed-weighting", action="store_true",
-        help="Weight per-row alignment-loss contribution by "
-             "1 / log1p(degree(seed)). Rare seeds get gradient parity "
-             "with popular seeds — addresses the both-active hard "
-             "cohort identified in phase-6 analysis.",
-    )
+    # Forward-walks alignment and inverse-degree seed weighting are
+    # always on. Iter 6 analysis (analysis/REPORT.md) established both
+    # as load-bearing improvements over baseline (test +0.010 combined);
+    # there is no scenario where either should be off, so no CLI knob.
     p.add_argument(
         "--tempest-batch-window-multiplier", default=-1.0, type=float,
         help="Tempest sliding-window cap expressed as a multiple of the "
@@ -386,8 +375,6 @@ def main() -> Dict[str, Any]:
         link_pred_forward_start_bias=args.link_pred_forward_start_bias,
         link_pred_backward_walk_bias=args.link_pred_backward_walk_bias,
         link_pred_backward_start_bias=args.link_pred_backward_start_bias,
-        enable_forward_alignment=args.enable_forward_alignment,
-        inverse_degree_seed_weighting=args.inverse_degree_seed_weighting,
         train_deg=_compute_train_deg(loaded),
         max_time_capacity=compute_max_time_capacity(
             args.tempest_batch_window_multiplier,
