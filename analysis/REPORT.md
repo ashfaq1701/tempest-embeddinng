@@ -317,30 +317,57 @@ iterations.
 
 ## 9. Prescription for the next link-pred head
 
-The geometric analysis suggests three things the eventual link head
-should consume, ranked by leverage:
+The geometric analysis prescribes three input channels for the head,
+ranked by leverage:
 
-1. **A cosine + scaled-cosine + magnitude-aware combo**, not raw cos.
-   Phase 2 showed `-L2` beats cos by +0.003 test, and the LIN logit on
-   `[E_u*E_v, (E_u-E_v)², |E_u-E_v|]` beats cos by +0.003 test. Stack
-   these three primitives as channels.
+1. **Per-dim Hadamard / squared-diff / abs-diff stack.** Phase 5 showed
+   that scalar cos / dot / -L2 saturate around test 0.471, but the LIN
+   logit on `[E_u·E_v, (E_u−E_v)², |E_u−E_v|]` raises test by +0.003
+   and Mahalanobis (full-rank re-weighting) raises test by +0.006. The
+   signal lives in per-dim primitives, not a single scalar similarity.
+   This is the principled minimum input the head should consume.
 
-2. **A walk-presence signal.** Phase 4 showed that 59 % of test edges
-   have v+ in u's forward walks — and for those, cos MRR is 0.76. A
-   binary `v ∈ W_u` feature, or a max-cos-to-walk-node feature, would
-   gate the head to the easy 60 % efficiently. The remaining 40 % is
-   uniformly hard regardless.
+2. **Walk-presence signal.** Phase 4 showed 59 % of test edges have
+   v+ ∈ W_u (u's forward walks) — cos MRR 0.76 in that cohort, 0.04
+   when not. A binary `v ∈ W_u` indicator (or a soft max-cos-to-walk
+   feature) is a sharp gate that splits the easy from the hard.
 
-3. **A synchrony channel.** Phase 3 showed `|Δ_u − Δ_v|` modulator
-   beats raw cos by +0.007 test as a standalone scorer. Adding it as an
-   input channel (not modulator) lets the head learn the interaction.
+3. **Synchrony channel.** Phase 3 showed `|Δ_u − Δ_v|` (similarity of
+   u's and v's dormancy at query time) is the most predictive temporal
+   feature. Synchrony-modulated cos alone beats trained model test by
+   +0.007 on baseline E. Adding it as a head input (not a multiplicative
+   modulator) lets the head learn the right interaction.
 
-These collectively predict the head should be able to push test MRR
-from 0.4709 to roughly 0.49–0.50 even on the baseline E — a +0.02–0.03
-lift without changing the embedding loss.
+**Expected payoff (using iter 6 E as the base):**
+- iter 6 already lifts test from 0.4709 (baseline-model) to 0.4809
+  via embedding-loss changes alone — link head unchanged.
+- The single-epoch test peak in iter 6 was 0.4857 (ep5, saved
+  snapshot lost +0.005 to val/test divergence).
+- A head with the three channels above, fed iter 6's E, should pick
+  up an additional +0.015–0.025 test (extrapolating from phase 5's
+  parametric-discriminator deltas on baseline E).
 
-Combined with iter 2 / iter 3 's improved E and the head, a realistic
-target is **test MRR ~ 0.50–0.52** on wiki seed 42.
+**Realistic target after the full design lands: test MRR ~ 0.500–0.510.**
+
+## 9.5. Shipping configuration
+
+```
+# iter 6 / all-winners stack — the winning embedding-loss recipe.
+./.venv/bin/python scripts/train.py \
+  --dataset tgbl-wiki \
+  --use-gpu --use-gpu-tempest \
+  --seed 42 \
+  --num-epochs 50 \
+  --early-stop-patience 0 \
+  --batch-size 500 \
+  --d-emb 256 \
+  --inverse-degree-seed-weighting \
+  --enable-forward-alignment \
+  --export-best-embedding-table
+```
+
+Yields val 0.5465 / test 0.4809 at ep33. Saved E at
+`logs/embeddings/tgbl-wiki_seed42_demb256_iter6_allwinners_ep33.npy`.
 
 ## 10. What we cannot fix at the embedding-loss level
 
