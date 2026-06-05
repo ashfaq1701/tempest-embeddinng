@@ -13,15 +13,16 @@ The head wants, per (B, W, L):
     K_idx      [B, W, L]         hop distance from seed (≥ 0)
     t_feat     [B, W, L, d_T]    TimeEncoder(gap_norm)
 
-Time normalisation (Option B):
-  gap_norm := log1p(gap / mean_inter_arrival)
+Time normalisation (Option A — pure linear):
+  gap_norm := (gap / T_full).clamp(0, 1)
   - Non-seed positions: gap = t_query - t_edge_p   (≥ 0 by strict causality)
   - Seed positions:     gap = t_query - t_min      (the override; gives
                                                     the head a "where in
                                                     data lifetime" signal)
-  log1p keeps the scale meaningful both inside the train window (where
-  log1p(gap/MIA) ∈ [0, ~11.6] on wiki) and at eval (where it extends
-  slightly to ~[11.6, 11.9]) — no saturation under clamp(0, 1).
+  T_full = (t_max_full - t_min) covers train + val + test, so
+  gap_norm ∈ [0, 1] under both regimes and the TimeEncoder operates
+  in its designed range. Switch to Option B by replacing the inner
+  expression with `log1p(raw_gap) / log1p(T_full)`.
 
 Padding positions are masked AND get a safe placeholder value
 (gap_norm=0, K_idx=0, E_walks=0).
@@ -40,7 +41,7 @@ def make_head_inputs(
     direction: str,                # "forward" | "backward"
     t_query_per_u: torch.Tensor,   # [B] long  — strict-causal query time
     t_min: int,
-    mean_inter_arrival: float,
+    T_full: float,                 # span across train + val + test
     embedding_table,               # EmbeddingTable
     time_encoder,                  # TimeEncoder
     device,
@@ -93,28 +94,25 @@ def make_head_inputs(
     else:
         seed_pos = torch.zeros_like(lens)
 
-    # gap_norm = log1p(gap / mean_inter_arrival)
-    #   non-seed positions: gap = t_query - t_edge
-    #   seed positions:     gap = t_query - t_min (override; the sentinel
-    #                       ts at the seed slot is INT64_MAX/INT64_MIN
-    #                       and is replaced before the log).
-    # No clamp at the top: log1p keeps values bounded and meaningful
-    # across train + eval. On wiki gap_norm ∈ [0, ~11.6] during train,
-    # [~11.6, ~11.9] during eval.
-    MIA = max(float(mean_inter_arrival), 1.0)
+    # Option A — pure linear: gap_norm = (gap / T_full).clamp(0, 1).
+    # Switch to Option B by replacing the two `_norm_fn` lines with
+    #   log1p(raw_gap) / log1p(T_full).
+    Tf = max(float(T_full), 1.0)
     t_query = t_query_per_u.to(device).long().view(B, 1, 1).expand_as(nodes)
-    raw_gap = (t_query - ts).clamp(min=0).float()
-    gap_norm = torch.log1p(raw_gap / MIA)
+    # Bound raw_gap to T_full so the forward-seed-slot INT64_MIN
+    # subtraction overflow (which produces a huge positive number)
+    # can't pollute autograd before the seed override fires.
+    raw_gap = (t_query - ts).clamp(min=0).clamp(max=int(Tf)).float()
+    gap_norm = (raw_gap / Tf).clamp(0.0, 1.0)
 
     # Seed override.
     seed_oh = torch.zeros_like(nodes, dtype=torch.bool)
     seed_oh.scatter_(2, seed_pos.unsqueeze(-1), True)
     seed_gap = (t_query_per_u.to(device).long() - t_min).clamp(min=0).float()
-    seed_gap_norm = torch.log1p(seed_gap / MIA).view(B, 1, 1)
+    seed_gap_norm = (seed_gap / Tf).clamp(0.0, 1.0).view(B, 1, 1)
     gap_norm = torch.where(
         seed_oh & valid, seed_gap_norm.expand_as(gap_norm), gap_norm,
     )
-    gap_norm = gap_norm.clamp_min(0.0)
 
     # Time features.
     t_feat = time_encoder(gap_norm)  # [B, W, L, d_T]

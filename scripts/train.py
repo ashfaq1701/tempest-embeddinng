@@ -351,7 +351,15 @@ def main() -> Dict[str, Any]:
     num_nodes = loaded.max_node_count
     is_directed = args.is_directed
     dst_pool = np.unique(loaded.train.destinations).astype(np.int32)
-    stats = compute_train_stats(loaded.train.timestamps)
+    # Full-dataset timestamps (train + val + test) feed compute_train_stats
+    # so it can populate t_max_full / T_full — the v2 link-pred head's
+    # time channel normaliser, bounded across train and eval splits.
+    full_ts = np.concatenate([
+        loaded.train.timestamps,
+        loaded.val.timestamps,
+        loaded.test.timestamps,
+    ])
+    stats = compute_train_stats(loaded.train.timestamps, full_timestamps=full_ts)
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  directed:      {is_directed}  (--is-directed)")
@@ -359,6 +367,8 @@ def main() -> Dict[str, Any]:
     print(f"  t_min:         {stats.t_min}")
     print(f"  t_max:         {stats.t_max}")
     print(f"  T_train:       {stats.T_train:.0f}")
+    print(f"  t_max_full:    {stats.t_max_full}")
+    print(f"  T_full:        {stats.T_full:.0f}")
     print(f"  median_inter_arrival: {stats.median_inter_arrival:.1f}")
     print(f"  mean_inter_arrival:   {stats.mean_inter_arrival:.1f}")
     print(f"  train edges:   {len(loaded.train.sources):,}")
@@ -422,6 +432,8 @@ def main() -> Dict[str, Any]:
         train_deg=_compute_train_deg(loaded),
         t_min=stats.t_min,
         T_train=stats.T_train,
+        t_max_full=stats.t_max_full,
+        T_full=stats.T_full,
         link_head_direction=args.link_head_direction,
         link_head_sim_primitives=args.link_head_sim_primitives,
         link_head_use_time_channel=not args.link_head_no_time_channel,

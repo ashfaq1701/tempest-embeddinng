@@ -150,6 +150,10 @@ class TrainerConfig:
     # uses them to normalise the per-position time gap.
     t_min: int = 0
     T_train: float = 1.0
+    t_max_full: int = 1     # max timestamp across train + val + test
+    T_full: float = 1.0     # span (t_max_full - t_min); the v2 head's
+                            # time channel divides by this so gap_norm
+                            # is bounded [0, 1] at train and eval.
 
     # Optimisation.
     lr: float = 1e-3            # peak LR (after warmup). Validated on
@@ -212,14 +216,19 @@ class Trainer:
             d_direct=int(config.link_head_d_direct),
             chunk_C=int(config.link_head_chunk_c),
         ).to(self.device)
-        # Dataset anchors for the head's time-feature normalisation.
-        self.t_min = int(config.t_min)
-        self.T_train = float(config.T_train)
-
         # Frozen recency time constant. Plain Python float — no
         # tensor, no autograd. alignment_loss broadcasts it against
         # the per-batch gap tensor at the use site.
         self.recency_scale = float(config.recency_scale)
+
+        # Dataset anchors for the head's time-feature normalisation.
+        self.t_min = int(config.t_min)
+        self.T_train = float(config.T_train)
+        self.t_max_full = int(config.t_max_full)
+        # T_full bounds the v2 head's per-position gap normaliser at
+        # both train and eval. The head reads `T_full` directly from
+        # the trainer.
+        self.T_full = float(config.T_full)
 
         # Frozen training-degree per node, used by inverse-degree seed
         # weighting in alignment_loss. Plain int64 CPU tensor; the
@@ -403,7 +412,7 @@ class Trainer:
                 direction=dir_key,
                 t_query_per_u=t_query_t,
                 t_min=self.t_min,
-                mean_inter_arrival=self.recency_scale,
+                T_full=self.T_full,
                 embedding_table=self.embedding_table,
                 time_encoder=self.link_head.time_encoder,
                 device=self.device,

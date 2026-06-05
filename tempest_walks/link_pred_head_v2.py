@@ -61,13 +61,11 @@ class TimeEncoder(nn.Module):
     def forward(self, gap_norm: torch.Tensor) -> torch.Tensor:
         """gap_norm shape [...]. Output [..., d_T].
 
-        Under the Option B normalisation (`log1p(gap / MIA)`), gap_norm
-        can exceed 1 (on wiki it reaches ~11.9 at eval); the encoder no
-        longer clamps. The high-frequency sin/cos channels become
-        aliased for g >> 1 — the head's effective resolution comes from
-        the four raw features and the low-frequency sinusoid.
+        Designed for gap_norm ∈ [0, 1] (the head's normaliser keeps it
+        there). The clamp is defensive against any caller that passes
+        a wider range.
         """
-        g = gap_norm.clamp_min(0.0)
+        g = gap_norm.clamp(0.0, 1.0)
         raw = torch.stack(
             [g, torch.exp(-g), g * g, torch.log1p(g)], dim=-1
         )
