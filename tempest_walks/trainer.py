@@ -119,8 +119,10 @@ class TrainerConfig:
     embedding_start_bias: str = "ExponentialWeight"
     link_pred_num_walks_per_node: int = 5
     link_pred_max_walk_len: int = 20
-    link_pred_walk_bias: str = "ExponentialWeight"
-    link_pred_start_bias: str = "Uniform"
+    link_pred_forward_walk_bias:  str = "ExponentialWeight"
+    link_pred_forward_start_bias: str = "Uniform"
+    link_pred_backward_walk_bias:  str = "ExponentialWeight"
+    link_pred_backward_start_bias: str = "ExponentialWeight"
     max_time_capacity: int = -1     # Tempest sliding-window eviction
                                     # in raw timestamp units; -1 = unbounded.
     # Symmetric forward-walk supervision: also sample fwd walks from
@@ -209,8 +211,10 @@ class Trainer:
             embedding_start_bias=config.embedding_start_bias,
             embedding_num_walks_per_node=config.embedding_num_walks_per_node,
             embedding_max_walk_len=config.embedding_max_walk_len,
-            link_pred_walk_bias=config.link_pred_walk_bias,
-            link_pred_start_bias=config.link_pred_start_bias,
+            link_pred_forward_walk_bias=config.link_pred_forward_walk_bias,
+            link_pred_forward_start_bias=config.link_pred_forward_start_bias,
+            link_pred_backward_walk_bias=config.link_pred_backward_walk_bias,
+            link_pred_backward_start_bias=config.link_pred_backward_start_bias,
             link_pred_num_walks_per_node=config.link_pred_num_walks_per_node,
             link_pred_max_walk_len=config.link_pred_max_walk_len,
             max_time_capacity=config.max_time_capacity,
@@ -357,7 +361,7 @@ class Trainer:
         walks = self.walk_gen.walks_for_nodes_embedding(seeds_np)
         if self.config.enable_forward_alignment:
             seeds_src_np = np.unique(batch.src)
-            walks_fwd = self.walk_gen.walks_for_nodes_link_pred(seeds_src_np)
+            walks_fwd = self.walk_gen.walks_for_nodes_link_pred_forward(seeds_src_np)
         else:
             walks_fwd = None
 

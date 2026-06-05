@@ -5,10 +5,12 @@ Responsibility:
     ingested-edge state; both directions query the same state).
   - Provide `walks_for_nodes_embedding(seeds)` — BACKWARD walks
     used by the alignment loss to shape the embedding table E.
-  - Provide `walks_for_nodes_link_pred(seeds)` — FORWARD walks
-    intended for link-prediction-side scoring channels. Not wired
-    into any caller yet; the method and CLI surface are reserved
-    for the next architectural pass.
+  - Provide `walks_for_nodes_link_pred_forward(seeds)` — FORWARD walks
+    consumed by the iter-6 forward-alignment term; also reserved for
+    a future link-prediction-side scoring head.
+  - Provide `walks_for_nodes_link_pred_backward(seeds)` — BACKWARD
+    walks plumbed for symmetry with the forward variant; no caller
+    yet.
   - Provide add_edges(...) for post-batch ingest (strict-causal).
   - Provide reset() for epoch-boundary state clear.
 
@@ -58,10 +60,13 @@ Grouping contract (load-bearing for BOTH directions):
   assumes this layout.
 
 CLI-exposed knobs (passed through from train.py):
-  embedding_walk_bias, embedding_start_bias,
-  embedding_num_walks_per_node, embedding_max_walk_len,
-  link_pred_walk_bias, link_pred_start_bias,
-  link_pred_num_walks_per_node, link_pred_max_walk_len.
+  embedding side (backward walks only):
+    embedding_walk_bias, embedding_start_bias,
+    embedding_num_walks_per_node, embedding_max_walk_len.
+  link-pred side (BOTH directions, per-direction biases):
+    link_pred_forward_walk_bias,  link_pred_forward_start_bias,
+    link_pred_backward_walk_bias, link_pred_backward_start_bias,
+    link_pred_num_walks_per_node, link_pred_max_walk_len.
 """
 
 from typing import NamedTuple, Optional
@@ -94,10 +99,24 @@ class WalkGenerator:
         embedding_start_bias: str = "Uniform",
         embedding_num_walks_per_node: int = 5,
         embedding_max_walk_len: int = 20,
-        # Link-pred side (forward walks). Reserved for future link-
-        # prediction-side scoring channels; no caller yet.
-        link_pred_walk_bias: str = "ExponentialWeight",
-        link_pred_start_bias: str = "Uniform",
+        # Link-pred side. Both directions are plumbed; the alignment
+        # loss currently consumes only the forward variant, but a
+        # future link-pred-side scoring head may want either.
+        # Defaults reflect the temporal structure of useful walks:
+        #   forward  start=Uniform, walk=ExpW
+        #     ExpW+ExpW from the source would shoot the walk toward
+        #     the chronological HEAD (oldest end) of the seed's
+        #     successor set, which is least predictive. Uniform start
+        #     spreads coverage across the successor set; ExpW walk
+        #     then biases continuations toward recency relative to
+        #     the previous hop.
+        #   backward start=ExpW,    walk=ExpW
+        #     ExpW+ExpW from the target traces the TAIL (most recent
+        #     incoming chain) — the most predictive predecessors.
+        link_pred_forward_walk_bias:  str = "ExponentialWeight",
+        link_pred_forward_start_bias: str = "Uniform",
+        link_pred_backward_walk_bias:  str = "ExponentialWeight",
+        link_pred_backward_start_bias: str = "ExponentialWeight",
         link_pred_num_walks_per_node: int = 5,
         link_pred_max_walk_len: int = 20,
         timescale_bound: int = 300,
@@ -126,8 +145,10 @@ class WalkGenerator:
         self.embedding_start_bias = embedding_start_bias
         self.embedding_num_walks_per_node = embedding_num_walks_per_node
         self.embedding_max_walk_len = embedding_max_walk_len
-        self.link_pred_walk_bias = link_pred_walk_bias
-        self.link_pred_start_bias = link_pred_start_bias
+        self.link_pred_forward_walk_bias  = link_pred_forward_walk_bias
+        self.link_pred_forward_start_bias = link_pred_forward_start_bias
+        self.link_pred_backward_walk_bias  = link_pred_backward_walk_bias
+        self.link_pred_backward_start_bias = link_pred_backward_start_bias
         self.link_pred_num_walks_per_node = link_pred_num_walks_per_node
         self.link_pred_max_walk_len = link_pred_max_walk_len
 
@@ -203,20 +224,38 @@ class WalkGenerator:
             max_walk_len=self.embedding_max_walk_len,
         )
 
-    def walks_for_nodes_link_pred(self, seeds: np.ndarray) -> WalkData:
+    def walks_for_nodes_link_pred_forward(self, seeds: np.ndarray) -> WalkData:
         """Sample FORWARD walks for the link-prediction side.
 
         Seed at row position 0; chronologically latest successor at
         position lens-1. timestamps[i, 0] = INT64_MIN sentinel.
+
+        Used by the iter-6 forward-alignment loss term; also reserved
+        for a future link-prediction-side scoring head.
+        """
+        return self._walks(
+            seeds,
+            walk_bias=self.link_pred_forward_walk_bias,
+            start_bias=self.link_pred_forward_start_bias,
+            direction="Forward_In_Time",
+            num_walks_per_node=self.link_pred_num_walks_per_node,
+            max_walk_len=self.link_pred_max_walk_len,
+        )
+
+    def walks_for_nodes_link_pred_backward(self, seeds: np.ndarray) -> WalkData:
+        """Sample BACKWARD walks for the link-prediction side.
+
+        Seed at row position lens-1; chronologically oldest predecessor
+        at position 0. timestamps[i, lens-1] = INT64_MAX sentinel.
 
         Reserved for a future link-prediction-side scoring path; no
         caller wired into the trainer yet.
         """
         return self._walks(
             seeds,
-            walk_bias=self.link_pred_walk_bias,
-            start_bias=self.link_pred_start_bias,
-            direction="Forward_In_Time",
+            walk_bias=self.link_pred_backward_walk_bias,
+            start_bias=self.link_pred_backward_start_bias,
+            direction="Backward_In_Time",
             num_walks_per_node=self.link_pred_num_walks_per_node,
             max_walk_len=self.link_pred_max_walk_len,
         )

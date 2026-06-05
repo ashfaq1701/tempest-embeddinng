@@ -13,10 +13,11 @@ Hyperparameters exposed at CLI (and their grouping):
   Walks:          --embedding-num-walks-per-node, --embedding-max-walk-len,
                   --embedding-walk-bias, --embedding-start-bias,
                   --link-pred-num-walks-per-node, --link-pred-max-walk-len,
-                  --link-pred-walk-bias, --link-pred-start-bias,
+                  --link-pred-forward-walk-bias, --link-pred-forward-start-bias,
+                  --link-pred-backward-walk-bias, --link-pred-backward-start-bias,
                   --tempest-batch-window-multiplier
-                  (link-pred-* are plumbed but currently unused; reserved
-                   for a future link-prediction-side scoring path.)
+                  (link-pred-forward-* are consumed by --enable-forward-alignment;
+                   link-pred-backward-* are plumbed but currently unused.)
   Optimisation:   --lr, --lr-min, --warmup-fraction, --warmup-steps-cap,
                   --decay-horizon-epochs, --weight-decay, --batch-size,
                   --eval-batch-size, --num-epochs, --early-stop-patience
@@ -158,13 +159,30 @@ def parse_args() -> argparse.Namespace:
         "--link-pred-max-walk-len", default=20, type=int,
         help="L for forward (link-pred-side) walks. Reserved; currently unused.",
     )
+    # Link-pred-side bias knobs split by direction. The forward and
+    # backward variants pick opposite ends of the chronological chain
+    # under the same Tempest weighting, so defaults differ per
+    # direction:
+    #   - forward + ExpW start would shoot the walk toward the head
+    #     of the seed's successor set (oldest, least predictive),
+    #     so the default is Uniform start + ExpW walk.
+    #   - backward + ExpW start lands on the seed's most recent
+    #     predecessor (the tail/most-predictive end), so ExpW + ExpW.
     p.add_argument(
-        "--link-pred-walk-bias", default="ExponentialWeight", type=str,
-        help="Per-hop edge bias for link-pred-side walks. Reserved.",
+        "--link-pred-forward-walk-bias", default="ExponentialWeight", type=str,
+        help="Per-hop edge bias for FORWARD link-pred-side walks.",
     )
     p.add_argument(
-        "--link-pred-start-bias", default="Uniform", type=str,
-        help="Initial-edge bias for link-pred-side walks. Reserved.",
+        "--link-pred-forward-start-bias", default="Uniform", type=str,
+        help="Initial-edge bias for FORWARD link-pred-side walks.",
+    )
+    p.add_argument(
+        "--link-pred-backward-walk-bias", default="ExponentialWeight", type=str,
+        help="Per-hop edge bias for BACKWARD link-pred-side walks.",
+    )
+    p.add_argument(
+        "--link-pred-backward-start-bias", default="ExponentialWeight", type=str,
+        help="Initial-edge bias for BACKWARD link-pred-side walks.",
     )
     p.add_argument(
         "--enable-forward-alignment", action="store_true",
@@ -173,7 +191,7 @@ def parse_args() -> argparse.Namespace:
              "default backward walks from batch TARGETS). The forward "
              "walks reuse the --link-pred-* knobs. Densifies source-"
              "side embedding gradient — phase-6 analysis showed low-"
-             "degree source nodes drive 15% of test-edge hardness.",
+             "degree source nodes drive 15 pct of test-edge hardness.",
     )
     p.add_argument(
         "--inverse-degree-seed-weighting", action="store_true",
@@ -364,8 +382,10 @@ def main() -> Dict[str, Any]:
         embedding_start_bias=args.embedding_start_bias,
         link_pred_num_walks_per_node=args.link_pred_num_walks_per_node,
         link_pred_max_walk_len=args.link_pred_max_walk_len,
-        link_pred_walk_bias=args.link_pred_walk_bias,
-        link_pred_start_bias=args.link_pred_start_bias,
+        link_pred_forward_walk_bias=args.link_pred_forward_walk_bias,
+        link_pred_forward_start_bias=args.link_pred_forward_start_bias,
+        link_pred_backward_walk_bias=args.link_pred_backward_walk_bias,
+        link_pred_backward_start_bias=args.link_pred_backward_start_bias,
         enable_forward_alignment=args.enable_forward_alignment,
         inverse_degree_seed_weighting=args.inverse_degree_seed_weighting,
         train_deg=_compute_train_deg(loaded),
