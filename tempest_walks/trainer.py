@@ -123,6 +123,18 @@ class TrainerConfig:
     link_pred_start_bias: str = "Uniform"
     max_time_capacity: int = -1     # Tempest sliding-window eviction
                                     # in raw timestamp units; -1 = unbounded.
+    # Symmetric forward-walk supervision: also sample fwd walks from
+    # batch sources and add an InfoNCE alignment loss term over them.
+    # Reuses the link_pred_* walk config (those are the forward-walk
+    # knobs; alignment-side reuse of them is harmless because the
+    # link-pred head doesn't consume walks yet).
+    enable_forward_alignment: bool = False
+    # Weight per-row alignment-loss contribution by 1/log1p(degree(seed)).
+    # Rare seeds get parity with popular seeds; addresses phase-6
+    # both-active hard cohort. Requires train_deg to be plumbed in.
+    inverse_degree_seed_weighting: bool = False
+    train_deg: Optional[np.ndarray] = None  # [num_nodes] int64 incidence
+                                            # count over the train split.
 
     # Optimisation.
     lr: float = 1e-3            # peak LR (after warmup). Validated on
@@ -173,6 +185,19 @@ class Trainer:
         # tensor, no autograd. alignment_loss broadcasts it against
         # the per-batch gap tensor at the use site.
         self.recency_scale = float(config.recency_scale)
+
+        # Frozen training-degree per node, used by inverse-degree seed
+        # weighting in alignment_loss. Plain int64 CPU tensor; the
+        # call site indexes it by per-batch seeds_np and moves the
+        # tiny slice to GPU on demand. Zero entries for nodes that
+        # never appear in train edges (handled by log1p+division so
+        # they map to a finite weight).
+        if config.train_deg is not None:
+            self.train_deg = torch.from_numpy(
+                np.asarray(config.train_deg, dtype=np.int64)
+            )
+        else:
+            self.train_deg = torch.zeros(config.num_nodes, dtype=torch.int64)
 
         # Walk sampler. Both directions share one Tempest instance;
         # the embedding-side knobs drive the alignment loss, the
@@ -330,6 +355,25 @@ class Trainer:
         # 2026-05-31 sweep).
         seeds_np = np.unique(batch.tgt)
         walks = self.walk_gen.walks_for_nodes_embedding(seeds_np)
+        if self.config.enable_forward_alignment:
+            seeds_src_np = np.unique(batch.src)
+            walks_fwd = self.walk_gen.walks_for_nodes_link_pred(seeds_src_np)
+        else:
+            walks_fwd = None
+
+        # Inverse-degree seed weights. The both-active hard cohort
+        # (phase-6 analysis) has median seed degree of 1; the popular-
+        # seed end of the distribution has degree 100+. Uniform per-
+        # row averaging starves rare seeds of gradient. Weighting each
+        # walk row by 1/log1p(deg(seed_of_row)) gives rare seeds
+        # parity per epoch.
+        if self.config.inverse_degree_seed_weighting:
+            seed_weights = 1.0 / torch.log1p(
+                self.train_deg[torch.from_numpy(seeds_np.astype(np.int64))]
+                .to(self.device).float()
+            )
+        else:
+            seed_weights = None
 
         # Step 2: InfoNCE contrastive alignment over batched walks.
         # The softmax denominator over all batch contexts is the
@@ -347,7 +391,29 @@ class Trainer:
             gamma_recency=self.config.gamma_recency,
             tau_align=self.config.tau_align,
             chunk_size=self.config.alignment_chunk_size,
+            direction="backward",
+            seed_weights=seed_weights,
         )
+        if walks_fwd is not None:
+            if self.config.inverse_degree_seed_weighting:
+                seeds_src_np_arr = np.unique(batch.src)
+                seed_weights_fwd = 1.0 / torch.log1p(
+                    self.train_deg[torch.from_numpy(seeds_src_np_arr.astype(np.int64))]
+                    .to(self.device).float()
+                )
+            else:
+                seed_weights_fwd = None
+            l_align_fwd = alignment_loss(
+                embedding_table=self.embedding_table,
+                walks=walks_fwd,
+                recency_scale=self.recency_scale,
+                gamma_recency=self.config.gamma_recency,
+                tau_align=self.config.tau_align,
+                chunk_size=self.config.alignment_chunk_size,
+                direction="forward",
+                seed_weights=seed_weights_fwd,
+            )
+            l_align = l_align + l_align_fwd
 
         # Step 3: per-query negatives. Sampler returns [B, K_train]
         # grouped output; no flattening — the link head consumes the

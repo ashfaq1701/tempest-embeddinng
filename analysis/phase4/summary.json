@@ -1,0 +1,19 @@
+{
+  "n_sample": 2000,
+  "n_walks": 20,
+  "max_walk_len": 20,
+  "walk_bias": "ExponentialWeight",
+  "start_bias": "Uniform",
+  "ingested": "train_only",
+  "mean_walk_node_count": 23.05,
+  "fraction_v_in_walks": 0.592,
+  "mrr_cos_base": 0.4644479955004798,
+  "mrr_hit": 0.226411527417927,
+  "mrr_max_cos": 0.26636041588537546,
+  "mrr_mean_cos": 0.3998582568730412,
+  "mrr_top3_cos": 0.34279502925416055,
+  "mrr_min_l2": 0.23299569486733146,
+  "mrr_combined": 0.46755054899412984,
+  "mrr_cos_when_v_in_walks": 0.7598806286998322,
+  "mrr_cos_when_v_NOT_in_walks": 0.03578103752494882
+}

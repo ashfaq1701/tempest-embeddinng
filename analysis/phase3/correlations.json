@@ -1,0 +1,22 @@
+{
+  "val": {
+    "spearman_log1p(du)_vs_margin": -0.3849733062848367,
+    "spearman_log1p(dv)_vs_margin": -0.2654246958262893,
+    "spearman_log1p(du+dv)_vs_margin": -0.4744427767295269,
+    "spearman_|log1p(du)-log1p(dv)|_vs_margin": -0.531751718442811,
+    "margin_mean": 0.6114108958867681,
+    "margin_std": 0.4361320351409005,
+    "margin_P10": -0.03524954617023468,
+    "margin_P90": 0.9981025443412364
+  },
+  "test": {
+    "spearman_log1p(du)_vs_margin": -0.4094123080221116,
+    "spearman_log1p(dv)_vs_margin": -0.3090095674905144,
+    "spearman_log1p(du+dv)_vs_margin": -0.5411485252511147,
+    "spearman_|log1p(du)-log1p(dv)|_vs_margin": -0.5226655688904814,
+    "margin_mean": 0.5749338263691837,
+    "margin_std": 0.44117606948499777,
+    "margin_P10": -0.052407565410248935,
+    "margin_P90": 0.996838562656194
+  }
+}

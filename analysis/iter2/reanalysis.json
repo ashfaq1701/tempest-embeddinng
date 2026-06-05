@@ -1,0 +1,41 @@
+{
+  "emb_path": "logs/embeddings/tgbl-wiki_seed42_demb128_iter2_invdeg_ep33.npy",
+  "n_active": 7475,
+  "n_total": 9227,
+  "active_norm_mean": 1.5323896408081055,
+  "inactive_norm_mean": 0.22480164468288422,
+  "val": {
+    "n_edges": 23621,
+    "mrr_cos": 0.5132486780376687,
+    "mrr_negl2": 0.5214959019702331,
+    "mrr_dot": 0.4890244982886305,
+    "margin_mean": 0.6116155379356796,
+    "margin_P10": -0.026568010449409485,
+    "margin_P90": 0.9971476793289185,
+    "mrr_cos_both_active": 0.6604042533775595,
+    "fraction_both_active": 0.7753270394987511,
+    "mrr_cos_ind_u_only": 0.007223381129964836,
+    "fraction_ind_u_only": 0.10329791287413742,
+    "mrr_cos_ind_v_only": 0.003486615513838262,
+    "fraction_ind_v_only": 0.08162228525464629,
+    "mrr_cos_ind_both": 0.004745775189942558,
+    "fraction_ind_both": 0.03975276237246518
+  },
+  "test": {
+    "n_edges": 23621,
+    "mrr_cos": 0.47050439624217205,
+    "mrr_negl2": 0.4738461896455067,
+    "mrr_dot": 0.4482535411573435,
+    "margin_mean": 0.5744204911552804,
+    "margin_P10": -0.052708689123392105,
+    "margin_P90": 0.9973450303077698,
+    "mrr_cos_both_active": 0.6193949452380344,
+    "fraction_both_active": 0.7573345751661656,
+    "mrr_cos_ind_u_only": 0.006937454236861451,
+    "fraction_ind_u_only": 0.11248465348630456,
+    "mrr_cos_ind_v_only": 0.004412387258385226,
+    "fraction_ind_v_only": 0.0779814571779349,
+    "mrr_cos_ind_both": 0.00556993920183421,
+    "fraction_ind_both": 0.05219931416959485
+  }
+}

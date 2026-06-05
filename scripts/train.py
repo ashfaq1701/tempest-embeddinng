@@ -54,6 +54,18 @@ from tempest_walks.trainer import Trainer, TrainerConfig
 from tempest_walks.utils import compute_max_time_capacity, seed_all
 
 
+def _compute_train_deg(loaded: Loaded) -> np.ndarray:
+    """Per-node incidence count over the train split. Undirected:
+    each edge counts once on each endpoint. Used by inverse-degree
+    seed weighting in the alignment loss."""
+    deg = np.zeros(loaded.max_node_count, dtype=np.int64)
+    src = loaded.train.sources.astype(np.int64)
+    tgt = loaded.train.destinations.astype(np.int64)
+    np.add.at(deg, src, 1)
+    np.add.at(deg, tgt, 1)
+    return deg
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Tempest walks-supervised temporal embedding training"
@@ -153,6 +165,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--link-pred-start-bias", default="Uniform", type=str,
         help="Initial-edge bias for link-pred-side walks. Reserved.",
+    )
+    p.add_argument(
+        "--enable-forward-alignment", action="store_true",
+        help="Add a symmetric InfoNCE alignment term using forward "
+             "walks sampled from batch SOURCES (in addition to the "
+             "default backward walks from batch TARGETS). The forward "
+             "walks reuse the --link-pred-* knobs. Densifies source-"
+             "side embedding gradient — phase-6 analysis showed low-"
+             "degree source nodes drive 15% of test-edge hardness.",
+    )
+    p.add_argument(
+        "--inverse-degree-seed-weighting", action="store_true",
+        help="Weight per-row alignment-loss contribution by "
+             "1 / log1p(degree(seed)). Rare seeds get gradient parity "
+             "with popular seeds — addresses the both-active hard "
+             "cohort identified in phase-6 analysis.",
     )
     p.add_argument(
         "--tempest-batch-window-multiplier", default=-1.0, type=float,
@@ -338,6 +366,9 @@ def main() -> Dict[str, Any]:
         link_pred_max_walk_len=args.link_pred_max_walk_len,
         link_pred_walk_bias=args.link_pred_walk_bias,
         link_pred_start_bias=args.link_pred_start_bias,
+        enable_forward_alignment=args.enable_forward_alignment,
+        inverse_degree_seed_weighting=args.inverse_degree_seed_weighting,
+        train_deg=_compute_train_deg(loaded),
         max_time_capacity=compute_max_time_capacity(
             args.tempest_batch_window_multiplier,
             args.batch_size,

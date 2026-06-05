@@ -1,0 +1,76 @@
+{
+  "counts": {
+    "hard": 3765,
+    "mid": 5496,
+    "easy": 14360
+  },
+  "hard": {
+    "mrr_cos": 0.0014327785465866327,
+    "u_active_rate": 0.5096945551128818,
+    "v_active_rate": 0.6278884462151394,
+    "u_norm_mean": 0.8051396012306213,
+    "v_norm_mean": 1.0257368087768555,
+    "u_deg_median": 1.0,
+    "v_deg_median": 28.0,
+    "u_deg_mean": 111.96626826029217,
+    "v_deg_mean": 83.9203187250996,
+    "log1p_dt_u_mean": 14.126822251816526,
+    "log1p_dt_v_mean": 13.902864281432906,
+    "pos_cos_mean": -0.07226016372442245,
+    "neg_cos_mean": 0.0041050659492611885
+  },
+  "mid": {
+    "mrr_cos": 0.01751750521361828,
+    "u_active_rate": 0.6280931586608443,
+    "v_active_rate": 0.6954148471615721,
+    "u_norm_mean": 0.9391075372695923,
+    "v_norm_mean": 1.08124840259552,
+    "u_deg_median": 7.0,
+    "v_deg_median": 22.0,
+    "u_deg_mean": 78.74181222707423,
+    "v_deg_mean": 86.67157933042212,
+    "log1p_dt_u_mean": 13.96342145447607,
+    "log1p_dt_v_mean": 13.848306414108073,
+    "pos_cos_mean": 0.13264700770378113,
+    "neg_cos_mean": -0.0018945804331451654
+  },
+  "easy": {
+    "mrr_cos": 0.7675608396530151,
+    "u_active_rate": 1.0,
+    "v_active_rate": 1.0,
+    "u_norm_mean": 1.6311421394348145,
+    "v_norm_mean": 1.6380146741867065,
+    "u_deg_median": 65.0,
+    "v_deg_median": 84.0,
+    "u_deg_mean": 130.98210306406685,
+    "v_deg_mean": 180.58210306406684,
+    "log1p_dt_u_mean": 13.40957659005602,
+    "log1p_dt_v_mean": 13.362778295424068,
+    "pos_cos_mean": 0.9172402620315552,
+    "neg_cos_mean": 0.0029932791367173195
+  },
+  "act_both_active": {
+    "count": 17889,
+    "fraction": 0.7573345751661656,
+    "mrr_cos": 0.6197567582130432,
+    "margin_mean": 0.756710946559906
+  },
+  "act_u_inactive_only": {
+    "count": 2657,
+    "fraction": 0.11248465348630456,
+    "mrr_cos": 0.008336617611348629,
+    "margin_mean": 0.0053408341482281685
+  },
+  "act_v_inactive_only": {
+    "count": 1842,
+    "fraction": 0.0779814571779349,
+    "mrr_cos": 0.004061183426529169,
+    "margin_mean": 0.01569637469947338
+  },
+  "act_both_inactive": {
+    "count": 1233,
+    "fraction": 0.05219931416959485,
+    "mrr_cos": 0.005988731514662504,
+    "margin_mean": 0.0004924747627228498
+  }
+}

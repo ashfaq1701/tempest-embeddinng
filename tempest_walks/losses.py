@@ -71,6 +71,8 @@ def alignment_loss(
     gamma_recency: float = 0.4,
     tau_align: float = 0.5,
     chunk_size: int = 8192,
+    direction: str = "backward",
+    seed_weights: torch.Tensor = None,
 ) -> torch.Tensor:
     """Returns ℒ as a scalar graph-attached tensor. See module docstring.
 
@@ -104,33 +106,52 @@ def alignment_loss(
     NK, L = nodes.shape
     M = NK * L
 
-    # valid(i, p) := 0 ≤ p ≤ ℓ_i - 2  (seed at ℓ_i - 1, padding at p ≥ ℓ_i)
+    # Direction-aware valid mask:
+    #   BACKWARD walks: seed at p = ℓ_i - 1, valid contexts p ∈ [0, ℓ_i - 2]
+    #   FORWARD  walks: seed at p = 0,       valid contexts p ∈ [1, ℓ_i - 1]
     positions = torch.arange(L, device=device).unsqueeze(0)       # [1, L]
-    is_context = positions < (lens - 1).unsqueeze(1)              # [NK, L]
+    if direction == "backward":
+        is_context = positions < (lens - 1).unsqueeze(1)          # [NK, L]
+    elif direction == "forward":
+        is_context = (positions >= 1) & (positions < lens.unsqueeze(1))
+    else:
+        raise ValueError(f"direction must be 'backward' or 'forward', got {direction!r}")
     ctx_valid_mask = is_context.reshape(M)                        # [M]
 
     # Empty batch (Tempest graph not yet populated): ℒ = 0 with grad.
     if not bool(ctx_valid_mask.any()):
         return torch.zeros((), device=device, requires_grad=True)
 
-    # K_hop(i, p) = max(1, ℓ_i - 1 - p)
-    hop_dist = (lens.unsqueeze(1) - 1 - positions).clamp_min(1).float()
+    # K_hop(i, p) = hop distance from seed:
+    #   BACKWARD: seed at ℓ_i - 1, so K_hop = ℓ_i - 1 - p
+    #   FORWARD:  seed at 0,       so K_hop = p
+    if direction == "backward":
+        hop_dist = (lens.unsqueeze(1) - 1 - positions).clamp_min(1).float()
+    else:
+        hop_dist = positions.expand(NK, L).clamp_min(1).float()
     mask_f = is_context.float()                                   # [NK, L]
 
     # Hop profile: 1/K_hop, masked, normalised per row so it sums to 1.
     hop_w = (1.0 / hop_dist) * mask_f                             # [NK, L]
     hop_p = hop_w / hop_w.sum(dim=1, keepdim=True).clamp_min(_EPS)
 
-    # Stationary recency: gap = t_seed_edge - t_{i, p}, ≥ 0.
-    # t_seed_edge = max of valid timestamps in the row. Masking
-    # invalid positions to -inf before .max() ensures sentinels
-    # (INT64_MAX at seed slot, -1 padding) cannot win the max.
+    # Stationary recency: gap = | t_seed_edge - t_{i, p} |, anchored
+    # at the SEED-ADJACENT edge time (the edge nearest the seed in the
+    # walk's chronology). For BACKWARD walks this is the max valid t
+    # (latest edge before seed); for FORWARD walks this is the min
+    # valid t (first edge after seed). Masking the other sentinel
+    # side keeps padding (-1) and seed slot from corrupting the
+    # reduction.
     ts_f = timestamps.float()
-    ts_masked = ts_f.masked_fill(~is_context, float("-inf"))
-    t_seed_edge = ts_masked.max(dim=1, keepdim=True).values       # [NK, 1]
-    # clamp_min(0) absorbs every sentinel: invalid rows get -inf
+    if direction == "backward":
+        ts_masked = ts_f.masked_fill(~is_context, float("-inf"))
+        t_seed_edge = ts_masked.max(dim=1, keepdim=True).values   # [NK, 1]
+    else:
+        ts_masked = ts_f.masked_fill(~is_context, float("inf"))
+        t_seed_edge = ts_masked.min(dim=1, keepdim=True).values   # [NK, 1]
+    # clamp_min(0) absorbs every sentinel: invalid rows get ±inf
     # subtracted to -inf, then clamped to 0; mask zeros their weight.
-    gap = (t_seed_edge - ts_f).clamp_min(0.0)                     # [NK, L]
+    gap = (ts_f - t_seed_edge).abs().clamp_min(0.0)               # [NK, L]
     # `recency_scale` is a frozen Python float (mean inter-arrival of
     # the train split). max(., 1.0) is a numerical guard; for any real
     # dataset the configured value sits well above the floor. Plain
@@ -236,6 +257,16 @@ def alignment_loss(
     # ℒ_i = -(1 / W_i) · Σ_p w_valid(i, p) · log p(n_{i, p} | s_i)
     L_per_row = -(w_valid * log_p_pos).sum(dim=1) / W.clamp_min(_EPS)
 
-    # ℒ = (1 / |I⁺|) · Σ_{i ∈ I⁺} ℒ_i,    I⁺ = { i : W_i > ε }
+    # ℒ = weighted mean of ℒ_i over rows i ∈ I⁺ = { i : W_i > ε }.
+    # When seed_weights is None, all rows weighted equally (uniform mean).
+    # When provided, per-row weights w_seed(i) typically encode an inverse-
+    # degree prior so rare-seed rows contribute proportionally more — fixes
+    # the both-active hard cohort identified in analysis/phase6.
     valid = (W > _EPS).float()                                    # [NK]
-    return (L_per_row * valid).sum() / valid.sum().clamp_min(1.0)
+    if seed_weights is None:
+        row_w = valid
+    else:
+        sw = seed_weights.to(device).float()                      # [N]
+        # Broadcast per-seed weight onto K walk rows per seed.
+        row_w = sw.repeat_interleave(K) * valid                   # [NK]
+    return (L_per_row * row_w).sum() / row_w.sum().clamp_min(_EPS)
