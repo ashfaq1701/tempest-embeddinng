@@ -156,6 +156,15 @@ class TrainerConfig:
                                    # the candidate dim inside the walk
                                    # tower's per-position MLP. Pure memory
                                    # knob; loss/gradient unchanged.
+    # Gradient-mix factor for L_link → E. Convex combination
+    # E_link_in = alpha * E + (1 - alpha) * E.detach() is forward-
+    # identical to E and backward-scales the link-loss gradient flowing
+    # into E by alpha. alpha=0.0 reproduces the historical pure-detach
+    # behaviour (L_link trains only the link head); alpha=1.0 lets the
+    # link loss co-shape E along with L_align; in between is a controlled
+    # leak. Applied uniformly across all three E lookups the head sees
+    # (E[u], E[v], E_walks).
+    link_loss_into_embedding_alpha: float = 0.2
     # Dataset-derived (plumbed by train.py from TrainStats); the head
     # uses them to normalise the per-position time gap.
     t_min: int = 0
@@ -230,6 +239,14 @@ class Trainer:
         # tensor, no autograd. alignment_loss broadcasts it against
         # the per-batch gap tensor at the use site.
         self.recency_scale = float(config.recency_scale)
+
+        # Gradient-mix factor for L_link → E (see TrainerConfig).
+        alpha = float(config.link_loss_into_embedding_alpha)
+        if not (0.0 <= alpha <= 1.0):
+            raise ValueError(
+                f"link_loss_into_embedding_alpha must be in [0, 1]; got {alpha}"
+            )
+        self.link_alpha = alpha
 
         # Dataset anchors for the head's time-feature normalisation.
         self.t_min = int(config.t_min)
@@ -326,6 +343,17 @@ class Trainer:
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────
+
+    def _mix_link(self, t: torch.Tensor) -> torch.Tensor:
+        """Convex-combination grad-mix for E lookups consumed by the link
+        head. Forward identical to t; backward scales L_link's gradient
+        into E by alpha. alpha=0.0 reduces to .detach(). Under no_grad
+        (eval) we short-circuit to .detach() to avoid pointless mix ops.
+        """
+        if self.link_alpha == 0.0 or not torch.is_grad_enabled():
+            return t.detach()
+        a = self.link_alpha
+        return a * t + (1.0 - a) * t.detach()
 
     def _setup_lr_scheduler(self, batches_per_epoch: int) -> None:
         """Build a cosine-decay + linear-warmup LR schedule.
@@ -424,6 +452,7 @@ class Trainer:
                 embedding_table=self.embedding_table,
                 time_encoder=self.link_head.time_encoder,
                 device=self.device,
+                link_alpha=self.link_alpha,
             )
         return _pack("forward"), _pack("backward")
 
@@ -537,17 +566,15 @@ class Trainer:
         )                                                            # [B, 1+K]
         candidates_u = src_t.unsqueeze(1).expand(B, 1 + K)           # [B, 1+K]
 
-        # Detach on the link path: L_link trains only the link head;
-        # E is updated exclusively by L_align (walk-supervised). Without
-        # detach, the softmax-CE over 100 random negatives drives E to
-        # memorise training (u, v⁺) pair geometry — visible as link loss
-        # collapsing far below the uniform baseline log(1+K_train) ≈ 4.62
-        # while val MRR drops monotonically from epoch 1. On
-        # high-surprise datasets (review surprise=0.987) this anti-ranks
-        # val positives because memorised seen-pair geometry has no
-        # bearing on unseen pairs.
-        e_u = self.embedding_table(candidates_u).detach()            # [B, 1+K, d]
-        e_v = self.embedding_table(candidates_v).detach()            # [B, 1+K, d]
+        # Grad-mix on the link path: L_link trains the link head AND
+        # leaks into E with strength alpha (see TrainerConfig.
+        # link_loss_into_embedding_alpha). alpha=0 reproduces the
+        # original pure-detach regime (the rationale for full detach
+        # was that bare link gradients on E memorise seen-pair geometry
+        # on high-surprise datasets like review; a controlled leak
+        # lets L_link nudge E without dominating L_align's signal).
+        e_u = self._mix_link(self.embedding_table(candidates_u))     # [B, 1+K, d]
+        e_v = self._mix_link(self.embedding_table(candidates_v))     # [B, 1+K, d]
         # Walk-mediated head: sample u-side walks (both directions) at
         # the batch query times and pass walk feature dicts. The head
         # is inherently u→v directional; no symmetrisation (cf.
