@@ -146,12 +146,22 @@ def parse_args() -> argparse.Namespace:
     #     predecessor (the tail / most predictive end), so ExpW + ExpW.
     p.add_argument(
         "--embedding-num-walks-per-node", default=10, type=int,
-        help="TOTAL K for embedding-side walks; split half/half into "
-             "forward + backward at construction (so default 10 → 5+5).",
+        help="TOTAL K for embedding-side walks per seed. When "
+             "--embedding-direction=both, split half/half (default "
+             "10 → 5 forward + 5 backward); when single-direction, "
+             "the full K is spent on that direction.",
     )
     p.add_argument(
         "--embedding-max-walk-len", default=20, type=int,
         help="L for embedding-side walks.",
+    )
+    p.add_argument(
+        "--embedding-direction", default="both", type=str,
+        choices=("forward", "backward", "both"),
+        help="Direction(s) the embedding-side alignment loss consumes. "
+             "Default 'both' samples backward walks from each batch tgt "
+             "plus forward walks from each batch src (iter-6 recipe). "
+             "Single-direction variants are ablation knobs.",
     )
     p.add_argument(
         "--embedding-forward-walk-bias", default="ExponentialWeight", type=str,
@@ -426,6 +436,7 @@ def main() -> Dict[str, Any]:
 
         embedding_num_walks_per_node=args.embedding_num_walks_per_node,
         embedding_max_walk_len=args.embedding_max_walk_len,
+        embedding_direction=args.embedding_direction,
         embedding_forward_walk_bias=args.embedding_forward_walk_bias,
         embedding_forward_start_bias=args.embedding_forward_start_bias,
         embedding_backward_walk_bias=args.embedding_backward_walk_bias,
