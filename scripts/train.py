@@ -240,16 +240,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--link-head-d-pos",    default=96, type=int)
     p.add_argument("--link-head-d-direct", default=64, type=int)
     p.add_argument(
-        "--link-loss-into-embedding-alpha", default=0.2, type=float,
-        help="Gradient-mix factor for L_link → E. The link-head's E "
-             "lookups are passed through alpha·E + (1-alpha)·E.detach(), "
-             "which is forward-identical to E and backward-scales the "
-             "link-loss gradient flowing into E by alpha. 0.0 = pure "
-             "detach (historical behaviour: L_link trains only the link "
-             "head); 1.0 = no detach (L_link fully co-shapes E along "
-             "with L_align); default 0.2 is a controlled leak.",
-    )
-    p.add_argument(
         "--link-head-chunk-c", default=0, type=int,
         help="0 (default) = no chunking; pass a positive N to enable "
              "candidate-dim chunking inside the walk tower with chunk "
@@ -470,7 +460,6 @@ def main() -> Dict[str, Any]:
         link_head_d_pos=args.link_head_d_pos,
         link_head_d_direct=args.link_head_d_direct,
         link_head_chunk_c=args.link_head_chunk_c,
-        link_loss_into_embedding_alpha=args.link_loss_into_embedding_alpha,
         max_time_capacity=compute_max_time_capacity(
             args.tempest_batch_window_multiplier,
             args.batch_size,

@@ -50,13 +50,6 @@ def make_head_inputs(
     embedding_table,               # EmbeddingTable
     time_encoder,                  # TimeEncoder
     device,
-    link_alpha: float = 0.0,       # convex-combo grad-mix factor for the
-                                   # E_walks lookup. 0.0 = pure detach
-                                   # (link loss does NOT shape E via the
-                                   # walks tower); 1.0 = no detach; in
-                                   # between = scaled leak. Only matters
-                                   # when grad is enabled; under no_grad
-                                   # the helper short-circuits to detach.
 ):
     """Stack per-u walks into [B, W, L, ...] tensors with consistent
     padding to the per-batch max (W_max, L_max) and return the dict
@@ -129,11 +122,7 @@ def make_head_inputs(
 
     # Embedding lookup. clamp to a safe id for padded slots; mask later.
     nodes_safe = nodes.clamp(min=0)
-    E_full = embedding_table(nodes_safe)            # [B, W, L, d_emb]
-    if link_alpha > 0.0 and torch.is_grad_enabled():
-        E_walks = link_alpha * E_full + (1.0 - link_alpha) * E_full.detach()
-    else:
-        E_walks = E_full.detach()
+    E_walks = embedding_table(nodes_safe).detach()  # [B, W, L, d_emb]
 
     # Zero out invalid slots so downstream sums see no leakage. The
     # mask covers max-pool; mean-pool divides by mask count.
