@@ -205,6 +205,15 @@ def parse_args() -> argparse.Namespace:
     # config emerges they will be collapsed into hardcoded defaults on
     # the post-experiment cleanup branch.
     p.add_argument(
+        "--link-head-direction", default="both", type=str,
+        choices=("forward", "backward", "both"),
+        help="Walk direction(s) the v2 link head consumes. Default "
+             "'both' (Phase-0 winner on tgbl-wiki seed=42). Single-"
+             "sided values are kept for ablation runs; when single-"
+             "sided, the full --link-pred-num-walks-per-node is "
+             "spent on the one direction (no half/half split).",
+    )
+    p.add_argument(
         "--link-head-sim-primitives", default="hadamard_absdiff", type=str,
         choices=("hadamard_absdiff", "cosine_only"),
         help="Per-position similarity primitives between E[v] and E[w_i].",
@@ -441,6 +450,7 @@ def main() -> Dict[str, Any]:
         T_train=stats.T_train,
         t_max_full=stats.t_max_full,
         T_full=stats.T_full,
+        link_head_direction=args.link_head_direction,
         link_head_sim_primitives=args.link_head_sim_primitives,
         link_head_use_time_channel=not args.link_head_no_time_channel,
         link_head_use_K_channel=not args.link_head_no_K_channel,

@@ -137,10 +137,13 @@ class TrainerConfig:
     # alignment loss (per-row weight = 1/log1p(deg(seed))).
     train_deg: Optional[np.ndarray] = None  # [num_nodes] int64
 
-    # LinkPredHeadV2 architecture knobs. The head consumes BOTH walk
-    # directions (Phase-0 sweep on tgbl-wiki seed=42 found "both"
-    # dominates either single direction; the head was collapsed to
-    # both-only after that result).
+    # LinkPredHeadV2 architecture knobs. Default direction is "both"
+    # (Phase-0 sweep on tgbl-wiki seed=42 winner); single-sided values
+    # are retained for ablation runs. When direction is single-sided,
+    # the link-pred-side per-direction K is the FULL link_pred_num_
+    # walks_per_node (no half/half split); when "both", it is K // 2
+    # per side.
+    link_head_direction: str = "both"            # forward | backward | both
     link_head_sim_primitives: str = "hadamard_absdiff"  # | "cosine_only"
     link_head_use_time_channel: bool = True
     link_head_use_K_channel: bool = True
@@ -206,11 +209,13 @@ class Trainer:
             d_emb=config.d_emb,
         ).to(self.device)
         # Walk-mediated link-pred head (see link_pred_head_v2.py). The
-        # head's `max_walk_len` sizes its K-embedding table. Both
-        # directions of u-side walks are always sampled and consumed.
+        # head's `max_walk_len` sizes its K-embedding table. Direction
+        # is forward / backward / both; for "both", forward + backward
+        # u-side walks are both sampled and consumed.
         self.link_head = LinkPredHeadV2(
             d_emb=config.d_emb,
             max_walk_len=int(config.link_pred_max_walk_len),
+            direction=config.link_head_direction,
             sim_primitives=config.link_head_sim_primitives,
             use_time_channel=config.link_head_use_time_channel,
             use_K_channel=config.link_head_use_K_channel,
@@ -248,12 +253,17 @@ class Trainer:
         else:
             self.train_deg = torch.zeros(config.num_nodes, dtype=torch.int64)
 
-        # Walk sampler. Each side draws BOTH directions; per-side
-        # num_walks_per_node is the total K split half/half across
-        # forward+backward, so the per-direction K passed to the
-        # WalkGenerator is total // 2 (minimum 1).
+        # Walk sampler. The embedding side ALWAYS draws both directions
+        # (symmetric supervision), so its K is split half/half. The
+        # link-pred side's split depends on link_head_direction: "both"
+        # halves K (the head consumes both towers, so each gets K // 2);
+        # single-sided uses the full K on the one direction the head
+        # consumes (the other direction is never sampled).
         emb_K_per_dir = max(1, int(config.embedding_num_walks_per_node) // 2)
-        link_K_per_dir = max(1, int(config.link_pred_num_walks_per_node) // 2)
+        if config.link_head_direction == "both":
+            link_K_per_dir = max(1, int(config.link_pred_num_walks_per_node) // 2)
+        else:
+            link_K_per_dir = max(1, int(config.link_pred_num_walks_per_node))
         self.walk_gen = WalkGenerator(
             is_directed=config.is_directed,
             use_gpu=config.use_gpu_tempest,
@@ -366,19 +376,25 @@ class Trainer:
         u_ids_np,                # np.ndarray [B] source ids
         t_query_np,              # np.ndarray [B] query timestamps
     ):
-        """Sample BOTH forward and backward walks for each row's source
-        u and package them into the per-position feature dicts the
-        head consumes. The walk-gen K is fixed at construction time to
-        `link_pred_num_walks_per_node // 2` per direction.
+        """Sample u-side walks in the direction(s) the head consumes
+        (self.config.link_head_direction) and package them into the
+        per-position feature dicts. Walk-gen K-per-direction is fixed
+        at construction time to either K // 2 ("both") or K (single).
+        Returns (walks_fwd, walks_bwd) — either may be None when the
+        head doesn't need that direction.
         """
-        uniq, inv = np.unique(u_ids_np, return_inverse=True)
+        direction_required = self.config.link_head_direction
+        if direction_required not in ("forward", "backward", "both"):
+            raise ValueError(direction_required)
 
+        uniq, inv = np.unique(u_ids_np, return_inverse=True)
         out = {}
         for dir_key, sampler in (
             ("forward",  self.walk_gen.walks_for_nodes_link_pred_forward),
             ("backward", self.walk_gen.walks_for_nodes_link_pred_backward),
         ):
-            # Sample once per UNIQUE u, then scatter back to row order.
+            if direction_required not in (dir_key, "both"):
+                continue
             wd = sampler(uniq)
             # wd.nodes: [N_u*K, L]; rows [i*K:(i+1)*K) belong to uniq[i].
             K = wd.K
@@ -394,6 +410,8 @@ class Trainer:
 
         t_query_t = torch.from_numpy(t_query_np).long()
         def _pack(dir_key):
+            if dir_key not in out:
+                return None
             nodes_l, ts_l, lens_l = out[dir_key]
             return make_head_inputs(
                 walks_nodes_per_u=nodes_l,
