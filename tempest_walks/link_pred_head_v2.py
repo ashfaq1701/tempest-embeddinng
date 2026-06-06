@@ -3,7 +3,9 @@
 Design (from analysis/REPORT.md §9, refined per design discussion):
 
 For each (u, t, v_candidate):
-    1. Sample n_walks walks for u in BOTH directions (forward + backward).
+    1. Sample n_walks walks for u in ONE direction (decided upstream by
+       the dataset's is_directed flag — undirected → backward, directed
+       → forward).
     2. For each (walk, position p) build:
          sim_vec  = primitives between E[v_cand] and E[walks_u[p]]
                     default: [Hadamard, |E_v - E_w|]            → 2·d_emb
@@ -20,13 +22,16 @@ For each (u, t, v_candidate):
     5. Pool over positions: concat(max, mean) → 2·d_pos per walk.
     6. Pool over walks: mean → 2·d_pos per (u, v).
     7. Direct channel (bypass walks): MLP(Hadamard(E_u, E_v), |E_u-E_v|).
-    8. Final MLP on concat[fwd_walk_features, bwd_walk_features, direct]
-       → scalar logit.
+    8. Final MLP on concat[walk_features, direct] → scalar logit.
 
-The two directions run through SEPARATE WalkTower instances; their
-outputs are concatenated before the final MLP. The Phase-0 direction
-sweep (2026-06-06, 15-epoch tgbl-wiki seed=42) found "both" beats
-single-sided on both val and test, so the head is hardcoded to "both".
+Why one tower, not two: the Phase-0 sweep + α-leak grid (2026-06-06
+on tgbl-wiki) showed that "both" beats single-sided by ≤ 0.008 test
+on wiki, INSIDE the noise band; the second tower doubles head compute
+and parameters for no statistically distinguishable gain. The choice
+of direction is dictated by the dataset: undirected graphs (TGB's
+default workload) consume backward walks; directed graphs consume
+forward walks (forward walks in link-pred have known time-weighting
+issues, but no TGB dataset we use is directed).
 
 The (E[u], E[v]) inputs are EXPECTED to be detached upstream — this
 head's gradients update only its own parameters; E is shaped by the
@@ -273,28 +278,24 @@ class DirectChannel(nn.Module):
 
 
 class LinkPredHeadV2(nn.Module):
-    """Walk-mediated similarity head.
+    """Walk-mediated similarity head (single tower).
 
     Args:
         d_emb           : embedding width (model config).
         max_walk_len    : L; used to size the K embedding table.
-        direction       : 'forward' | 'backward' | 'both'. Default 'both'
-                          (Phase-0 winner on wiki). Single-sided variants
-                          are kept for ablation runs.
         sim_primitives  : 'hadamard_absdiff' (default) | 'cosine_only'.
         use_time_channel/use_K_channel : channel ablations.
         use_direct      : include the direct bypass (default True).
-        direct_only     : drop walk towers entirely; head reduces to a
-                          per-dim MLP on (E[u], E[v]).
+        direct_only     : drop the walk tower entirely; head reduces to
+                          a per-dim MLP on (E[u], E[v]).
 
     Inputs at forward():
         E_u           : [B, C, d_emb]  source embedding broadcast across
                                        candidates (detached upstream).
         E_v           : [B, C, d_emb]  candidate embeddings (detached).
-        walks_fwd     : dict. Required if direction in {'forward','both'}.
-                              Keys: E_walks [B,W,L,d], mask [B,W,L],
+        walks         : dict. Required unless direct_only. Keys:
+                              E_walks [B,W,L,d], mask [B,W,L],
                               K_idx [B,W,L], t_feat [B,W,L,d_T].
-        walks_bwd     : dict. Required if direction in {'backward','both'}.
 
     Returns: [B, C] logits.
     """
@@ -303,7 +304,6 @@ class LinkPredHeadV2(nn.Module):
         self,
         d_emb: int,
         max_walk_len: int,
-        direction: str = "both",
         sim_primitives: str = "hadamard_absdiff",
         use_time_channel: bool = True,
         use_K_channel: bool = True,
@@ -315,9 +315,6 @@ class LinkPredHeadV2(nn.Module):
         chunk_C: int = 0,
     ):
         super().__init__()
-        if direction not in ("forward", "backward", "both"):
-            raise ValueError(direction)
-        self.direction = direction
         self.direct_only = direct_only
         self.use_direct = bool(use_direct or direct_only)
 
@@ -325,19 +322,14 @@ class LinkPredHeadV2(nn.Module):
 
         final_in = 0
         if not direct_only:
-            shared_kwargs = dict(
+            self.tower = WalkTower(
                 d_emb=d_emb, max_walk_len=max_walk_len,
                 sim_primitives=sim_primitives,
                 use_K=use_K_channel, use_t=use_time_channel,
                 d_K=d_K, d_pos=d_pos, d_T=self.time_encoder.d_T,
                 chunk_C=chunk_C,
             )
-            if direction in ("forward", "both"):
-                self.tower_fwd = WalkTower(**shared_kwargs)
-                final_in += self.tower_fwd.out_dim
-            if direction in ("backward", "both"):
-                self.tower_bwd = WalkTower(**shared_kwargs)
-                final_in += self.tower_bwd.out_dim
+            final_in += self.tower.out_dim
 
         if self.use_direct:
             self.direct = DirectChannel(d_emb=d_emb, d_direct=d_direct)
@@ -359,17 +351,12 @@ class LinkPredHeadV2(nn.Module):
         self,
         E_u: torch.Tensor,
         E_v: torch.Tensor,
-        walks_fwd: Optional[dict] = None,
-        walks_bwd: Optional[dict] = None,
+        walks: Optional[dict] = None,
     ) -> torch.Tensor:
         parts = []
         if not self.direct_only:
-            if self.direction in ("forward", "both"):
-                assert walks_fwd is not None, "forward walks required"
-                parts.append(self.tower_fwd(E_v=E_v, **walks_fwd))
-            if self.direction in ("backward", "both"):
-                assert walks_bwd is not None, "backward walks required"
-                parts.append(self.tower_bwd(E_v=E_v, **walks_bwd))
+            assert walks is not None, "walks dict required"
+            parts.append(self.tower(E_v=E_v, **walks))
         if self.use_direct:
             parts.append(self.direct(E_u, E_v))
         x = torch.cat(parts, dim=-1)
