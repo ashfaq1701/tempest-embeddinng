@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Phase 1 — channel ablations on V0 (both directions; the only config).
-# 4 variants, 15 epochs each, sequential. ~4h per variant → ~16h total.
+# Phase 1 — channel ablations on the single-tower V0 head.
+# 4 variants, 15 epochs each with --early-stop-patience 5 (drift-stops
+# after 5 consecutive non-improving epochs). Sequential.
 #
-# Each ablation removes ONE component of V0; comparison to a separate
-# V0 baseline isolates that component's contribution.
+# Each ablation removes ONE component of V0; comparison to the
+# embedding-direction sweep's E0_both baseline isolates that
+# component's contribution.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -15,7 +17,7 @@ COMMON=(
     --use-gpu --use-gpu-tempest
     --seed 42
     --num-epochs 15
-    --early-stop-patience 0
+    --early-stop-patience 5
     --batch-size 500
     --eval-batch-size 50
     --d-emb 128
