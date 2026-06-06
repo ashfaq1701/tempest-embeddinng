@@ -3,9 +3,9 @@
 Single Trainer class. Per-batch ordering:
 
   TRAINING:
-    1. walks = walk_gen.walks_for_nodes_embedding(seeds)  ← pre-ingest state
-       seeds = unique(B_tgt)               if is_directed
-       seeds = unique(B_src ∪ B_tgt)       if undirected
+    1. walks_bwd = walk_gen.walks_for_nodes_embedding_backward(seeds_tgt)
+       walks_fwd = walk_gen.walks_for_nodes_embedding_forward (seeds_src)
+       ← pre-ingest state
     2. L_align = alignment_loss(walks, ...)          ← InfoNCE scalar
     3. neg = neg_sampler.sample(batch)               ← stateless uniform
        neg_tgt: [B, K_train]
@@ -109,17 +109,22 @@ class TrainerConfig:
     gamma_recency: float = 0.4
     recency_scale: float = 1.0  # Plumbed in by train.py from TrainStats.
 
-    # Walks. Two sides:
-    #   embedding_* — BACKWARD walks consumed by the alignment loss.
-    #                  Drives the geometry of E.
-    #   link_pred_* — FORWARD walks reserved for a future link-prediction-
-    #                  side scoring path. Plumbed end-to-end but no Trainer
-    #                  caller wires them in yet.
-    embedding_num_walks_per_node: int = 5
+    # Walks. Two sides; each samples BOTH directions.
+    #   embedding_* — drive the geometry of E via the alignment loss
+    #                  (backward walks from each batch tgt, forward walks
+    #                  from each batch src).
+    #   link_pred_* — drive the walk-mediated link head (forward + backward
+    #                  walks per source u, fused inside the head).
+    # `num_walks_per_node` on each side is the TOTAL K split half/half
+    # across the two directions. The Trainer halves it before passing
+    # to WalkGenerator, which then samples K // 2 rows per direction.
+    embedding_num_walks_per_node: int = 10
     embedding_max_walk_len: int = 20
-    embedding_walk_bias: str = "ExponentialWeight"
-    embedding_start_bias: str = "ExponentialWeight"
-    link_pred_num_walks_per_node: int = 5
+    embedding_forward_walk_bias:  str = "ExponentialWeight"
+    embedding_forward_start_bias: str = "Uniform"
+    embedding_backward_walk_bias:  str = "ExponentialWeight"
+    embedding_backward_start_bias: str = "ExponentialWeight"
+    link_pred_num_walks_per_node: int = 10
     link_pred_max_walk_len: int = 20
     link_pred_forward_walk_bias:  str = "ExponentialWeight"
     link_pred_forward_start_bias: str = "Uniform"
@@ -132,8 +137,10 @@ class TrainerConfig:
     # alignment loss (per-row weight = 1/log1p(deg(seed))).
     train_deg: Optional[np.ndarray] = None  # [num_nodes] int64
 
-    # LinkPredHeadV2 architecture knobs.
-    link_head_direction: str = "both"            # forward | backward | both
+    # LinkPredHeadV2 architecture knobs. The head consumes BOTH walk
+    # directions (Phase-0 sweep on tgbl-wiki seed=42 found "both"
+    # dominates either single direction; the head was collapsed to
+    # both-only after that result).
     link_head_sim_primitives: str = "hadamard_absdiff"  # | "cosine_only"
     link_head_use_time_channel: bool = True
     link_head_use_K_channel: bool = True
@@ -198,14 +205,12 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=config.d_emb,
         ).to(self.device)
-        # Walk-mediated link-pred head (see link_pred_head_v2.py).
-        # The head's `max_walk_len` sizes its K-embedding table; use
-        # the link-pred-side L (forward walks at training time;
-        # backward walks at eval time both share the same L config).
+        # Walk-mediated link-pred head (see link_pred_head_v2.py). The
+        # head's `max_walk_len` sizes its K-embedding table. Both
+        # directions of u-side walks are always sampled and consumed.
         self.link_head = LinkPredHeadV2(
             d_emb=config.d_emb,
             max_walk_len=int(config.link_pred_max_walk_len),
-            direction=config.link_head_direction,
             sim_primitives=config.link_head_sim_primitives,
             use_time_channel=config.link_head_use_time_channel,
             use_K_channel=config.link_head_use_K_channel,
@@ -243,21 +248,26 @@ class Trainer:
         else:
             self.train_deg = torch.zeros(config.num_nodes, dtype=torch.int64)
 
-        # Walk sampler. Both directions share one Tempest instance;
-        # the embedding-side knobs drive the alignment loss, the
-        # link-pred-side knobs are plumbed but currently unused.
+        # Walk sampler. Each side draws BOTH directions; per-side
+        # num_walks_per_node is the total K split half/half across
+        # forward+backward, so the per-direction K passed to the
+        # WalkGenerator is total // 2 (minimum 1).
+        emb_K_per_dir = max(1, int(config.embedding_num_walks_per_node) // 2)
+        link_K_per_dir = max(1, int(config.link_pred_num_walks_per_node) // 2)
         self.walk_gen = WalkGenerator(
             is_directed=config.is_directed,
             use_gpu=config.use_gpu_tempest,
-            embedding_walk_bias=config.embedding_walk_bias,
-            embedding_start_bias=config.embedding_start_bias,
-            embedding_num_walks_per_node=config.embedding_num_walks_per_node,
+            embedding_forward_walk_bias=config.embedding_forward_walk_bias,
+            embedding_forward_start_bias=config.embedding_forward_start_bias,
+            embedding_backward_walk_bias=config.embedding_backward_walk_bias,
+            embedding_backward_start_bias=config.embedding_backward_start_bias,
+            embedding_num_walks_per_node=emb_K_per_dir,
             embedding_max_walk_len=config.embedding_max_walk_len,
             link_pred_forward_walk_bias=config.link_pred_forward_walk_bias,
             link_pred_forward_start_bias=config.link_pred_forward_start_bias,
             link_pred_backward_walk_bias=config.link_pred_backward_walk_bias,
             link_pred_backward_start_bias=config.link_pred_backward_start_bias,
-            link_pred_num_walks_per_node=config.link_pred_num_walks_per_node,
+            link_pred_num_walks_per_node=link_K_per_dir,
             link_pred_max_walk_len=config.link_pred_max_walk_len,
             max_time_capacity=config.max_time_capacity,
         )
@@ -355,57 +365,37 @@ class Trainer:
         self,
         u_ids_np,                # np.ndarray [B] source ids
         t_query_np,              # np.ndarray [B] query timestamps
-        direction_required: str, # "forward" | "backward" | "both"
     ):
-        """For each row's source u sample walks (forward, backward, or
-        both as required by self.config.link_head_direction) and
-        package the per-position feature tensors the head consumes.
-
-        Note on K_per_direction: per design discussion, when
-        direction="both" the per-direction K is `link_pred_num_walks
-        _per_node // 2`. When direction is single-sided, K is the full
-        link_pred_num_walks_per_node. The WalkGenerator reads K from
-        its config field, so we temporarily override here.
+        """Sample BOTH forward and backward walks for each row's source
+        u and package them into the per-position feature dicts the
+        head consumes. The walk-gen K is fixed at construction time to
+        `link_pred_num_walks_per_node // 2` per direction.
         """
-        out = {"forward": None, "backward": None}
-        if direction_required not in ("forward", "backward", "both"):
-            raise ValueError(direction_required)
-        # Determine per-direction K.
-        if direction_required == "both":
-            K_per_dir = max(1, int(self.config.link_pred_num_walks_per_node) // 2)
-        else:
-            K_per_dir = max(1, int(self.config.link_pred_num_walks_per_node))
+        uniq, inv = np.unique(u_ids_np, return_inverse=True)
 
-        # Stash & override K on the WalkGenerator for this batch.
-        saved_K = self.walk_gen.link_pred_num_walks_per_node
-        self.walk_gen.link_pred_num_walks_per_node = K_per_dir
-        try:
-            walks_per_u = {}  # direction -> list of (nodes_t, ts_t, lens_t) per row
-            for dir_key, sampler in (
-                ("forward",  self.walk_gen.walks_for_nodes_link_pred_forward),
-                ("backward", self.walk_gen.walks_for_nodes_link_pred_backward),
-            ):
-                if direction_required in (dir_key, "both"):
-                    # Sample once per UNIQUE u, then scatter back to row order.
-                    uniq, inv = np.unique(u_ids_np, return_inverse=True)
-                    wd = sampler(uniq)
-                    # wd.nodes: [N_u*K, L]; rows [i*K:(i+1)*K) belong to uniq[i].
-                    K = wd.K
-                    L = wd.nodes.shape[1]
-                    nodes_full = wd.nodes.view(len(uniq), K, L)
-                    ts_full    = wd.timestamps.view(len(uniq), K, L)
-                    lens_full  = wd.lens.view(len(uniq), K)
-                    nodes_per_row = [nodes_full[idx] for idx in inv]
-                    ts_per_row    = [ts_full[idx]    for idx in inv]
-                    lens_per_row  = [lens_full[idx]  for idx in inv]
-                    walks_per_u[dir_key] = (nodes_per_row, ts_per_row, lens_per_row)
-        finally:
-            self.walk_gen.link_pred_num_walks_per_node = saved_K
+        out = {}
+        for dir_key, sampler in (
+            ("forward",  self.walk_gen.walks_for_nodes_link_pred_forward),
+            ("backward", self.walk_gen.walks_for_nodes_link_pred_backward),
+        ):
+            # Sample once per UNIQUE u, then scatter back to row order.
+            wd = sampler(uniq)
+            # wd.nodes: [N_u*K, L]; rows [i*K:(i+1)*K) belong to uniq[i].
+            K = wd.K
+            L = wd.nodes.shape[1]
+            nodes_full = wd.nodes.view(len(uniq), K, L)
+            ts_full    = wd.timestamps.view(len(uniq), K, L)
+            lens_full  = wd.lens.view(len(uniq), K)
+            out[dir_key] = (
+                [nodes_full[idx] for idx in inv],
+                [ts_full[idx]    for idx in inv],
+                [lens_full[idx]  for idx in inv],
+            )
 
         t_query_t = torch.from_numpy(t_query_np).long()
-        for dir_key, sampled in walks_per_u.items():
-            nodes_l, ts_l, lens_l = sampled
-            out[dir_key] = make_head_inputs(
+        def _pack(dir_key):
+            nodes_l, ts_l, lens_l = out[dir_key]
+            return make_head_inputs(
                 walks_nodes_per_u=nodes_l,
                 walks_ts_per_u=ts_l,
                 walks_lens_per_u=lens_l,
@@ -417,7 +407,7 @@ class Trainer:
                 time_encoder=self.link_head.time_encoder,
                 device=self.device,
             )
-        return out["forward"], out["backward"]
+        return _pack("forward"), _pack("backward")
 
     def _score_query(
         self,
@@ -443,7 +433,7 @@ class Trainer:
         e_u = self.embedding_table(candidates_u).detach()
         e_v = self.embedding_table(candidates_v).detach()
         walks_fwd, walks_bwd = self._sample_u_walks_for_head(
-            u_ids_np, t_query_np, self.config.link_head_direction,
+            u_ids_np, t_query_np,
         )
         return self.link_head(e_u, e_v, walks_fwd=walks_fwd, walks_bwd=walks_bwd)
 
@@ -455,23 +445,16 @@ class Trainer:
         device = self.device
 
         # Step 1: walks from PRE-INGEST state.
-        # Seeds are always the unique batch targets (regardless of
-        # is_directed). TGB ranks candidate dsts given a fixed src at
-        # eval, so the dst side is what gets scored; walking only from
-        # the dst follows its incoming-edge history — the predictive
-        # signal for "which dst did src hit". The undirected variant
-        # (seeds = unique(src ∪ tgt)) gives ~2× the alignment signal
-        # per batch but did not improve test on wiki (50ep seed=42
-        # 2026-05-31 sweep).
-        # Always-on symmetric supervision: backward walks from
-        # targets + forward walks from sources. Iter-6 analysis
-        # established this as the winning recipe (test +0.010 over
-        # the asymmetric baseline). Forward walks reuse the
-        # --link-pred-forward-* knobs.
+        # Always-on symmetric embedding supervision: backward walks
+        # from each unique target + forward walks from each unique
+        # source. Iter-6 analysis established this as the winning
+        # recipe (test +0.010 over the asymmetric baseline). Each
+        # direction has its own bias config (--embedding-{forward,
+        # backward}-{walk,start}-bias).
         seeds_tgt_np = np.unique(batch.tgt)
         seeds_src_np = np.unique(batch.src)
-        walks_bwd = self.walk_gen.walks_for_nodes_embedding(seeds_tgt_np)
-        walks_fwd = self.walk_gen.walks_for_nodes_link_pred_forward(seeds_src_np)
+        walks_bwd = self.walk_gen.walks_for_nodes_embedding_backward(seeds_tgt_np)
+        walks_fwd = self.walk_gen.walks_for_nodes_embedding_forward(seeds_src_np)
 
         # Always-on inverse-degree seed weighting. The phase-6
         # both-active hard cohort has median seed degree 1; the
@@ -547,12 +530,12 @@ class Trainer:
         # bearing on unseen pairs.
         e_u = self.embedding_table(candidates_u).detach()            # [B, 1+K, d]
         e_v = self.embedding_table(candidates_v).detach()            # [B, 1+K, d]
-        # Walk-mediated head: sample u-side walks at the batch query
-        # times and pass walk feature dicts. The head is inherently u→v
-        # directional; no symmetrisation (cf. _score_query docstring).
+        # Walk-mediated head: sample u-side walks (both directions) at
+        # the batch query times and pass walk feature dicts. The head
+        # is inherently u→v directional; no symmetrisation (cf.
+        # _score_query docstring).
         walks_fwd, walks_bwd = self._sample_u_walks_for_head(
             batch.src.astype(np.int64), batch.ts.astype(np.int64),
-            self.config.link_head_direction,
         )
         logits = self.link_head(e_u, e_v, walks_fwd=walks_fwd, walks_bwd=walks_bwd)
                                                                      # [B, 1+K]

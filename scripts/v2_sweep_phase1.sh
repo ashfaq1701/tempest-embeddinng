@@ -1,20 +1,11 @@
 #!/usr/bin/env bash
-# Phase 1 — channel ablations on the Phase-0 direction winner.
+# Phase 1 — channel ablations on V0 (both directions; the only config).
 # 4 variants, 15 epochs each, sequential. ~4h per variant → ~16h total.
 #
-# Set WINNER below to the Phase-0 winning direction
-# ('forward', 'backward', or 'both') before launching.
-#
-# Each ablation removes ONE component of V0; comparison to the V0 run
-# (rerun here as the baseline) isolates that component's contribution.
+# Each ablation removes ONE component of V0; comparison to a separate
+# V0 baseline isolates that component's contribution.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-
-# ────────────────────────────────────────────────────────────────────
-# Set this AFTER Phase 0 finishes. Pick the direction with the highest
-# best_test_mrr (or best_val if tied).
-WINNER=both     # TODO: replace with Phase-0 winner before launching
-# ────────────────────────────────────────────────────────────────────
 
 PY=./.venv/bin/python
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -31,7 +22,6 @@ COMMON=(
     --link-pred-num-walks-per-node 10
     --link-pred-max-walk-len 20
     --link-head-chunk-c 8
-    --link-head-direction "$WINNER"
     --export-best-embedding-table
 )
 
