@@ -196,7 +196,6 @@ def parse_args() -> argparse.Namespace:
     # the post-experiment cleanup branch.
     p.add_argument("--link-head-d-K",      default=16, type=int)
     p.add_argument("--link-head-d-pos",    default=96, type=int)
-    p.add_argument("--link-head-d-direct", default=64, type=int)
     p.add_argument(
         "--link-head-chunk-c", default=0, type=int,
         help="0 (default) = no chunking; pass a positive N to enable "
@@ -408,7 +407,6 @@ def main() -> Dict[str, Any]:
         T_full=stats.T_full,
         link_head_d_K=args.link_head_d_K,
         link_head_d_pos=args.link_head_d_pos,
-        link_head_d_direct=args.link_head_d_direct,
         link_head_chunk_c=args.link_head_chunk_c,
         max_time_capacity=compute_max_time_capacity(
             args.tempest_batch_window_multiplier,

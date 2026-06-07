@@ -14,9 +14,10 @@ Single Trainer class. Per-batch ordering:
     4. candidates_v = [pos_v | neg_tgt]              ← [B, 1+K_train]
        u-side walks = walk_gen.walks_for_nodes_link_pred_*(unique src)
        (forward direction if is_directed, backward if undirected)
-       logits = link_head(E[u].detach(), E[v].detach(), walks=walks)
+       logits = link_head(E[v].detach(), walks=walks)
        E is detached — L_link trains only the link head; L_align is
-       the sole gradient path into E.
+       the sole gradient path into E. (u enters only through its walks,
+       whose seed slot is node u.)
        L_link = CE(logits / tau_link, target=zeros(B))
     5. L_total = L_align + L_link
     6. optimizer.zero_grad(set_to_none=True); L_total.backward(); optimizer.step()
@@ -144,7 +145,6 @@ class TrainerConfig:
     # is_directed (undirected → backward, directed → forward).
     link_head_d_K: int = 16
     link_head_d_pos: int = 96
-    link_head_d_direct: int = 64
     link_head_chunk_c: int = 0     # 0 = OFF (default). >0 = chunk size for
                                    # the candidate dim inside the walk
                                    # tower's per-position MLP. Pure memory
@@ -216,7 +216,6 @@ class Trainer:
             max_walk_len=int(config.link_pred_max_walk_len),
             d_K=int(config.link_head_d_K),
             d_pos=int(config.link_head_d_pos),
-            d_direct=int(config.link_head_d_direct),
             chunk_C=int(config.link_head_chunk_c),
         ).to(self.device)
         # Frozen recency time constant. Plain Python float — no
@@ -405,14 +404,12 @@ class Trainer:
 
     def _score_query(
         self,
-        u_ids: torch.Tensor,
         candidates_v: torch.Tensor,
-        u_ids_np,                # original numpy [B]  for walk sampling
+        u_ids_np,                # numpy [B]  query sources, for walk sampling
         t_query_np,              # numpy [B] query timestamps
     ) -> torch.Tensor:
         """Per-query scoring for eval (no_grad context).
 
-        u_ids:        [B]               — query source nodes (torch)
         candidates_v: [B, 1+K_eval]     — column 0 = positive dst,
                                           columns 1..K = TGB negatives
 
@@ -423,11 +420,9 @@ class Trainer:
         directional — backward symmetrisation would require sampling
         walks from each candidate v, prohibitive at K_eval=999).
         """
-        candidates_u = u_ids.unsqueeze(1).expand_as(candidates_v)
-        e_u = self.embedding_table(candidates_u).detach()
         e_v = self.embedding_table(candidates_v).detach()
         walks = self._sample_u_walks_for_head(u_ids_np, t_query_np)
-        return self.link_head(e_u, e_v, walks=walks)
+        return self.link_head(e_v, walks=walks)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
@@ -472,16 +467,15 @@ class Trainer:
         # Step 3: per-query negatives. Sampler returns [B, K_train]
         # grouped output; no flattening — the link head consumes the
         # whole candidate matrix directly. The sampler's neg_src is
-        # ignored (we re-derive candidates_u from batch.src).
+        # ignored (the head scores candidates against u's walks, not a
+        # paired source embedding).
         _, neg_tgt = self.neg_sampler_train.sample(batch)
         B = len(batch.src)
-        K = neg_tgt.shape[1]
 
         # Step 4: build [B, 1+K] candidate matrix with positive at
         # column 0, then score the whole batch in one forward and
         # apply softmax CE with target=0 per row (Bruch et al. 2019
         # — upper-bounds 1 − MRR).
-        src_t = torch.from_numpy(batch.src).long().to(device)        # [B]
         pos_v_t = torch.from_numpy(batch.tgt).long().to(device)      # [B]
         neg_v_t = torch.from_numpy(
             np.ascontiguousarray(neg_tgt, dtype=np.int64),
@@ -490,7 +484,6 @@ class Trainer:
         candidates_v = torch.cat(
             [pos_v_t.unsqueeze(1), neg_v_t], dim=1,
         )                                                            # [B, 1+K]
-        candidates_u = src_t.unsqueeze(1).expand(B, 1 + K)           # [B, 1+K]
 
         # Detach on the link path: L_link trains only the link head;
         # E is updated exclusively by L_align (walk-supervised). Without
@@ -501,7 +494,6 @@ class Trainer:
         # high-surprise datasets (review surprise=0.987) this anti-ranks
         # val positives because memorised seen-pair geometry has no
         # bearing on unseen pairs.
-        e_u = self.embedding_table(candidates_u).detach()            # [B, 1+K, d]
         e_v = self.embedding_table(candidates_v).detach()            # [B, 1+K, d]
         # Walk-mediated head: sample u-side walks (one direction, set by
         # is_directed) at the batch query times and pass the walk
@@ -510,7 +502,7 @@ class Trainer:
         walks = self._sample_u_walks_for_head(
             batch.src.astype(np.int64), batch.ts.astype(np.int64),
         )
-        logits = self.link_head(e_u, e_v, walks=walks)               # [B, 1+K]
+        logits = self.link_head(e_v, walks=walks)                    # [B, 1+K]
 
         target = torch.zeros(B, dtype=torch.long, device=device)
         l_link = F.cross_entropy(logits / self.config.tau_link, target)
@@ -585,10 +577,9 @@ class Trainer:
 
                 u_ids_np = batch.src.astype(np.int64)
                 t_query_np = batch.ts.astype(np.int64)
-                u_ids = torch.from_numpy(u_ids_np).to(self.device)  # [B]
                 candidates_v = torch.from_numpy(cand_v_np).to(self.device)
                 logits = self._score_query(
-                    u_ids, candidates_v, u_ids_np, t_query_np,
+                    candidates_v, u_ids_np, t_query_np,
                 ).cpu().numpy()
 
                 for i in range(B):

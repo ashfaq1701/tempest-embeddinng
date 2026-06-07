@@ -893,7 +893,6 @@ After all the above, the head and surrounding code were frozen:
 - K (hop) embedding (V4 win inside noise; kept).
 - Time channel with Option B normaliser
   `log1p(gap) / log1p(T_full)` (V1 win inside noise; kept).
-- Direct (E[u], E[v]) bypass channel.
 - Single tower direction = `is_directed ? "forward" : "backward"`.
 - Embedding-side BACKWARD alignment only (E0_bwd > E0_both
   outside noise band).
@@ -902,6 +901,13 @@ After all the above, the head and surrounding code were frozen:
   memory knob (default off, set to 8 for 8 GB GPUs at d_emb=128).
 
 **Dropped:**
+- Direct (E[u], E[v]) bypass channel — removed 2026-06-07 (post-§7).
+  The walk seed slot IS node u and is compared with each candidate v
+  inside the tower, so the tower already carries the u-vs-v signal the
+  channel duplicated; the walk-only ablation cost only ~0.03 val /
+  ~0.05 test. Removed the `DirectChannel` class, the head's `E_u`
+  forward input + its trainer plumbing, and the `--link-head-d-direct`
+  / `link_head_d_direct` knob.
 - Cosine_only sim primitive path.
 - Walk-tower channel toggles (no_time / no_K / no_direct /
   direct_only).

@@ -19,8 +19,7 @@ For each (u, t, v_candidate):
     4. Mask padded / sentinel positions to -inf / 0.
     5. Pool over positions: concat(max, mean) → 2·d_pos per walk.
     6. Pool over walks: mean → 2·d_pos per (u, v).
-    7. Direct channel (bypass walks): MLP(Hadamard(E_u, E_v), |E_u-E_v|).
-    8. Final MLP on concat[walk_features, direct] → scalar logit.
+    7. Final MLP on the pooled walk features → scalar logit.
 
 The single-tower decision is settled: Phase-0 + α-leak grid showed
 "both" beats single-sided by ≤ 0.008 test (inside the wiki noise
@@ -28,7 +27,15 @@ band) at 2× compute, so the second tower is dropped. The choice of
 direction is dictated by is_directed (TGB's default workload is
 undirected, so backward is the operative mode).
 
-The (E[u], E[v]) inputs are EXPECTED to be detached upstream — this
+The earlier standalone "direct channel" — a per-pair MLP on
+(E[u], E[v]) concatenated to the walk features — was removed: the
+walk seed slot IS node u (kept and compared with each candidate v at
+hop=0), so the tower already carries the u-vs-v comparison the direct
+channel duplicated. The walk-only ablation cost only ~0.03 val /
+~0.05 test, attributable to that overlap, so the redundant channel
+(and its E_u input) is dropped.
+
+The E[v] candidate input is EXPECTED to be detached upstream — this
 head's gradients update only its own parameters; E is shaped by the
 alignment loss alone.
 """
@@ -216,51 +223,26 @@ class WalkTower(nn.Module):
 
 
 # ---------------------------------------------------------------------
-# Direct (E[u], E[v]) bypass
-
-
-class DirectChannel(nn.Module):
-    """Per-pair direct features from raw E. Acts as a residual when walks
-    fail (empty W_u, inductive nodes) so the head doesn't lose all
-    signal — it still has cosine-baseline-equivalent capacity."""
-
-    def __init__(self, d_emb: int, d_direct: int = 64):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(2 * d_emb, d_direct),
-            nn.GELU(),
-            nn.Linear(d_direct, d_direct),
-        )
-        self.out_dim = d_direct
-
-    def forward(
-        self, E_u: torch.Tensor, E_v: torch.Tensor,
-    ) -> torch.Tensor:
-        x = torch.cat([E_u * E_v, (E_u - E_v).abs()], dim=-1)
-        return self.mlp(x)
-
-
-# ---------------------------------------------------------------------
 # Top-level head
 
 
 class LinkPredHeadV2(nn.Module):
     """Walk-mediated similarity head — fixed architecture.
 
-    Composed of a WalkTower (per-position sim + K + time, pooled) and
-    a DirectChannel (per-pair MLP on (E[u], E[v])); their outputs are
-    concatenated and fed to a final MLP.
+    A single WalkTower (per-position sim + K + time, pooled) feeds a
+    final MLP that maps the pooled walk features to a scalar logit.
+    The walk seed slot is node u itself (kept and compared with each
+    candidate v), so the tower already carries the u-vs-v signal; the
+    earlier standalone direct (E[u], E[v]) channel was removed as
+    redundant.
 
     Args:
         d_emb           : embedding width (model config).
         max_walk_len    : L; used to size the K embedding table.
         d_K, d_pos      : tower hyperparameters.
-        d_direct        : direct-channel MLP width.
         chunk_C         : candidate-dim memory chunking (see WalkTower).
 
     Inputs at forward():
-        E_u           : [B, C, d_emb]  source embedding broadcast across
-                                       candidates (detached upstream).
         E_v           : [B, C, d_emb]  candidate embeddings (detached).
         walks         : dict. Required. Keys:
                               E_walks [B,W,L,d], mask [B,W,L],
@@ -275,7 +257,6 @@ class LinkPredHeadV2(nn.Module):
         max_walk_len: int,
         d_K: int = 16,
         d_pos: int = 96,
-        d_direct: int = 64,
         chunk_C: int = 0,
     ):
         super().__init__()
@@ -285,8 +266,7 @@ class LinkPredHeadV2(nn.Module):
             d_K=d_K, d_pos=d_pos, d_T=self.time_encoder.d_T,
             chunk_C=chunk_C,
         )
-        self.direct = DirectChannel(d_emb=d_emb, d_direct=d_direct)
-        final_in = self.tower.out_dim + self.direct.out_dim
+        final_in = self.tower.out_dim
         self.final_mlp = nn.Sequential(
             nn.Linear(final_in, final_in),
             nn.GELU(),
@@ -295,11 +275,8 @@ class LinkPredHeadV2(nn.Module):
 
     def forward(
         self,
-        E_u: torch.Tensor,
         E_v: torch.Tensor,
         walks: dict,
     ) -> torch.Tensor:
         walk_features = self.tower(E_v=E_v, **walks)
-        direct_features = self.direct(E_u, E_v)
-        x = torch.cat([walk_features, direct_features], dim=-1)
-        return self.final_mlp(x).squeeze(-1)
+        return self.final_mlp(walk_features).squeeze(-1)
