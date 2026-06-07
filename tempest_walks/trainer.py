@@ -125,7 +125,7 @@ class TrainerConfig:
     embedding_max_walk_len: int = 20
     embedding_backward_walk_bias:  str = "ExponentialWeight"
     embedding_backward_start_bias: str = "ExponentialWeight"
-    link_pred_num_walks_per_node: int = 10
+    link_pred_num_walks_per_node: int = 5
     link_pred_max_walk_len: int = 20
     link_pred_forward_walk_bias:  str = "ExponentialWeight"
     link_pred_forward_start_bias: str = "Uniform"

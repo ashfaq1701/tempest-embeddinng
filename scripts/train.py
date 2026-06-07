@@ -131,10 +131,10 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Walks.
-    # Both the embedding and link-pred sides sample BOTH directions per
-    # seed. *-num-walks-per-node is the TOTAL K, split half/half between
-    # forward and backward at the trainer level — defaults to 10
-    # (5+5 per direction). Bias knobs are per direction; defaults
+    # *-num-walks-per-node is K walks per seed. The embedding side uses
+    # the backward direction only; the link-pred head uses ONE direction
+    # chosen by is_directed (backward if undirected, forward if directed)
+    # and spends the full K on it. Bias knobs are per direction; defaults
     # reflect Tempest's chronological semantics:
     #   - forward + ExpW start shoots toward the head (oldest end) of
     #     the successor set, the least predictive slice. Uniform start
@@ -160,9 +160,10 @@ def parse_args() -> argparse.Namespace:
         help="Initial-edge bias for backward embedding-side walks.",
     )
     p.add_argument(
-        "--link-pred-num-walks-per-node", default=10, type=int,
-        help="TOTAL K for link-pred-side walks; split half/half into "
-             "forward + backward at construction (so default 10 → 5+5).",
+        "--link-pred-num-walks-per-node", default=5, type=int,
+        help="K walks per seed for the link-pred head. The head consumes "
+             "ONE direction (backward if undirected, forward if directed; "
+             "set by is_directed) and spends the full K on it.",
     )
     p.add_argument(
         "--link-pred-max-walk-len", default=20, type=int,
