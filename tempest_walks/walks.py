@@ -1,11 +1,13 @@
-"""Tempest walk sampler wrapper (bidirectional).
+"""Tempest walk sampler wrapper.
 
 Responsibility:
   - Construct ONE TemporalRandomWalk instance (Tempest holds the
     ingested-edge state; both directions query the same state).
-  - Provide `walks_for_nodes_embedding_backward(seeds)` and
-    `walks_for_nodes_embedding_forward(seeds)` — the two directions
-    consumed by the alignment loss to shape the embedding table E.
+  - Provide `walks_for_nodes_embedding_backward(seeds)` — the single
+    direction consumed by the alignment loss to shape the embedding
+    table E. (Forward embedding alignment was ablated and dropped:
+    the 2026-06-07 sweep on tgbl-wiki showed backward-only beats
+    forward+backward by +0.009 test, outside the noise band.)
   - Provide `walks_for_nodes_link_pred_forward(seeds)` and
     `walks_for_nodes_link_pred_backward(seeds)` — the two directions
     consumed by the walk-mediated link-prediction head.
@@ -58,8 +60,7 @@ Grouping contract (load-bearing for BOTH directions):
   assumes this layout.
 
 CLI-exposed knobs (passed through from train.py):
-  embedding side (BOTH directions, per-direction biases):
-    embedding_forward_walk_bias,  embedding_forward_start_bias,
+  embedding side (backward only):
     embedding_backward_walk_bias, embedding_backward_start_bias,
     embedding_num_walks_per_node, embedding_max_walk_len.
   link-pred side (BOTH directions, per-direction biases):
@@ -67,10 +68,9 @@ CLI-exposed knobs (passed through from train.py):
     link_pred_backward_walk_bias, link_pred_backward_start_bias,
     link_pred_num_walks_per_node, link_pred_max_walk_len.
 
-The num_walks_per_node stored on the WalkGenerator is the per-direction
-K — every walks_for_nodes_*_{forward,backward} call returns exactly
-that many rows per seed. The "K total, half each way" semantic lives
-one layer up in Trainer.__init__ (which passes K // 2 here).
+The num_walks_per_node stored on the WalkGenerator is the per-call
+K (one direction). Every walks_for_nodes_*_{forward,backward} call
+returns exactly that many rows per seed.
 """
 
 from typing import NamedTuple, Optional
@@ -98,15 +98,10 @@ class WalkGenerator:
         self,
         is_directed: bool,
         use_gpu: bool = False,
-        # Embedding side. Both directions; per-direction biases.
-        # Defaults match the link-pred side rationale below:
-        #   forward  start=Uniform, walk=ExpW
-        #   backward start=ExpW,    walk=ExpW
-        embedding_forward_walk_bias:  str = "ExponentialWeight",
-        embedding_forward_start_bias: str = "Uniform",
+        # Embedding side — backward walks only (forward was ablated).
         embedding_backward_walk_bias:  str = "ExponentialWeight",
         embedding_backward_start_bias: str = "ExponentialWeight",
-        embedding_num_walks_per_node: int = 5,
+        embedding_num_walks_per_node: int = 10,
         embedding_max_walk_len: int = 20,
         # Link-pred side. Both directions, per-direction biases.
         # Defaults reflect the temporal structure of useful walks:
@@ -148,8 +143,6 @@ class WalkGenerator:
             max_time_capacity=max_time_capacity,
             shuffle_walk_order=False,
         )
-        self.embedding_forward_walk_bias  = embedding_forward_walk_bias
-        self.embedding_forward_start_bias = embedding_forward_start_bias
         self.embedding_backward_walk_bias  = embedding_backward_walk_bias
         self.embedding_backward_start_bias = embedding_backward_start_bias
         self.embedding_num_walks_per_node = embedding_num_walks_per_node
@@ -229,21 +222,6 @@ class WalkGenerator:
             walk_bias=self.embedding_backward_walk_bias,
             start_bias=self.embedding_backward_start_bias,
             direction="Backward_In_Time",
-            num_walks_per_node=self.embedding_num_walks_per_node,
-            max_walk_len=self.embedding_max_walk_len,
-        )
-
-    def walks_for_nodes_embedding_forward(self, seeds: np.ndarray) -> WalkData:
-        """Sample FORWARD walks for the embedding-side alignment loss.
-
-        Seed at row position 0; chronologically latest successor at
-        position lens-1. timestamps[i, 0] = INT64_MIN sentinel.
-        """
-        return self._walks(
-            seeds,
-            walk_bias=self.embedding_forward_walk_bias,
-            start_bias=self.embedding_forward_start_bias,
-            direction="Forward_In_Time",
             num_walks_per_node=self.embedding_num_walks_per_node,
             max_walk_len=self.embedding_max_walk_len,
         )

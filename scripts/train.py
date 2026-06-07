@@ -11,15 +11,13 @@ Hyperparameters exposed at CLI (and their grouping):
   Loss:           --tau-align, --tau-link, --gamma-recency,
                   --k-train, --alignment-chunk-size
   Walks:          --embedding-num-walks-per-node, --embedding-max-walk-len,
-                  --embedding-forward-walk-bias, --embedding-forward-start-bias,
                   --embedding-backward-walk-bias, --embedding-backward-start-bias,
                   --link-pred-num-walks-per-node, --link-pred-max-walk-len,
                   --link-pred-forward-walk-bias, --link-pred-forward-start-bias,
                   --link-pred-backward-walk-bias, --link-pred-backward-start-bias,
                   --tempest-batch-window-multiplier
-                  (Each *-num-walks-per-node is the TOTAL walks per seed,
-                   split half/half between forward and backward at the
-                   trainer level — defaults to 10 ⇒ 5+5 per side.)
+                  (Embedding side is backward-only. Link-pred side picks
+                   forward or backward by --is-directed.)
   Optimisation:   --lr, --lr-min, --warmup-fraction, --warmup-steps-cap,
                   --decay-horizon-epochs, --weight-decay, --batch-size,
                   --eval-batch-size, --num-epochs, --early-stop-patience
@@ -146,38 +144,20 @@ def parse_args() -> argparse.Namespace:
     #     predecessor (the tail / most predictive end), so ExpW + ExpW.
     p.add_argument(
         "--embedding-num-walks-per-node", default=10, type=int,
-        help="TOTAL K for embedding-side walks per seed. When "
-             "--embedding-direction=both, split half/half (default "
-             "10 → 5 forward + 5 backward); when single-direction, "
-             "the full K is spent on that direction.",
+        help="K for embedding-side walks per seed (all spent on the "
+             "single backward direction).",
     )
     p.add_argument(
         "--embedding-max-walk-len", default=20, type=int,
         help="L for embedding-side walks.",
     )
     p.add_argument(
-        "--embedding-direction", default="both", type=str,
-        choices=("forward", "backward", "both"),
-        help="Direction(s) the embedding-side alignment loss consumes. "
-             "Default 'both' samples backward walks from each batch tgt "
-             "plus forward walks from each batch src (iter-6 recipe). "
-             "Single-direction variants are ablation knobs.",
-    )
-    p.add_argument(
-        "--embedding-forward-walk-bias", default="ExponentialWeight", type=str,
-        help="Per-hop edge bias for FORWARD embedding-side walks.",
-    )
-    p.add_argument(
-        "--embedding-forward-start-bias", default="Uniform", type=str,
-        help="Initial-edge bias for FORWARD embedding-side walks.",
-    )
-    p.add_argument(
         "--embedding-backward-walk-bias", default="ExponentialWeight", type=str,
-        help="Per-hop edge bias for BACKWARD embedding-side walks.",
+        help="Per-hop edge bias for backward embedding-side walks.",
     )
     p.add_argument(
         "--embedding-backward-start-bias", default="ExponentialWeight", type=str,
-        help="Initial-edge bias for BACKWARD embedding-side walks.",
+        help="Initial-edge bias for backward embedding-side walks.",
     )
     p.add_argument(
         "--link-pred-num-walks-per-node", default=10, type=int,
@@ -436,9 +416,6 @@ def main() -> Dict[str, Any]:
 
         embedding_num_walks_per_node=args.embedding_num_walks_per_node,
         embedding_max_walk_len=args.embedding_max_walk_len,
-        embedding_direction=args.embedding_direction,
-        embedding_forward_walk_bias=args.embedding_forward_walk_bias,
-        embedding_forward_start_bias=args.embedding_forward_start_bias,
         embedding_backward_walk_bias=args.embedding_backward_walk_bias,
         embedding_backward_start_bias=args.embedding_backward_start_bias,
         link_pred_num_walks_per_node=args.link_pred_num_walks_per_node,

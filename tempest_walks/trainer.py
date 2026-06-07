@@ -3,9 +3,10 @@
 Single Trainer class. Per-batch ordering:
 
   TRAINING:
-    1. walks_bwd = walk_gen.walks_for_nodes_embedding_backward(seeds_tgt)
-       walks_fwd = walk_gen.walks_for_nodes_embedding_forward (seeds_src)
-       ← pre-ingest state
+    1. walks = walk_gen.walks_for_nodes_embedding_backward(seeds_tgt)
+       ← pre-ingest state. Forward embedding alignment was ablated
+       and dropped (2026-06-07 wiki sweep: backward-only beats
+       forward+backward by +0.009 test, outside noise band).
     2. L_align = alignment_loss(walks, ...)          ← InfoNCE scalar
     3. neg = neg_sampler.sample(batch)               ← stateless uniform
        neg_tgt: [B, K_train]
@@ -110,22 +111,15 @@ class TrainerConfig:
     recency_scale: float = 1.0  # Plumbed in by train.py from TrainStats.
 
     # Walks. Two sides.
-    #   embedding_* — drive the geometry of E via the alignment loss.
-    #                  embedding_direction selects which directions are
-    #                  active: "both" (default — backward from tgt +
-    #                  forward from src), "backward" (from tgt only), or
-    #                  "forward" (from src only).
+    #   embedding_* — drive the geometry of E via the alignment loss
+    #                  (BACKWARD walks from each batch tgt only;
+    #                  forward embedding alignment was ablated and
+    #                  dropped 2026-06-07).
     #   link_pred_* — drive the walk-mediated link head. The head's
-    #                  direction is dataset-driven (is_directed): undirected
-    #                  → backward, directed → forward.
-    # `num_walks_per_node` on each side is the TOTAL K spent per seed.
-    # For embedding_direction="both" the Trainer splits K // 2 per side
-    # so total walks-per-seed is constant across the three settings.
+    #                  direction is dataset-driven (is_directed):
+    #                  undirected → backward, directed → forward.
     embedding_num_walks_per_node: int = 10
     embedding_max_walk_len: int = 20
-    embedding_direction: str = "both"  # forward | backward | both
-    embedding_forward_walk_bias:  str = "ExponentialWeight"
-    embedding_forward_start_bias: str = "Uniform"
     embedding_backward_walk_bias:  str = "ExponentialWeight"
     embedding_backward_start_bias: str = "ExponentialWeight"
     link_pred_num_walks_per_node: int = 10
@@ -261,22 +255,11 @@ class Trainer:
         else:
             self.train_deg = torch.zeros(config.num_nodes, dtype=torch.int64)
 
-        # Walk sampler. The embedding side draws one or both directions
-        # per `embedding_direction`; total walks-per-seed is held at
-        # `embedding_num_walks_per_node` regardless. The link-pred side
-        # draws ONE direction (decided by is_directed below) and uses
-        # the full K on that direction.
-        if config.embedding_direction == "both":
-            emb_K_per_dir = max(1, int(config.embedding_num_walks_per_node) // 2)
-        elif config.embedding_direction in ("forward", "backward"):
-            emb_K_per_dir = max(1, int(config.embedding_num_walks_per_node))
-        else:
-            raise ValueError(
-                f"embedding_direction must be 'forward'|'backward'|'both', "
-                f"got {config.embedding_direction!r}"
-            )
+        # Walk sampler. The embedding side draws BACKWARD walks only
+        # (forward was ablated). The link-pred side draws ONE direction
+        # (decided by is_directed below) and uses the full K on it.
+        emb_K = max(1, int(config.embedding_num_walks_per_node))
         link_K_per_dir = max(1, int(config.link_pred_num_walks_per_node))
-        self.embedding_direction = config.embedding_direction
         # Direction the link head consumes — frozen by is_directed.
         self.link_head_walk_direction = (
             "forward" if config.is_directed else "backward"
@@ -284,11 +267,9 @@ class Trainer:
         self.walk_gen = WalkGenerator(
             is_directed=config.is_directed,
             use_gpu=config.use_gpu_tempest,
-            embedding_forward_walk_bias=config.embedding_forward_walk_bias,
-            embedding_forward_start_bias=config.embedding_forward_start_bias,
             embedding_backward_walk_bias=config.embedding_backward_walk_bias,
             embedding_backward_start_bias=config.embedding_backward_start_bias,
-            embedding_num_walks_per_node=emb_K_per_dir,
+            embedding_num_walks_per_node=emb_K,
             embedding_max_walk_len=config.embedding_max_walk_len,
             link_pred_forward_walk_bias=config.link_pred_forward_walk_bias,
             link_pred_forward_start_bias=config.link_pred_forward_start_bias,
@@ -465,55 +446,37 @@ class Trainer:
         device = self.device
 
         # Step 1: walks from PRE-INGEST state.
-        # Embedding supervision: per self.embedding_direction, draw
-        # backward walks from each unique target ("backward"/"both"),
-        # forward walks from each unique source ("forward"/"both"), or
-        # both. Each direction has its own bias config (--embedding-
-        # {forward,backward}-{walk,start}-bias).
+        # Embedding supervision: BACKWARD walks from each unique target
+        # (forward embedding alignment was ablated and dropped — see
+        # the module docstring).
         seeds_tgt_np = np.unique(batch.tgt)
-        seeds_src_np = np.unique(batch.src)
+        walks_bwd = self.walk_gen.walks_for_nodes_embedding_backward(seeds_tgt_np)
 
         # Inverse-degree seed weighting (always on). The phase-6
         # both-active hard cohort has median seed degree 1; the
         # popular end has degree 100+. Uniform per-row averaging
         # starves rare seeds. Weighting each walk row by
         # 1/log1p(deg(seed_of_row)) restores parity.
-        def _w(seeds):
-            return 1.0 / torch.log1p(
-                self.train_deg[torch.from_numpy(seeds.astype(np.int64))]
-                .to(self.device).float()
-            )
+        seed_weights_bwd = 1.0 / torch.log1p(
+            self.train_deg[torch.from_numpy(seeds_tgt_np.astype(np.int64))]
+            .to(self.device).float()
+        )
 
         # Step 2: InfoNCE contrastive alignment over batched walks.
         # The softmax denominator over all batch contexts is the
         # anti-collapse mechanism (replaces Wang-Isola uniformity).
         # Per-position weights are a convex combination of hop and
         # *stationary* recency profiles.
-        l_align = 0.0
-        if self.embedding_direction in ("backward", "both"):
-            walks_bwd = self.walk_gen.walks_for_nodes_embedding_backward(seeds_tgt_np)
-            l_align = l_align + alignment_loss(
-                embedding_table=self.embedding_table,
-                walks=walks_bwd,
-                recency_scale=self.recency_scale,
-                gamma_recency=self.config.gamma_recency,
-                tau_align=self.config.tau_align,
-                chunk_size=self.config.alignment_chunk_size,
-                direction="backward",
-                seed_weights=_w(seeds_tgt_np),
-            )
-        if self.embedding_direction in ("forward", "both"):
-            walks_fwd = self.walk_gen.walks_for_nodes_embedding_forward(seeds_src_np)
-            l_align = l_align + alignment_loss(
-                embedding_table=self.embedding_table,
-                walks=walks_fwd,
-                recency_scale=self.recency_scale,
-                gamma_recency=self.config.gamma_recency,
-                tau_align=self.config.tau_align,
-                chunk_size=self.config.alignment_chunk_size,
-                direction="forward",
-                seed_weights=_w(seeds_src_np),
-            )
+        l_align = alignment_loss(
+            embedding_table=self.embedding_table,
+            walks=walks_bwd,
+            recency_scale=self.recency_scale,
+            gamma_recency=self.config.gamma_recency,
+            tau_align=self.config.tau_align,
+            chunk_size=self.config.alignment_chunk_size,
+            direction="backward",
+            seed_weights=seed_weights_bwd,
+        )
 
         # Step 3: per-query negatives. Sampler returns [B, K_train]
         # grouped output; no flattening — the link head consumes the
