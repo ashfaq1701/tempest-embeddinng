@@ -3,18 +3,20 @@
 Single Trainer class. Per-batch ordering:
 
   TRAINING:
-    1. walks = walk_gen.walks_for_nodes_embedding_backward(seeds_tgt)
-       ← pre-ingest state. Forward embedding alignment was ablated
-       and dropped (2026-06-07 wiki sweep: backward-only beats
-       forward+backward by +0.009 test, outside noise band).
-    2. L_align = alignment_loss(walks, ...)          ← InfoNCE scalar
+    1. walks_bwd = walk_gen.walks_for_nodes_embedding_backward(seeds_tgt)
+       ← pre-ingest state. Embedding alignment is backward-only;
+       forward embedding alignment was ablated and dropped 2026-06-07
+       on wiki (backward-only beats forward+backward by +0.009 test,
+       outside the noise band).
+    2. L_align = alignment_loss(walks_bwd, ...)      ← InfoNCE scalar
     3. neg = neg_sampler.sample(batch)               ← stateless uniform
        neg_tgt: [B, K_train]
     4. candidates_v = [pos_v | neg_tgt]              ← [B, 1+K_train]
-       logits = link_head(E[u].detach(), E[v].detach())  ← [B, 1+K_train]
-                (undirected: 0.5 × (link_head(u,v) + link_head(v,u)))
-                E is detached — L_link trains only the link head;
-                L_align is the sole gradient path into E.
+       u-side walks = walk_gen.walks_for_nodes_link_pred_*(unique src)
+       (forward direction if is_directed, backward if undirected)
+       logits = link_head(E[u].detach(), E[v].detach(), walks=walks)
+       E is detached — L_link trains only the link head; L_align is
+       the sole gradient path into E.
        L_link = CE(logits / tau_link, target=zeros(B))
     5. L_total = L_align + L_link
     6. optimizer.zero_grad(set_to_none=True); L_total.backward(); optimizer.step()
@@ -22,22 +24,22 @@ Single Trainer class. Per-batch ordering:
 
   EVAL (within torch.no_grad()):
     1. neg_dst_list = tgb_neg_sampler.sample(batch)  ← per-positive negs
-    2. Score per-query: candidates_v = [pos_v | neg_v_padded_to_max_K]
-       → logits [B, 1+max_K] via link_head (undirected symmetrise
-       matches the training rule).
-    3. evaluator.score_to_metric(logits[i,0], logits[i,1:1+K_i]) per
+    2. u-side walks sampled in the same direction as training.
+    3. Score per-query: candidates_v = [pos_v | neg_v_padded_to_max_K]
+       → logits [B, 1+max_K] via link_head.
+    4. evaluator.score_to_metric(logits[i,0], logits[i,1:1+K_i]) per
        positive (TGB MRR).
-    4. walk_gen.add_edges(batch)                     ← Tempest state
+    5. walk_gen.add_edges(batch)                     ← Tempest state
                                                        carries forward.
-    NOTE: walks not sampled at eval. Model parameters frozen.
+    NOTE: model parameters frozen at eval; walks ARE sampled because
+    the head is walk-mediated.
 
 Epoch boundary:
   - walk_gen.reset()
-  - neg_sampler.reset() (if Historical)
   - Model parameters and optimiser state are NOT reset.
 
 Early stop:
-  - Snapshot best-val model + projection + head state_dicts.
+  - Snapshot best-val model + head state_dicts.
   - Restore best-val weights at end of training.
   - Optimiser state not snapshotted (not needed after training stops).
   - The reported `best_val_mrr` / `best_test_mrr` are the snapshot
