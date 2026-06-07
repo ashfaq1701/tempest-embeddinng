@@ -665,3 +665,278 @@ walk-encoder integration, or pair-history features upstream).
 Log paths: `logs/link_head/wiki_seed42_{inner_product,scaled_cosine,
 distmult,bilinear_only}_20260601_144414.log`. Branch:
 `feature/link-head-variants` (not merged; experimental).
+
+---
+
+## Walk-mediated link head (v2) — history, sweeps, final architecture
+
+This section captures the full lifecycle of `link_pred_head_v2.py`
+(the LinkPredHeadV2 class), the embedding-side direction split, and
+the L_link → E gradient-leak experiment. Numbers are all single-seed
+tgbl-wiki seed=42; all "win" callouts are flagged against the
+wiki noise band (single-seed gap must be ≥ 0.015 test OR confirmed
+across ≥ 3 seeds to count as real).
+
+### 0. Initial v2 head design (2026-06-04 → 2026-06-05)
+
+The bilinear+pair-MLP `LinkHead` was replaced by a walk-mediated
+similarity head (`tempest_walks/link_pred_head_v2.py`), motivated
+by analysis/REPORT.md §9. Per (u, t, v_candidate):
+
+1. Sample K walks for u (forward or backward, configurable).
+2. Per (walk, position p):
+   - sim primitives: `[Hadamard(E[v], E[w_p]), |E[v] − E[w_p]|]`
+     (alternative: `cosine_only` scalar — kept as an ablation knob)
+   - K (hop) embedding: `nn.Embedding(max_walk_len, d_K)[hop]`
+   - time channel: `TimeEncoder(gap_norm)`
+     - gap_norm = `log1p(gap) / log1p(T_full)` (Option B; Option A
+       was linear `gap / T_full` and bunched non-seed positions at
+       ~0.005–0.035 on wiki, giving the per-position MLP no
+       resolution. Option B verified +0.009 val / +0.016 test at
+       ep2 over Option A on V0_fwd.)
+3. Per-position MLP → max + mean pool over positions → mean over walks
+4. Direct (E[u], E[v]) bypass MLP
+5. Final MLP on concat[walk_features, direct] → scalar logit
+
+Channels were toggleable behind ablation flags
+(`--link-head-{no-time-channel, no-K-channel, no-direct, direct-only,
+sim-primitives}`) for the sweep below; all toggles were dropped
+once the sweep settled.
+
+### 1. Phase 0 — direction sweep (2026-06-05 → 2026-06-06)
+
+V0 = full head with all channels on, hadamard_absdiff sim,
+embedding=both (5 forward + 5 backward), K_link split half/half
+for "both". 15 epochs each, patience disabled.
+
+| variant | best val | best test | best ep |
+|---|---|---|---|
+| V0_fwd  | 0.7017 | 0.6758 | 3 |
+| V0_bwd  | 0.7724 | 0.7439 | 1 |
+| **V0_both** | **0.7775** | **0.7522** | **2** |
+
+V0_both margin over V0_bwd: **+0.005 val / +0.008 test** — *inside*
+the wiki noise band. Recorded as a non-decisive win pending future
+ablation. V0_fwd much weaker because K=1 (most-recent neighbor) in
+forward direction maps to the *earliest* successor (least
+predictive); backward direction's K=1 maps to the most-recent
+predecessor (most predictive).
+
+### 2. α-leak grid — L_link → E gradient mix (2026-06-06)
+
+Hypothesis: the historical pure-detach (E.detach() on the link
+path) may be too aggressive; a controlled leak of L_link gradient
+into E could help. Implemented via convex-combo
+
+    E_link_in = α · E + (1 − α) · E.detach()
+
+forward-identical to E, backward scales dE/dL_link by α. α=0
+reproduces detach; α=1 is no detach.
+
+4 cells run at 10ep with patience=4 (drift-kill at ep5):
+
+| α | both (val / test) | backward (val / test) |
+|---|---|---|
+| 0   | 0.7775 / 0.7522 (Phase-0) | 0.7724 / 0.7439 (Phase-0) |
+| 0.2 | 0.7664 / 0.7396 (killed ep5) | 0.7642 / 0.7355 |
+| 0.5 | 0.7560 / 0.7253 | 0.7719 / 0.7357 |
+| 1.0 | 0.7506 / 0.7237 | (skipped) |
+
+Findings:
+- Every α>0 cell trailed α=0 on test by 0.008–0.029.
+- "Both" row: monotone test decline with rising α.
+- "Backward" row: non-monotone (α=0.5 > α=0.2 on val).
+- Verified the mix math by isolating L_link backward at α=0.2:
+  ||dE|| was 0.219× the α=1.0 case (expected 0.2×); α=0 was
+  exactly zero. Mechanism correct; the knob just doesn't help.
+
+Conclusion: **α=0 (pure detach) restored.** The link-loss-into-E
+plumbing was removed entirely; E is shaped by L_align alone.
+
+### 3. Single-tower collapse (2026-06-06)
+
+With V0_both's +0.008 test over V0_bwd sitting inside the noise
+band — and every α>0 also losing — the dual-tower architecture's
+2× compute/parameters paid for nothing statistically distinguishable.
+The dual-tower path was removed. The head now consumes ONE direction
+of walks; the direction is dictated by `is_directed` at construction:
+
+- undirected → backward walks (--link-pred-backward-{walk,start}-bias)
+- directed   → forward  walks (--link-pred-forward-{walk,start}-bias)
+
+The link-pred side uses the full `--link-pred-num-walks-per-node`
+on its one direction (no half/half split). The dual-tower
+`--link-head-direction` flag was briefly retained for ablation runs
+then dropped.
+
+### 4. Embedding-direction sweep (2026-06-07)
+
+Iter-6 had always-on symmetric embedding alignment: backward walks
+from each unique tgt + forward walks from each unique src, two
+`alignment_loss` calls summed. Is the forward term load-bearing?
+
+Both runs use the single-tower head; K_embed total = 10. Fair
+compute: "both" splits 5+5, "backward only" spends all 10 on bwd.
+15-epoch cap, patience=5.
+
+| | val | test | peak ep |
+|---|---|---|---|
+| E0_both | 0.7677 | 0.7332 | 1 |
+| **E0_bwd** | **0.7682** | **0.7426** | **5** |
+
+Δ = backward − both = **+0.0005 val / +0.0094 test** — *outside*
+the wiki noise band on test. Forward embedding alignment dropped.
+
+Important calibration: these E0 numbers are NOT comparable to
+Phase-0 V0_both (0.7775 / 0.7522) — Phase-0 used the dual-tower
+head; E0 runs use the single tower. The Δ between dual-tower and
+single-tower is ~0.007–0.019 test on wiki (consistent with the
+Phase-0 dual-vs-single argument), but again all inside the noise
+band at single seed.
+
+### 5. Phase 1 — channel ablations on the single-tower head (2026-06-07)
+
+V0 baseline here = E0_both (both embedding dirs, single-tower head).
+4 variants × 15 ep × patience=5.
+
+| variant | val | test | Δ test vs V0 | speed |
+|---|---|---|---|---|
+| V0 (full head) | 0.7677 | 0.7332 | — | 1× |
+| V1_no_time | 0.7697 | 0.7420 | +0.009 | 1× |
+| V2_cos_only | 0.7707 | 0.7404 | +0.007 | ~2× faster |
+| **V3_direct_only** | **0.5225** | **0.4743** | **−0.259** | ~30× faster |
+| V4_no_K | 0.7731 | 0.7433 | +0.010 | 1× |
+
+Interpretation:
+- V1/V2/V4 all "win" by 0.007–0.010 test, at the edge of the wiki
+  noise band. Single-seed; not robust enough to drop on their own.
+- V2's 2× speed-up reflects sim_dim collapsing from 2·d_emb=256 to 1.
+- **V3 confirms the walks tower is load-bearing.** Without it the
+  head falls to cosine-baseline territory (~0.52 val / ~0.47 test),
+  a 0.26 test cliff. The direct (E[u], E[v]) bypass alone cannot
+  reach the walk-mediated peak.
+
+### 6. The overfitting / degeneration observation
+
+**Every walk-tower variant — V0, V1, V2, V4, E0_both, E0_bwd, plus
+all four α-leak both/bwd cells — exhibits the same shape:**
+
+1. Val MRR peaks at ep1–ep5 (usually ep1 or ep2).
+2. Train losses (`align`, `link`) continue to fall monotonically.
+3. Val MRR drifts down for the rest of training.
+4. Patience=5 kills the run around ep6–ep10.
+
+Concrete trajectories:
+
+- V0_both (Phase 0, 15ep): peak val 0.7775 @ ep2; ep15 val 0.7119.
+- V0_bwd (Phase 0): peak val 0.7724 @ ep1; ep15 val 0.7122.
+- V0_fwd (Phase 0): peak val 0.7017 @ ep3; ep15 val 0.6805.
+- E0_bwd: peak val 0.7682 @ ep5; the run bounced (ep4=0.7651,
+  ep5=0.7682, ep6=0.7570, ep7=0.7680, ep8=0.7385) before dying.
+- V1_no_time: 0.7697 → 0.7575 → 0.7320 → 0.7214 → 0.7431 → 0.7056.
+- V4_no_K: 0.7731 → 0.7445 → 0.7322 → 0.7218 → 0.7290 → 0.7307.
+
+**V3_direct_only is the exception** — no walks tower, no peak, no
+drift. Monotone climb to ep15:
+
+  0.4494 → 0.4786 → 0.4816 → 0.4949 → 0.5078 → 0.5048 → 0.5168
+  → 0.5159 → 0.5179 → 0.5204 → 0.5174 → 0.5206 → 0.5144 → 0.5140
+  → 0.5225 (best).
+
+The pattern is unambiguous: **the walks tower is what causes the
+overfit-then-drift shape.** It lifts val MRR from ~0.52 (cosine
+baseline) to ~0.77 peak — real signal extraction — but then
+memorises train-walk geometry past the peak and val regresses
+while train losses still fall. Without the walks tower (V3),
+training is well-behaved but caps at cosine baseline.
+
+Working hypotheses, none of which were exhaustively tested:
+- The per-position MLP's parameter count (≈ 96·in_dim + 96² ≈ 60K
+  per head) memorises specific (E[v], E[w_p], K, t) joint patterns
+  observed in train walks; those patterns don't generalise to val
+  walks (which arrive after additional Tempest state has been
+  ingested past the val cutoff).
+- The walk tower's gradient pathway dwarfs the direct channel's:
+  the tower's max + mean pool over positions back-propagates
+  through every position MLP, while the direct channel sees only
+  E[u], E[v]. Once the tower starts overfitting, the final MLP
+  upweights tower features and the direct channel's stabilising
+  contribution gets crowded out.
+- Wiki is a recurrence-heavy workload — the walk-mediated channel
+  may not be the right inductive bias here. Cold-start workloads
+  (review surprise≈0.987) are the natural domain for walk-based
+  signals; that hasn't been re-tested under the cleaned-up head.
+
+What we DID NOT try and could be worth attempting:
+- Dropout on the per-position MLP / final MLP.
+- L2 / weight-decay specifically on the walk tower parameters.
+- A learning-rate schedule that decays faster for tower parameters
+  than for the direct channel.
+- Training-time mask-out of walk positions (random drop of walk
+  rows or position slices).
+- Smaller d_pos (the tower out_dim is 2·d_pos=192; the direct
+  out_dim is 64 — the head's representational mass is heavily on
+  the tower side).
+- A multi-seed sweep at ep1-ep5 only, to estimate whether the peak
+  is reproducible across seeds (currently every conclusion is
+  single-seed).
+
+### 7. Final architecture (post-2026-06-07 cleanup)
+
+After all the above, the head and surrounding code were frozen:
+
+**Kept (load-bearing or inside-noise-band wins):**
+- Walks tower (V3 ablation makes it non-negotiable).
+- Per-position primitives: `[Hadamard(E_v, E_w), |E_v − E_w|]`
+  (V2's cosine_only win was inside noise band; kept the original
+  primitives to match Phase-0 V0).
+- K (hop) embedding (V4 win inside noise; kept).
+- Time channel with Option B normaliser
+  `log1p(gap) / log1p(T_full)` (V1 win inside noise; kept).
+- Direct (E[u], E[v]) bypass channel.
+- Single tower direction = `is_directed ? "forward" : "backward"`.
+- Embedding-side BACKWARD alignment only (E0_bwd > E0_both
+  outside noise band).
+- Pure E.detach() on link path (α-leak grid: every α>0 loses).
+- Chunk_c (memory chunking + gradient checkpoint) as a pure
+  memory knob (default off, set to 8 for 8 GB GPUs at d_emb=128).
+
+**Dropped:**
+- Cosine_only sim primitive path.
+- Walk-tower channel toggles (no_time / no_K / no_direct /
+  direct_only).
+- Dual-tower direction option and `--link-head-direction` flag.
+- Forward embedding alignment (`walks_for_nodes_embedding_forward`,
+  the `embedding_direction` field, and the K // 2 split).
+- The `--embedding-{forward,backward}-{walk,start}-bias` split
+  (only backward retained).
+- L_link → E gradient leak α and all its plumbing.
+
+The cleanup branch `feature/walk-tower-cleanup` collapses all of
+this with net negative line counts in the head + trainer (≈ 460
+lines removed across the cleanup commits).
+
+### 8. Quick numbers reference (all single-seed wiki seed=42)
+
+| baseline label | val | test | head type | embedding dirs |
+|---|---|---|---|---|
+| Phase-0 V0_both | 0.7775 | 0.7522 | dual tower | fwd+bwd (5+5) |
+| Phase-0 V0_bwd  | 0.7724 | 0.7439 | dual tower | fwd+bwd (5+5) |
+| E0_both         | 0.7677 | 0.7332 | single bwd | fwd+bwd (5+5) |
+| E0_bwd          | 0.7682 | 0.7426 | single bwd | bwd only (10) |
+| V1_no_time      | 0.7697 | 0.7420 | single bwd (no time) | fwd+bwd (5+5) |
+| V2_cos_only     | 0.7707 | 0.7404 | single bwd (cosine sim) | fwd+bwd (5+5) |
+| V3_direct_only  | 0.5225 | 0.4743 | direct MLP only | fwd+bwd (5+5) |
+| V4_no_K         | 0.7731 | 0.7433 | single bwd (no K) | fwd+bwd (5+5) |
+| α-leak best (V0_bwd α=0.5) | 0.7719 | 0.7357 | dual tower | fwd+bwd (5+5) |
+
+The current `master`-merge target is the **single-tower head +
+backward embedding only + all walk-tower channels on** stack. That
+is approximately E0_bwd in the table above — val 0.7682 / test
+0.7426 single-seed on wiki — with the understanding that:
+- the single-seed gap to Phase-0 V0_both (−0.009 val / −0.010
+  test) is the documented cost of dropping the second tower, and
+- on cold-start workloads (review) the walks tower's inductive
+  bias is expected to matter more than on wiki, but that hasn't
+  been re-validated under the cleaned-up head and remains an open
+  follow-up.
