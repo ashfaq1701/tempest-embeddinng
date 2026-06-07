@@ -77,7 +77,7 @@ def _build_walks() -> tuple[WalkData, dict, int]:
     seed_pool = np.unique(np.concatenate([src, tgt]))
     rng = np.random.default_rng(42)
     seeds = rng.choice(seed_pool, size=_N_SEEDS, replace=False)
-    walks = wg.walks_for_nodes_embedding(seeds)
+    walks = wg.walks_for_nodes_embedding_backward(seeds)
 
     edge_set: dict = {}
     for s, t, time in zip(src, tgt, ts):

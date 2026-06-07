@@ -3,17 +3,20 @@
 Single Trainer class. Per-batch ordering:
 
   TRAINING:
-    1. walks = walk_gen.walks_for_nodes_embedding(seeds)  ← pre-ingest state
-       seeds = unique(B_tgt)               if is_directed
-       seeds = unique(B_src ∪ B_tgt)       if undirected
-    2. L_align = alignment_loss(walks, ...)          ← InfoNCE scalar
+    1. walks_bwd = walk_gen.walks_for_nodes_embedding_backward(seeds_tgt)
+       ← pre-ingest state. Embedding alignment is backward-only;
+       forward embedding alignment was ablated and dropped 2026-06-07
+       on wiki (backward-only beats forward+backward by +0.009 test,
+       outside the noise band).
+    2. L_align = alignment_loss(walks_bwd, ...)      ← InfoNCE scalar
     3. neg = neg_sampler.sample(batch)               ← stateless uniform
        neg_tgt: [B, K_train]
     4. candidates_v = [pos_v | neg_tgt]              ← [B, 1+K_train]
-       logits = link_head(E[u].detach(), E[v].detach())  ← [B, 1+K_train]
-                (undirected: 0.5 × (link_head(u,v) + link_head(v,u)))
-                E is detached — L_link trains only the link head;
-                L_align is the sole gradient path into E.
+       u-side walks = walk_gen.walks_for_nodes_link_pred_*(unique src)
+       (forward direction if is_directed, backward if undirected)
+       logits = link_head(E[u].detach(), E[v].detach(), walks=walks)
+       E is detached — L_link trains only the link head; L_align is
+       the sole gradient path into E.
        L_link = CE(logits / tau_link, target=zeros(B))
     5. L_total = L_align + L_link
     6. optimizer.zero_grad(set_to_none=True); L_total.backward(); optimizer.step()
@@ -21,22 +24,22 @@ Single Trainer class. Per-batch ordering:
 
   EVAL (within torch.no_grad()):
     1. neg_dst_list = tgb_neg_sampler.sample(batch)  ← per-positive negs
-    2. Score per-query: candidates_v = [pos_v | neg_v_padded_to_max_K]
-       → logits [B, 1+max_K] via link_head (undirected symmetrise
-       matches the training rule).
-    3. evaluator.score_to_metric(logits[i,0], logits[i,1:1+K_i]) per
+    2. u-side walks sampled in the same direction as training.
+    3. Score per-query: candidates_v = [pos_v | neg_v_padded_to_max_K]
+       → logits [B, 1+max_K] via link_head.
+    4. evaluator.score_to_metric(logits[i,0], logits[i,1:1+K_i]) per
        positive (TGB MRR).
-    4. walk_gen.add_edges(batch)                     ← Tempest state
+    5. walk_gen.add_edges(batch)                     ← Tempest state
                                                        carries forward.
-    NOTE: walks not sampled at eval. Model parameters frozen.
+    NOTE: model parameters frozen at eval; walks ARE sampled because
+    the head is walk-mediated.
 
 Epoch boundary:
   - walk_gen.reset()
-  - neg_sampler.reset() (if Historical)
   - Model parameters and optimiser state are NOT reset.
 
 Early stop:
-  - Snapshot best-val model + projection + head state_dicts.
+  - Snapshot best-val model + head state_dicts.
   - Restore best-val weights at end of training.
   - Optimiser state not snapshotted (not needed after training stops).
   - The reported `best_val_mrr` / `best_test_mrr` are the snapshot
@@ -58,7 +61,9 @@ from torch.optim.lr_scheduler import LambdaLR
 from .data import Batch
 from .evaluator import Evaluator
 from .losses import alignment_loss
-from .model import EmbeddingTable, LinkHead
+from .link_pred_head_v2 import LinkPredHeadV2
+from .link_pred_walks_features import make_head_inputs
+from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
 from .utils import make_lr_lambda
 from .walks import WalkGenerator
@@ -107,17 +112,19 @@ class TrainerConfig:
     gamma_recency: float = 0.4
     recency_scale: float = 1.0  # Plumbed in by train.py from TrainStats.
 
-    # Walks. Two sides:
-    #   embedding_* — BACKWARD walks consumed by the alignment loss.
-    #                  Drives the geometry of E.
-    #   link_pred_* — FORWARD walks reserved for a future link-prediction-
-    #                  side scoring path. Plumbed end-to-end but no Trainer
-    #                  caller wires them in yet.
-    embedding_num_walks_per_node: int = 5
+    # Walks. Two sides.
+    #   embedding_* — drive the geometry of E via the alignment loss
+    #                  (BACKWARD walks from each batch tgt only;
+    #                  forward embedding alignment was ablated and
+    #                  dropped 2026-06-07).
+    #   link_pred_* — drive the walk-mediated link head. The head's
+    #                  direction is dataset-driven (is_directed):
+    #                  undirected → backward, directed → forward.
+    embedding_num_walks_per_node: int = 10
     embedding_max_walk_len: int = 20
-    embedding_walk_bias: str = "ExponentialWeight"
-    embedding_start_bias: str = "ExponentialWeight"
-    link_pred_num_walks_per_node: int = 5
+    embedding_backward_walk_bias:  str = "ExponentialWeight"
+    embedding_backward_start_bias: str = "ExponentialWeight"
+    link_pred_num_walks_per_node: int = 10
     link_pred_max_walk_len: int = 20
     link_pred_forward_walk_bias:  str = "ExponentialWeight"
     link_pred_forward_start_bias: str = "Uniform"
@@ -129,6 +136,33 @@ class TrainerConfig:
     # Drives the always-on inverse-degree seed weighting in the
     # alignment loss (per-row weight = 1/log1p(deg(seed))).
     train_deg: Optional[np.ndarray] = None  # [num_nodes] int64
+
+    # LinkPredHeadV2 architecture knobs. The architecture is fixed
+    # (sweep settled 2026-06-07): single walk tower + direct (E[u],E[v])
+    # bypass, with sim = [Hadamard, |E_v − E_w|], K embedding, and time
+    # channel all on. The walk-tower direction is dataset-driven from
+    # is_directed (undirected → backward, directed → forward).
+    link_head_d_K: int = 16
+    link_head_d_pos: int = 96
+    link_head_d_direct: int = 64
+    link_head_chunk_c: int = 0     # 0 = OFF (default). >0 = chunk size for
+                                   # the candidate dim inside the walk
+                                   # tower's per-position MLP. Pure memory
+                                   # knob; loss/gradient unchanged.
+    # E is detached on all link-head lookups (E[u], E[v], E_walks);
+    # L_link trains only the link head, L_align is the sole gradient
+    # path into E. A controllable L_link → E leak (convex-combo grad
+    # mix) was tried and rejected on tgbl-wiki (4-cell α∈{0.2, 0.5, 1.0}
+    # × {both, backward} sweep 2026-06-06: every α>0 cell trailed α=0
+    # on test by 0.008–0.029).
+    # Dataset-derived (plumbed by train.py from TrainStats); the head
+    # uses them to normalise the per-position time gap.
+    t_min: int = 0
+    T_train: float = 1.0
+    t_max_full: int = 1     # max timestamp across train + val + test
+    T_full: float = 1.0     # span (t_max_full - t_min); the v2 head's
+                            # time channel divides by this so gap_norm
+                            # is bounded [0, 1] at train and eval.
 
     # Optimisation.
     lr: float = 1e-3            # peak LR (after warmup). Validated on
@@ -173,12 +207,31 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=config.d_emb,
         ).to(self.device)
-        self.link_head = LinkHead(d_emb=config.d_emb).to(self.device)
-
+        # Walk-mediated link-pred head (see link_pred_head_v2.py). The
+        # head's `max_walk_len` sizes its K-embedding table. The tower
+        # consumes ONE direction of walks; the direction is chosen by
+        # is_directed (see self.link_head_walk_direction below).
+        self.link_head = LinkPredHeadV2(
+            d_emb=config.d_emb,
+            max_walk_len=int(config.link_pred_max_walk_len),
+            d_K=int(config.link_head_d_K),
+            d_pos=int(config.link_head_d_pos),
+            d_direct=int(config.link_head_d_direct),
+            chunk_C=int(config.link_head_chunk_c),
+        ).to(self.device)
         # Frozen recency time constant. Plain Python float — no
         # tensor, no autograd. alignment_loss broadcasts it against
         # the per-batch gap tensor at the use site.
         self.recency_scale = float(config.recency_scale)
+
+        # Dataset anchors for the head's time-feature normalisation.
+        self.t_min = int(config.t_min)
+        self.T_train = float(config.T_train)
+        self.t_max_full = int(config.t_max_full)
+        # T_full bounds the v2 head's per-position gap normaliser at
+        # both train and eval. The head reads `T_full` directly from
+        # the trainer.
+        self.T_full = float(config.T_full)
 
         # Frozen training-degree per node, used by inverse-degree seed
         # weighting in alignment_loss. Plain int64 CPU tensor; the
@@ -193,21 +246,27 @@ class Trainer:
         else:
             self.train_deg = torch.zeros(config.num_nodes, dtype=torch.int64)
 
-        # Walk sampler. Both directions share one Tempest instance;
-        # the embedding-side knobs drive the alignment loss, the
-        # link-pred-side knobs are plumbed but currently unused.
+        # Walk sampler. The embedding side draws BACKWARD walks only
+        # (forward was ablated). The link-pred side draws ONE direction
+        # (decided by is_directed below) and uses the full K on it.
+        emb_K = max(1, int(config.embedding_num_walks_per_node))
+        link_K_per_dir = max(1, int(config.link_pred_num_walks_per_node))
+        # Direction the link head consumes — frozen by is_directed.
+        self.link_head_walk_direction = (
+            "forward" if config.is_directed else "backward"
+        )
         self.walk_gen = WalkGenerator(
             is_directed=config.is_directed,
             use_gpu=config.use_gpu_tempest,
-            embedding_walk_bias=config.embedding_walk_bias,
-            embedding_start_bias=config.embedding_start_bias,
-            embedding_num_walks_per_node=config.embedding_num_walks_per_node,
+            embedding_backward_walk_bias=config.embedding_backward_walk_bias,
+            embedding_backward_start_bias=config.embedding_backward_start_bias,
+            embedding_num_walks_per_node=emb_K,
             embedding_max_walk_len=config.embedding_max_walk_len,
             link_pred_forward_walk_bias=config.link_pred_forward_walk_bias,
             link_pred_forward_start_bias=config.link_pred_forward_start_bias,
             link_pred_backward_walk_bias=config.link_pred_backward_walk_bias,
             link_pred_backward_start_bias=config.link_pred_backward_start_bias,
-            link_pred_num_walks_per_node=config.link_pred_num_walks_per_node,
+            link_pred_num_walks_per_node=link_K_per_dir,
             link_pred_max_walk_len=config.link_pred_max_walk_len,
             max_time_capacity=config.max_time_capacity,
         )
@@ -301,37 +360,74 @@ class Trainer:
             f"{batches_per_epoch} batches)"
         )
 
+    def _sample_u_walks_for_head(
+        self,
+        u_ids_np,                # np.ndarray [B] source ids
+        t_query_np,              # np.ndarray [B] query timestamps
+    ):
+        """Sample u-side walks in the dataset-dictated direction
+        (self.link_head_walk_direction; backward for undirected, forward
+        for directed) and package them into the per-position feature dict
+        the head consumes. Returns a single dict.
+        """
+        direction = self.link_head_walk_direction
+        if direction == "forward":
+            sampler = self.walk_gen.walks_for_nodes_link_pred_forward
+        else:
+            sampler = self.walk_gen.walks_for_nodes_link_pred_backward
+
+        # Sample once per UNIQUE u, then scatter back to row order.
+        uniq, inv = np.unique(u_ids_np, return_inverse=True)
+        wd = sampler(uniq)
+        # wd.nodes: [N_u*K, L]; rows [i*K:(i+1)*K) belong to uniq[i].
+        K = wd.K
+        L = wd.nodes.shape[1]
+        nodes_full = wd.nodes.view(len(uniq), K, L)
+        ts_full    = wd.timestamps.view(len(uniq), K, L)
+        lens_full  = wd.lens.view(len(uniq), K)
+        nodes_per_row = [nodes_full[idx] for idx in inv]
+        ts_per_row    = [ts_full[idx]    for idx in inv]
+        lens_per_row  = [lens_full[idx]  for idx in inv]
+
+        t_query_t = torch.from_numpy(t_query_np).long()
+        return make_head_inputs(
+            walks_nodes_per_u=nodes_per_row,
+            walks_ts_per_u=ts_per_row,
+            walks_lens_per_u=lens_per_row,
+            direction=direction,
+            t_query_per_u=t_query_t,
+            t_min=self.t_min,
+            T_full=self.T_full,
+            embedding_table=self.embedding_table,
+            time_encoder=self.link_head.time_encoder,
+            device=self.device,
+        )
+
     def _score_query(
         self,
         u_ids: torch.Tensor,
         candidates_v: torch.Tensor,
+        u_ids_np,                # original numpy [B]  for walk sampling
+        t_query_np,              # numpy [B] query timestamps
     ) -> torch.Tensor:
         """Per-query scoring for eval (no_grad context).
 
-        u_ids:        [B]               — query source nodes
+        u_ids:        [B]               — query source nodes (torch)
         candidates_v: [B, 1+K_eval]     — column 0 = positive dst,
                                           columns 1..K = TGB negatives
-        Returns:       [B, 1+K_eval]    — logits per candidate.
 
-        Memory: the link head's forward materialises tensors of shape
-        [B, 1+K_eval, d_emb]. Budget eval-batch-size accordingly. With
-        TGB's K values (wiki=999, review=100, coin=20, comment=20),
-        comfortable eval_batch_size values are ~25-50 / ~200-500 /
-        ~2000+ / ~2000+ at d_emb=128 on an 8 GB GPU.
+        Returns: [B, 1+K_eval] logits.
 
-        Symmetrisation matches the training rule: undirected datasets
-        average link_head(E[u], E[v]) with link_head(E[v], E[u]) so
-        train and eval score by the exact same formula; directed
-        datasets do one call.
+        The head consumes u-side walks (sampled per the configured
+        direction); no symmetrisation (the head is inherently u→v
+        directional — backward symmetrisation would require sampling
+        walks from each candidate v, prohibitive at K_eval=999).
         """
         candidates_u = u_ids.unsqueeze(1).expand_as(candidates_v)
-        e_u = self.embedding_table(candidates_u)
-        e_v = self.embedding_table(candidates_v)
-        if self.config.is_directed:
-            return self.link_head(e_u, e_v)
-        return 0.5 * (
-            self.link_head(e_u, e_v) + self.link_head(e_v, e_u)
-        )
+        e_u = self.embedding_table(candidates_u).detach()
+        e_v = self.embedding_table(candidates_v).detach()
+        walks = self._sample_u_walks_for_head(u_ids_np, t_query_np)
+        return self.link_head(e_u, e_v, walks=walks)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
@@ -341,43 +437,28 @@ class Trainer:
         device = self.device
 
         # Step 1: walks from PRE-INGEST state.
-        # Seeds are always the unique batch targets (regardless of
-        # is_directed). TGB ranks candidate dsts given a fixed src at
-        # eval, so the dst side is what gets scored; walking only from
-        # the dst follows its incoming-edge history — the predictive
-        # signal for "which dst did src hit". The undirected variant
-        # (seeds = unique(src ∪ tgt)) gives ~2× the alignment signal
-        # per batch but did not improve test on wiki (50ep seed=42
-        # 2026-05-31 sweep).
-        # Always-on symmetric supervision: backward walks from
-        # targets + forward walks from sources. Iter-6 analysis
-        # established this as the winning recipe (test +0.010 over
-        # the asymmetric baseline). Forward walks reuse the
-        # --link-pred-forward-* knobs.
+        # Embedding supervision: BACKWARD walks from each unique target
+        # (forward embedding alignment was ablated and dropped — see
+        # the module docstring).
         seeds_tgt_np = np.unique(batch.tgt)
-        seeds_src_np = np.unique(batch.src)
-        walks_bwd = self.walk_gen.walks_for_nodes_embedding(seeds_tgt_np)
-        walks_fwd = self.walk_gen.walks_for_nodes_link_pred_forward(seeds_src_np)
+        walks_bwd = self.walk_gen.walks_for_nodes_embedding_backward(seeds_tgt_np)
 
-        # Always-on inverse-degree seed weighting. The phase-6
+        # Inverse-degree seed weighting (always on). The phase-6
         # both-active hard cohort has median seed degree 1; the
         # popular end has degree 100+. Uniform per-row averaging
         # starves rare seeds. Weighting each walk row by
         # 1/log1p(deg(seed_of_row)) restores parity.
-        def _w(seeds):
-            return 1.0 / torch.log1p(
-                self.train_deg[torch.from_numpy(seeds.astype(np.int64))]
-                .to(self.device).float()
-            )
-        seed_weights_bwd = _w(seeds_tgt_np)
-        seed_weights_fwd = _w(seeds_src_np)
+        seed_weights_bwd = 1.0 / torch.log1p(
+            self.train_deg[torch.from_numpy(seeds_tgt_np.astype(np.int64))]
+            .to(self.device).float()
+        )
 
-        # Step 2: InfoNCE contrastive alignment over batched walks
-        # (both directions). The softmax denominator over all batch
-        # contexts is the anti-collapse mechanism (replaces Wang-Isola
-        # uniformity). Per-position weights are a convex combination
-        # of hop and *stationary* recency profiles.
-        l_align_bwd = alignment_loss(
+        # Step 2: InfoNCE contrastive alignment over batched walks.
+        # The softmax denominator over all batch contexts is the
+        # anti-collapse mechanism (replaces Wang-Isola uniformity).
+        # Per-position weights are a convex combination of hop and
+        # *stationary* recency profiles.
+        l_align = alignment_loss(
             embedding_table=self.embedding_table,
             walks=walks_bwd,
             recency_scale=self.recency_scale,
@@ -387,17 +468,6 @@ class Trainer:
             direction="backward",
             seed_weights=seed_weights_bwd,
         )
-        l_align_fwd = alignment_loss(
-            embedding_table=self.embedding_table,
-            walks=walks_fwd,
-            recency_scale=self.recency_scale,
-            gamma_recency=self.config.gamma_recency,
-            tau_align=self.config.tau_align,
-            chunk_size=self.config.alignment_chunk_size,
-            direction="forward",
-            seed_weights=seed_weights_fwd,
-        )
-        l_align = l_align_bwd + l_align_fwd
 
         # Step 3: per-query negatives. Sampler returns [B, K_train]
         # grouped output; no flattening — the link head consumes the
@@ -433,12 +503,14 @@ class Trainer:
         # bearing on unseen pairs.
         e_u = self.embedding_table(candidates_u).detach()            # [B, 1+K, d]
         e_v = self.embedding_table(candidates_v).detach()            # [B, 1+K, d]
-        if self.config.is_directed:
-            logits = self.link_head(e_u, e_v)                        # [B, 1+K]
-        else:
-            logits = 0.5 * (
-                self.link_head(e_u, e_v) + self.link_head(e_v, e_u)
-            )                                                        # [B, 1+K]
+        # Walk-mediated head: sample u-side walks (one direction, set by
+        # is_directed) at the batch query times and pass the walk
+        # feature dict. The head is inherently u→v directional; no
+        # symmetrisation (cf. _score_query docstring).
+        walks = self._sample_u_walks_for_head(
+            batch.src.astype(np.int64), batch.ts.astype(np.int64),
+        )
+        logits = self.link_head(e_u, e_v, walks=walks)               # [B, 1+K]
 
         target = torch.zeros(B, dtype=torch.long, device=device)
         l_link = F.cross_entropy(logits / self.config.tau_link, target)
@@ -511,11 +583,13 @@ class Trainer:
                             neg_tgt_list[i].astype(np.int64)
                         )
 
-                u_ids = torch.from_numpy(
-                    batch.src.astype(np.int64),
-                ).to(self.device)                                  # [B]
+                u_ids_np = batch.src.astype(np.int64)
+                t_query_np = batch.ts.astype(np.int64)
+                u_ids = torch.from_numpy(u_ids_np).to(self.device)  # [B]
                 candidates_v = torch.from_numpy(cand_v_np).to(self.device)
-                logits = self._score_query(u_ids, candidates_v).cpu().numpy()
+                logits = self._score_query(
+                    u_ids, candidates_v, u_ids_np, t_query_np,
+                ).cpu().numpy()
 
                 for i in range(B):
                     K_i = counts[i]

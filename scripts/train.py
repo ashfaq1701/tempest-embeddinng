@@ -11,14 +11,13 @@ Hyperparameters exposed at CLI (and their grouping):
   Loss:           --tau-align, --tau-link, --gamma-recency,
                   --k-train, --alignment-chunk-size
   Walks:          --embedding-num-walks-per-node, --embedding-max-walk-len,
-                  --embedding-walk-bias, --embedding-start-bias,
+                  --embedding-backward-walk-bias, --embedding-backward-start-bias,
                   --link-pred-num-walks-per-node, --link-pred-max-walk-len,
                   --link-pred-forward-walk-bias, --link-pred-forward-start-bias,
                   --link-pred-backward-walk-bias, --link-pred-backward-start-bias,
                   --tempest-batch-window-multiplier
-                  (link-pred-forward-* are consumed by the always-on
-                   forward-alignment term; link-pred-backward-* are
-                   plumbed but currently unused.)
+                  (Embedding side is backward-only. Link-pred side picks
+                   forward or backward by --is-directed.)
   Optimisation:   --lr, --lr-min, --warmup-fraction, --warmup-steps-cap,
                   --decay-horizon-epochs, --weight-decay, --batch-size,
                   --eval-batch-size, --num-epochs, --early-stop-patience
@@ -132,43 +131,43 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Walks.
-    # Embedding side — BACKWARD walks consumed by the alignment loss.
+    # Both the embedding and link-pred sides sample BOTH directions per
+    # seed. *-num-walks-per-node is the TOTAL K, split half/half between
+    # forward and backward at the trainer level — defaults to 10
+    # (5+5 per direction). Bias knobs are per direction; defaults
+    # reflect Tempest's chronological semantics:
+    #   - forward + ExpW start shoots toward the head (oldest end) of
+    #     the successor set, the least predictive slice. Uniform start
+    #     + ExpW walk spreads coverage, then biases continuations
+    #     toward recency relative to the previous hop.
+    #   - backward + ExpW start lands on the seed's most recent
+    #     predecessor (the tail / most predictive end), so ExpW + ExpW.
     p.add_argument(
-        "--embedding-num-walks-per-node", default=5, type=int,
-        help="K for backward (embedding-side) walks.",
+        "--embedding-num-walks-per-node", default=10, type=int,
+        help="K for embedding-side walks per seed (all spent on the "
+             "single backward direction).",
     )
     p.add_argument(
         "--embedding-max-walk-len", default=20, type=int,
-        help="L for backward (embedding-side) walks.",
+        help="L for embedding-side walks.",
     )
     p.add_argument(
-        "--embedding-walk-bias", default="ExponentialWeight", type=str,
-        help="Per-hop edge bias for embedding-side walks.",
+        "--embedding-backward-walk-bias", default="ExponentialWeight", type=str,
+        help="Per-hop edge bias for backward embedding-side walks.",
     )
     p.add_argument(
-        "--embedding-start-bias", default="ExponentialWeight", type=str,
-        help="Initial-edge bias for embedding-side walks.",
+        "--embedding-backward-start-bias", default="ExponentialWeight", type=str,
+        help="Initial-edge bias for backward embedding-side walks.",
     )
-    # Link-pred side — FORWARD walks reserved for a future scoring path.
-    # Plumbed end-to-end (WalkGenerator, TrainerConfig) but no Trainer
-    # caller consumes them yet.
     p.add_argument(
-        "--link-pred-num-walks-per-node", default=5, type=int,
-        help="K for forward (link-pred-side) walks. Reserved; currently unused.",
+        "--link-pred-num-walks-per-node", default=10, type=int,
+        help="TOTAL K for link-pred-side walks; split half/half into "
+             "forward + backward at construction (so default 10 → 5+5).",
     )
     p.add_argument(
         "--link-pred-max-walk-len", default=20, type=int,
-        help="L for forward (link-pred-side) walks. Reserved; currently unused.",
+        help="L for link-pred-side walks.",
     )
-    # Link-pred-side bias knobs split by direction. The forward and
-    # backward variants pick opposite ends of the chronological chain
-    # under the same Tempest weighting, so defaults differ per
-    # direction:
-    #   - forward + ExpW start would shoot the walk toward the head
-    #     of the seed's successor set (oldest, least predictive),
-    #     so the default is Uniform start + ExpW walk.
-    #   - backward + ExpW start lands on the seed's most recent
-    #     predecessor (the tail/most-predictive end), so ExpW + ExpW.
     p.add_argument(
         "--link-pred-forward-walk-bias", default="ExponentialWeight", type=str,
         help="Per-hop edge bias for FORWARD link-pred-side walks.",
@@ -185,10 +184,27 @@ def parse_args() -> argparse.Namespace:
         "--link-pred-backward-start-bias", default="ExponentialWeight", type=str,
         help="Initial-edge bias for BACKWARD link-pred-side walks.",
     )
-    # Forward-walks alignment and inverse-degree seed weighting are
-    # always on. Iter 6 analysis (analysis/REPORT.md) established both
-    # as load-bearing improvements over baseline (test +0.010 combined);
-    # there is no scenario where either should be off, so no CLI knob.
+    # Symmetric forward+backward embedding alignment and inverse-degree
+    # seed weighting are always on. Iter 6 analysis (analysis/REPORT.md)
+    # established both as load-bearing improvements over baseline (test
+    # +0.010 combined); there is no scenario where either should be off,
+    # so no CLI knob.
+
+    # LinkPredHeadV2 — walk-mediated link-pred head. Flags scope the
+    # ablation sweep designed in analysis/REPORT.md §9; once a winning
+    # config emerges they will be collapsed into hardcoded defaults on
+    # the post-experiment cleanup branch.
+    p.add_argument("--link-head-d-K",      default=16, type=int)
+    p.add_argument("--link-head-d-pos",    default=96, type=int)
+    p.add_argument("--link-head-d-direct", default=64, type=int)
+    p.add_argument(
+        "--link-head-chunk-c", default=0, type=int,
+        help="0 (default) = no chunking; pass a positive N to enable "
+             "candidate-dim chunking inside the walk tower with chunk "
+             "size N. Pure memory knob; loss/gradient are identical "
+             "to non-chunked. Smaller N → less peak memory but more "
+             "kernel launches per step.",
+    )
     p.add_argument(
         "--tempest-batch-window-multiplier", default=-1.0, type=float,
         help="Tempest sliding-window cap expressed as a multiple of the "
@@ -307,7 +323,15 @@ def main() -> Dict[str, Any]:
     num_nodes = loaded.max_node_count
     is_directed = args.is_directed
     dst_pool = np.unique(loaded.train.destinations).astype(np.int32)
-    stats = compute_train_stats(loaded.train.timestamps)
+    # Full-dataset timestamps (train + val + test) feed compute_train_stats
+    # so it can populate t_max_full / T_full — the v2 link-pred head's
+    # time channel normaliser, bounded across train and eval splits.
+    full_ts = np.concatenate([
+        loaded.train.timestamps,
+        loaded.val.timestamps,
+        loaded.test.timestamps,
+    ])
+    stats = compute_train_stats(loaded.train.timestamps, full_timestamps=full_ts)
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  directed:      {is_directed}  (--is-directed)")
@@ -315,6 +339,8 @@ def main() -> Dict[str, Any]:
     print(f"  t_min:         {stats.t_min}")
     print(f"  t_max:         {stats.t_max}")
     print(f"  T_train:       {stats.T_train:.0f}")
+    print(f"  t_max_full:    {stats.t_max_full}")
+    print(f"  T_full:        {stats.T_full:.0f}")
     print(f"  median_inter_arrival: {stats.median_inter_arrival:.1f}")
     print(f"  mean_inter_arrival:   {stats.mean_inter_arrival:.1f}")
     print(f"  train edges:   {len(loaded.train.sources):,}")
@@ -367,8 +393,8 @@ def main() -> Dict[str, Any]:
 
         embedding_num_walks_per_node=args.embedding_num_walks_per_node,
         embedding_max_walk_len=args.embedding_max_walk_len,
-        embedding_walk_bias=args.embedding_walk_bias,
-        embedding_start_bias=args.embedding_start_bias,
+        embedding_backward_walk_bias=args.embedding_backward_walk_bias,
+        embedding_backward_start_bias=args.embedding_backward_start_bias,
         link_pred_num_walks_per_node=args.link_pred_num_walks_per_node,
         link_pred_max_walk_len=args.link_pred_max_walk_len,
         link_pred_forward_walk_bias=args.link_pred_forward_walk_bias,
@@ -376,6 +402,14 @@ def main() -> Dict[str, Any]:
         link_pred_backward_walk_bias=args.link_pred_backward_walk_bias,
         link_pred_backward_start_bias=args.link_pred_backward_start_bias,
         train_deg=_compute_train_deg(loaded),
+        t_min=stats.t_min,
+        T_train=stats.T_train,
+        t_max_full=stats.t_max_full,
+        T_full=stats.T_full,
+        link_head_d_K=args.link_head_d_K,
+        link_head_d_pos=args.link_head_d_pos,
+        link_head_d_direct=args.link_head_d_direct,
+        link_head_chunk_c=args.link_head_chunk_c,
         max_time_capacity=compute_max_time_capacity(
             args.tempest_batch_window_multiplier,
             args.batch_size,
