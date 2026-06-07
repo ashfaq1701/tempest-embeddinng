@@ -135,17 +135,11 @@ class TrainerConfig:
     # alignment loss (per-row weight = 1/log1p(deg(seed))).
     train_deg: Optional[np.ndarray] = None  # [num_nodes] int64
 
-    # LinkPredHeadV2 architecture knobs. The walk tower is single
-    # direction; the direction is decided by `is_directed`:
-    #   undirected → backward walks (powered by --link-pred-backward-*)
-    #   directed   → forward walks  (powered by --link-pred-forward-*)
-    # (The dual-tower "both" mode was tested against single-direction
-    # and lost INSIDE the wiki noise band — see git history.)
-    link_head_sim_primitives: str = "hadamard_absdiff"  # | "cosine_only"
-    link_head_use_time_channel: bool = True
-    link_head_use_K_channel: bool = True
-    link_head_use_direct: bool = True
-    link_head_direct_only: bool = False
+    # LinkPredHeadV2 architecture knobs. The architecture is fixed
+    # (sweep settled 2026-06-07): single walk tower + direct (E[u],E[v])
+    # bypass, with sim = [Hadamard, |E_v − E_w|], K embedding, and time
+    # channel all on. The walk-tower direction is dataset-driven from
+    # is_directed (undirected → backward, directed → forward).
     link_head_d_K: int = 16
     link_head_d_pos: int = 96
     link_head_d_direct: int = 64
@@ -218,11 +212,6 @@ class Trainer:
         self.link_head = LinkPredHeadV2(
             d_emb=config.d_emb,
             max_walk_len=int(config.link_pred_max_walk_len),
-            sim_primitives=config.link_head_sim_primitives,
-            use_time_channel=config.link_head_use_time_channel,
-            use_K_channel=config.link_head_use_K_channel,
-            use_direct=config.link_head_use_direct,
-            direct_only=config.link_head_direct_only,
             d_K=int(config.link_head_d_K),
             d_pos=int(config.link_head_d_pos),
             d_direct=int(config.link_head_d_direct),

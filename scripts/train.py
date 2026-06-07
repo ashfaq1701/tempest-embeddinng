@@ -194,29 +194,6 @@ def parse_args() -> argparse.Namespace:
     # ablation sweep designed in analysis/REPORT.md §9; once a winning
     # config emerges they will be collapsed into hardcoded defaults on
     # the post-experiment cleanup branch.
-    p.add_argument(
-        "--link-head-sim-primitives", default="hadamard_absdiff", type=str,
-        choices=("hadamard_absdiff", "cosine_only"),
-        help="Per-position similarity primitives between E[v] and E[w_i].",
-    )
-    p.add_argument(
-        "--link-head-no-time-channel", action="store_true",
-        help="Strip the per-position time feature (ablation V1).",
-    )
-    p.add_argument(
-        "--link-head-no-K-channel", action="store_true",
-        help="Strip the per-position K (hop) embedding (ablation V2).",
-    )
-    p.add_argument(
-        "--link-head-no-direct", action="store_true",
-        help="Strip the direct (E[u], E[v]) bypass channel.",
-    )
-    p.add_argument(
-        "--link-head-direct-only", action="store_true",
-        help="Drop the walk towers entirely; head reduces to per-dim "
-             "MLP on (E[u], E[v]). Ablation V3 — null hypothesis "
-             "for the walk-mediated path.",
-    )
     p.add_argument("--link-head-d-K",      default=16, type=int)
     p.add_argument("--link-head-d-pos",    default=96, type=int)
     p.add_argument("--link-head-d-direct", default=64, type=int)
@@ -429,11 +406,6 @@ def main() -> Dict[str, Any]:
         T_train=stats.T_train,
         t_max_full=stats.t_max_full,
         T_full=stats.T_full,
-        link_head_sim_primitives=args.link_head_sim_primitives,
-        link_head_use_time_channel=not args.link_head_no_time_channel,
-        link_head_use_K_channel=not args.link_head_no_K_channel,
-        link_head_use_direct=not args.link_head_no_direct,
-        link_head_direct_only=args.link_head_direct_only,
         link_head_d_K=args.link_head_d_K,
         link_head_d_pos=args.link_head_d_pos,
         link_head_d_direct=args.link_head_d_direct,

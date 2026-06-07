@@ -1,48 +1,41 @@
 """Link-prediction head v2 — walk-mediated per-position similarity.
 
-Design (from analysis/REPORT.md §9, refined per design discussion):
+Fixed architecture (sweep settled 2026-06-07 on tgbl-wiki):
 
 For each (u, t, v_candidate):
-    1. Sample n_walks walks for u in ONE direction (decided upstream by
-       the dataset's is_directed flag — undirected → backward, directed
-       → forward).
+    1. Sample K walks for u in ONE direction (undirected → backward,
+       directed → forward; decided upstream from is_directed).
     2. For each (walk, position p) build:
-         sim_vec  = primitives between E[v_cand] and E[walks_u[p]]
-                    default: [Hadamard, |E_v - E_w|]            → 2·d_emb
-                    cosine_only ablation: scalar cosine          → 1
-         K_feat   = nn.Embedding(max_walk_len, d_K)[hop_distance]
-                    forward direction:  hop = p
-                    backward direction: hop = lens-1-p
+         sim_vec  = [Hadamard(E[v], E[w]), |E[v] - E[w]|]      → 2·d_emb
+         K_feat   = nn.Embedding(max_walk_len, d_K)[hop]       → d_K
+                    forward:  hop = p; backward: hop = lens-1-p.
                     (Seed slot gets hop=0 either way.)
-         t_feat   = TimeEncoder(gap_norm)
-                    non-seed: gap = (t_query - t_edge_p) / T_train
-                    seed:     gap = (t_query - t_min)    / T_train
-    3. Per-position MLP on concat[sim_vec, K_feat, t_feat] → d_pos
+         t_feat   = TimeEncoder(gap_norm)                       → d_T
+                    non-seed: gap = log1p(t_query - t_edge_p) /
+                                    log1p(T_full)
+                    seed:     gap = log1p(t_query - t_min)    /
+                                    log1p(T_full)
+    3. Per-position MLP on concat[sim_vec, K_feat, t_feat] → d_pos.
     4. Mask padded / sentinel positions to -inf / 0.
     5. Pool over positions: concat(max, mean) → 2·d_pos per walk.
     6. Pool over walks: mean → 2·d_pos per (u, v).
     7. Direct channel (bypass walks): MLP(Hadamard(E_u, E_v), |E_u-E_v|).
     8. Final MLP on concat[walk_features, direct] → scalar logit.
 
-Why one tower, not two: the Phase-0 sweep + α-leak grid (2026-06-06
-on tgbl-wiki) showed that "both" beats single-sided by ≤ 0.008 test
-on wiki, INSIDE the noise band; the second tower doubles head compute
-and parameters for no statistically distinguishable gain. The choice
-of direction is dictated by the dataset: undirected graphs (TGB's
-default workload) consume backward walks; directed graphs consume
-forward walks (forward walks in link-pred have known time-weighting
-issues, but no TGB dataset we use is directed).
+The single-tower decision is settled: Phase-0 + α-leak grid showed
+"both" beats single-sided by ≤ 0.008 test (inside the wiki noise
+band) at 2× compute, so the second tower is dropped. The choice of
+direction is dictated by is_directed (TGB's default workload is
+undirected, so backward is the operative mode).
 
 The (E[u], E[v]) inputs are EXPECTED to be detached upstream — this
 head's gradients update only its own parameters; E is shaped by the
 alignment loss alone.
 """
 import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 
@@ -88,6 +81,12 @@ class TimeEncoder(nn.Module):
 class WalkTower(nn.Module):
     """Process u-side walks into per-(u, v) pooled vectors.
 
+    Fixed architecture:
+      - sim primitives: [Hadamard, |E_v - E_w|]   → 2·d_emb per position
+      - K (hop) embedding: nn.Embedding(L, d_K)   → d_K   per position
+      - time channel:  TimeEncoder(gap_norm)       → d_T   per position
+      - per-position MLP, max + mean pool over positions, mean over walks.
+
     Inputs shapes (B = batch, C = num candidates per row,
                    W = num walks per seed, L = max walk length):
         E_walks   : [B, W, L, d_emb]  walk node embeddings (detached)
@@ -104,9 +103,6 @@ class WalkTower(nn.Module):
         self,
         d_emb: int,
         max_walk_len: int,
-        sim_primitives: str,
-        use_K: bool,
-        use_t: bool,
         d_K: int = 16,
         d_pos: int = 96,
         d_T: int = 12,
@@ -121,24 +117,9 @@ class WalkTower(nn.Module):
         # gradient, optimizer step) is identical to the un-chunked
         # path; only wall-clock changes (~2-3× slower per step).
         super().__init__()
-        if sim_primitives == "hadamard_absdiff":
-            self.sim_dim = 2 * d_emb
-        elif sim_primitives == "cosine_only":
-            self.sim_dim = 1
-        else:
-            raise ValueError(f"unknown sim_primitives: {sim_primitives}")
-        self.sim_primitives = sim_primitives
-        self.use_K = use_K
-        self.use_t = use_t
         self.chunk_C = int(chunk_C)
-
-        in_dim = self.sim_dim
-        if use_K:
-            self.K_emb = nn.Embedding(max_walk_len, d_K)
-            in_dim += d_K
-        if use_t:
-            in_dim += d_T
-
+        self.K_emb = nn.Embedding(max_walk_len, d_K)
+        in_dim = 2 * d_emb + d_K + d_T
         self.per_pos_mlp = nn.Sequential(
             nn.Linear(in_dim, d_pos),
             nn.GELU(),
@@ -150,25 +131,16 @@ class WalkTower(nn.Module):
     def _chunk_sim(
         self, E_walks: torch.Tensor, E_v_chunk: torch.Tensor,
     ) -> torch.Tensor:
-        """Per-(B, chunk_C, W, L) similarity primitives. Output last
-        dim = sim_dim. Same math as a single broadcast over C; chunked
-        for memory."""
+        """Per-(B, chunk_C, W, L) similarity primitives — [Hadamard,
+        |E_v - E_w|]. Output last dim = 2·d_emb. Same math as a single
+        broadcast over C; chunked for memory."""
         # E_walks [B, W, L, d]   → [B, 1, W, L, d]
         # E_v_chunk [B, chunk, d] → [B, chunk, 1, 1, d]
         Ew = E_walks.unsqueeze(1)
         Ev = E_v_chunk.unsqueeze(2).unsqueeze(3)
-        if self.sim_primitives == "hadamard_absdiff":
-            had = Ev * Ew
-            absd = (Ev - Ew).abs()
-            return torch.cat([had, absd], dim=-1)
-        # cosine_only
-        eps = 1e-6
-        num = (Ev * Ew).sum(-1, keepdim=True)
-        den = (
-            Ev.norm(dim=-1, keepdim=True).clamp_min(eps)
-            * Ew.norm(dim=-1, keepdim=True).clamp_min(eps)
-        )
-        return num / den
+        had = Ev * Ew
+        absd = (Ev - Ew).abs()
+        return torch.cat([had, absd], dim=-1)
 
     def _process_chunk(
         self,
@@ -183,18 +155,13 @@ class WalkTower(nn.Module):
         B, W, L, _ = E_walks.shape
         chunk = E_v_chunk.shape[1]
 
-        sim = self._chunk_sim(E_walks, E_v_chunk)  # [B, chunk, W, L, sim_dim]
-        feat_parts = [sim]
-        if self.use_K:
-            Ke = self.K_emb(K_idx)  # [B, W, L, d_K]
-            feat_parts.append(
-                Ke.unsqueeze(1).expand(B, chunk, W, L, Ke.shape[-1])
-            )
-        if self.use_t:
-            feat_parts.append(
-                t_feat.unsqueeze(1).expand(B, chunk, W, L, t_feat.shape[-1])
-            )
-        feat = torch.cat(feat_parts, dim=-1)
+        sim = self._chunk_sim(E_walks, E_v_chunk)  # [B, chunk, W, L, 2·d_emb]
+        Ke = self.K_emb(K_idx)                      # [B, W, L, d_K]
+        feat = torch.cat([
+            sim,
+            Ke.unsqueeze(1).expand(B, chunk, W, L, Ke.shape[-1]),
+            t_feat.unsqueeze(1).expand(B, chunk, W, L, t_feat.shape[-1]),
+        ], dim=-1)
         h = self.per_pos_mlp(feat)  # [B, chunk, W, L, d_pos]
         m = mask.unsqueeze(1).unsqueeze(-1).float()  # [B, 1, W, L, 1]
 
@@ -278,22 +245,24 @@ class DirectChannel(nn.Module):
 
 
 class LinkPredHeadV2(nn.Module):
-    """Walk-mediated similarity head (single tower).
+    """Walk-mediated similarity head — fixed architecture.
+
+    Composed of a WalkTower (per-position sim + K + time, pooled) and
+    a DirectChannel (per-pair MLP on (E[u], E[v])); their outputs are
+    concatenated and fed to a final MLP.
 
     Args:
         d_emb           : embedding width (model config).
         max_walk_len    : L; used to size the K embedding table.
-        sim_primitives  : 'hadamard_absdiff' (default) | 'cosine_only'.
-        use_time_channel/use_K_channel : channel ablations.
-        use_direct      : include the direct bypass (default True).
-        direct_only     : drop the walk tower entirely; head reduces to
-                          a per-dim MLP on (E[u], E[v]).
+        d_K, d_pos      : tower hyperparameters.
+        d_direct        : direct-channel MLP width.
+        chunk_C         : candidate-dim memory chunking (see WalkTower).
 
     Inputs at forward():
         E_u           : [B, C, d_emb]  source embedding broadcast across
                                        candidates (detached upstream).
         E_v           : [B, C, d_emb]  candidate embeddings (detached).
-        walks         : dict. Required unless direct_only. Keys:
+        walks         : dict. Required. Keys:
                               E_walks [B,W,L,d], mask [B,W,L],
                               K_idx [B,W,L], t_feat [B,W,L,d_T].
 
@@ -304,43 +273,20 @@ class LinkPredHeadV2(nn.Module):
         self,
         d_emb: int,
         max_walk_len: int,
-        sim_primitives: str = "hadamard_absdiff",
-        use_time_channel: bool = True,
-        use_K_channel: bool = True,
-        use_direct: bool = True,
-        direct_only: bool = False,
         d_K: int = 16,
         d_pos: int = 96,
         d_direct: int = 64,
         chunk_C: int = 0,
     ):
         super().__init__()
-        self.direct_only = direct_only
-        self.use_direct = bool(use_direct or direct_only)
-
         self.time_encoder = TimeEncoder()  # d_T = 12
-
-        final_in = 0
-        if not direct_only:
-            self.tower = WalkTower(
-                d_emb=d_emb, max_walk_len=max_walk_len,
-                sim_primitives=sim_primitives,
-                use_K=use_K_channel, use_t=use_time_channel,
-                d_K=d_K, d_pos=d_pos, d_T=self.time_encoder.d_T,
-                chunk_C=chunk_C,
-            )
-            final_in += self.tower.out_dim
-
-        if self.use_direct:
-            self.direct = DirectChannel(d_emb=d_emb, d_direct=d_direct)
-            final_in += self.direct.out_dim
-
-        if final_in == 0:
-            raise ValueError(
-                "head has no input — at least one of {walk_tower, direct} "
-                "must be active."
-            )
-
+        self.tower = WalkTower(
+            d_emb=d_emb, max_walk_len=max_walk_len,
+            d_K=d_K, d_pos=d_pos, d_T=self.time_encoder.d_T,
+            chunk_C=chunk_C,
+        )
+        self.direct = DirectChannel(d_emb=d_emb, d_direct=d_direct)
+        final_in = self.tower.out_dim + self.direct.out_dim
         self.final_mlp = nn.Sequential(
             nn.Linear(final_in, final_in),
             nn.GELU(),
@@ -351,13 +297,9 @@ class LinkPredHeadV2(nn.Module):
         self,
         E_u: torch.Tensor,
         E_v: torch.Tensor,
-        walks: Optional[dict] = None,
+        walks: dict,
     ) -> torch.Tensor:
-        parts = []
-        if not self.direct_only:
-            assert walks is not None, "walks dict required"
-            parts.append(self.tower(E_v=E_v, **walks))
-        if self.use_direct:
-            parts.append(self.direct(E_u, E_v))
-        x = torch.cat(parts, dim=-1)
+        walk_features = self.tower(E_v=E_v, **walks)
+        direct_features = self.direct(E_u, E_v)
+        x = torch.cat([walk_features, direct_features], dim=-1)
         return self.final_mlp(x).squeeze(-1)
