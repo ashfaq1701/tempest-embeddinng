@@ -71,5 +71,16 @@
 numpy>=1.24,<3
 torch==2.7.1
 py-tgb>=2.2.0
+# pandas is PINNED to <3. TGB's first-time preprocessing
+# (tgb.utils.pre_process.load_edgelist_*) mutates `df.iloc[:, k].values`
+# IN PLACE (e.g. `dst += int(src.max()) + 1`). pandas 3.0 makes
+# Copy-on-Write MANDATORY — it cannot be turned off (set_option /
+# option_context for `mode.copy_on_write` are accepted but are no-ops),
+# so `.values` is always read-only and the in-place op raises
+# "ValueError: output array is read-only" during LinkPropPredDataset
+# construction (seen on a py3.11 / pandas 3.0.3 / numpy 2.4.6 box). pandas
+# 2.x defaults CoW off and loads fine. Keep pandas <3 until TGB is
+# pandas-3.0-ready (do NOT install pandas 3.x in the env).
+pandas>=2,<3
 temporal-random-walk>=1.8.4
 prodigyopt>=1.1
