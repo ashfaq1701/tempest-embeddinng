@@ -1,7 +1,5 @@
 """TGB dataset bridge + timestamp-grouping batch iterator."""
 
-import contextlib
-
 from typing import Iterator, NamedTuple, Optional
 
 import numpy as np
@@ -42,42 +40,6 @@ def _strip_version_suffix(name: str) -> str:
     return re.sub(r"-v\d+$", "", name)
 
 
-@contextlib.contextmanager
-def _tgb_preprocess_compat():
-    """Disable pandas Copy-on-Write for the duration of TGB dataset
-    construction.
-
-    TGB's first-time preprocessing (`tgb.utils.pre_process.load_edgelist_*`)
-    reads edge columns via `df.iloc[:, k].values` and mutates them IN PLACE
-    (e.g. `dst += int(src.max()) + 1`). Under pandas Copy-on-Write — the
-    default in newer pandas builds — `.values` returns a READ-ONLY array,
-    so the in-place op raises `ValueError: output array is read-only`. The
-    crash happens inside LinkPropPredDataset construction, before any of
-    our code runs. (Confirmed: toggling CoW reproduces it exactly; the dev
-    laptop defaults to CoW off, which is why it never failed there.)
-
-    Disabling CoW for this block restores writeable `.values`; pandas
-    auto-restores the prior setting on exit. No-op where CoW is already
-    off. If a future pandas removes the option, we fall back to running
-    without the override rather than breaking dataset loading.
-    """
-    import pandas as pd
-
-    try:
-        cm = pd.option_context("mode.copy_on_write", False)
-    except Exception:
-        cm = contextlib.nullcontext()
-    try:
-        cm.__enter__()
-    except Exception:
-        cm = contextlib.nullcontext()
-        cm.__enter__()
-    try:
-        yield
-    finally:
-        cm.__exit__(None, None, None)
-
-
 def load_tgb(name: str, root: str = "datasets") -> Loaded:
     """Load a TGB link-property-prediction dataset using only TGB's APIs.
 
@@ -85,17 +47,11 @@ def load_tgb(name: str, root: str = "datasets") -> Loaded:
     TGB's registry uses bare names ("tgbl-review") and serves the
     current version internally; passing "tgbl-review-v2" raises
     "Dataset not supported" because the suffixed key isn't registered.
-
-    Dataset construction runs inside `_tgb_preprocess_compat()`, which
-    disables pandas Copy-on-Write so TGB's in-place-mutation preprocessing
-    doesn't hit read-only `.values` arrays (see that helper). No-op when
-    CoW is already off.
     """
     from tgb.linkproppred.dataset import LinkPropPredDataset
 
     tgb_name = _strip_version_suffix(name)
-    with _tgb_preprocess_compat():
-        dataset = LinkPropPredDataset(name=tgb_name, root=root, preprocess=True)
+    dataset = LinkPropPredDataset(name=tgb_name, root=root, preprocess=True)
     full = dataset.full_data
     sources = np.asarray(full["sources"], dtype=np.int64)
     destinations = np.asarray(full["destinations"], dtype=np.int64)
