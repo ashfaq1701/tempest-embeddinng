@@ -191,10 +191,9 @@ def parse_args() -> argparse.Namespace:
     # +0.010 combined); there is no scenario where either should be off,
     # so no CLI knob.
 
-    # LinkPredHeadV2 — walk-mediated link-pred head. Flags scope the
-    # ablation sweep designed in analysis/REPORT.md §9; once a winning
-    # config emerges they will be collapsed into hardcoded defaults on
-    # the post-experiment cleanup branch.
+    # LinkPredGRU — walk-mediated GRU link-pred head.
+    #   --link-head-d-K   : hop-embedding width
+    #   --link-head-d-pos : GRU hidden size
     p.add_argument("--link-head-d-K",      default=16, type=int)
     p.add_argument("--link-head-d-pos",    default=96, type=int)
     p.add_argument(

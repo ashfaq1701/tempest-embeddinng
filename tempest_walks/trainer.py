@@ -62,7 +62,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from .data import Batch
 from .evaluator import Evaluator
 from .losses import alignment_loss
-from .link_pred_head_v2 import LinkPredHeadV2
+from .link_pred_head import LinkPredGRU
 from .link_pred_walks_features import make_head_inputs
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
@@ -138,17 +138,17 @@ class TrainerConfig:
     # alignment loss (per-row weight = 1/log1p(deg(seed))).
     train_deg: Optional[np.ndarray] = None  # [num_nodes] int64
 
-    # LinkPredHeadV2 architecture knobs. The architecture is fixed
-    # (sweep settled 2026-06-07): single walk tower + direct (E[u],E[v])
-    # bypass, with sim = [Hadamard, |E_v − E_w|], K embedding, and time
-    # channel all on. The walk-tower direction is dataset-driven from
+    # LinkPredGRU architecture knobs. The head runs a right-to-left GRU
+    # over per-position similarity features [Hadamard, |E_v − E_w|, K
+    # (hop) embedding, time], max+mean pools the GRU states, and means
+    # over walks. The walk-tower direction is dataset-driven from
     # is_directed (undirected → backward, directed → forward).
-    link_head_d_K: int = 16
-    link_head_d_pos: int = 96
+    link_head_d_K: int = 16        # hop-embedding width
+    link_head_d_pos: int = 96      # GRU hidden size
     link_head_chunk_c: int = 0     # 0 = OFF (default). >0 = chunk size for
                                    # the candidate dim inside the walk
-                                   # tower's per-position MLP. Pure memory
-                                   # knob; loss/gradient unchanged.
+                                   # tower. Pure memory knob; loss/gradient
+                                   # unchanged.
     # E is detached on all link-head lookups (E[u], E[v], E_walks);
     # L_link trains only the link head, L_align is the sole gradient
     # path into E. A controllable L_link → E leak (convex-combo grad
@@ -207,11 +207,11 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=config.d_emb,
         ).to(self.device)
-        # Walk-mediated link-pred head (see link_pred_head_v2.py). The
+        # Walk-mediated GRU link-pred head (see link_pred_head.py). The
         # head's `max_walk_len` sizes its K-embedding table. The tower
         # consumes ONE direction of walks; the direction is chosen by
         # is_directed (see self.link_head_walk_direction below).
-        self.link_head = LinkPredHeadV2(
+        self.link_head = LinkPredGRU(
             d_emb=config.d_emb,
             max_walk_len=int(config.link_pred_max_walk_len),
             d_K=int(config.link_head_d_K),
