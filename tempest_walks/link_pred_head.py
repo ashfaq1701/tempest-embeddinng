@@ -11,9 +11,13 @@ hidden states are max+mean pooled over positions into a per-walk vector
 seed-anchored trajectory), then mean-pooled over walks and passed through a
 final MLP to a scalar logit.
 
-Right-to-left + variable length is handled by a masked GRUCell loop
-(p = L-1 .. 0) that updates the hidden only at valid positions, so trailing
-padding (processed first) leaves the hidden at zero until the seed.
+Right-to-left + variable length is handled with a single cuDNN-fused
+nn.GRU over packed sequences: each walk's valid block is reversed so the
+seed (originally at p=lens-1) lands at index 0, then packed by length and
+run in one call. This is equivalent to the former per-timestep masked
+GRUCell loop — the pool is order-invariant, so the reversed per-position
+states give the same pooled vector — but replaces L serialized kernel
+launches with one.
 
 Chosen on tgbl-wiki (2026-06-08): peaks at ep6 (val 0.7460 / test 0.7133)
 vs the prior per-position-MLP head's ep1 peak 0.7422 / 0.7041 that then
@@ -31,6 +35,7 @@ import math
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.utils.checkpoint import checkpoint
 
 
@@ -51,9 +56,10 @@ class TimeEncoder(nn.Module):
 
 
 class WalkTower(nn.Module):
-    """Per-position similarity features -> right-to-left masked GRU ->
-    max+mean pool over per-position states -> mean over walks.
-    out_dim = 2*d_pos (max ‖ mean); d_pos is the GRU hidden size."""
+    """Per-position similarity features -> right-to-left (seed-first) fused
+    nn.GRU over packed walks -> max+mean pool over per-position states ->
+    mean over walks. out_dim = 2*d_pos (max ‖ mean); d_pos is the GRU
+    hidden size."""
 
     def __init__(
         self,
@@ -68,8 +74,7 @@ class WalkTower(nn.Module):
         self.chunk_C = int(chunk_C)
         self.K_emb = nn.Embedding(max_walk_len, d_K)
         in_dim = 2 * d_emb + d_K + d_T
-        self.hidden = d_pos
-        self.gru = nn.GRUCell(in_dim, d_pos)
+        self.gru = nn.GRU(in_dim, d_pos, batch_first=True)
         self.out_dim = 2 * d_pos   # max + mean pool over per-position GRU states
 
     def _chunk_sim(self, E_walks, E_v_chunk):
@@ -92,18 +97,22 @@ class WalkTower(nn.Module):
         mask_c = (
             mask.unsqueeze(1).expand(B, chunk, W, L).reshape(N, L).to(feat.dtype)
         )
-        h = torch.zeros(N, self.hidden, device=feat.device, dtype=feat.dtype)
-        # Right-to-left: p = L-1 .. 0. Update hidden only at valid slots,
-        # and record the running state at every original position p so we
-        # can pool over the whole trajectory (not just the final, oldest
-        # state). At padding slots h is carried unchanged and excluded by
-        # the mask below.
-        H = feat_flat.new_zeros(N, L, self.hidden)
-        for p in range(L - 1, -1, -1):
-            hn = self.gru(feat_flat[:, p, :], h)
-            vp = mask_c[:, p].unsqueeze(-1)
-            h = vp * hn + (1.0 - vp) * h
-            H[:, p, :] = h
+        # Right-to-left (seed-first) recurrence, fused. The former masked
+        # GRUCell loop ran p = L-1 .. 0: seed slot (p = lens-1) first, oldest
+        # (p = 0) last. Reproduce that order by reversing each walk's valid
+        # block so the seed lands at index 0, then run one packed nn.GRU.
+        # Padding stays at the tail (never read by pack); the whole
+        # per-position feature reverses in lockstep so channels stay aligned;
+        # the pool below is order-invariant so H needs no un-reversal.
+        lengths = mask_c.sum(dim=1).clamp_min(1).long()          # [N] valid count
+        rev = (lengths - 1).unsqueeze(1) - torch.arange(L, device=feat.device)
+        rev = rev.clamp_min(0)                                    # pad idx unread
+        feat_flat = feat_flat.gather(
+            1, rev.unsqueeze(-1).expand(N, L, feat_flat.shape[-1]))
+        packed = pack_padded_sequence(
+            feat_flat, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        out_packed, _ = self.gru(packed)
+        H, _ = pad_packed_sequence(out_packed, batch_first=True, total_length=L)
 
         # Masked max + mean pool over the per-position GRU states. Rows
         # are always non-empty (the seed slot is valid); the isinf guard
