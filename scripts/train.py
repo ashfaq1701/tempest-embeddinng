@@ -160,7 +160,7 @@ def parse_args() -> argparse.Namespace:
         help="Initial-edge bias for backward embedding-side walks.",
     )
     p.add_argument(
-        "--link-pred-num-walks-per-node", default=5, type=int,
+        "--link-pred-num-walks-per-node", default=3, type=int,
         help="K walks per seed for the link-pred head. The head consumes "
              "ONE direction (backward if undirected, forward if directed; "
              "set by is_directed) and spends the full K on it.",
@@ -217,19 +217,24 @@ def parse_args() -> argparse.Namespace:
              "the raw window depends on the dataset's calendar density.",
     )
 
-    # Optimisation.
+    # Optimisation. The link head trains on Prodigy (parameter-free; its
+    # peak is an internal multiplier, not a CLI knob). The embedding table E
+    # trains on RiemannianAdam on the unit sphere, with a REAL peak LR
+    # (--emb-lr). --lr-min / --weight-decay below are the HEAD knobs.
     p.add_argument(
-        "--lr", default=1e-3, type=float,
-        help="Peak learning rate (after warmup). Default 1e-3 — "
-             "wiki bs=200 seed-42 A/B (sampled-neg K=64): lr=1e-3 "
-             "hit val 0.4454 vs lr=1e-2 at val 0.4301. The K=64 "
-             "sampled-negative gradients are noisier than the full "
-             "in-batch InfoNCE's, so a smaller step size converges "
-             "more reliably.",
+        "--emb-lr", default=1e-3, type=float,
+        help="Peak learning rate for the embedding table E (RiemannianAdam "
+             "on the unit sphere). A real LR — Prodigy's auto-scale does "
+             "not apply to E. Re-tune jointly with --tau-align (the sphere "
+             "constraint changes the effective temperature).",
+    )
+    p.add_argument(
+        "--emb-lr-min", default=1e-5, type=float,
+        help="Minimum LR for E at the end of cosine decay (~emb-lr/100..1000).",
     )
     p.add_argument(
         "--lr-min", default=1e-5, type=float,
-        help="Minimum LR at end of cosine decay. Default 1e-5 follows "
+        help="Head Prodigy-multiplier cosine floor. Default 1e-5 follows "
              "contrastive-SSL convention (SimCLR/MoCo/BYOL cosine to ~0; "
              "we use 1e-5 ≈ peak/1000).",
     )
@@ -289,6 +294,8 @@ def parse_args() -> argparse.Namespace:
              "weights to logs/embeddings/<dataset>_seed<seed>_demb<d_emb>"
              "_ep<stopped_at_epoch>.npy. Raw float32 [num_nodes, d_emb] "
              "array; node ids follow TGB's contiguous integer ordering. "
+             "NOTE: rows are now UNIT-NORM (sphere-constrained E) — analyse "
+             "by direction (cosine), not magnitude. "
              "Off by default.",
     )
 
@@ -414,12 +421,14 @@ def main() -> Dict[str, Any]:
             stats.mean_inter_arrival,
         ),
 
-        lr=args.lr,
         lr_min=args.lr_min,
         warmup_fraction=args.warmup_fraction,
         warmup_steps_cap=args.warmup_steps_cap,
         decay_horizon_epochs=args.decay_horizon_epochs,
         weight_decay=args.weight_decay,
+        emb_lr=args.emb_lr,
+        emb_lr_min=args.emb_lr_min,
+        emb_weight_decay=0.0,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 

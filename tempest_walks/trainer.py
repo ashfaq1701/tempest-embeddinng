@@ -53,6 +53,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
+import geoopt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -125,7 +126,7 @@ class TrainerConfig:
     embedding_max_walk_len: int = 20
     embedding_backward_walk_bias:  str = "ExponentialWeight"
     embedding_backward_start_bias: str = "ExponentialWeight"
-    link_pred_num_walks_per_node: int = 5
+    link_pred_num_walks_per_node: int = 3
     link_pred_max_walk_len: int = 20
     link_pred_forward_walk_bias:  str = "ExponentialWeight"
     link_pred_forward_start_bias: str = "Uniform"
@@ -164,21 +165,32 @@ class TrainerConfig:
                             # time channel divides by this so gap_norm
                             # is bounded [0, 1] at train and eval.
 
-    # Optimisation.
-    lr: float = 1e-3            # peak LR (after warmup). Validated on
-                                # wiki bs=200 seed-42 sampled-neg K=64:
-                                # lr=1e-3 → val 0.4454 vs lr=1e-2 → 0.4301.
-                                # Noisier K=64 gradients prefer smaller steps.
-    lr_min: float = 1e-5        # cosine decay floor (~peak/1000; matches
-                                # contrastive-SSL cosine-to-near-0 norm).
+    # Optimisation. Two optimisers over disjoint params:
+    #   head — Prodigy (parameter-free; `lr` is a multiplier left at 1.0,
+    #          the schedule rides on top). weight_decay / lr_min below are
+    #          the HEAD knobs.
+    #   E    — RiemannianAdam on the unit sphere (emb_* knobs). Prodigy's
+    #          auto-scale is gone for E, so emb_lr is a REAL peak LR.
+    # warmup_fraction / warmup_steps_cap / decay_horizon_epochs set the
+    # shared warmup+cosine SHAPE for both schedules.
+    lr_min: float = 1e-5        # head Prodigy-multiplier cosine floor
+                                # (~peak/1000; matches contrastive-SSL
+                                # cosine-to-near-0 norm).
     warmup_fraction: float = 0.05
     warmup_steps_cap: int = 500
-    decay_horizon_epochs: int = 50  # cosine reaches lr_min at this
+    decay_horizon_epochs: int = 50  # cosine reaches the floor at this
                                     # epoch count. SEPARATE from
                                     # num_epochs — short runs stay
                                     # near peak; full decay is hit
                                     # only at num_epochs = horizon.
-    weight_decay: float = 1e-4
+    weight_decay: float = 1e-4  # head Prodigy weight decay (decoupled).
+    emb_lr: float = 1e-3        # E peak LR (RiemannianAdam, real LR — no
+                                # Prodigy auto-scale). Re-tune with tau_align.
+    emb_lr_min: float = 1e-5    # E cosine floor.
+    emb_weight_decay: float = 0.0  # MUST be 0: ‖E‖≡1 makes the ‖E‖² penalty
+                                   # a constant (zero gradient); WD here is
+                                   # dead arithmetic and can interact with
+                                   # the retraction.
     num_epochs: int = 50
     early_stop_patience: int = 0
 
@@ -286,29 +298,39 @@ class Trainer:
         # no projection heads); L_link sees E.detach() so only the link
         # head's parameters receive the link-loss gradient.
         # recency_scale is frozen.
-        params = (
-            list(self.embedding_table.parameters())
-            + list(self.link_head.parameters())
-        )
-        # Prodigy: hyperparameter-free adaptive optimiser. Internally
-        # estimates the optimal step-size; the `lr` arg is a multiplier
-        # on the discovered scale and should be left at 1.0. The
-        # cosine warmup+decay LambdaLR below still modulates the
-        # effective step (schedule shape applies on top of Prodigy's
-        # discovered d_k). decouple=True gives AdamW-style weight decay.
-        # safeguard_warmup=True keeps d_k from over-shooting before the
-        # warmup phase has produced meaningful gradient statistics.
-        self.optimizer = Prodigy(
-            params,
+        # Two optimisers over DISJOINT parameter sets, one backward feeds
+        # both (autograd fills .grad for every leaf with a gradient path;
+        # each optimiser steps only its own params).
+        #
+        # Head — Prodigy (unchanged form): hyperparameter-free, `lr` is a
+        # multiplier left at 1.0, the cosine LambdaLR rides on top.
+        # decouple=True → AdamW-style WD; safeguard_warmup=True keeps d_k
+        # from over-shooting before warmup. NOTE: Prodigy's global step-size
+        # d_k is now estimated from HEAD gradients alone (E is no longer in
+        # this group), so the head's effective LR differs from the old
+        # combined optimiser — watched, not a no-op.
+        self.opt_head = Prodigy(
+            list(self.link_head.parameters()),
             lr=1.0,
             weight_decay=config.weight_decay,
             decouple=True,
             safeguard_warmup=True,
         )
+        # Embedding — Riemannian Adam on the unit sphere. Reads `.manifold`
+        # off the ManifoldParameter and does egrad→rgrad, retraction, and
+        # transported momentum internally. weight_decay MUST be 0 (‖E‖≡1).
+        # stabilize=10 periodically re-projects to correct float drift.
+        self.opt_emb = geoopt.optim.RiemannianAdam(
+            list(self.embedding_table.parameters()),
+            lr=config.emb_lr,
+            weight_decay=0.0,
+            stabilize=10,
+        )
 
-        # LR scheduler is set up at the start of train() once we know
+        # LR schedules are set up at the start of train() once we know
         # batches_per_epoch (which depends on the train_batches_factory).
-        self.lr_scheduler: Optional[LambdaLR] = None
+        self.sched_head: Optional[LambdaLR] = None
+        self.sched_emb: Optional[LambdaLR] = None
         self._global_step = 0
 
     # ──────────────────────────────────────────────────────────────────
@@ -326,16 +348,8 @@ class Trainer:
         (5 ep — stays near peak) from full runs (50 ep — completes
         decay).
         """
-        # Prodigy treats `lr` as a multiplier on its internally
-        # discovered step-size d_k. The cosine LambdaLR rides on top
-        # of that multiplier — peak=1.0 leaves Prodigy free to scale
-        # by its discovery, while the schedule shape (warmup +
-        # cosine to a small ratio) anneals the multiplier near end
-        # of training. lr_min_ratio is computed against peak=1.0,
-        # so config.lr_min is interpreted directly as the floor.
-        peak_lr = 1.0
-        lr_min = float(self.config.lr_min)
-
+        # Shared warmup+cosine SHAPE (same batches_per_epoch / horizon for
+        # both optimisers); each gets its own peak and floor.
         decay_steps = self.config.decay_horizon_epochs * max(batches_per_epoch, 1)
         warmup_steps = min(
             int(self.config.warmup_fraction * decay_steps),
@@ -343,20 +357,28 @@ class Trainer:
         )
         warmup_steps = max(warmup_steps, 1)
 
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = peak_lr
-            param_group["initial_lr"] = peak_lr
+        def _build(optimizer, peak_lr, floor_lr):
+            for pg in optimizer.param_groups:
+                pg["lr"] = peak_lr
+                pg["initial_lr"] = peak_lr
+            ratio = floor_lr / peak_lr if peak_lr > 0 else 0.0
+            return LambdaLR(optimizer, lr_lambda=make_lr_lambda(
+                warmup_steps, decay_steps, ratio))
 
-        lr_min_ratio = lr_min / peak_lr if peak_lr > 0 else 0.0
-        lr_lambda = make_lr_lambda(warmup_steps, decay_steps, lr_min_ratio)
-        self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+        # Head — Prodigy treats lr as a multiplier on its discovered d_k,
+        # so peak=1.0 and config.lr_min is the multiplier floor.
+        self.sched_head = _build(self.opt_head, 1.0, float(self.config.lr_min))
+        # E — RiemannianAdam uses a REAL LR, so the schedule directly
+        # modulates the step size between emb_lr and emb_lr_min.
+        self.sched_emb = _build(
+            self.opt_emb, float(self.config.emb_lr), float(self.config.emb_lr_min))
         self._global_step = 0
         print(
-            f"  LR schedule (Prodigy multiplier): peak={peak_lr:.2e}, "
-            f"min={lr_min:.2e}, warmup={warmup_steps} steps, "
-            f"decay_horizon={decay_steps} steps "
-            f"({self.config.decay_horizon_epochs} epochs × "
-            f"{batches_per_epoch} batches)"
+            f"  LR schedule (warmup+cosine): head peak=1.00 (Prodigy mult) "
+            f"min={float(self.config.lr_min):.2e}; "
+            f"E peak={float(self.config.emb_lr):.2e} min={float(self.config.emb_lr_min):.2e}; "
+            f"warmup={warmup_steps} steps, decay_horizon={decay_steps} steps "
+            f"({self.config.decay_horizon_epochs} epochs × {batches_per_epoch} batches)"
         )
 
     def _sample_u_walks_for_head(
@@ -507,13 +529,19 @@ class Trainer:
         target = torch.zeros(B, dtype=torch.long, device=device)
         l_link = F.cross_entropy(logits / self.config.tau_link, target)
 
-        # Step 5 + 6: total loss + single backward + step.
+        # Step 5 + 6: total loss + ONE backward + step both optimisers.
+        # Autograd populates .grad for every leaf with a gradient path; each
+        # optimiser steps only its own (disjoint) params. E receives grad
+        # from L_align only (E is detached on the link path).
         l_total = l_align + l_link
-        self.optimizer.zero_grad(set_to_none=True)
+        self.opt_head.zero_grad(set_to_none=True)
+        self.opt_emb.zero_grad(set_to_none=True)
         l_total.backward()
-        self.optimizer.step()
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step()
+        self.opt_head.step()
+        self.opt_emb.step()
+        if self.sched_head is not None:
+            self.sched_head.step()
+            self.sched_emb.step()
             self._global_step += 1
 
         # Step 7: ingest into Tempest (LAST).
@@ -523,7 +551,7 @@ class Trainer:
             "align": float(l_align.detach()),
             "link": float(l_link.detach()),
             "total": float(l_total.detach()),
-            "lr": float(self.optimizer.param_groups[0]["lr"]),
+            "lr": float(self.opt_emb.param_groups[0]["lr"]),
         }
 
     # ──────────────────────────────────────────────────────────────────
