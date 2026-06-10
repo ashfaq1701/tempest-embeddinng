@@ -17,7 +17,7 @@ from tempest_walks.trainer import Trainer, TrainerConfig
 
 def _tiny_trainer():
     cfg = TrainerConfig(
-        num_nodes=80, dst_pool=np.arange(40, dtype=np.int32),
+        num_nodes=80, is_directed=False, dst_pool=np.arange(40, dtype=np.int32),
         d_emb=16, K_train=10,
         link_pred_num_walks_per_node=5, link_pred_max_walk_len=20,
         embedding_num_walks_per_node=5, embedding_max_walk_len=20,

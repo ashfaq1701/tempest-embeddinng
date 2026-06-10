@@ -13,7 +13,7 @@ Single Trainer class. Per-batch ordering:
        neg_tgt: [B, K_train]
     4. candidates_v = [pos_v | neg_tgt]              ← [B, 1+K_train]
        u-side walks = walk_gen.walks_for_nodes_link_pred_*(unique src)
-       (backward walks — graphs are treated as undirected)
+       (forward direction if is_directed, backward if undirected)
        logits = link_head(E[v].detach(), walks=walks)
        E is detached — L_link trains only the link head; L_align is
        the sole gradient path into E. (u enters only through its walks,
@@ -79,6 +79,7 @@ class TrainerConfig:
     # for the TrainStats bundle that carries them (plus inter-arrival
     # statistics) for display + recency_scale derivation.
     num_nodes: int
+    is_directed: bool
     dst_pool: np.ndarray
 
     # Model.
@@ -119,7 +120,8 @@ class TrainerConfig:
     #                  forward embedding alignment was ablated and
     #                  dropped 2026-06-07).
     #   link_pred_* — drive the walk-mediated link head. The head's
-    #                  direction: BACKWARD walks (graphs undirected).
+    #                  direction is dataset-driven (is_directed):
+    #                  undirected → backward, directed → forward.
     embedding_num_walks_per_node: int = 10
     embedding_max_walk_len: int = 20
     embedding_backward_walk_bias:  str = "ExponentialWeight"
@@ -139,8 +141,8 @@ class TrainerConfig:
 
     # The link head (DeepSphereSimpleHead) scores each candidate against u's
     # recency-pooled walk history by a tied ReZero deep on-sphere map + bounded
-    # cosine. The walk direction is BACKWARD (graphs are treated as
-    # undirected; forward-embedding alignment was ablated and dropped).
+    # cosine. The walk direction is dataset-driven from is_directed (undirected
+    # → backward, directed → forward).
     # E is detached on all link-head lookups (E[u], E[v], E_walks);
     # L_link trains only the link head, L_align is the sole gradient
     # path into E. A controllable L_link → E leak (convex-combo grad
@@ -213,8 +215,8 @@ class Trainer:
         ).to(self.device)
         # Walk-mediated link-pred head (see link_pred_head.py): a tied ReZero
         # deep on-sphere map + bounded cosine. The head consumes ONE direction
-        # of walks; graphs are undirected so the head consumes BACKWARD
-        # walks (u's most-recent predecessors).
+        # of walks; the direction is chosen by is_directed (see
+        # self.link_head_walk_direction below).
         self.link_head = DeepSphereSimpleHead(d=int(config.d_emb)).to(self.device)
         # Frozen recency time constant. Plain Python float — no
         # tensor, no autograd. alignment_loss broadcasts it against
@@ -238,12 +240,17 @@ class Trainer:
         else:
             self.train_deg = torch.zeros(config.num_nodes, dtype=torch.int64)
 
-        # Walk sampler. Graphs are treated as undirected: both the embedding
-        # side and the link-pred head draw BACKWARD walks (the head consumes
-        # u's most-recent predecessors).
+        # Walk sampler. The embedding side draws BACKWARD walks only
+        # (forward was ablated). The link-pred side draws ONE direction
+        # (decided by is_directed below) and uses the full K on it.
         emb_K = max(1, int(config.embedding_num_walks_per_node))
         link_K_per_dir = max(1, int(config.link_pred_num_walks_per_node))
+        # Direction the link head consumes — frozen by is_directed.
+        self.link_head_walk_direction = (
+            "forward" if config.is_directed else "backward"
+        )
         self.walk_gen = WalkGenerator(
+            is_directed=config.is_directed,
             use_gpu=config.use_gpu_tempest,
             embedding_backward_walk_bias=config.embedding_backward_walk_bias,
             embedding_backward_start_bias=config.embedding_backward_start_bias,
@@ -362,11 +369,16 @@ class Trainer:
         u_ids_np,                # np.ndarray [B] source ids
         t_query_np,              # np.ndarray [B] query timestamps
     ):
-        """Sample u-side BACKWARD walks (graphs are undirected; the head
-        consumes u's most-recent predecessors) and package them into the
-        per-position feature dict the head consumes. Returns a single dict.
+        """Sample u-side walks in the dataset-dictated direction
+        (self.link_head_walk_direction; backward for undirected, forward
+        for directed) and package them into the per-position feature dict
+        the head consumes. Returns a single dict.
         """
-        sampler = self.walk_gen.walks_for_nodes_link_pred_backward
+        direction = self.link_head_walk_direction
+        if direction == "forward":
+            sampler = self.walk_gen.walks_for_nodes_link_pred_forward
+        else:
+            sampler = self.walk_gen.walks_for_nodes_link_pred_backward
 
         # Sample once per UNIQUE u, then scatter back to row order.
         uniq, inv = np.unique(u_ids_np, return_inverse=True)
@@ -495,7 +507,7 @@ class Trainer:
         # bearing on unseen pairs.
         e_v = self.embedding_table(candidates_v).detach()            # [B, 1+K, d]
         # Walk-mediated head: sample u-side walks (one direction, set by
-        # undirected) at the batch query times and pass the walk
+        # is_directed) at the batch query times and pass the walk
         # feature dict. The head is inherently u→v directional; no
         # symmetrisation (cf. _score_query docstring).
         walks = self._sample_u_walks_for_head(
