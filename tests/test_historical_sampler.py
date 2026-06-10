@@ -71,3 +71,22 @@ def test_batch_observe_and_reset():
     assert s.count[1] == 2 and s.count[2] == 1
     s.reset()
     assert (s.reservoir == -1).all() and (s.count == 0).all()
+
+
+def test_sample_uniform():
+    s = HistoricalNegativeSampler(num_nodes=10, dst_pool=np.arange(500, 560),
+                                  reservoir_size=8, seed=5)
+    neg = s.sample_uniform(np.array([3, 7, 7, 1]), uniform_negative_count=12)
+    assert neg.shape == (4, 12)
+    assert set(neg.flatten().tolist()).issubset(set(range(500, 560)))  # from pool
+
+
+def test_combine_negatives():
+    hist = np.arange(6).reshape(3, 2)          # [3, 2]
+    unif = np.arange(100, 112).reshape(3, 4)   # [3, 4]
+    out = HistoricalNegativeSampler.combine_negatives(hist, unif)
+    assert out.shape == (3, 6)                 # [3, 2+4]
+    assert np.array_equal(out[:, :2], hist) and np.array_equal(out[:, 2:], unif)
+    import pytest
+    with pytest.raises(ValueError):            # node-dim mismatch
+        HistoricalNegativeSampler.combine_negatives(hist, unif[:2])
