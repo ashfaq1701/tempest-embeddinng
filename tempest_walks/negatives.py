@@ -1,20 +1,18 @@
 """Negative samplers.
 
-Three flavours:
-  - UniformNegativeSampler    : random over a destination pool. The
-                                default training-side sampler.
-  - HistoricalNegativeSampler : per-source reservoir (Vitter R, fixed pool of
-                                128) returning a source's PAST destinations as
-                                hard negatives. Historical-only; accepts some
-                                false negatives by design. observe() after
-                                scoring, reset() per epoch. Re-added for
-                                cold-start / low-recurrence datasets (e.g.
-                                tgbl-review) where eval negatives are partly
-                                historical; NOT for recurrence-dominated
-                                tgbl-wiki (historical ≈ future positives there).
-  - TGBNegativeSampler        : eval-time. Routes through
-                                dataset.negative_sampler.query_batch — the
-                                TGB-prescribed protocol.
+Two flavours:
+  - UniformNegativeSampler  : random over a destination pool. The
+                              training-side sampler (the only one).
+  - TGBNegativeSampler      : eval-time. Routes through
+                              dataset.negative_sampler.query_batch — the
+                              TGB-prescribed protocol.
+
+The Historical (per-source reservoir + Vitter R) sampler was dropped:
+on recurrence-dominated datasets like tgbl-wiki it actively trained
+the model AGAINST the eval signal — most eval positives are nodes
+the source has previously interacted with, and historical negatives
+push E[u] away from exactly those. Removed wholesale (class +
+TrainerConfig fields + CLI args + reservoir-uniformity test).
 """
 
 import abc
@@ -68,99 +66,6 @@ class UniformNegativeSampler(NegativeSampler):
         idx = self.rng.integers(0, len(self.dst_pool), (B, self.num_neg_per_pos))
         neg_tgt = self.dst_pool[idx]
         return neg_src, neg_tgt
-
-
-class HistoricalNegativeSampler:
-    """Per-source reservoir of past destinations → HISTORICAL negatives only.
-
-    Each source keeps a FIXED pool of `reservoir_size` (default 128) of its
-    past destinations, maintained as a uniform random sample of that source's
-    history via Vitter's Algorithm R (accept the (count+1)-th item with
-    probability M/(count+1), replacing a uniform-random slot; the fill phase
-    accepts unconditionally). All numpy/CPU, fully vectorised — O(B) observe,
-    O(Q·k) query.
-
-    Contract:
-      * observe(src, dst) — call AFTER scoring (strict causal). Groups the
-        batch's destinations per source and inserts them via Vitter R.
-      * reset()           — call at each epoch start (the stream is replayed,
-                            so history must clear or future edges leak).
-      * sample(nodes, k)  — returns [len(nodes), k] historical negatives.
-
-    Returns historical negatives ONLY (no random mix, no positive-target
-    exclusion — some false negatives are accepted by design, which on
-    recurrence-heavy graphs is a known cost). Empty reservoir slots (cold or
-    under-filled sources with fewer than k distinct partners) fall back to
-    random draws from `dst_pool` — the only way to return a full [.,k] row for
-    a node with insufficient history.
-    """
-
-    def __init__(
-        self,
-        num_nodes: int,
-        dst_pool: np.ndarray,
-        reservoir_size: int = 128,
-        seed: Optional[int] = None,
-    ):
-        self.num_nodes = int(num_nodes)
-        self.M = int(reservoir_size)
-        self.reservoir = np.full((self.num_nodes, self.M), -1, dtype=np.int32)
-        self.count = np.zeros(self.num_nodes, dtype=np.int64)
-        self.dst_pool = np.asarray(dst_pool, dtype=np.int32)
-        self.rng = np.random.default_rng(seed)
-
-    def reset(self) -> None:
-        self.reservoir.fill(-1)
-        self.count.fill(0)
-
-    def observe(self, src: np.ndarray, dst: np.ndarray) -> None:
-        """Vitter-R reservoir update over a batch. MUST run AFTER scoring.
-
-        Vectorised: each (src, dst) is accepted into src's reservoir in the
-        fill phase (count < M) into the next empty slot, or in the full phase
-        with probability M/(count+1) replacing a uniform-random slot. For a
-        source repeated within the batch the last accepted write to a given
-        (src, slot) wins — a negligible deviation from sequential Vitter R at
-        batch sizes ≪ per-source accepted-write rate.
-        """
-        B = src.shape[0]
-        if B == 0:
-            return
-        src_i = src.astype(np.int64, copy=False)
-        dst_i = dst.astype(np.int32, copy=False)
-        pre_count = self.count[src_i]
-
-        fill_mask = pre_count < self.M
-        # full phase: accept with probability M / (count + 1)
-        accept = self.rng.random(size=B) < (self.M / (pre_count + 1).astype(np.float64))
-        do_insert = fill_mask | accept
-        # slot: next empty in fill phase, uniform-random in full phase
-        insert_pos = np.where(fill_mask, pre_count, self.rng.integers(0, self.M, size=B))
-
-        idx = np.where(do_insert)[0]
-        if idx.size:
-            self.reservoir[src_i[idx], insert_pos[idx]] = dst_i[idx]
-        np.add.at(self.count, src_i, 1)
-
-    def sample(self, nodes: np.ndarray, num_neg: int) -> np.ndarray:
-        """Return [len(nodes), num_neg] historical negatives for `nodes`.
-
-        Draws num_neg uniform-random slots per node from its reservoir; empty
-        slots (-1) are filled with random destinations from `dst_pool`.
-        """
-        nodes = np.asarray(nodes, dtype=np.int64)
-        Q = nodes.shape[0]
-        slot = self.rng.integers(0, self.M, size=(Q, num_neg))
-        neg = np.take_along_axis(
-            self.reservoir[nodes], slot, axis=1,
-        ).astype(np.int32, copy=False)
-        empty = neg < 0
-        if empty.any():
-            rand = self.dst_pool[
-                self.rng.integers(0, self.dst_pool.shape[0], size=(Q, num_neg))
-            ]
-            neg = np.where(empty, rand, neg)
-        return neg
 
 
 class TGBNegativeSampler(NegativeSampler):
