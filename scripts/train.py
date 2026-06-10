@@ -191,8 +191,8 @@ def parse_args() -> argparse.Namespace:
     # +0.010 combined); there is no scenario where either should be off,
     # so no CLI knob.
 
-    # The link head (LinkPredHead) has no architecture knobs beyond
-    # max_walk_len, which is set from --link-pred-max-walk-len.
+    # The link head (DeepSphereSimpleHead) has no CLI architecture knobs;
+    # walk length is set from --link-pred-max-walk-len.
     p.add_argument(
         "--tempest-batch-window-multiplier", default=-1.0, type=float,
         help="Tempest sliding-window cap expressed as a multiple of the "

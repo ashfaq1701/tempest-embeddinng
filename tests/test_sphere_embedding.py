@@ -60,14 +60,14 @@ def inv3_disjoint_optimizers():
 
 def inv4_grad_to_E_from_align_only():
     tr = _tiny_trainer()
-    # Emulate the link path exactly: E detached -> only head gets grad.
+    # Pass E_v / E_w WITHOUT detaching upstream — the head must detach E
+    # internally so no L_link gradient reaches the embedding table.
     cand = torch.randint(0, 40, (4, 11))
-    e_v = tr.embedding_table(cand).detach()
-    walks = dict(
-        E_walks=torch.randn(4, 5, 20, 16), mask=torch.ones(4, 5, 20, dtype=torch.bool),
-        K_idx=torch.randint(0, 20, (4, 5, 20)), t_feat=torch.randn(4, 5, 20, 12),
-    )
-    logits = tr.link_head(e_v, walks=walks)
+    e_v = tr.embedding_table(cand)                       # NOT detached here
+    E_w = torch.randn(4, 100, 16)
+    elapsed = torch.rand(4, 100)
+    mask = torch.ones(4, 100, dtype=torch.bool)
+    logits = tr.link_head(e_v, E_w, elapsed, mask)
     loss = torch.nn.functional.cross_entropy(logits, torch.zeros(4, dtype=torch.long))
     tr.embedding_table.E.weight.grad = None
     loss.backward()

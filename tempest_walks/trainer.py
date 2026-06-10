@@ -63,7 +63,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from .data import Batch
 from .evaluator import Evaluator
 from .losses import alignment_loss
-from .link_pred_head import LinkPredHead
+from .link_pred_head import DeepSphereSimpleHead
 from .link_pred_walks_features import make_head_inputs
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
@@ -139,24 +139,24 @@ class TrainerConfig:
     # alignment loss (per-row weight = 1/log1p(deg(seed))).
     train_deg: Optional[np.ndarray] = None  # [num_nodes] int64
 
-    # The link head (LinkPredHead) scores each candidate against u's walks by
-    # a per-hop-weighted recency pool of cosines; its only architecture knob
-    # is max_walk_len (sized from link_pred_max_walk_len). The walk direction
-    # is dataset-driven from is_directed (undirected → backward, directed →
-    # forward).
+    # The link head (DeepSphereSimpleHead) scores each candidate against u's
+    # recency-pooled walk history by a tied ReZero deep on-sphere map + bounded
+    # cosine. The walk direction is dataset-driven from is_directed (undirected
+    # → backward, directed → forward).
     # E is detached on all link-head lookups (E[u], E[v], E_walks);
     # L_link trains only the link head, L_align is the sole gradient
     # path into E. A controllable L_link → E leak (convex-combo grad
     # mix) was tried and rejected on tgbl-wiki (4-cell α∈{0.2, 0.5, 1.0}
     # × {both, backward} sweep 2026-06-06: every α>0 cell trailed α=0
     # on test by 0.008–0.029).
-    # Dataset-derived (plumbed by train.py from TrainStats); the head
-    # uses them to normalise the per-position time gap.
+    # Dataset-derived (plumbed by train.py from TrainStats). Only T_full is
+    # consumed by the head (elapsed normaliser); the others are kept for
+    # display / data-stats compatibility.
     t_min: int = 0
     T_train: float = 1.0
     t_max_full: int = 1     # max timestamp across train + val + test
-    T_full: float = 1.0     # span (t_max_full - t_min); the v2 head's
-                            # time channel divides by this so gap_norm
+    T_full: float = 1.0     # span (t_max_full - t_min); the head's elapsed
+                            # channel divides by this so the gap
                             # is bounded [0, 1] at train and eval.
 
     # Optimisation. Two optimisers over disjoint params:
@@ -213,25 +213,18 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=config.d_emb,
         ).to(self.device)
-        # Walk-mediated link-pred head (see link_pred_head.py). `max_walk_len`
-        # sizes its per-hop weight table. The head consumes ONE direction of
-        # walks; the direction is chosen by is_directed (see
+        # Walk-mediated link-pred head (see link_pred_head.py): a tied ReZero
+        # deep on-sphere map + bounded cosine. The head consumes ONE direction
+        # of walks; the direction is chosen by is_directed (see
         # self.link_head_walk_direction below).
-        self.link_head = LinkPredHead(
-            max_walk_len=int(config.link_pred_max_walk_len),
-        ).to(self.device)
+        self.link_head = DeepSphereSimpleHead(d=int(config.d_emb)).to(self.device)
         # Frozen recency time constant. Plain Python float — no
         # tensor, no autograd. alignment_loss broadcasts it against
         # the per-batch gap tensor at the use site.
         self.recency_scale = float(config.recency_scale)
 
-        # Dataset anchors for the head's time-feature normalisation.
-        self.t_min = int(config.t_min)
-        self.T_train = float(config.T_train)
-        self.t_max_full = int(config.t_max_full)
-        # T_full bounds the v2 head's per-position gap normaliser at
-        # both train and eval. The head reads `T_full` directly from
-        # the trainer.
+        # T_full (span over train+val+test) bounds the head's elapsed
+        # normaliser at both train and eval; read by make_head_inputs.
         self.T_full = float(config.T_full)
 
         # Frozen training-degree per node, used by inverse-degree seed
@@ -405,14 +398,20 @@ class Trainer:
             walks_nodes_per_u=nodes_per_row,
             walks_ts_per_u=ts_per_row,
             walks_lens_per_u=lens_per_row,
-            direction=direction,
             t_query_per_u=t_query_t,
-            t_min=self.t_min,
             T_full=self.T_full,
             embedding_table=self.embedding_table,
-            time_encoder=self.link_head.time_encoder,
             device=self.device,
         )
+
+    def _head_logits(self, e_v: torch.Tensor, walks: dict) -> torch.Tensor:
+        """Flatten the per-(W,L) walk dict to the head's [B, L, d] contract and
+        score. The head pools over all positions, so W and L collapse."""
+        B, _, d = e_v.shape
+        E_w = walks["E_walks"].reshape(B, -1, d)
+        elapsed = walks["elapsed"].reshape(B, -1)
+        mask = walks["mask"].reshape(B, -1)
+        return self.link_head(e_v, E_w, elapsed, mask)
 
     def _score_query(
         self,
@@ -434,7 +433,7 @@ class Trainer:
         """
         e_v = self.embedding_table(candidates_v).detach()
         walks = self._sample_u_walks_for_head(u_ids_np, t_query_np)
-        return self.link_head(e_v, walks=walks)
+        return self._head_logits(e_v, walks)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
@@ -514,7 +513,7 @@ class Trainer:
         walks = self._sample_u_walks_for_head(
             batch.src.astype(np.int64), batch.ts.astype(np.int64),
         )
-        logits = self.link_head(e_v, walks=walks)                    # [B, 1+K]
+        logits = self._head_logits(e_v, walks)                       # [B, 1+K]
 
         target = torch.zeros(B, dtype=torch.long, device=device)
         l_link = F.cross_entropy(logits / self.config.tau_link, target)
