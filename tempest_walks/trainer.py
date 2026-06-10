@@ -90,6 +90,11 @@ class TrainerConfig:
     K_train: int = 100          # Per-query training negatives. The link
                                 # head sees [B, 1+K_train] candidates per
                                 # query; positive at column 0.
+    # Fraction (0-100) of each positive's negatives drawn HISTORICAL (a
+    # source's past partners, per-source reservoir) vs uniform. 0 = all
+    # uniform (current behaviour). Plumbed; consumed once the per-source
+    # negative sampling lands with the loss rework.
+    historical_negative_per_positive_percent: float = 0.0
     alignment_chunk_size: int = 8192
                                 # Slices the unique-pool dimension V when
                                 # computing the InfoNCE partition. Each

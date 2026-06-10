@@ -108,6 +108,14 @@ def parse_args() -> argparse.Namespace:
              "gradients, at proportional compute cost.",
     )
     p.add_argument(
+        "--historical-negative-per-positive-percent", default=0.0, type=float,
+        help="Fraction (0-100) of each positive's negatives drawn as "
+             "HISTORICAL (a source's past partners, from the per-source "
+             "reservoir); the rest are uniform. 0 (default) = all uniform "
+             "(current behaviour). Per-dataset: ~0 for recurrence-heavy wiki, "
+             "higher for cold-start review.",
+    )
+    p.add_argument(
         "--alignment-chunk-size", default=8192, type=int,
         help="Slices the unique-pool dimension V when computing the "
              "InfoNCE partition log Z. Each chunk's forward is "
@@ -368,6 +376,8 @@ def main() -> Dict[str, Any]:
         gamma_recency=args.gamma_recency,
         recency_scale=stats.mean_inter_arrival,
         K_train=args.k_train,
+        historical_negative_per_positive_percent=(
+            args.historical_negative_per_positive_percent),
         alignment_chunk_size=args.alignment_chunk_size,
 
         embedding_num_walks_per_node=args.embedding_num_walks_per_node,
