@@ -3,26 +3,24 @@
 Single Trainer class. Per-batch ordering:
 
   TRAINING:
-    0. uniq_src = unique(batch.src); ONE designated negative set per
-       source (n_hist% historical reservoir + uniform) — SHARED by both
-       heads below.
-    1. walks_bwd = walk_gen.walks_for_nodes_embedding_backward(uniq_src)
-       ← pre-ingest state. Seeds are SOURCES (the link head queries from
-       the source, so E[source] is what must be shaped). Backward-only;
-       forward embedding alignment was ablated and dropped 2026-06-07.
-    2. L_align = source_alignment_loss(walks_bwd, neg_per_source, ...)
-       ← per-source InfoNCE; partition over the source's OWN designated
-       negatives (no batch pool, no count weighting). softplus form.
-    3. candidates_v = [pos_v | neg_per_source[edge.src]] ← [B, 1+n_neg]
-       u-side walks = walk_gen.walks_for_nodes_link_pred_backward(uniq src)
+    1. walks_bwd = walk_gen.walks_for_nodes_embedding_backward(seeds_tgt)
+       ← pre-ingest state. Embedding alignment is backward-only;
+       forward embedding alignment was ablated and dropped 2026-06-07
+       on wiki (backward-only beats forward+backward by +0.009 test,
+       outside the noise band).
+    2. L_align = alignment_loss(walks_bwd, ...)      ← InfoNCE scalar
+    3. neg = neg_sampler.sample(batch)               ← stateless uniform
+       neg_tgt: [B, K_train]
+    4. candidates_v = [pos_v | neg_tgt]              ← [B, 1+K_train]
+       u-side walks = walk_gen.walks_for_nodes_link_pred_*(unique src)
+       (backward walks — graphs are treated as undirected)
        logits = link_head(E[v].detach(), walks=walks)
        E is detached — L_link trains only the link head; L_align is
        the sole gradient path into E. (u enters only through its walks,
        whose seed slot is node u.)
        L_link = CE(logits / tau_link, target=zeros(B))
-    4. L_total = L_align + L_link
-    5. optimizer.zero_grad(set_to_none=True); L_total.backward(); optimizer.step()
-    6. neg_historical.observe(B_src, B_tgt)          ← post-scoring
+    5. L_total = L_align + L_link
+    6. optimizer.zero_grad(set_to_none=True); L_total.backward(); optimizer.step()
     7. walk_gen.add_edges(B_src, B_tgt, B_ts, B_ef)  ← post-scoring, last
 
   EVAL (within torch.no_grad()):
@@ -50,6 +48,7 @@ Early stop:
     epochs to save eval time).
 """
 
+import copy
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
@@ -63,15 +62,11 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
-from .losses import source_alignment_loss
+from .losses import alignment_loss
 from .link_pred_head import DeepSphereSimpleHead
 from .link_pred_walks_features import make_head_inputs
 from .model import EmbeddingTable
-from .negatives import (
-    HistoricalNegativeSampler,
-    UniformNegativeSampler,
-    combine_negatives,
-)
+from .negatives import UniformNegativeSampler
 from .utils import make_lr_lambda
 from .walks import WalkGenerator
 
@@ -92,23 +87,24 @@ class TrainerConfig:
     # Loss-formulation.
     tau_align: float = 0.5      # InfoNCE alignment temperature
     tau_link: float = 1.0       # Softmax-CE link-prediction temperature
-    n_negatives_per_positive: int = 100
-                                # Per-source designated negatives. ONE set
-                                # of n_neg negatives is drawn per unique
-                                # source and shared by BOTH heads: it is the
-                                # partition of the per-source alignment loss
-                                # AND the negative columns of the link head's
-                                # [B, 1+n_neg] candidate matrix (per edge,
-                                # looked up by the edge's source).
-    historical_negative_per_positive_percent: float = 10.0
-                                # Fraction (0-100) of each source's negatives
-                                # drawn HISTORICAL (its past partners, from a
-                                # per-source Vitter-R reservoir); the rest are
-                                # uniform from dst_pool. 0 = all uniform (no
-                                # reservoir allocated). Default 10 → 10 hist +
-                                # 90 uniform at n_neg=100. Higher suits cold-
-                                # start data (review); drop to ~0 for
-                                # recurrence-heavy wiki.
+    K_train: int = 100          # Per-query training negatives. The link
+                                # head sees [B, 1+K_train] candidates per
+                                # query; positive at column 0.
+    # Fraction (0-100) of each positive's negatives drawn HISTORICAL (a
+    # source's past partners, per-source reservoir) vs uniform. 0 = all
+    # uniform (current behaviour). Plumbed; consumed once the per-source
+    # negative sampling lands with the loss rework.
+    historical_negative_per_positive_percent: float = 0.0
+    alignment_chunk_size: int = 8192
+                                # Slices the unique-pool dimension V when
+                                # computing the InfoNCE partition. Each
+                                # chunk's forward is checkpointed, so
+                                # backward peak memory is bounded by
+                                # O(NK · chunk_size) rather than O(NK · V).
+                                # When V ≤ chunk_size the loop runs once
+                                # and the behaviour reduces to the dense
+                                # path. 8192 fits wiki/coin in one chunk
+                                # and bounds review's pathological pools.
 
     # Convex-combination stationary recency weight (replaces the old
     # additive 1/K_hop + t̃^β formulation). γ ∈ [0, 1] mixes the hop
@@ -226,7 +222,7 @@ class Trainer:
         # walks (u's most-recent predecessors).
         self.link_head = DeepSphereSimpleHead(d=int(config.d_emb)).to(self.device)
         # Frozen recency time constant. Plain Python float — no
-        # tensor, no autograd. source_alignment_loss broadcasts it against
+        # tensor, no autograd. alignment_loss broadcasts it against
         # the per-batch gap tensor at the use site.
         self.recency_scale = float(config.recency_scale)
 
@@ -235,7 +231,7 @@ class Trainer:
         self.T_full = float(config.T_full)
 
         # Frozen training-degree per node, used by inverse-degree seed
-        # weighting in source_alignment_loss. Plain int64 CPU tensor; the
+        # weighting in alignment_loss. Plain int64 CPU tensor; the
         # call site indexes it by per-batch seeds_np and moves the
         # tiny slice to GPU on demand. Zero entries for nodes that
         # never appear in train edges (handled by log1p+division so
@@ -267,32 +263,16 @@ class Trainer:
             max_time_capacity=config.max_time_capacity,
         )
 
-        # Training negative samplers. ONE designated negative set per
-        # unique source is drawn each batch and shared by the alignment
-        # loss (its per-source partition) and the link head (its per-edge
-        # candidate columns, looked up by source). The set mixes
-        # `historical_negative_per_positive_percent`% historical (the
-        # source's past partners, from a per-source Vitter-R reservoir)
-        # with the remainder uniform from dst_pool. The reservoir is only
-        # allocated when the historical fraction is > 0.
-        self.n_negatives_per_positive = int(config.n_negatives_per_positive)
-        hist_pct = float(config.historical_negative_per_positive_percent)
-        self.n_hist_per_positive = max(
-            0, min(self.n_negatives_per_positive,
-                   int(round(self.n_negatives_per_positive * hist_pct / 100.0))))
-        self.n_unif_per_positive = (
-            self.n_negatives_per_positive - self.n_hist_per_positive)
-        self.neg_uniform = UniformNegativeSampler(
-            dst_pool=config.dst_pool, seed=config.seed,
-        )
-        self.neg_historical = (
-            HistoricalNegativeSampler(
-                num_nodes=config.num_nodes,
-                dst_pool=config.dst_pool,
-                reservoir_size=128,
-                seed=config.seed,
-            )
-            if self.n_hist_per_positive > 0 else None
+        # Negative sampler (training). UniformNegativeSampler is the
+        # only training-side sampler: HistoricalNegativeSampler was
+        # removed because on recurrence-dominated datasets it pushes E
+        # away from the eval-signal direction (now that detach is off
+        # on the link path, the historical-negative gradient leaks into
+        # E rather than just the link head).
+        self.neg_sampler_train = UniformNegativeSampler(
+            num_neg_per_pos=config.K_train,
+            dst_pool=config.dst_pool,
+            seed=config.seed,
         )
 
         # Single optimiser. E is trained by L_align only (directly —
@@ -452,97 +432,81 @@ class Trainer:
     # Per-batch training step
     # ──────────────────────────────────────────────────────────────────
 
-    def _sample_source_negatives(self, uniq_src_np: np.ndarray) -> np.ndarray:
-        """Draw the per-source designated negative set, shared by the
-        alignment loss and the link head.
-
-        Returns `[len(uniq_src), n_neg]` int64, row j = negatives for
-        `uniq_src[j]`. The first `n_hist` columns come from the source's
-        historical reservoir (empty slots fall back to uniform), the
-        remaining `n_unif` are uniform from `dst_pool`.
-        """
-        uniq = uniq_src_np.astype(np.int64)
-        parts: List[np.ndarray] = []
-        if self.n_hist_per_positive > 0 and self.neg_historical is not None:
-            parts.append(
-                self.neg_historical.sample(uniq, self.n_hist_per_positive))
-        if self.n_unif_per_positive > 0:
-            parts.append(
-                self.neg_uniform.sample(uniq, self.n_unif_per_positive))
-        neg = parts[0] if len(parts) == 1 else combine_negatives(parts[0], parts[1])
-        return np.ascontiguousarray(neg, dtype=np.int64)
-
     def _train_step(self, batch: Batch) -> Dict[str, float]:
         device = self.device
 
-        # Unique sources of this batch — the alignment seeds AND the key
-        # for the shared designated-negative lookup. inv maps each edge
-        # back to its source's row in the negative array.
-        uniq_src, inv = np.unique(batch.src, return_inverse=True)
-        uniq_src = uniq_src.astype(np.int64)
+        # Step 1: walks from PRE-INGEST state.
+        # Embedding supervision: BACKWARD walks from each unique target
+        # (forward embedding alignment was ablated and dropped — see
+        # the module docstring).
+        seeds_tgt_np = np.unique(batch.tgt)
+        walks_bwd = self.walk_gen.walks_for_nodes_embedding_backward(seeds_tgt_np)
 
-        # Step 1: BACKWARD walks from each unique SOURCE (pre-ingest
-        # state). Seed = source; contexts = its recent predecessors
-        # (graphs are undirected). The source-seeded design replaces the
-        # earlier target-seeded alignment: the link head queries from the
-        # source, so E[source] is the representation that must be shaped.
-        walks_bwd = self.walk_gen.walks_for_nodes_embedding_backward(uniq_src)
-
-        # Step 2: ONE designated negative set per unique source, shared by
-        # both heads. n_hist% historical (source's past partners) + the
-        # rest uniform.
-        neg_uniq = self._sample_source_negatives(uniq_src)           # [U, n_neg]
-
-        # Align the negative rows to the walk seeds for the loss.
-        # walks.seeds is the requested set; np.unique returns uniq_src
-        # sorted, so searchsorted maps each walk seed to its row.
-        walk_seeds_np = walks_bwd.seeds.cpu().numpy().astype(np.int64)
-        neg_for_seeds = neg_uniq[np.searchsorted(uniq_src, walk_seeds_np)]
-        neg_for_seeds_t = torch.from_numpy(
-            np.ascontiguousarray(neg_for_seeds)).to(device)          # [N_seeds, n_neg]
-
-        # Inverse-degree seed weighting (always on). Rare sources (deg 1)
-        # would be starved by uniform per-row averaging; weight each walk
-        # row by 1/log1p(deg(seed)) to restore parity.
-        seed_weights = 1.0 / torch.log1p(
-            self.train_deg[torch.from_numpy(walk_seeds_np)].to(device).float()
+        # Inverse-degree seed weighting (always on). The phase-6
+        # both-active hard cohort has median seed degree 1; the
+        # popular end has degree 100+. Uniform per-row averaging
+        # starves rare seeds. Weighting each walk row by
+        # 1/log1p(deg(seed_of_row)) restores parity.
+        seed_weights_bwd = 1.0 / torch.log1p(
+            self.train_deg[torch.from_numpy(seeds_tgt_np.astype(np.int64))]
+            .to(self.device).float()
         )
 
-        # Step 3: per-source alignment loss. Pull E[source] toward its
-        # walk contexts; push from the designated negatives. The partition
-        # is over N_source ALONE — no batch pool, no count^0.75 weighting
-        # (the sampler IS the prior).
-        l_align = source_alignment_loss(
+        # Step 2: InfoNCE contrastive alignment over batched walks.
+        # The softmax denominator over all batch contexts is the
+        # anti-collapse mechanism (replaces Wang-Isola uniformity).
+        # Per-position weights are a convex combination of hop and
+        # *stationary* recency profiles.
+        l_align = alignment_loss(
             embedding_table=self.embedding_table,
             walks=walks_bwd,
-            neg_nodes=neg_for_seeds_t,
             recency_scale=self.recency_scale,
             gamma_recency=self.config.gamma_recency,
             tau_align=self.config.tau_align,
+            chunk_size=self.config.alignment_chunk_size,
             direction="backward",
-            seed_weights=seed_weights,
+            seed_weights=seed_weights_bwd,
         )
 
-        # Step 4: link candidates REUSE the same negatives. Per edge, the
-        # negative destinations are its source's designated set (looked up
-        # via inv); the positive sits at column 0. Softmax-CE with
-        # target=0 (Bruch et al. 2019 — upper-bounds 1 − MRR).
+        # Step 3: per-query negatives. Sampler returns [B, K_train]
+        # grouped output; no flattening — the link head consumes the
+        # whole candidate matrix directly. The sampler's neg_src is
+        # ignored (the head scores candidates against u's walks, not a
+        # paired source embedding).
+        _, neg_tgt = self.neg_sampler_train.sample(batch)
         B = len(batch.src)
-        pos_v_t = torch.from_numpy(batch.tgt.astype(np.int64)).to(device)   # [B]
+
+        # Step 4: build [B, 1+K] candidate matrix with positive at
+        # column 0, then score the whole batch in one forward and
+        # apply softmax CE with target=0 per row (Bruch et al. 2019
+        # — upper-bounds 1 − MRR).
+        pos_v_t = torch.from_numpy(batch.tgt).long().to(device)      # [B]
         neg_v_t = torch.from_numpy(
-            np.ascontiguousarray(neg_uniq[inv])).to(device)          # [B, n_neg]
+            np.ascontiguousarray(neg_tgt, dtype=np.int64),
+        ).to(device)                                                 # [B, K]
+
         candidates_v = torch.cat(
             [pos_v_t.unsqueeze(1), neg_v_t], dim=1,
-        )                                                            # [B, 1+n_neg]
+        )                                                            # [B, 1+K]
 
-        # E detached on the link path: L_link trains only the link head;
-        # L_align is the sole gradient into E. u enters the head only
-        # through its walks, whose seed slot is node u.
-        e_v = self.embedding_table(candidates_v).detach()            # [B, 1+n_neg, d]
+        # Detach on the link path: L_link trains only the link head;
+        # E is updated exclusively by L_align (walk-supervised). Without
+        # detach, the softmax-CE over 100 random negatives drives E to
+        # memorise training (u, v⁺) pair geometry — visible as link loss
+        # collapsing far below the uniform baseline log(1+K_train) ≈ 4.62
+        # while val MRR drops monotonically from epoch 1. On
+        # high-surprise datasets (review surprise=0.987) this anti-ranks
+        # val positives because memorised seen-pair geometry has no
+        # bearing on unseen pairs.
+        e_v = self.embedding_table(candidates_v).detach()            # [B, 1+K, d]
+        # Walk-mediated head: sample u-side walks (one direction, set by
+        # undirected) at the batch query times and pass the walk
+        # feature dict. The head is inherently u→v directional; no
+        # symmetrisation (cf. _score_query docstring).
         walks = self._sample_u_walks_for_head(
             batch.src.astype(np.int64), batch.ts.astype(np.int64),
         )
-        logits = self._head_logits(e_v, walks)                       # [B, 1+n_neg]
+        logits = self._head_logits(e_v, walks)                       # [B, 1+K]
 
         target = torch.zeros(B, dtype=torch.long, device=device)
         l_link = F.cross_entropy(logits / self.config.tau_link, target)
@@ -562,12 +526,7 @@ class Trainer:
             self.sched_emb.step()
             self._global_step += 1
 
-        # Step 7: post-scoring state updates (strict-causal).
-        #   a) historical reservoir observes this batch's (src → tgt).
-        #   b) Tempest ingests the batch edges (LAST).
-        if self.neg_historical is not None:
-            self.neg_historical.observe(
-                batch.src.astype(np.int64), batch.tgt.astype(np.int64))
+        # Step 7: ingest into Tempest (LAST).
         self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
 
         return {
@@ -700,12 +659,9 @@ class Trainer:
         per_epoch_test: List[float] = []
 
         for ep in range(1, n_epochs + 1):
-            # Epoch boundary: reset Tempest walk state and the historical
-            # reservoir (strict-causal — each epoch re-accumulates source
-            # history from scratch). The uniform sampler is stateless.
+            # Epoch boundary: walks reset only (the uniform sampler is
+            # stateless; nothing else carries over).
             self.walk_gen.reset()
-            if self.neg_historical is not None:
-                self.neg_historical.reset()
 
             self.embedding_table.train()
             self.link_head.train()

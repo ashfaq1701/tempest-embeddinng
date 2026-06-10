@@ -49,7 +49,7 @@ Walk layout — FORWARD (link-pred side, seeds = batch sources):
 
 Convention β (edge-toward-seed) attaches walks.edge_feats[p] to
 context at walk position p as the edge OUT of that context toward
-the seed (backward direction). Loss-side code in source_alignment_loss
+the seed (backward direction). Loss-side code in alignment_loss
 right-pads ef by one row so the projection sees shape [NK, L, d_ef]
 aligned with e_ctx.
 
@@ -194,7 +194,7 @@ class WalkGenerator:
             assert ef.shape[:2] == expected_2d, (
                 f"Tempest edge_feats shape {ef.shape[:2]} != expected "
                 f"{expected_2d} (NK, L-1). The convention-β attachment in "
-                f"source_alignment_loss assumes ef[p] is the edge between nodes[p] "
+                f"alignment_loss assumes ef[p] is the edge between nodes[p] "
                 f"and nodes[p+1]; revisit if Tempest output changed."
             )
 

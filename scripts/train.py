@@ -9,8 +9,7 @@ Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root
   Model:          --d-emb
   Loss:           --tau-align, --tau-link, --gamma-recency,
-                  --n-negatives-per-positive,
-                  --historical-negative-per-positive-percent
+                  --k-train, --alignment-chunk-size
   Walks:          --embedding-num-walks-per-node, --embedding-max-walk-len,
                   --embedding-backward-walk-bias, --embedding-backward-start-bias,
                   --link-pred-num-walks-per-node, --link-pred-max-walk-len,
@@ -101,23 +100,30 @@ def parse_args() -> argparse.Namespace:
              "knob — see tempest_walks/data_stats.py.",
     )
     p.add_argument(
-        "--n-negatives-per-positive", type=int, default=100,
-        help="Designated negatives drawn per UNIQUE SOURCE each batch, "
-             "shared by both heads: they form the partition of the "
-             "per-source alignment loss AND the negative columns of the "
-             "link head's [B, 1+n_neg] candidate matrix (per edge, looked "
-             "up by the edge's source). Larger means harder per-query "
-             "competition and a tighter alignment partition, at "
-             "proportional compute cost.",
+        "--k-train", type=int, default=100,
+        help="Per-query training negatives for the ranking link "
+             "loss. The link head sees [B, 1+K_train] candidates "
+             "per query; positive at column 0. Larger K_train means "
+             "harder per-query competition and stronger ranking "
+             "gradients, at proportional compute cost.",
     )
     p.add_argument(
-        "--historical-negative-per-positive-percent", default=10.0, type=float,
-        help="Fraction (0-100) of each source's designated negatives drawn "
-             "HISTORICAL (its past partners, from a per-source Vitter-R "
-             "reservoir); the rest are uniform from dst_pool. Default 10 → "
-             "10 historical + 90 uniform at n_neg=100. 0 = all uniform (no "
-             "reservoir allocated). Per-dataset: ~0 for recurrence-heavy "
-             "wiki, higher for cold-start review.",
+        "--historical-negative-per-positive-percent", default=0.0, type=float,
+        help="Fraction (0-100) of each positive's negatives drawn as "
+             "HISTORICAL (a source's past partners, from the per-source "
+             "reservoir); the rest are uniform. 0 (default) = all uniform "
+             "(current behaviour). Per-dataset: ~0 for recurrence-heavy wiki, "
+             "higher for cold-start review.",
+    )
+    p.add_argument(
+        "--alignment-chunk-size", default=8192, type=int,
+        help="Slices the unique-pool dimension V when computing the "
+             "InfoNCE partition log Z. Each chunk's forward is "
+             "gradient-checkpointed, so backward peak memory is "
+             "bounded by O(NK·chunk_size) rather than O(NK·V). When "
+             "V ≤ chunk_size the loop runs once and behaviour reduces "
+             "to the dense path. Default 8192 fits wiki/coin in one "
+             "chunk and bounds review's pathological pools.",
     )
 
     # Walks.
@@ -234,7 +240,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--batch-size", default=500, type=int,
         help="Train batch size. Under the per-query ranking link "
-             "loss each batch does B*(1+n_neg) link_head forwards. "
+             "loss each batch does B*(1+K_train) link_head forwards. "
              "Default 500 keeps the per-step compute envelope "
              "comparable to historical baselines.",
     )
@@ -369,9 +375,10 @@ def main() -> Dict[str, Any]:
         tau_link=args.tau_link,
         gamma_recency=args.gamma_recency,
         recency_scale=stats.mean_inter_arrival,
-        n_negatives_per_positive=args.n_negatives_per_positive,
+        K_train=args.k_train,
         historical_negative_per_positive_percent=(
             args.historical_negative_per_positive_percent),
+        alignment_chunk_size=args.alignment_chunk_size,
 
         embedding_num_walks_per_node=args.embedding_num_walks_per_node,
         embedding_max_walk_len=args.embedding_max_walk_len,
