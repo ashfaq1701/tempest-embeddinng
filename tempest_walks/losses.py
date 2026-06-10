@@ -1,101 +1,96 @@
-r"""Walks-supervised InfoNCE alignment loss.
+r"""Source-alignment loss (per-source InfoNCE over designated negatives).
+
+Each walk seed is a SOURCE node `u`. The loss pulls `E[u]` toward `u`'s
+backward-walk context nodes (its recent predecessors), weighted by a
+hop/recency profile, and pushes it away from a per-source DESIGNATED
+negative set `N_u` (historical reservoir + uniform mix, drawn by the
+Trainer). The partition is over `N_u` ALONE — there is no shared batch
+pool and no count^0.75 proposal correction: the sampler IS the prior.
 
 Indices:
-    i ∈ [NK]            row (walk); walks are grouped K-per-seed contiguously
+    i ∈ [NK]            row (walk); rows are grouped K-per-seed contiguously
     p ∈ [L]             walk position
-    v ∈ U               unique node in the batch's valid-context pool
+    k ∈ [n_neg]         designated negative of the row's seed
 
-Per row, seed and walk-length:
-    s_i := walks.seeds[i // K]          (seed of row i)
-    ℓ_i := walks.lens[i]                (effective walk length)
-    valid(i, p) := 0 ≤ p ≤ ℓ_i - 2      (seed lives at p = ℓ_i - 1)
-    n_{i, p}   := walks.nodes[i, p]
-    t_{i, p}   := walks.timestamps[i, p]    (= edge time for valid p)
+Per row / seed / length:
+    s_i := walks.seeds[i // K]              (seed = source of row i)
+    ℓ_i := walks.lens[i]
+    valid(i, p):  BACKWARD → 0 ≤ p ≤ ℓ_i − 2   (seed at p = ℓ_i − 1)
+                  FORWARD  → 1 ≤ p ≤ ℓ_i − 1   (seed at p = 0)
+    n_{i,p} := walks.nodes[i, p]            (a positive context node)
+    N_{s_i} := neg_nodes[i // K]            (the seed's designated negatives)
 
-Candidate distribution over the batch pool U
-(word2vec NEG convention, α = 0.75):
-    c(v)     := #{ (i, p) : valid(i, p) ∧ n_{i, p} = v }
-    μ(v)     := c(v)^α / Σ_u c(u)^α                        (proposal)
+Energy on the unit sphere (E rows are unit by manifold construction, so
+‖E_u − E_v‖² = 2 − 2⟨E_u, E_v⟩; the additive constant cancels in every
+per-seed softmax). Logit:
 
-Energy-based conditional with μ as base measure:
-    φ(s, v)  := -‖P_t(E[s]) - P_c(E[v])‖² / τ
-    Z(s)     := Σ_{v ∈ U} c(v)^α · exp(φ(s, v))
-    p(v | s) := c(v)^α · exp(φ(s, v)) / Z(s)
-    log p(v | s) = α · log c(v) + φ(s, v) - log Z(s)
+    ψ(u, v) := (2 / τ) · ⟨E_u, E_v⟩            ∈ [−2/τ, +2/τ]
 
-Per-position weight (convex combination of hop and stationary recency):
-    K_hop(i, p)  := max(1, ℓ_i - 1 - p)
-    gap(i, p)    := max(0, t_seed_edge(i) - t_{i, p})            stationary
-                    where t_seed_edge(i) = max_{valid p} t_{i, p}
-                    — the timestamp of the seed's own most-recent edge,
-                    so gap is elapsed time between context p and the
-                    seed's interaction (not absolute calendar position).
-                    Window-position-invariant: a week-1 seed and a
-                    week-4 seed with the same local history get the
-                    same recency profile.
-    h_p          := normalize(1/K_hop)        — hop profile, sums to 1
-    r_p          := normalize(exp(-gap/scale)) — recency profile, sums to 1
-                    where scale = recency_scale, in raw timestamp units
-                    (data-driven: median inter-arrival of train edges).
-    w̃(i, p)      := (1 - γ) · h_p(i, p) + γ · r_p(i, p)
-                    Convex mix; γ ∈ [0, 1]. γ=0 is hop-only, γ=1 is
-                    recency-only. Per-row sum is 1 by construction.
+Per-seed negative log-partition (computed once per row from N_{s_i}):
 
-Per-row weighted negative log-likelihood:
-    W_i      := Σ_p 𝟙[valid(i, p)] · w̃(i, p)
-    ℒ_i      := -(1 / W_i) · Σ_p 𝟙[valid(i, p)] · w̃(i, p) · log p(n_{i, p} | s_i)
+    Z⁻_i := logsumexp_k ψ(s_i, N_{s_i,k})
 
-Batch loss:
-    I⁺       := { i : W_i > ε }                            (rows with positives)
-    ℒ        := (1 / |I⁺|) · Σ_{i ∈ I⁺} ℒ_i
+Per-positive term (positive in the numerator, the seed's negatives in the
+denominator — 1-positive InfoNCE):
 
-Notes:
-    Positives lying in U are not removed from the partition (SimCLR/CLIP).
-    The caller is responsible for calling .backward() on ℒ.
+    ℓ_{i,p} := softplus( Z⁻_i − ψ(s_i, n_{i,p}) )
+             = log( 1 + exp(Z⁻_i − ψ(s_i, n_{i,p})) )
+             = −log p(n_{i,p} | {n_{i,p}} ∪ N_{s_i})
+
+No dedup against positives: a node that is both a positive context and a
+designated negative contributes opposing gradients on the same row, which
+is permitted (the contradiction is small and the speed is worth it).
+
+Per-position weight (convex mix of hop and stationary recency, unchanged):
+    K_hop(i, p) := max(1, ℓ_i − 1 − p)               (backward)
+    gap(i, p)   := |t_seed_edge(i) − t_{i, p}|        (stationary anchor)
+    h_p         := normalize(1 / K_hop)               sums to 1 over valid p
+    r_p         := normalize(exp(−gap / scale))       sums to 1 over valid p
+    w̃(i, p)     := (1 − γ) · h_p + γ · r_p
+
+Per-row and batch reduction:
+    W_i := Σ_p 𝟙[valid] · w̃(i, p)
+    ℒ_i := (1 / W_i) · Σ_p 𝟙[valid] · w̃(i, p) · ℓ_{i,p}
+    I⁺  := { i : W_i > ε }
+    ℒ   := (Σ_{i∈I⁺} β_i ℒ_i) / (Σ_{i∈I⁺} β_i)        (β = seed_weights, def 1)
+
+ψ uses the embedding rows DIRECTLY (no projection MLP); gradients flow
+straight to `embedding_table.E.weight`. The caller owns `.backward()`.
 """
 
 import torch
-from torch.utils.checkpoint import checkpoint
+import torch.nn.functional as F
 
 from .walks import WalkData
 
 
-_ALPHA = 0.75   # μ(v) ∝ c(v)^α — softens partition emphasis on popular v
 _EPS = 1e-9     # W_i validity threshold and denominator clamp
 
 
-def alignment_loss(
+def source_alignment_loss(
     embedding_table,
     walks: WalkData,
+    neg_nodes: torch.Tensor,
     recency_scale: float,
     gamma_recency: float = 0.4,
     tau_align: float = 0.5,
-    chunk_size: int = 8192,
     direction: str = "backward",
     seed_weights: torch.Tensor = None,
 ) -> torch.Tensor:
     """Returns ℒ as a scalar graph-attached tensor. See module docstring.
 
-    `recency_scale` is a frozen Python float (owned by the Trainer).
-    Its value is the recency time-constant in raw timestamp units, set
-    once from `TrainStats.mean_inter_arrival` at Trainer-init.
-    Previously this was a learnable parameter under a softplus
-    reparameterisation, but the scalar was observed to collapse toward
-    zero under longer runs without improving val MRR, so it's now
-    frozen.
+    `neg_nodes` is the per-seed designated negative set, shape
+    `[N_seeds, n_neg]` (int), ALIGNED ROW-FOR-ROW to `walks.seeds`
+    (row j holds the negatives for `walks.seeds[j]`). The Trainer draws
+    it (historical reservoir + uniform) and shares the SAME array with
+    the link-prediction candidate matrix.
 
-    `chunk_size` slices the unique-pool dimension V when computing the
-    InfoNCE partition log Z(s_i). Forward computes log Z via streaming
-    logsumexp, and each chunk's forward is wrapped in
-    torch.utils.checkpoint.checkpoint(use_reentrant=False) so its
-    intermediates (the [NK, chunk_size] phi tensor in particular) are
-    discarded after the chunk runs and re-materialised on demand in
-    backward. Peak activation memory drops from O(NK · V) to
-    O(NK · chunk_size). When V ≤ chunk_size the loop runs once and the
-    behaviour reduces to the dense path (up to fp summation order in
-    the running max/sumexp). The positive numerator is computed
-    directly at pool_idx positions and never materialises the
-    [NK, V] tensor.
+    `recency_scale` is a frozen Python float (the train split's mean
+    inter-arrival, owned by the Trainer).
+
+    The partition is O(n_neg) per row — a logsumexp over the designated
+    negatives only — so there is no pool chunking or gradient
+    checkpointing here (unlike the old batch-pool InfoNCE).
     """
     device = embedding_table.E.weight.device
     nodes = walks.nodes.to(device).long()                         # [NK, L]
@@ -104,169 +99,86 @@ def alignment_loss(
     seeds_t = walks.seeds.to(device).long()                       # [N]
     K = walks.K
     NK, L = nodes.shape
-    M = NK * L
 
-    # Direction-aware valid mask:
-    #   BACKWARD walks: seed at p = ℓ_i - 1, valid contexts p ∈ [0, ℓ_i - 2]
-    #   FORWARD  walks: seed at p = 0,       valid contexts p ∈ [1, ℓ_i - 1]
+    # Direction-aware valid-context mask.
+    #   BACKWARD: seed at p = ℓ_i − 1, contexts p ∈ [0, ℓ_i − 2]
+    #   FORWARD : seed at p = 0,       contexts p ∈ [1, ℓ_i − 1]
     positions = torch.arange(L, device=device).unsqueeze(0)       # [1, L]
     if direction == "backward":
         is_context = positions < (lens - 1).unsqueeze(1)          # [NK, L]
     elif direction == "forward":
         is_context = (positions >= 1) & (positions < lens.unsqueeze(1))
     else:
-        raise ValueError(f"direction must be 'backward' or 'forward', got {direction!r}")
-    ctx_valid_mask = is_context.reshape(M)                        # [M]
+        raise ValueError(
+            f"direction must be 'backward' or 'forward', got {direction!r}")
 
     # Empty batch (Tempest graph not yet populated): ℒ = 0 with grad.
-    if not bool(ctx_valid_mask.any()):
+    if not bool(is_context.any()):
         return torch.zeros((), device=device, requires_grad=True)
 
-    # K_hop(i, p) = hop distance from seed:
-    #   BACKWARD: seed at ℓ_i - 1, so K_hop = ℓ_i - 1 - p
-    #   FORWARD:  seed at 0,       so K_hop = p
+    mask_f = is_context.float()                                   # [NK, L]
+
+    # ── Per-position weight w̃ = (1−γ)·hop + γ·recency ────────────────
+    # Hop profile: 1/K_hop, masked, normalised per row to sum 1.
     if direction == "backward":
         hop_dist = (lens.unsqueeze(1) - 1 - positions).clamp_min(1).float()
     else:
         hop_dist = positions.expand(NK, L).clamp_min(1).float()
-    mask_f = is_context.float()                                   # [NK, L]
-
-    # Hop profile: 1/K_hop, masked, normalised per row so it sums to 1.
-    hop_w = (1.0 / hop_dist) * mask_f                             # [NK, L]
+    hop_w = (1.0 / hop_dist) * mask_f
     hop_p = hop_w / hop_w.sum(dim=1, keepdim=True).clamp_min(_EPS)
 
-    # Stationary recency: gap = | t_seed_edge - t_{i, p} |, anchored
-    # at the SEED-ADJACENT edge time (the edge nearest the seed in the
-    # walk's chronology). For BACKWARD walks this is the max valid t
-    # (latest edge before seed); for FORWARD walks this is the min
-    # valid t (first edge after seed). Masking the other sentinel
-    # side keeps padding (-1) and seed slot from corrupting the
-    # reduction.
+    # Stationary recency: gap anchored at the SEED-ADJACENT edge time
+    # (latest valid t for backward, first valid t for forward), so a
+    # week-1 seed and a week-4 seed with the same local history get the
+    # same recency profile. Sentinels on the wrong side are masked to
+    # ±inf so they never win the min/max.
     ts_f = timestamps.float()
     if direction == "backward":
-        ts_masked = ts_f.masked_fill(~is_context, float("-inf"))
-        t_seed_edge = ts_masked.max(dim=1, keepdim=True).values   # [NK, 1]
+        t_seed_edge = ts_f.masked_fill(~is_context, float("-inf")).max(
+            dim=1, keepdim=True).values
     else:
-        ts_masked = ts_f.masked_fill(~is_context, float("inf"))
-        t_seed_edge = ts_masked.min(dim=1, keepdim=True).values   # [NK, 1]
-    # clamp_min(0) absorbs every sentinel: invalid rows get ±inf
-    # subtracted to -inf, then clamped to 0; mask zeros their weight.
-    gap = (ts_f - t_seed_edge).abs().clamp_min(0.0)               # [NK, L]
-    # `recency_scale` is a frozen Python float (mean inter-arrival of
-    # the train split). max(., 1.0) is a numerical guard; for any real
-    # dataset the configured value sits well above the floor. Plain
-    # float broadcasts cleanly against `gap` in the divide.
+        t_seed_edge = ts_f.masked_fill(~is_context, float("inf")).min(
+            dim=1, keepdim=True).values
+    gap = (ts_f - t_seed_edge).abs().clamp_min(0.0)
     scale = max(recency_scale, 1.0)
-    recency_w = torch.exp(-gap / scale) * mask_f                  # [NK, L]
-    rec_p = recency_w / recency_w.sum(dim=1, keepdim=True).clamp_min(_EPS)
+    rec_w = torch.exp(-gap / scale) * mask_f
+    rec_p = rec_w / rec_w.sum(dim=1, keepdim=True).clamp_min(_EPS)
 
-    # Convex combination: per-row profile, sums to 1 by construction.
     w_tilde = (1.0 - gamma_recency) * hop_p + gamma_recency * rec_p
-
-    # U   = unique({ n_{i, p} : valid(i, p) })
-    # c   = ( c(v) )_{v ∈ U}
-    nodes_safe = nodes.clamp_min(0)
-    valid_nodes = nodes_safe.reshape(M)[ctx_valid_mask]
-    unique_nodes, inverse_idx_valid, counts = torch.unique(
-        valid_nodes, return_inverse=True, return_counts=True,
-    )                                                              # [V]
-
-    # log_c_pool[v] = α · log c(v)
-    log_c_pool = _ALPHA * torch.log(counts.float().clamp_min(1.0))  # [V]
-
-    # pool_idx(i, p) = index in U of n_{i, p}  (arbitrary at invalid p; masked)
-    pool_idx_flat = torch.zeros(M, dtype=torch.long, device=device)
-    pool_idx_flat[ctx_valid_mask] = inverse_idx_valid
-    pool_idx = pool_idx_flat.view(NK, L)                          # [NK, L]
-
-    # E[s_i], E[v]  (embedding lookups — no projection)
-    # The loss operates DIRECTLY on the embedding-table rows. There
-    # is no projection MLP between E and the squared-L2 similarity;
-    # gradients flow straight to embedding_table.E.weight.
-    seed_per_row = seeds_t.repeat_interleave(K)                   # [NK]
-    a = embedding_table(seed_per_row)                             # [NK, d]
-    b = embedding_table(unique_nodes)                             # [V, d]
-
-    # φ(s_i, v) = -‖a_i - b_v‖² / τ,  with ‖a-b‖² = ‖a‖² + ‖b‖² - 2 ⟨a, b⟩
-    # sq_a / sq_b are tiny and reused across chunks → compute outside the loop.
-    sq_a = (a * a).sum(dim=-1, keepdim=True)                      # [NK, 1]
-
-    # Streaming logsumexp over V in chunks of `chunk_size`. The [NK, V]
-    # phi matrix is never materialised: each chunk computes its own
-    # [NK, C] slice inside a checkpoint frame, updates the running
-    # (max, sumexp) accumulators, and discards the slice. Backward
-    # recomputes one chunk at a time.
-    V_total = b.shape[0]
-    running_max = torch.full((NK,), float("-inf"), device=device, dtype=a.dtype)
-    running_sumexp = torch.zeros(NK, device=device, dtype=a.dtype)
-
-    def _chunk_logsumexp(
-        a_in, b_chunk, log_c_chunk, sq_a_in, prev_max, prev_sumexp,
-    ):
-        # phi_chunk: [NK, C]
-        sq_b_chunk = (b_chunk * b_chunk).sum(dim=-1).unsqueeze(0)      # [1, C]
-        inner_chunk = a_in @ b_chunk.t()                               # [NK, C]
-        phi_chunk = (
-            -(sq_a_in + sq_b_chunk - 2.0 * inner_chunk).clamp_min(0.0)
-            / tau_align
-        )
-        w_chunk = phi_chunk + log_c_chunk.unsqueeze(0)                 # [NK, C]
-        chunk_max = w_chunk.max(dim=-1).values                          # [NK]
-        new_max = torch.maximum(prev_max, chunk_max)
-        # Both terms handle the -inf bootstrap safely: exp(-inf) = 0
-        # zeroes the prev_sumexp contribution on the first chunk.
-        prev_scaled = prev_sumexp * (prev_max - new_max).exp()
-        chunk_scaled = (w_chunk - new_max.unsqueeze(1)).exp().sum(dim=-1)
-        new_sumexp = prev_scaled + chunk_scaled
-        return new_max, new_sumexp
-
-    for s in range(0, V_total, chunk_size):
-        e = min(s + chunk_size, V_total)
-        running_max, running_sumexp = checkpoint(
-            _chunk_logsumexp,
-            a,
-            b[s:e],
-            log_c_pool[s:e],
-            sq_a,
-            running_max,
-            running_sumexp,
-            use_reentrant=False,
-        )
-
-    log_Z = running_max + running_sumexp.log()                     # [NK]
-
-    # Positive numerator computed directly at pool_idx — no [NK, V] tensor.
-    # b_pos[i, p] = b[pool_idx[i, p]]; invalid positions read b[0] and are
-    # masked out by w_valid downstream (same convention as the dense path).
-    pool_idx_flat_for_pos = pool_idx.reshape(-1)
-    b_pos = b[pool_idx_flat_for_pos].view(NK, L, b.shape[-1])      # [NK, L, d]
-    sq_b_pos = (b_pos * b_pos).sum(dim=-1)                         # [NK, L]
-    inner_pos = (a.unsqueeze(1) * b_pos).sum(dim=-1)               # [NK, L]
-    phi_pos = (
-        -(sq_a + sq_b_pos - 2.0 * inner_pos).clamp_min(0.0) / tau_align
-    )                                                              # [NK, L]
-    log_c_pos = log_c_pool[pool_idx]                               # [NK, L]
-
-    # log p(n_{i, p} | s_i) = α · log c(n_{i, p}) + φ(s_i, n_{i, p}) - log Z(s_i)
-    log_p_pos = log_c_pos + phi_pos - log_Z.unsqueeze(1)          # [NK, L]
-
-    # w_valid(i, p) = 𝟙[valid(i, p)] · w̃(i, p);   W_i = Σ_p w_valid(i, p)
-    w_valid = w_tilde * is_context.float()                        # [NK, L]
+    w_valid = w_tilde * mask_f                                    # [NK, L]
     W = w_valid.sum(dim=1)                                        # [NK]
 
-    # ℒ_i = -(1 / W_i) · Σ_p w_valid(i, p) · log p(n_{i, p} | s_i)
-    L_per_row = -(w_valid * log_p_pos).sum(dim=1) / W.clamp_min(_EPS)
+    # ── Embedding lookups (direct on E; no projection) ───────────────
+    inv_tau2 = 2.0 / tau_align
+    seed_per_row = seeds_t.repeat_interleave(K)                   # [NK]
+    a = embedding_table(seed_per_row)                            # [NK, d]
 
-    # ℒ = weighted mean of ℒ_i over rows i ∈ I⁺ = { i : W_i > ε }.
-    # When seed_weights is None, all rows weighted equally (uniform mean).
-    # When provided, per-row weights w_seed(i) typically encode an inverse-
-    # degree prior so rare-seed rows contribute proportionally more — fixes
-    # the both-active hard cohort identified in analysis/phase6.
-    valid = (W > _EPS).float()                                    # [NK]
+    # Positives: ψ_pos[i, p] = (2/τ)·⟨E[s_i], E[n_{i,p}]⟩. Invalid
+    # positions read E[0] but are masked out by w_valid downstream.
+    ctx_nodes = nodes.clamp_min(0)                               # [NK, L]
+    b_ctx = embedding_table(ctx_nodes.reshape(-1)).view(NK, L, -1)  # [NK, L, d]
+    psi_pos = inv_tau2 * (a.unsqueeze(1) * b_ctx).sum(dim=-1)    # [NK, L]
+
+    # Negatives: the partition depends only on the seed, so compute it
+    # once per seed ([N, n_neg]) and broadcast to the seed's K rows —
+    # avoids the K×-duplicated [NK, n_neg, d] negative-embedding tensor.
+    neg_nodes = neg_nodes.to(device).long().clamp_min(0)         # [N, n_neg]
+    n_neg = neg_nodes.shape[1]
+    a_seed = embedding_table(seeds_t)                            # [N, d]
+    b_neg = embedding_table(neg_nodes.reshape(-1)).view(
+        seeds_t.shape[0], n_neg, -1)                             # [N, n_neg, d]
+    psi_neg = inv_tau2 * torch.einsum("nd,nkd->nk", a_seed, b_neg)  # [N, n_neg]
+    Z_neg = torch.logsumexp(psi_neg, dim=1).repeat_interleave(K)  # [NK]
+
+    # ℓ_{i,p} = softplus(Z⁻_i − ψ_pos[i,p]); positive sits in its own
+    # denominator (1-positive InfoNCE over {pos} ∪ N_seed).
+    ell = F.softplus(Z_neg.unsqueeze(1) - psi_pos)              # [NK, L]
+
+    # Per-row weighted mean over valid positions, then batch reduction.
+    L_per_row = (w_valid * ell).sum(dim=1) / W.clamp_min(_EPS)   # [NK]
+    valid = (W > _EPS).float()                                  # [NK]
     if seed_weights is None:
         row_w = valid
     else:
-        sw = seed_weights.to(device).float()                      # [N]
-        # Broadcast per-seed weight onto K walk rows per seed.
-        row_w = sw.repeat_interleave(K) * valid                   # [NK]
+        row_w = seed_weights.to(device).float().repeat_interleave(K) * valid
     return (L_per_row * row_w).sum() / row_w.sum().clamp_min(_EPS)
