@@ -162,34 +162,6 @@ class HistoricalNegativeSampler:
             neg = np.where(empty, rand, neg)
         return neg
 
-    def sample_uniform(self, nodes: np.ndarray,
-                       uniform_negative_count: int) -> np.ndarray:
-        """Uniform negatives from dst_pool, independent of any node history.
-
-        nodes: [Q] ids (only its length is used — uniform negs don't depend on
-        the node). Returns [Q, uniform_negative_count] (one independent draw
-        per node-slot).
-        """
-        Q = np.asarray(nodes).shape[0]
-        idx = self.rng.integers(
-            0, self.dst_pool.shape[0], size=(Q, uniform_negative_count),
-        )
-        return self.dst_pool[idx]
-
-    @staticmethod
-    def combine_negatives(historical: np.ndarray,
-                          uniform: np.ndarray) -> np.ndarray:
-        """Concatenate per-node historical and uniform negatives along the
-        negative axis: [N, n_hist] + [N, n_unif] -> [N, n_hist + n_unif]."""
-        historical = np.asarray(historical)
-        uniform = np.asarray(uniform)
-        if historical.shape[0] != uniform.shape[0]:
-            raise ValueError(
-                f"node-dim mismatch: historical {historical.shape[0]} vs "
-                f"uniform {uniform.shape[0]}"
-            )
-        return np.concatenate([historical, uniform], axis=1)
-
 
 class TGBNegativeSampler(NegativeSampler):
     """Eval-time sampler. Wraps `dataset.negative_sampler.query_batch`,
