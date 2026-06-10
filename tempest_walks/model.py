@@ -3,7 +3,7 @@
 Single nn.Embedding(num_nodes, d_emb), lookup-only. Trained directly
 by InfoNCE contrastive alignment on raw rows — there is no projection
 head between E and L_align. The link-prediction head
-(`link_pred_head.LinkPredGRU`) consumes E.detach(), so L_link
+(`link_pred_head.LinkPredHead`) consumes E.detach(), so L_link
 trains only the head's parameters; L_align is the sole gradient path
 into E.
 

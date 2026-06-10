@@ -1,5 +1,5 @@
 """Convert a Tempest WalkData object into the per-position feature
-tensors LinkPredGRU expects.
+tensors LinkPredHead expects.
 
 For each walk row (a single u and its K walks) Tempest returns:
     nodes      [W, L]   int32, -1 = pad, seed at p=lens-1 (bwd) or p=0 (fwd)
@@ -53,7 +53,7 @@ def make_head_inputs(
 ):
     """Stack per-u walks into [B, W, L, ...] tensors with consistent
     padding to the per-batch max (W_max, L_max) and return the dict
-    expected by LinkPredGRU."""
+    expected by LinkPredHead."""
     B = len(walks_nodes_per_u)
     W_max = max(t.shape[0] for t in walks_nodes_per_u)
     L_max = max(t.shape[1] for t in walks_nodes_per_u)

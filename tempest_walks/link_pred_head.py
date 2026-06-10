@@ -1,42 +1,35 @@
-"""Walk-mediated link-prediction head — right-to-left GRU over per-position
-similarity vectors.
+"""Walk-mediated link-prediction head — order-aware recency pool.
 
-Per (u, t, candidate v), for each of u's K walks and each walk position p:
-    feat_p = [Hadamard(E_v, E_w_p), |E_v - E_w_p|, K_emb[hop], TimeEncoder(t)]
-             (v's similarity-to-walk-node vector + hop + time; 2·d_emb+d_K+d_T)
-A GRU runs RIGHT TO LEFT over the walk — from the seed slot (p = lens-1,
-node u) outward to the oldest predecessor (p = 0). The GRU's per-position
-hidden states are max+mean pooled over positions into a per-walk vector
-(taking only the final, oldest-dominated state would discard the
-seed-anchored trajectory), then mean-pooled over walks and passed through a
-final MLP to a scalar logit.
+Per (u, t, candidate v), for each of u's K walks and each walk position p
+the head scores the candidate against the walk node at that position by a
+plain cosine (E is unit-norm, so cos(E_v, E_w_p) = E_v · E_w_p), then pools
+those per-position similarities with a learned per-hop recency kernel:
 
-Right-to-left + variable length is handled with a single cuDNN-fused
-nn.GRU over packed sequences: each walk's valid block is reversed so the
-seed (originally at p=lens-1) lands at index 0, then packed by length and
-run in one call. This is equivalent to the former per-timestep masked
-GRUCell loop — the pool is order-invariant, so the reversed per-position
-states give the same pooled vector — but replaces L serialized kernel
-launches with one.
+    s_p(v) = cos(E_v, E_w_p)
+    score(v) = scale · mean_walks  Σ_p  ω_p · s_p(v)
 
-Chosen on tgbl-wiki (2026-06-08): peaks at ep6 (val 0.7460 / test 0.7133)
-vs the prior per-position-MLP head's ep1 peak 0.7422 / 0.7041 that then
-collapsed to ~0.69 — the GRU peaks later AND holds a stable 0.733-0.746
-band with no hard drift. Single-seed; the drift-shape fix is the
-load-bearing win, the test delta is near the wiki noise band.
+ω_p is a learned weight per hop index, softmax-normalised over the valid
+positions of each walk (a recency/order kernel over the walk), and is
+candidate-INDEPENDENT — so the candidate enters only through the cosine and
+the whole head is a single einsum plus a pooled sum (no per-position MLP, no
+recurrence). `scale` is a learnable temperature: the pooled score is a convex
+combination of cosines in [-1, 1], which would give a near-flat per-query
+softmax (and vanishing gradients) without it.
 
-E[v] is EXPECTED to be detached upstream — this head's gradients update
-only its own parameters; E is shaped by the alignment loss alone (u enters
-only through its walks, whose seed slot is node u).
+The walk's seed slot is node u, so cos(E_v, E_u) — the direct u-vs-v
+similarity — is one of the pooled terms.
 
-forward(E_v, walks) -> [B, C] logits.
+E[v] is EXPECTED to be detached upstream — this head's gradients update only
+its own parameters; E is shaped by the alignment loss alone (u enters only
+through its walks, whose seed slot is node u).
+
+forward(E_v, walks) -> [B, C] logits.  walks is the per-position feature dict
+(E_walks [B,W,L,d], mask [B,W,L], K_idx [B,W,L] hop, t_feat [B,W,L,d_T]).
 """
 import math
 
 import torch
 import torch.nn as nn
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-from torch.utils.checkpoint import checkpoint
 
 
 class TimeEncoder(nn.Module):
@@ -55,137 +48,46 @@ class TimeEncoder(nn.Module):
         return torch.cat([raw, sin_cos], dim=-1)
 
 
-class WalkTower(nn.Module):
-    """Per-position similarity features -> right-to-left (seed-first) fused
-    nn.GRU over packed walks -> max+mean pool over per-position states ->
-    mean over walks. out_dim = 2*d_pos (max ‖ mean); d_pos is the GRU
-    hidden size."""
+class LinkPredHead(nn.Module):
+    """Order-aware recency pool over candidate-vs-walk cosines.
 
-    def __init__(
-        self,
-        d_emb: int,
-        max_walk_len: int,
-        d_K: int = 16,
-        d_pos: int = 96,
-        d_T: int = 12,
-        chunk_C: int = 0,
-    ):
-        super().__init__()
-        self.chunk_C = int(chunk_C)
-        self.K_emb = nn.Embedding(max_walk_len, d_K)
-        in_dim = 2 * d_emb + d_K + d_T
-        self.gru = nn.GRU(in_dim, d_pos, batch_first=True)
-        self.out_dim = 2 * d_pos   # max + mean pool over per-position GRU states
+    See the module docstring for the scoring rule. A learned per-hop weight
+    ω (softmax over each walk's valid positions) replaces an order-blind pool;
+    the candidate enters only through the cosine, so the head is ~free per
+    candidate. `time_encoder` is exposed because the trainer builds the walks'
+    t_feat channel through it (the head itself scores from hop + cosine only).
 
-    def _chunk_sim(self, E_walks, E_v_chunk):
-        Ew = E_walks.unsqueeze(1)                 # [B,1,W,L,d]
-        Ev = E_v_chunk.unsqueeze(2).unsqueeze(3)  # [B,chunk,1,1,d]
-        return torch.cat([Ev * Ew, (Ev - Ew).abs()], dim=-1)
-
-    def _process_chunk(self, E_walks, mask, K_idx, t_feat, E_v_chunk):
-        B, W, L, _ = E_walks.shape
-        chunk = E_v_chunk.shape[1]
-        sim = self._chunk_sim(E_walks, E_v_chunk)            # [B,chunk,W,L,2d]
-        Ke = self.K_emb(K_idx)                                # [B,W,L,d_K]
-        feat = torch.cat([
-            sim,
-            Ke.unsqueeze(1).expand(B, chunk, W, L, Ke.shape[-1]),
-            t_feat.unsqueeze(1).expand(B, chunk, W, L, t_feat.shape[-1]),
-        ], dim=-1)                                            # [B,chunk,W,L,in]
-        N = B * chunk * W
-        feat_flat = feat.reshape(N, L, -1)
-        mask_c = (
-            mask.unsqueeze(1).expand(B, chunk, W, L).reshape(N, L).to(feat.dtype)
-        )
-        # Right-to-left (seed-first) recurrence, fused. The former masked
-        # GRUCell loop ran p = L-1 .. 0: seed slot (p = lens-1) first, oldest
-        # (p = 0) last. Reproduce that order by reversing each walk's valid
-        # block so the seed lands at index 0, then run one packed nn.GRU.
-        # Padding stays at the tail (never read by pack); the whole
-        # per-position feature reverses in lockstep so channels stay aligned;
-        # the pool below is order-invariant so H needs no un-reversal.
-        lengths = mask_c.sum(dim=1).clamp_min(1).long()          # [N] valid count
-        rev = (lengths - 1).unsqueeze(1) - torch.arange(L, device=feat.device)
-        rev = rev.clamp_min(0)                                    # pad idx unread
-        feat_flat = feat_flat.gather(
-            1, rev.unsqueeze(-1).expand(N, L, feat_flat.shape[-1]))
-        packed = pack_padded_sequence(
-            feat_flat, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        out_packed, _ = self.gru(packed)
-        H, _ = pad_packed_sequence(out_packed, batch_first=True, total_length=L)
-
-        # Masked max + mean pool over the per-position GRU states. Rows
-        # are always non-empty (the seed slot is valid); the isinf guard
-        # is defensive.
-        m = mask_c.unsqueeze(-1)                              # [N, L, 1]
-        H_neg = H.masked_fill(m == 0, float("-inf"))
-        h_max = H_neg.max(dim=1).values                      # [N, hidden]
-        h_max = torch.where(torch.isinf(h_max), torch.zeros_like(h_max), h_max)
-        h_mean = (H * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
-        pooled = torch.cat([h_max, h_mean], dim=-1)          # [N, 2*hidden]
-        return pooled.reshape(B, chunk, W, self.out_dim).mean(dim=2)  # [B,chunk,2*hidden]
-
-    def forward(self, E_walks, mask, K_idx, t_feat, E_v):
-        C = E_v.shape[1]
-        if self.chunk_C <= 0 or self.chunk_C >= C:
-            return self._process_chunk(E_walks, mask, K_idx, t_feat, E_v)
-        out_parts = []
-        for c0 in range(0, C, self.chunk_C):
-            c1 = min(c0 + self.chunk_C, C)
-            E_v_chunk = E_v[:, c0:c1]
-            if self.training and torch.is_grad_enabled():
-                out_parts.append(checkpoint(
-                    self._process_chunk, E_walks, mask, K_idx, t_feat,
-                    E_v_chunk, use_reentrant=False))
-            else:
-                out_parts.append(self._process_chunk(
-                    E_walks, mask, K_idx, t_feat, E_v_chunk))
-        return torch.cat(out_parts, dim=1)
-
-
-class LinkPredGRU(nn.Module):
-    """Walk-mediated GRU link-prediction head.
-
-    A WalkTower (per-position similarity GRU, pooled) feeds a final MLP
-    that maps the pooled walk features to a scalar logit. The walk seed
-    slot is node u — kept and compared with each candidate v — so the
-    tower carries the u-vs-v signal directly.
-
-    Args:
-        d_emb         : embedding width (model config).
-        max_walk_len  : L; sizes the K (hop) embedding table.
-        d_K           : hop-embedding width.
-        d_pos         : GRU hidden size (per-walk vector is 2*d_pos after
-                        the max+mean pool).
-        chunk_C       : candidate-dim memory chunking (see WalkTower).
-
-    forward(E_v, walks) -> [B, C] logits. E_v is the candidate embedding
-    [B, C, d_emb], detached upstream; walks is the per-position feature
-    dict (E_walks, mask, K_idx, t_feat).
+    forward(E_v, walks) -> [B, C]. E_v / E_walks detached upstream.
     """
 
-    def __init__(
-        self,
-        d_emb: int,
-        max_walk_len: int,
-        d_K: int = 16,
-        d_pos: int = 96,
-        chunk_C: int = 0,
-    ):
+    def __init__(self, max_walk_len: int):
         super().__init__()
+        # The trainer reads link_head.time_encoder to build the walks' t_feat
+        # channel; this head scores from hop + cosine and does not consume
+        # t_feat itself, but must expose the encoder for the shared path.
         self.time_encoder = TimeEncoder()
-        self.tower = WalkTower(
-            d_emb=d_emb, max_walk_len=max_walk_len,
-            d_K=d_K, d_pos=d_pos, d_T=self.time_encoder.d_T,
-            chunk_C=chunk_C,
-        )
-        final_in = self.tower.out_dim
-        self.final_mlp = nn.Sequential(
-            nn.Linear(final_in, final_in),
-            nn.GELU(),
-            nn.Linear(final_in, 1),
-        )
+        # one scalar log-weight per hop index; ω_p = softmax over valid p
+        self.omega = nn.Embedding(max_walk_len, 1)
+        nn.init.zeros_(self.omega.weight)          # uniform pool at init
+        # Learnable temperature. The pooled score is a convex combination of
+        # cosines (range [-1, 1]); at init the uniform pool averages ~WL
+        # cosines toward 0, so a larger scale is needed for a healthy per-query
+        # softmax (ω concentrates during training and widens the spread).
+        # Clamped to (0, 100].
+        self.logit_scale = nn.Parameter(torch.tensor(30.0))
 
     def forward(self, E_v: torch.Tensor, walks: dict) -> torch.Tensor:
-        walk_features = self.tower(E_v=E_v, **walks)
-        return self.final_mlp(walk_features).squeeze(-1)
+        E_walks = walks["E_walks"]                 # [B,W,L,d]
+        mask = walks["mask"]                       # [B,W,L]
+        K_idx = walks["K_idx"]                     # [B,W,L] hop
+        valid = mask.bool()
+        s = torch.einsum("bcd,bwld->bcwl", E_v, E_walks)        # [B,C,W,L] cos
+        w = self.omega(K_idx).squeeze(-1)                       # [B,W,L] log-weight
+        w = w.masked_fill(~valid, float("-inf"))
+        alpha = torch.softmax(w, dim=-1)                        # [B,W,L] over positions
+        alpha = torch.nan_to_num(alpha, 0.0)                    # empty walk row -> 0
+        score_w = (s * alpha.unsqueeze(1)).sum(dim=-1)         # [B,C,W] per-walk
+        walk_valid = valid.any(dim=-1).float()                 # [B,W]
+        denom = walk_valid.sum(dim=-1).clamp_min(1.0)          # [B]
+        score = (score_w * walk_valid.unsqueeze(1)).sum(dim=-1) / denom.unsqueeze(1)
+        return self.logit_scale.clamp(1.0, 100.0) * score      # [B,C]

@@ -191,19 +191,8 @@ def parse_args() -> argparse.Namespace:
     # +0.010 combined); there is no scenario where either should be off,
     # so no CLI knob.
 
-    # LinkPredGRU — walk-mediated GRU link-pred head.
-    #   --link-head-d-K   : hop-embedding width
-    #   --link-head-d-pos : GRU hidden size
-    p.add_argument("--link-head-d-K",      default=16, type=int)
-    p.add_argument("--link-head-d-pos",    default=96, type=int)
-    p.add_argument(
-        "--link-head-chunk-c", default=0, type=int,
-        help="0 (default) = no chunking; pass a positive N to enable "
-             "candidate-dim chunking inside the walk tower with chunk "
-             "size N. Pure memory knob; loss/gradient are identical "
-             "to non-chunked. Smaller N → less peak memory but more "
-             "kernel launches per step.",
-    )
+    # The link head (LinkPredHead) has no architecture knobs beyond
+    # max_walk_len, which is set from --link-pred-max-walk-len.
     p.add_argument(
         "--tempest-batch-window-multiplier", default=-1.0, type=float,
         help="Tempest sliding-window cap expressed as a multiple of the "
@@ -412,9 +401,6 @@ def main() -> Dict[str, Any]:
         T_train=stats.T_train,
         t_max_full=stats.t_max_full,
         T_full=stats.T_full,
-        link_head_d_K=args.link_head_d_K,
-        link_head_d_pos=args.link_head_d_pos,
-        link_head_chunk_c=args.link_head_chunk_c,
         max_time_capacity=compute_max_time_capacity(
             args.tempest_batch_window_multiplier,
             args.batch_size,
