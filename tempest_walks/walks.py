@@ -96,7 +96,6 @@ class WalkData(NamedTuple):
 class WalkGenerator:
     def __init__(
         self,
-        is_directed: bool,
         use_gpu: bool = False,
         # Embedding side — backward walks only (forward was ablated).
         embedding_backward_walk_bias:  str = "ExponentialWeight",
@@ -136,7 +135,7 @@ class WalkGenerator:
         # add_multiple_edges call. -1 = unbounded (keep every ingested
         # edge until walk_gen.reset() at epoch boundary).
         self.trw = TemporalRandomWalk(
-            is_directed=is_directed,
+            is_directed=False,        # graphs treated as undirected
             use_gpu=use_gpu,
             enable_weight_computation=True,
             timescale_bound=timescale_bound,
