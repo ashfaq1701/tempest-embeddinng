@@ -190,3 +190,63 @@ Notes that bound what we can do:
   is the most predictive). The `Forward_In_Time` mirror (seed at position 0,
   `INT64_MIN` sentinel, `timestamps[i,p]` = edge *into* `p`) is also verified in
   `CLAUDE.md` if a forward pair feature is ever wanted.
+
+---
+
+## Candidate pair features for tonight
+
+### What our model already covers (the baseline for "gap")
+
+- **`E[u]↔h[v]` + `E[v]↔h[u]` chord** → latent node-context similarity. *Partially*
+  carries recurrence (if `v` is a frequent partner of `u`, `v` appears in `u`'s walk
+  → `E[v]` lands near pooled `h[u]`) — but pooled-mean over `K` walks/positions
+  **dilutes** a single occurrence badly.
+- **`rec_head(Time2Vec(log1p(t_query − t_last[v])))`** → candidate *global* recency.
+  `t_last[v]` is `v`'s last activity with **anyone**, not with `u` — so pairwise
+  recency is **not** in the model.
+- **Structurally absent:** no `h[u]↔h[v]` (context-context) term → no explicit
+  common-neighbour channel; no pair-specific history; no degree/popularity feature.
+
+### Feature list
+
+`B` = batch sources, `K` = train negs, `N` = #nodes, `NK·L` = total walk slots.
+Gain estimates are single-seed-wiki ballparks against the noise discipline
+(≥0.015 test or ≥3 seeds to count a win).
+
+| # | Feature | Covered by embedding? | Why / what gap it closes | Fast & vectorizable? | Source | Expected gain (wiki) |
+|---|---|---|---|---|---|---|
+| 1 | **Exact pairwise recurrence** — `Δt = t_query − last_ts[u,v]` (+ "ever interacted" bit) | **Partially** — walk-membership encodes it but pooled-diluted; recency head is *global to v*, not pairwise | Wiki is recurrence-dominated; "when did `u` last touch `v` specifically" is the single strongest link cue and is exactly TPNet's `A^(1)_{u,v}`. Sharp, exact, pair-specific — closes the dilution gap | **Yes** — gather `store[u, cand]` → `[B,1+K]`, one Time2Vec, add to logit (same shape as existing recency head) | Streaming store, updated in `add_edges` | **Large, +0.04–0.10.** Highest-value single feature; may reach 0.83 alone |
+| 2 | **Pairwise frequency** — `count[u,v]` (decayed count of past (u,v) edges) | **No** | Distinguishes a one-off from a habitual partner; recurrence *strength*, not just recency. TPNet gets this from the weighted walk count | Yes — same gather as #1 | Streaming store | Medium, +0.01–0.03 (correlated with #1; stack, don't double-count) |
+| 3 | **Time-decayed common neighbours / co-reachability** — `Σ_w e^{−λ(t−t_w)}·1[w∈walks(u)]·1[w∈walks(v)]` | **No** (we never compute `h[u]↔h[v]`) | The TPNet co-reachability block (`⟨A^(li)_u, A^(lj)_v⟩`, li,lj≥1) — "do `u` and `v` share recent neighbours." The untried multi-hop lever, computable **exactly from real Tempest walks** (no JL sketch) | **Yes** — one-hot walk nodes → sparse `[uniq, N]`, weight by recency, gather+dot per (u,cand). Bounded by `NK·L`, not `N²` | **Walks (free — already sampled)** | Medium, +0.01–0.04 |
+| 4 | **Temporal Adamic-Adar / resource-allocation** — `Σ_w decay(t_w)/log(deg(w))` over shared `w` | **No** | Down-weights shared *hubs* (a common neighbour everyone talks to is uninformative). Classic, robust; #3 with degree-discount. Strong on heavy-tailed graphs | Yes — #3 weighted by `1/log(deg)` from the degree store | Walks + degree store | Medium, +0.01–0.03 (partly overlaps #3 — A/B which wins) |
+| 5 | **Context-context similarity** — add `−scale·‖h[u]−h[v]‖` chord term to the logit | **No** (only E↔h cross-terms exist) | Free structural channel: shared neighbourhoods make `h[u]`, `h[v]` similar — a soft, learned common-neighbour signal with zero new data structures | **Yes** — one extra dot on tensors already in hand | Walks (free) | Small–medium, +0.005–0.02; cheapest to try |
+| 6 | **Candidate global recency** — `Δt = t_query − t_last[v]` | **Yes** — this is the current `rec_head` | Already shipped; listed so we don't re-add it | Yes | Already in model | 0 (baseline) |
+| 7 | **Node activity / popularity** — decayed `deg(v)`, `deg(u)` | **Partially** — softmax over candidates absorbs some; recency correlates | Popularity prior: busy nodes are likelier endpoints. Cheap normaliser the chord lacks explicitly | Yes — `[N]` gather | Streaming store | Small, +0.005–0.015 |
+| 8 | **Preferential attachment** — `deg(u)·deg(v)` | **Partially** (#7 components) | Liben-Nowell PA baseline; one scalar. Marginal once #1/#7 exist | Yes | Streaming store | Small, ≤0.01 |
+| 9 | **Jaccard / overlap coefficient** — `#CN / (deg(u)+deg(v)−#CN)` | **No** | Degree-normalised #3; helps when raw CN is degree-confounded | Yes — #3 + #7 | Walks + degree store | Small, +0.005–0.015 (alt normaliser to #4) |
+
+### Ship order tonight
+
+1. **#1 (exact pairwise recurrence)** first and alone. Dominant missing signal on
+   wiki, mechanically identical to the existing recency head (Time2Vec → logit term,
+   keyed on `[u,v]` instead of `[v]`), near-zero pipeline cost. The overnight
+   `ExactPairStore` already proved +0.033 even in the *wrong* architecture. Land it,
+   measure — it tells us fast whether 0.83 is in reach.
+2. **#5 (`h[u]↔h[v]` term)** — one extra chord on tensors already computed; free A/B.
+3. **#3 (time-decayed common neighbours from walks)** — the TPNet co-reachability
+   analog from genuine causal walks (our unique angle). Then #4/#9 as normaliser
+   variants if #3 helps.
+4. Defer **#2/#7/#8** — correlated tail features; add only if #1 leaves a visible
+   popularity gap.
+
+### Data structures (fast, vectorizable, no pipeline-cost increase)
+
+- **Streaming store (#1,2,7,8):** on wiki (`N≈9.2k`) a dense `last_ts[N,N]` int64 +
+  `count[N,N]` int32 (~1 GB) gathers in one indexed op; updated in the existing
+  `add_edges` hook. For scale (coin/comment, millions of nodes) swap to a hash on
+  `min(u,v)<<32|max(u,v)` or per-node sorted-neighbour CSR + `searchsorted` — note
+  now, build dense tonight.
+- **Walk-derived (#3,4,5,9):** we **already sample walks for every unique node**
+  (sources + candidates) via the dedup path, so co-reachability is `bincount` /
+  sparse-matmul over walk-node one-hots weighted by timestamp recency — bounded by
+  `NK·L`, not `N²`, reusing tensors already in the forward pass.
