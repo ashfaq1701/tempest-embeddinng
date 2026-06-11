@@ -62,7 +62,8 @@ class CrossWalkGRUHead(nn.Module):
         last_idx = valid.reshape(M * K, L).sum(dim=1).clamp_min(1) - 1
         rows = torch.arange(M * K, device=out.device)
         last = out[rows, last_idx]
-        return last.reshape(M, K, d).mean(dim=1)                     # [M, d]
+        pooled = last.reshape(M, K, d).mean(dim=1)                   # [M, d]
+        return F.normalize(pooled, dim=-1)                          # h on the unit sphere
 
     def forward(self, E_u: torch.Tensor, E_v: torch.Tensor,
                 h_u: torch.Tensor, h_v: torch.Tensor,
