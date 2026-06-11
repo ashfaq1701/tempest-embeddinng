@@ -155,3 +155,38 @@ a block of entries) of that Gram, and the MLP learns which combinations matter.
 - Injection mirrors TPNet's point 1: concat the pair feature to the per-candidate
   decoder input / add a learned pair-term to the logit, co-trained end-to-end with
   `E` and the GRU (no detach).
+
+---
+
+## What Tempest returns (the raw material for our pair features)
+
+Everything we build has to come from one call:
+`trw.get_random_walks_and_times_for_nodes(...)` (wrapped in
+`tempest_walks/walks.py::walks_for_nodes`). It returns four arrays — **walk
+nodes, timestamps, walk lengths, and edge features** — which the wrapper packs
+into `WalkData`. Shapes/dtypes are pinned by `tests/test_walk_contract.py` and the
+verified contract in `CLAUDE.md`. `N` = #seeds, `K` = walks/seed, `L` =
+`max_walk_len`, `NK = N·K`.
+
+| Field | Shape / dtype | What it is | Easy explanation |
+|---|---|---|---|
+| **nodes** | `[NK, L]` int64; padding `-1` | The node id at each step of each walk. Rows `[i·K, (i+1)·K)` are seed `i`'s `K` walks (`shuffle_walk_order=False` pins the grouping). Backward direction: chronologically **oldest predecessor at position 0**, the **seed at position `lens-1`**. | "For every walk, the list of nodes visited." Each block of `K` rows belongs to one seed; the seed sits at the right end. |
+| **timestamps** | `[NK, L]` int64; sentinel `INT64_MAX` at seed slot; padding `-1` | `timestamps[i,p]` = the time of the edge `(nodes[i,p], nodes[i,p+1])` (the hop *out of* position `p`, backward convention). The seed slot `p=lens-1` has no outgoing edge → `INT64_MAX` sentinel. Verified 79/79 `(u,v,t)` tuples match an ingested edge. | "For every hop, when that edge happened." The seed's own slot has a dummy max-time marker because it has no next edge. |
+| **lens** | `[NK]` int64 | The true length of each walk (≤ `L`). Positions `p ≥ lens[i]` are padding. The valid mask is `arange(L) < lens.unsqueeze(1)`. | "How long each walk actually is" — walks can be shorter than `L` and the tail is padded. |
+| **seeds** | `[N]` int64 | The query nodes we asked walks for; `seeds[i] == nodes[i·K, lens-1]`. | "Which node each block of walks started from." |
+| **edge features** | `[NK, L-1, d_ef]` float32 (the 4th return value) | Per-hop edge feature vectors, **one column shorter than `nodes`** (a hop lives between two nodes, so `L-1` hops; tail rows zero). `edge_feats[i,p]` belongs to the edge `(nodes[i,p], nodes[i,p+1])`. **Present only if the graph was ingested with edge features** (wiki has LIWC-style EFs; many TGB datasets do not). | "If the dataset has features on its edges, the feature of each hop." Optional — empty/absent when the data has no edge features. |
+
+Notes that bound what we can do:
+- **The current wrapper discards edge features.** `walks_for_nodes` unpacks
+  `nodes, ts, lens, _ef` and drops `_ef` (the cross-GRU stack doesn't use EFs;
+  prior EF investigations found them dead weight on wiki — see the EF section in
+  `CLAUDE.md`). They are still *available* from Tempest if a pair feature wants
+  them — re-plumb the 4th return value into `WalkData`.
+- **`K = num_walks_per_node`** and **`L = max_walk_len`** are the two knobs that
+  set how much neighbourhood each call sees. Multi-hop co-reachability (the TPNet
+  analog) is read off `nodes`/`timestamps` directly: shared nodes appearing in
+  `u`'s walks and `v`'s walks, weighted by their hop position and timestamp recency.
+- **Direction.** The link path uses `"Backward_In_Time"` (most-recent predecessor
+  is the most predictive). The `Forward_In_Time` mirror (seed at position 0,
+  `INT64_MIN` sentinel, `timestamps[i,p]` = edge *into* `p`) is also verified in
+  `CLAUDE.md` if a forward pair feature is ever wanted.
