@@ -6,6 +6,7 @@
 # Usage: scripts/pair_campaign.sh <wave-name> "<name>|<flags>" "<name>|<flags>" ...
 set -u
 export PYTHONUNBUFFERED=1   # python block-buffers stdout when redirected; force live logs
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # reduce fragmentation on 8 GB
 PY=.venv/bin/python
 OUT=logs/pair_features
 mkdir -p "$OUT"
