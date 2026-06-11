@@ -250,3 +250,111 @@ Gain estimates are single-seed-wiki ballparks against the noise discipline
   (sources + candidates) via the dedup path, so co-reachability is `bincount` /
   sparse-matmul over walk-node one-hots weighted by timestamp recency — bounded by
   `NK·L`, not `N²`, reusing tensors already in the forward pass.
+
+---
+
+## Campaign decision tree (10 h, ~16–18 runs)
+
+**Target:** val ≥ 0.84, test ≥ 0.83 (base: val 0.7345 / test 0.6926).
+
+**The fact that drives ordering:** tgbl-wiki is **~89% repeat edges** (surprise
+≈ 0.11), so recurrence is the dominant lever — but TGB's negative sampler injects
+**historical negatives** `(u, v')` where `u`–`v'` also have history. A bare
+"ever-interacted" bit can't separate the true positive from a historical negative;
+you need **Δt + frequency + the embedding** to rank *within* a node's history. Hence
+recurrence first, then the history disambiguators, then cold/new-edge
+co-reachability — with a repeat-vs-new / historical-negative diagnostic placed
+**early**, not at the end.
+
+**Fixed search config:** seed 42, K=5, L=20, 2-layer GRU, chord, RiemannianAdam,
+~20 ep / patience 5. Confirm seeds {42, 1, 7}. Wiki ≈ 1 min/epoch → runs ≈ 15–30 min.
+
+```
+REFERENCE  base = val 0.7345 / test 0.6926   (target: val ≥0.84, test ≥0.83)
+  │        guardrail everywhere: smooth val curve (no ep1-peak-then-drift),
+  │        additive logit terms BEFORE any pair-MLP, co-trained (no detach).
+  │
+  ├─ E1  Feature #1 exact pairwise recurrence
+  │      pairwise Δt = t_query − last_ts[u,v]  →  2nd Time2Vec → +logit
+  │      (keep the existing global-recency term; this is additive)
+  │      ── run E1b in parallel (free, no infra): #5  h[u]↔h[v] chord term ──
+  │
+  ├─ D1  DIAGNOSTIC (no train, eval E1 ckpt): stratify val MRR by
+  │      (a) repeat vs new positive, (b) historical-neg-heavy vs random-neg query.
+  │      This decides Stage 2's direction.
+  │
+  ├── test ≥ 0.83 AND val ≥ 0.84 ───────────────► STAGE 5 (confirm + lock)
+  │
+  ├── test ∈ [0.78, 0.83)  (recurrence works, gap remains) ──► STAGE 2
+  │
+  └── test < 0.78  (recurrence underperforms) ──► read D1:
+            • repeats already high, NEW edges drag → STAGE 2 (co-reach) directly
+            • repeats LOW → injection/scale bug: E1 variants
+              (learnable scale, ever-bit, count) before moving on
+
+
+STAGE 2 — disambiguate history + close the cold/new slice
+  ├─ E2  #1 + #2 : add decayed log-count + ever-interacted bit
+  │       small MLP on [Δt_feat, log_count, bit] → +logit   (history ranking)
+  ├─ E3  #3 time-decayed common-neighbours from the walks we already sample
+  │       (TPNet co-reachability, exact, free source) → +logit
+  ├─ E4  #4 temporal Adamic-Adar (#3 degree-discounted) — A/B vs E3
+  │
+  ├── best single Stage-2 add gets test ≥ 0.83 ──► STAGE 5
+  └── still short ──► STAGE 3 (stack)
+
+
+STAGE 3 — stack winners + injection form
+  ├─ E5  best-recurrence(E1/E2) + best-co-reach(E3/E4), additive
+  ├─ E6  same features joined through ONE small pair-MLP (test interactions)
+  │       — watch the overfit cliff; revert to additive if val peaks ep1 & drifts
+  ├─ E7  tune decay λ / Time2Vec dims on the E5/E6 winner
+  │
+  ├── test ≥ 0.83 ──► STAGE 5
+  └── plateau < 0.83 ──► STAGE 4
+
+
+STAGE 4 — popularity cleanup (only if a measurable gap persists)
+  ├─ E8  #7 node popularity (decayed deg)      ├─ E9  #9 Jaccard normaliser
+  └── pick anything that adds outside noise; else STAGE 5 with best-so-far
+
+
+STAGE 5 — confirm & generalise
+  ├─ E10–E12  best config × seeds {42,1,7}: require mean test ≥0.83 / val ≥0.84
+  │           AND smooth curves (not a seed-42 lucky peak)
+  └─ budget left? E13+  cross-dataset sanity (review / coin) — stretch goal
+```
+
+### Budget allocation
+
+| Stage | Runs | ~Time | Exit gate |
+|---|---|---|---|
+| E1 (+E1b free) | 1.5 | 0.5 h | recurrence hypothesis |
+| D1 diagnostic | 0 train | 0.3 h | picks Stage-2 direction |
+| Stage 2 (E2–E4) | 3 | 1.5 h | single-add ≥0.83? |
+| Stage 3 (E5–E7) | 3 | 1.5 h | stack ≥0.83? |
+| Stage 4 (E8–E9) | 2 | 1.0 h | marginal cleanup |
+| Stage 5 (E10–E12) | 3 | 1.5 h | **multi-seed lock** |
+| Stretch / reruns | 3–5 | 2–3 h | cross-dataset / re-confirms |
+
+≈ 16 runs, ~9 h, ~1 h slack.
+
+### Guardrails (from the project's hard-won lessons)
+
+- **Additive logit terms first, pair-MLP only at Stage 3.** The walk-tower history
+  shows a per-position MLP overfits (val peaks ep1, train loss keeps falling).
+  Additive Time2Vec terms don't have that failure mode.
+- **Smooth-curve rule, not peak-chasing.** A config that peaks ep1 then drifts loses
+  to a monotone one even at a lower peak.
+- **Noise discipline.** No single-seed win counts unless test Δ ≥ 0.015; Stage 5
+  multi-seed is mandatory before claiming 0.83.
+- **Each feature stays co-trained (no detach), keyed correctly**
+  (`min(u,v)<<32|max(u,v)` undirected), dense store on wiki — scale path deferred.
+
+### First move
+
+**E1 (exact pairwise recurrence)**, with **E1b (`h[u]↔h[v]`)** riding along free. It
+is the decisive test of the dominant lever at near-zero pipeline cost; given the
+89%-repeat structure it plausibly lands in the 0.80s by itself, at which point D1
+forks the campaign cleanly: remaining gap on the new-edge slice → co-reachability;
+gap on history-ranking among negatives → frequency.
