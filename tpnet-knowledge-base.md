@@ -286,3 +286,77 @@ possible).
    use RP-style projection instead of an exact dense store.
 6. **Honesty constraint**: hold the wiki noise discipline (≥0.015 single-seed or
    ≥3-seed); compare only against the TGB-MRR ~0.84, never the paper's AP.
+
+---
+
+## 6. Tempest — our moat (what TPNet lacks)
+
+Source: "A GPU Accelerated Temporal Window-Based Random Walk Sampler", Salehin,
+Parisis, Berthouze (Univ. of Sussex), arXiv:2605.16182 (May 2026). Tempest =
+**TEMPoral nEtwork Streaming Traversals**, the engine behind `temporal_random_walk`.
+
+The whole cross-GRU stack is **built on real temporal random walks from Tempest** —
+a capability TPNet structurally does not have. This is the offensive side of the
+comparison.
+
+### 6.1 The structural gap
+
+- **TPNet has no walks at all.** Its "temporal walk matrix" is maintained by
+  *exact random-feature propagation* (matrix-power algebra, §1.3) — it never
+  ingests a stream, never samples a causal walk, and its RP is a bulk/static-
+  leaning structure. The "temporal walk" is what the matrix *counts*, not a
+  process it runs.
+- **Tempest produces genuine, causality-preserving walks, at streaming
+  billion-edge scale.** That is the sellable contribution and the thing TPNet
+  cannot replicate.
+
+### 6.2 What Tempest is (three pillars)
+
+1. **Dual-index over a shared edge store** (no edge duplication): a
+   *timestamp-grouped* view → O(1) start-edge sampling under a bias + bulk window
+   eviction; a *node+timestamp-grouped* view → causal walk progression by O(1)
+   node-edge-range lookup + O(log G) binary search for the first timestamp `> t`
+   (no per-hop neighborhood scan).
+2. **Hierarchical cooperative scheduler**: groups walks sharing a (node, step) into
+   a cooperative unit and dispatches at **thread / warp / block** granularity by
+   per-step walk-population count `W` and shared-memory-fit `G` (the "dispatch
+   plane", Fig. 5). Solves the temporal regime's GPU killers: variable walk length,
+   runtime regrouping (the convergence set changes every hop), bounded smem,
+   mega-hubs (`W>8193` split across blocks).
+3. **Bounded-memory streaming**: sliding-window eviction `W(t)={e : t-Δ ≤ t_e ≤ t}`;
+   memory tracks the *active window*, not stream length. Each batch triggers a
+   batch-bounded dual-index rebuild that does not accumulate.
+4. **Closed-form O(1) bias samplers**: uniform `⌊u·n⌋`, linear, **exponential**
+   `⌊n+ln(u)-1⌋` (the start/walk bias we use), plus weight-based O(log n) and
+   **Temporal Node2Vec via rejection** on the exponential proposal (keeps the inner
+   CDF prev-independent so it runs through the same cooperative dispatch).
+
+### 6.3 The numbers (what TPNet can't match)
+
+- **Causal validity**: Tempest = **100% temporally-valid walks** on every dataset;
+  static GPU engines FlowWalker / ThunderRW = **0%** valid (Table 6 — they have no
+  notion of temporal causality). Throughput 30.6–112.3 M steps/s, fastest on every
+  dataset (51× over FlowWalker on Delicious, 6.4× on TGBL-Coin).
+- **Scale**: sustains **real-time** on **Alibaba 81B edges / 14 days** (596 ms
+  ingest + 167 ms sampling per batch vs 180 s arrival → **235× headroom**; full
+  81B in 1.42 h). Delicious 301M edges ingested in **0.9 s — 76× faster than
+  Raphtory**, 84× faster than the CPU backend.
+- **vs the closest causal baselines (TEA/TEA+)**: exponential bias **4.6–5.8×**
+  faster, Temporal Node2Vec **6–7×** faster (Table 5; growth 0.50 s vs 2.93,
+  delicious 8.43 s vs 38.84 — the numbers from this project's TEA-reimpl work).
+- **Memory**: 1B edges ≈ 35 GB (linear, fits one A40); streaming memory flat in
+  stream length (Fig. 11).
+
+### 6.4 Why this matters for the project
+
+- It is **why we are orders of magnitude faster per epoch than TPNet** on TGB-MRR
+  (§4.5): Tempest generates billions of causal walks essentially for free, and the
+  cross-GRU dedups the encode (per-unique-node, not per-candidate).
+- It is the **path to all TGB datasets** — including the large ones (coin, comment,
+  flight) where TPNet is impractically slow (10+ h/epoch) — and beyond, to
+  billion-edge streams TPNet's bulk RP cannot stream.
+- **Positioning**: TPNet's RP is clever exact matrix algebra but bulk/static-leaning
+  and slow on TGB-MRR. **Tempest (real causal walks, GPU-streaming, billion-scale) +
+  the geometric cross-GRU model is a different, faster, more scalable paradigm.** The
+  pair-feature work (§5) is about closing the *accuracy* gap; Tempest is the
+  *capability/efficiency* gap that already runs the other way.
