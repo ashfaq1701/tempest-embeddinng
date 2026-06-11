@@ -61,12 +61,9 @@ def _build_walks() -> tuple[WalkData, dict, int]:
     ts = train.timestamps[:_N_INGEST]
     ef = train.edge_feat[:_N_INGEST] if train.edge_feat is not None else None
 
-    # Wiki edges are bipartite user→page action streams; the
-    # contract test treats them as undirected (Tempest is configured
-    # the same way at the trainer's default --is-directed=False).
-    is_directed = False
+    # Wiki edges are bipartite user→page action streams; Tempest always
+    # treats graphs as undirected (is_directed was removed).
     wg = WalkGenerator(
-        is_directed=is_directed,
         use_gpu=False,
         embedding_num_walks_per_node=_NUM_WALKS_PER_NODE,
         embedding_max_walk_len=_MAX_WALK_LEN,
@@ -79,12 +76,12 @@ def _build_walks() -> tuple[WalkData, dict, int]:
     seeds = rng.choice(seed_pool, size=_N_SEEDS, replace=False)
     walks = wg.walks_for_nodes_embedding_backward(seeds)
 
+    # Undirected: every edge is reachable in reverse too.
     edge_set: dict = {}
     for s, t, time in zip(src, tgt, ts):
         edge_set.setdefault((int(s), int(t)), []).append(int(time))
-    if not is_directed:
-        for s, t, time in zip(src, tgt, ts):
-            edge_set.setdefault((int(t), int(s)), []).append(int(time))
+    for s, t, time in zip(src, tgt, ts):
+        edge_set.setdefault((int(t), int(s)), []).append(int(time))
 
     return walks, edge_set, len(src)
 

@@ -3,8 +3,9 @@
 Single Trainer class. Per-batch ordering:
 
   TRAINING:
-    1. walks_bwd = walk_gen.walks_for_nodes_embedding_backward(seeds_tgt)
-       ← pre-ingest state. Embedding alignment is backward-only;
+    1. walks_bwd = walk_gen.walks_for_nodes_embedding_backward(seeds_src)
+       ← pre-ingest state. Seeds are unique SOURCES; embedding alignment
+       is backward-only;
        forward embedding alignment was ablated and dropped 2026-06-07
        on wiki (backward-only beats forward+backward by +0.009 test,
        outside the noise band).
@@ -12,8 +13,8 @@ Single Trainer class. Per-batch ordering:
     3. neg = neg_sampler.sample(batch)               ← stateless uniform
        neg_tgt: [B, K_train]
     4. candidates_v = [pos_v | neg_tgt]              ← [B, 1+K_train]
-       u-side walks = walk_gen.walks_for_nodes_link_pred_*(unique src)
-       (forward direction if is_directed, backward if undirected)
+       u-side walks = walk_gen.walks_for_nodes_link_pred_backward(unique src)
+       (BACKWARD walks; graphs are treated as undirected)
        logits = link_head(E[v].detach(), walks=walks)
        E is detached — L_link trains only the link head; L_align is
        the sole gradient path into E. (u enters only through its walks,
@@ -79,7 +80,6 @@ class TrainerConfig:
     # for the TrainStats bundle that carries them (plus inter-arrival
     # statistics) for display + recency_scale derivation.
     num_nodes: int
-    is_directed: bool
     dst_pool: np.ndarray
 
     # Model.
@@ -114,22 +114,18 @@ class TrainerConfig:
     gamma_recency: float = 0.4
     recency_scale: float = 1.0  # Plumbed in by train.py from TrainStats.
 
-    # Walks. Two sides.
+    # Walks. Two sides, both BACKWARD only (graphs treated as undirected;
+    # forward embedding alignment was ablated 2026-06-07, and the link-pred
+    # forward direction — used only for directed graphs — was removed).
     #   embedding_* — drive the geometry of E via the alignment loss
-    #                  (BACKWARD walks from each batch tgt only;
-    #                  forward embedding alignment was ablated and
-    #                  dropped 2026-06-07).
-    #   link_pred_* — drive the walk-mediated link head. The head's
-    #                  direction is dataset-driven (is_directed):
-    #                  undirected → backward, directed → forward.
+    #                  (BACKWARD walks from each batch SOURCE).
+    #   link_pred_* — drive the walk-mediated link head (BACKWARD walks).
     embedding_num_walks_per_node: int = 10
     embedding_max_walk_len: int = 20
     embedding_backward_walk_bias:  str = "ExponentialWeight"
     embedding_backward_start_bias: str = "ExponentialWeight"
     link_pred_num_walks_per_node: int = 3
     link_pred_max_walk_len: int = 20
-    link_pred_forward_walk_bias:  str = "ExponentialWeight"
-    link_pred_forward_start_bias: str = "Uniform"
     link_pred_backward_walk_bias:  str = "ExponentialWeight"
     link_pred_backward_start_bias: str = "ExponentialWeight"
     max_time_capacity: int = -1     # Tempest sliding-window eviction
@@ -142,8 +138,7 @@ class TrainerConfig:
     # The link head (LinkPredHead) scores each candidate against u's walks by
     # a per-hop-weighted recency pool of cosines; its only architecture knob
     # is max_walk_len (sized from link_pred_max_walk_len). The walk direction
-    # is dataset-driven from is_directed (undirected → backward, directed →
-    # forward).
+    # is always BACKWARD (graphs are treated as undirected).
     # E is detached on all link-head lookups (E[u], E[v], E_walks);
     # L_link trains only the link head, L_align is the sole gradient
     # path into E. A controllable L_link → E leak (convex-combo grad
@@ -214,9 +209,8 @@ class Trainer:
             d_emb=config.d_emb,
         ).to(self.device)
         # Walk-mediated link-pred head (see link_pred_head.py). `max_walk_len`
-        # sizes its per-hop weight table. The head consumes ONE direction of
-        # walks; the direction is chosen by is_directed (see
-        # self.link_head_walk_direction below).
+        # sizes its per-hop weight table. The head consumes BACKWARD walks
+        # (graphs are treated as undirected).
         self.link_head = LinkPredHead(
             max_walk_len=int(config.link_pred_max_walk_len),
         ).to(self.device)
@@ -247,24 +241,17 @@ class Trainer:
         else:
             self.train_deg = torch.zeros(config.num_nodes, dtype=torch.int64)
 
-        # Walk sampler. The embedding side draws BACKWARD walks only
-        # (forward was ablated). The link-pred side draws ONE direction
-        # (decided by is_directed below) and uses the full K on it.
+        # Walk sampler. Both the embedding side and the link-pred side
+        # draw BACKWARD walks only (graphs are treated as undirected; the
+        # forward direction was only used for directed graphs and removed).
         emb_K = max(1, int(config.embedding_num_walks_per_node))
         link_K_per_dir = max(1, int(config.link_pred_num_walks_per_node))
-        # Direction the link head consumes — frozen by is_directed.
-        self.link_head_walk_direction = (
-            "forward" if config.is_directed else "backward"
-        )
         self.walk_gen = WalkGenerator(
-            is_directed=config.is_directed,
             use_gpu=config.use_gpu_tempest,
             embedding_backward_walk_bias=config.embedding_backward_walk_bias,
             embedding_backward_start_bias=config.embedding_backward_start_bias,
             embedding_num_walks_per_node=emb_K,
             embedding_max_walk_len=config.embedding_max_walk_len,
-            link_pred_forward_walk_bias=config.link_pred_forward_walk_bias,
-            link_pred_forward_start_bias=config.link_pred_forward_start_bias,
             link_pred_backward_walk_bias=config.link_pred_backward_walk_bias,
             link_pred_backward_start_bias=config.link_pred_backward_start_bias,
             link_pred_num_walks_per_node=link_K_per_dir,
@@ -376,16 +363,13 @@ class Trainer:
         u_ids_np,                # np.ndarray [B] source ids
         t_query_np,              # np.ndarray [B] query timestamps
     ):
-        """Sample u-side walks in the dataset-dictated direction
-        (self.link_head_walk_direction; backward for undirected, forward
-        for directed) and package them into the per-position feature dict
-        the head consumes. Returns a single dict.
+        """Sample u-side BACKWARD walks (graphs are treated as undirected;
+        the head consumes u's most-recent predecessors) and package them
+        into the per-position feature dict the head consumes. Returns a
+        single dict.
         """
-        direction = self.link_head_walk_direction
-        if direction == "forward":
-            sampler = self.walk_gen.walks_for_nodes_link_pred_forward
-        else:
-            sampler = self.walk_gen.walks_for_nodes_link_pred_backward
+        direction = "backward"
+        sampler = self.walk_gen.walks_for_nodes_link_pred_backward
 
         # Sample once per UNIQUE u, then scatter back to row order.
         uniq, inv = np.unique(u_ids_np, return_inverse=True)
@@ -444,11 +428,12 @@ class Trainer:
         device = self.device
 
         # Step 1: walks from PRE-INGEST state.
-        # Embedding supervision: BACKWARD walks from each unique target
-        # (forward embedding alignment was ablated and dropped — see
-        # the module docstring).
-        seeds_tgt_np = np.unique(batch.tgt)
-        walks_bwd = self.walk_gen.walks_for_nodes_embedding_backward(seeds_tgt_np)
+        # Embedding supervision: BACKWARD walks from each unique SOURCE
+        # (the link head queries from the source, so E[source] is the
+        # representation that must be shaped; forward embedding alignment
+        # was ablated and dropped — see the module docstring).
+        seeds_src_np = np.unique(batch.src)
+        walks_bwd = self.walk_gen.walks_for_nodes_embedding_backward(seeds_src_np)
 
         # Inverse-degree seed weighting (always on). The phase-6
         # both-active hard cohort has median seed degree 1; the
@@ -456,7 +441,7 @@ class Trainer:
         # starves rare seeds. Weighting each walk row by
         # 1/log1p(deg(seed_of_row)) restores parity.
         seed_weights_bwd = 1.0 / torch.log1p(
-            self.train_deg[torch.from_numpy(seeds_tgt_np.astype(np.int64))]
+            self.train_deg[torch.from_numpy(seeds_src_np.astype(np.int64))]
             .to(self.device).float()
         )
 
@@ -507,10 +492,10 @@ class Trainer:
         # val positives because memorised seen-pair geometry has no
         # bearing on unseen pairs.
         e_v = self.embedding_table(candidates_v).detach()            # [B, 1+K, d]
-        # Walk-mediated head: sample u-side walks (one direction, set by
-        # is_directed) at the batch query times and pass the walk
-        # feature dict. The head is inherently u→v directional; no
-        # symmetrisation (cf. _score_query docstring).
+        # Walk-mediated head: sample u-side BACKWARD walks at the batch
+        # query times and pass the walk feature dict. The head is
+        # inherently u→v directional; no symmetrisation (cf. _score_query
+        # docstring).
         walks = self._sample_u_walks_for_head(
             batch.src.astype(np.int64), batch.ts.astype(np.int64),
         )

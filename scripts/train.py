@@ -6,25 +6,24 @@ management logic — for parameter sweeps, invoke this script
 repeatedly with different CLI args.
 
 Hyperparameters exposed at CLI (and their grouping):
-  Dataset:        --dataset, --tgb-root, --is-directed
+  Dataset:        --dataset, --tgb-root
   Model:          --d-emb
   Loss:           --tau-align, --tau-link, --gamma-recency,
                   --k-train, --alignment-chunk-size
   Walks:          --embedding-num-walks-per-node, --embedding-max-walk-len,
                   --embedding-backward-walk-bias, --embedding-backward-start-bias,
                   --link-pred-num-walks-per-node, --link-pred-max-walk-len,
-                  --link-pred-forward-walk-bias, --link-pred-forward-start-bias,
                   --link-pred-backward-walk-bias, --link-pred-backward-start-bias,
                   --tempest-batch-window-multiplier
-                  (Embedding side is backward-only. Link-pred side picks
-                   forward or backward by --is-directed.)
+                  (Both the embedding and link-pred sides are backward-only;
+                   graphs are treated as undirected.)
   Optimisation:   --lr, --lr-min, --warmup-fraction, --warmup-steps-cap,
                   --decay-horizon-epochs, --weight-decay, --batch-size,
                   --eval-batch-size, --num-epochs, --early-stop-patience
   System:         --seed, --use-gpu, --use-gpu-tempest
 
 Derived from the dataset (not exposed):
-  num_nodes, is_directed, dst_pool,
+  num_nodes, dst_pool,
   TrainStats (t_min, t_max, T_train, median_inter_arrival,
               mean_inter_arrival) — see tempest_walks/data_stats.py.
   recency_scale defaults to TrainStats.mean_inter_arrival and is
@@ -77,17 +76,6 @@ def parse_args() -> argparse.Namespace:
                    help="TGB dataset name, e.g. tgbl-wiki, tgbl-review")
     p.add_argument("--tgb-root", default="datasets", type=str)
 
-    # Directedness is an explicit caller-supplied flag with no
-    # internal fallback table. Default OFF (treat the graph as
-    # undirected). Pass --is-directed for datasets where the
-    # topology is genuinely directed; this only affects the walk
-    # sampler (Tempest constructor) — eval scoring is always
-    # task-directional regardless.
-    p.add_argument(
-        "--is-directed", action="store_true",
-        help="Treat the graph as directed (default: undirected). "
-             "Consumed by the walk sampler (Tempest) only.",
-    )
 
     # Model.
     p.add_argument("--d-emb", default=128, type=int)
@@ -131,17 +119,11 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Walks.
-    # *-num-walks-per-node is K walks per seed. The embedding side uses
-    # the backward direction only; the link-pred head uses ONE direction
-    # chosen by is_directed (backward if undirected, forward if directed)
-    # and spends the full K on it. Bias knobs are per direction; defaults
-    # reflect Tempest's chronological semantics:
-    #   - forward + ExpW start shoots toward the head (oldest end) of
-    #     the successor set, the least predictive slice. Uniform start
-    #     + ExpW walk spreads coverage, then biases continuations
-    #     toward recency relative to the previous hop.
-    #   - backward + ExpW start lands on the seed's most recent
-    #     predecessor (the tail / most predictive end), so ExpW + ExpW.
+    # *-num-walks-per-node is K walks per seed. Both the embedding side
+    # and the link-pred head use the BACKWARD direction only (graphs are
+    # treated as undirected) and spend the full K on it. Backward + ExpW
+    # start lands on the seed's most recent predecessor (the tail / most
+    # predictive end), so ExpW + ExpW.
     p.add_argument(
         "--embedding-num-walks-per-node", default=10, type=int,
         help="K for embedding-side walks per seed (all spent on the "
@@ -162,20 +144,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--link-pred-num-walks-per-node", default=3, type=int,
         help="K walks per seed for the link-pred head. The head consumes "
-             "ONE direction (backward if undirected, forward if directed; "
-             "set by is_directed) and spends the full K on it.",
+             "BACKWARD walks (graphs treated as undirected) and spends "
+             "the full K on them.",
     )
     p.add_argument(
         "--link-pred-max-walk-len", default=20, type=int,
         help="L for link-pred-side walks.",
-    )
-    p.add_argument(
-        "--link-pred-forward-walk-bias", default="ExponentialWeight", type=str,
-        help="Per-hop edge bias for FORWARD link-pred-side walks.",
-    )
-    p.add_argument(
-        "--link-pred-forward-start-bias", default="Uniform", type=str,
-        help="Initial-edge bias for FORWARD link-pred-side walks.",
     )
     p.add_argument(
         "--link-pred-backward-walk-bias", default="ExponentialWeight", type=str,
@@ -316,7 +290,6 @@ def main() -> Dict[str, Any]:
 
     # Derived dataset constants.
     num_nodes = loaded.max_node_count
-    is_directed = args.is_directed
     dst_pool = np.unique(loaded.train.destinations).astype(np.int32)
     # Full-dataset timestamps (train + val + test) feed compute_train_stats
     # so it can populate t_max_full / T_full — the v2 link-pred head's
@@ -329,7 +302,6 @@ def main() -> Dict[str, Any]:
     stats = compute_train_stats(loaded.train.timestamps, full_timestamps=full_ts)
 
     print(f"  num_nodes:     {num_nodes:,}")
-    print(f"  directed:      {is_directed}  (--is-directed)")
     print(f"  dst_pool:      {len(dst_pool):,} unique destinations")
     print(f"  t_min:         {stats.t_min}")
     print(f"  t_max:         {stats.t_max}")
@@ -374,7 +346,6 @@ def main() -> Dict[str, Any]:
     # ─── Build TrainerConfig ───────────────────────────────────────
     config = TrainerConfig(
         num_nodes=num_nodes,
-        is_directed=is_directed,
         dst_pool=dst_pool,
 
         d_emb=args.d_emb,
@@ -392,8 +363,6 @@ def main() -> Dict[str, Any]:
         embedding_backward_start_bias=args.embedding_backward_start_bias,
         link_pred_num_walks_per_node=args.link_pred_num_walks_per_node,
         link_pred_max_walk_len=args.link_pred_max_walk_len,
-        link_pred_forward_walk_bias=args.link_pred_forward_walk_bias,
-        link_pred_forward_start_bias=args.link_pred_forward_start_bias,
         link_pred_backward_walk_bias=args.link_pred_backward_walk_bias,
         link_pred_backward_start_bias=args.link_pred_backward_start_bias,
         train_deg=_compute_train_deg(loaded),
