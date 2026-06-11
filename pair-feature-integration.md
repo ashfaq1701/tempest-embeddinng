@@ -93,3 +93,65 @@ stores**, not walks — within the Tempest-only-for-walks constraint):
 
 Success = wiki test MRR ≥ 0.83, holding the smooth-curve / noise discipline
 (≥0.015 single-seed or multi-seed confirmation before claiming a win).
+
+---
+
+## TPNet's pair features — full inventory
+
+This is the catalogue of every pairwise signal TPNet's `RandomProjectionModule`
+produces, what each one *is* (paper + code), and a plain-language reading. Source
+of truth: `TGB_TPNet/models/TPNet.py` (`get_pair_wise_feature`, L119–139;
+`get_random_projections`, L108–117; `update`, L70–106) and `modules.py`
+(`LinkPredictor_v1.forward`, L97–119).
+
+**One sentence first.** TPNet never stores the pair features explicitly. It
+maintains one random-projected vector per node per hop-level, and the pair feature
+for `(u,v)` is the **Gram matrix** (all pairwise dot-products) of the stacked
+`[u^(0..k), v^(0..k)]` projections — `(2(k+1))²` numbers, `= 36` for wiki's `k=2` —
+then `ReLU → log(·+1) → MLP`. By the Johnson–Lindenstrauss guarantee (Theorem 2)
+each dot-product `⟨H^(la)_a, H^(lb)_b⟩ ≈ ⟨A^(la)_a, A^(lb)_b⟩`, an inner product of
+two **temporal-walk-matrix** rows. So every "feature" below is really one entry (or
+a block of entries) of that Gram, and the MLP learns which combinations matter.
+
+### A. The underlying objects (how the features are constructed)
+
+| Name | What it is (paper + code jargon) | Easy explanation |
+|---|---|---|
+| **Temporal walk matrix** `A^(k)(t)` | The `k`-hop **time-respecting** reachability matrix at time `t`. `A^(k)_{u,v}(t) = Σ_{W: u⇝v, k hops, non-increasing times ≤ t} s(W)`; `A^(0)=I`. Built implicitly, never materialised. | "How many `k`-step temporal walks get from `u` to `v`, counting recent ones more." A recency-weighted count of time-ordered paths. |
+| **Time-decay walk score** `s(W) = ∏_i e^{-λ(t − t_i)}` | Per-walk weight: each edge on the walk at time `t_i` contributes `e^{-λ(t−t_i)}`; `λ` = decay rate (`rp_time_decay_weight`). Makes `A^(k)` a *recency-weighted* walk count, and is what lets the relative-time update (L88–90, `*= exp(-λΔt)^i`) avoid the `e^{λt}` overflow. | "Old hops fade, recent hops count full." A walk through stale edges barely registers; a fresh one counts strongly. |
+| **Random-feature node rep** `H^(l)(t)` (JL projection) | The maintained per-node vector. The module stores `e^{-λlt}H^(l)(t) = A^(l)(t)P` directly (decayed form), `P ∈ R^{N×dim}` a fixed Gaussian sketch (`random_projections[i]`, `dim = rp_dim`). Theorem 1: `e^{-λlt}H^(l) = A^(l)P` exactly; Theorem 2 (JL): `⟨H^(la)_a, H^(lb)_b⟩ ≈ ⟨A^(la)_a, A^(lb)_b⟩` to `(1±ε)`. `O(1)`-amortised update per edge. | "Each node carries a tiny fingerprint of its whole `l`-hop temporal neighbourhood." Dotting two fingerprints recovers their neighbourhood overlap without touching the full `N×N` matrix. |
+
+### B. The pair feature itself (the Gram and its semantic blocks)
+
+| Name | What it is (paper + code jargon) | Easy explanation |
+|---|---|---|
+| **Raw pairwise feature** `f̃_{u,v}` | `flatten(F_{u,v} F_{u,v}ᵀ)`, where `F_{u,v} = [H^(0)_u … H^(k)_u, H^(0)_v … H^(k)_v] ∈ R^{2(k+1)×dim}`. In code: `matmul(rp, rp.transpose(1,2)).reshape(B,-1)` (L132). A `(2(k+1))²`-vector (`36`-d for wiki) of all cross-hop, cross-node inner products. | "Take `u`'s and `v`'s fingerprints at every hop level, dot every one against every other." The whole table of overlaps is the feature. |
+| **Node-identity / self-norm term** (`A^(0)` block) | Entries `⟨H^(0)_a, H^(0)_b⟩ ≈ ⟨A^(0)_a, A^(0)_b⟩ = δ(a,b)` since `A^(0)=I`: `≈1` on the diagonal, `≈0` for distinct `u,v`. An anchor/normaliser, uninformative alone. | "A node is identical to itself and (mostly) not the other node." Gives the MLP a fixed reference scale. |
+| **Direct `l`-hop connectivity** `A^(l)_{u,v}` | Entries `⟨H^(0)_u, H^(l)_v⟩ ≈ A^(l)_{v,u}(t)` (and the mirror): recency-weighted count of `l`-step temporal walks **between `u` and `v`**. `l=1` = recent direct edges (**recurrence**); `l=2` = recency-weighted 2-hop bridging. | "Have `u` and `v` actually interacted lately (`l=1`), or are they one node apart (`l=2`)?" The strongest single link cue. |
+| **Co-reachability / shared context** `⟨A^(li)_u, A^(lj)_v⟩`, `li,lj ≥ 1` | Off-diagonal cross-block entries `≈ Σ_w A^(li)_{u,w}(t)·A^(lj)_{v,w}(t)`: recency-weighted count of nodes `w` reachable from `u` in `li` hops **and** from `v` in `lj` hops. `li=lj=1` = time-decayed **common neighbours**; mixed = asymmetric multi-hop overlap. | "How many of the same nodes have `u` and `v` both been touching lately?" Friends-in-common, generalised to multi-hop and weighted by recency. |
+| **Self-structure / activity** `⟨A^(li)_w, A^(lj)_w⟩` | The `u·u` and `v·v` diagonal blocks (`li,lj ≥ 1`): a node's own neighbourhood density / return-walk structure, ≈ recency-weighted degree and closed-walk counts. A per-node activity normaliser the MLP can divide by. | "How busy / well-connected is `u` on its own (and `v`)?" Lets the model discount overlap that's high only because a node talks to everyone. |
+
+### C. Processing & where it's used
+
+| Name | What it is (paper + code jargon) | Easy explanation |
+|---|---|---|
+| **Scale transform** `log(ReLU(·)+1)` | L137–138: clamp negatives (sketch noise / sign) to 0, then `log1p`. Compresses heavy-tailed Gram magnitudes (walk counts span orders of magnitude) into a learnable range. Skipped iff `not_scale`. | "Squash the huge raw counts so a few giant numbers don't dominate." Standard count→log scaling. |
+| **Learned pair feature** `f_{u,v} = MLP(log(ReLU(f̃)+1))` | 2-layer MLP (`pair_wise_feature_dim → … → out`, `pair_wise_feature_dim = (2·num_layer+2)² = 36` for `k=2`) projecting the `36` raw overlaps into the model's feature space. The vector the rest of the network consumes. | "Let a small network decide which overlaps matter and mix them." The end product handed to the decoder/backbone. |
+| **Injection point 1 — decoder** | `LinkPredictor_v1.forward` (`modules.py` L97–119): `MLP([h_u ‖ h_v ‖ f_{u,v}])`. The pair feature is concatenated with the two node embeddings right before the final link score. | "Glue the pairwise overlap onto the two node vectors and read off the score." Most direct use. |
+| **Injection point 2 — backbone** | `TPNetEmbedding.compute_node_temporal_embeddings` (L305–368): for each sampled neighbour `w` of the target pair, the per-neighbour relative encodings `[r_{w|u}, r_{w|v}] = [f_{w,u}, f_{w,v}]` are appended to that neighbour's token before the MLP-Mixer. (Note the latent L361 `masked_fill` no-op bug found in the fidelity pass.) | "Also tell every neighbour how it relates to both endpoints, before mixing." Spreads the pairwise signal through the whole node encoder, not just the final layer. |
+
+### What this means for our reproduction
+
+- The untried lever is **co-reachability with recency** (rows B-4/B-5): 2-hop
+  common-neighbour overlap, time-decayed — and crucially we can compute it
+  **exactly from Tempest walks** (genuine causal walks) rather than via the JL
+  sketch TPNet is forced into. Direct `l=1` connectivity (recurrence) we already
+  capture with the recency head; the headroom is the `l≥2` overlap.
+- We do **not** need TPNet's `RandomProjectionModule` machinery: the sketch exists
+  only because TPNet computes `A^(l)P` analytically over the full graph. We sample
+  walks, so we can read these same quantities off walk membership directly (an
+  exact edge / 2-hop store keyed on the candidate), sidestepping the JL `ε`-error
+  and keeping Tempest as the moat.
+- Injection mirrors TPNet's point 1: concat the pair feature to the per-candidate
+  decoder input / add a learned pair-term to the logit, co-trained end-to-end with
+  `E` and the GRU (no detach).
