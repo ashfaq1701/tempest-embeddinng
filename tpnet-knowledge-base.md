@@ -237,6 +237,33 @@ AP/AUC numbers — different protocol entirely.
 
 ---
 
+## 4.5 Runtime in practice — we are orders of magnitude faster (so far)
+
+A counterintuitive but important measured fact. The paper sells TPNet as *fast*
+(33× vs DyGFormer) — but that is **relative to walk-sampling baselines on the
+paper's AP protocol**. In **absolute** terms on the **TGB-MRR** setting it is
+heavy, and our architecture is dramatically faster per epoch:
+
+| dataset | our epoch time | TPNet epoch time |
+|---|---|---|
+| `tgbl-wiki` | **~1 min** | **~30 min** |
+| `tgbl-coin` (larger) | (not yet run our side) | **10+ hours** |
+
+So far we are **orders of magnitude faster than TPNet**, and the gap widens on
+larger datasets.
+
+Why (likely): (1) the TGB-MRR eval scores ~999 negatives per positive, and TPNet
+runs its **full MLP-Mixer backbone + per-candidate pairwise-feature decode** for
+every candidate, plus neighbor sampling and the RP update — all per query; (2) on
+larger graphs the neighbor sampling / RP bookkeeping grows. Our cross-GRU dedups
+the per-node walk encoding (one encode per unique node, reused across all ~999
+candidates) and uses a light chord decoder, so eval cost scales with *unique
+nodes* per batch (≲ N) rather than with candidates. This speed headroom is a real
+asset: it lets us iterate and, ultimately, run all TGB datasets where TPNet is
+impractically slow — provided we add the pairwise signal without re-introducing
+TPNet's per-candidate cost (keep it dedup-friendly / query-independent where
+possible).
+
 ## 5. Implications for `pair-feature-integration.md`
 
 1. **The pairwise feature is the lever, and it's a local pairwise store, not a
