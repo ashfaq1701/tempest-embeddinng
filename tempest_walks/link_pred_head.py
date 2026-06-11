@@ -1,93 +1,62 @@
-"""Walk-mediated link-prediction head — order-aware recency pool.
+"""Cross walk-encoder link head.
 
-Per (u, t, candidate v), for each of u's K walks and each walk position p
-the head scores the candidate against the walk node at that position by a
-plain cosine (E is unit-norm, so cos(E_v, E_w_p) = E_v · E_w_p), then pools
-those per-position similarities with a learned per-hop recency kernel:
+Per batch the head is given, for every UNIQUE node that appears (as a source or
+a candidate), K Tempest walks of length L. It looks up E on the walk nodes,
+encodes each node's walks with a GRU (final state, pooled over the K walks) into
+a context vector h[node], and scores a candidate pair (u, v) by the symmetric
+cross comparison of E[u] against h[v] and E[v] against h[u]:
 
-    s_p(v) = cos(E_v, E_w_p)
-    score(v) = scale · mean_walks  Σ_p  ω_p · s_p(v)
+    dist:  logit(u, v) = -scale * ( D(E[u], h[v]) + D(E[v], h[u]) )    D = l2² or l1
+    cos:   logit(u, v) =  scale * ( cos(E[u], h[v]) + cos(E[v], h[u]) )
 
-ω_p is a learned weight per hop index, softmax-normalised over the valid
-positions of each walk (a recency/order kernel over the walk), and is
-candidate-INDEPENDENT — so the candidate enters only through the cosine and
-the whole head is a single einsum plus a pooled sum (no per-position MLP, no
-recurrence). `scale` is a learnable temperature: the pooled score is a convex
-combination of cosines in [-1, 1], which would give a near-flat per-query
-softmax (and vanishing gradients) without it.
-
-The walk's seed slot is node u, so cos(E_v, E_u) — the direct u-vs-v
-similarity — is one of the pooled terms.
-
-E[v] is EXPECTED to be detached upstream — this head's gradients update only
-its own parameters; E is shaped by the alignment loss alone (u enters only
-through its walks, whose seed slot is node u).
-
-forward(E_v, walks) -> [B, C] logits.  walks is the per-position feature dict
-(E_walks [B,W,L,d], mask [B,W,L], K_idx [B,W,L] hop, t_feat [B,W,L,d_T]).
+E is link-trained (no detach, no alignment): the link loss flows into E both
+directly (the E[u] / E[v] terms) and through the GRU (E on the walk nodes).
+``scale`` is the only temperature. For the distance forms E / h are compared
+RAW (no normalisation) so magnitude is part of the signal; training aligns the
+two spaces.
 """
-import math
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class TimeEncoder(nn.Module):
-    def __init__(self, n_omega: int = 4):
+class CrossWalkGRUHead(nn.Module):
+    def __init__(self, d_emb: int, dist: str = "l2", num_layers: int = 1):
         super().__init__()
-        self.n_omega = n_omega
-        omegas = 2.0 * math.pi * (2.0 ** torch.arange(n_omega).float())
-        self.register_buffer("omegas", omegas, persistent=False)
-        self.d_T = 4 + 2 * n_omega
+        if dist not in ("l2", "l1", "cos"):
+            raise ValueError(f"dist must be l2 / l1 / cos, got {dist!r}")
+        self.dist = dist
+        self.gru = nn.GRU(d_emb, d_emb, num_layers=num_layers, batch_first=True)
+        # cos sits in [-1,1] (needs a larger scale); distances are O(1-10).
+        self.logit_scale = nn.Parameter(torch.tensor(10.0 if dist == "cos" else 1.0))
 
-    def forward(self, gap_norm: torch.Tensor) -> torch.Tensor:
-        g = gap_norm.clamp(0.0, 1.0)
-        raw = torch.stack([g, torch.exp(-g), g * g, torch.log1p(g)], dim=-1)
-        ang = g.unsqueeze(-1) * self.omegas
-        sin_cos = torch.cat([ang.sin(), ang.cos()], dim=-1)
-        return torch.cat([raw, sin_cos], dim=-1)
+    def encode(self, walk_emb: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """walk_emb [M, K, L, d], valid [M, K, L] bool -> h [M, d].
 
+        GRU each of the M*K walks, take the hidden state at the last valid
+        position, mean-pool over the K walks of each node."""
+        M, K, L, d = walk_emb.shape
+        out, _ = self.gru(walk_emb.reshape(M * K, L, d))          # [M*K, L, d]
+        last_idx = valid.reshape(M * K, L).sum(dim=1).clamp_min(1) - 1  # [M*K]
+        rows = torch.arange(M * K, device=out.device)
+        last = out[rows, last_idx]                                # [M*K, d]
+        return last.reshape(M, K, d).mean(dim=1)                  # [M, d]
 
-class LinkPredHead(nn.Module):
-    """Order-aware recency pool over candidate-vs-walk cosines.
+    def forward(self, E_u: torch.Tensor, E_v: torch.Tensor,
+                h_u: torch.Tensor, h_v: torch.Tensor) -> torch.Tensor:
+        """E_u/h_u [B, d]; E_v/h_v [B, C, d] -> [B, C] logits."""
+        if self.dist == "cos":
+            eu = F.normalize(E_u, dim=-1).unsqueeze(1)           # [B, 1, d]
+            hu = F.normalize(h_u, dim=-1).unsqueeze(1)
+            ev = F.normalize(E_v, dim=-1)                        # [B, C, d]
+            hv = F.normalize(h_v, dim=-1)
+            s = (eu * hv).sum(dim=-1) + (ev * hu).sum(dim=-1)    # [B, C]
+            return self.logit_scale.clamp(1.0, 100.0) * s
 
-    See the module docstring for the scoring rule. A learned per-hop weight
-    ω (softmax over each walk's valid positions) replaces an order-blind pool;
-    the candidate enters only through the cosine, so the head is ~free per
-    candidate. `time_encoder` is exposed because the trainer builds the walks'
-    t_feat channel through it (the head itself scores from hop + cosine only).
-
-    forward(E_v, walks) -> [B, C]. E_v / E_walks detached upstream.
-    """
-
-    def __init__(self, max_walk_len: int):
-        super().__init__()
-        # The trainer reads link_head.time_encoder to build the walks' t_feat
-        # channel; this head scores from hop + cosine and does not consume
-        # t_feat itself, but must expose the encoder for the shared path.
-        self.time_encoder = TimeEncoder()
-        # one scalar log-weight per hop index; ω_p = softmax over valid p
-        self.omega = nn.Embedding(max_walk_len, 1)
-        nn.init.zeros_(self.omega.weight)          # uniform pool at init
-        # Learnable temperature. The pooled score is a convex combination of
-        # cosines (range [-1, 1]); at init the uniform pool averages ~WL
-        # cosines toward 0, so a larger scale is needed for a healthy per-query
-        # softmax (ω concentrates during training and widens the spread).
-        # Clamped to (0, 100].
-        self.logit_scale = nn.Parameter(torch.tensor(30.0))
-
-    def forward(self, E_v: torch.Tensor, walks: dict) -> torch.Tensor:
-        E_walks = walks["E_walks"]                 # [B,W,L,d]
-        mask = walks["mask"]                       # [B,W,L]
-        K_idx = walks["K_idx"]                     # [B,W,L] hop
-        valid = mask.bool()
-        s = torch.einsum("bcd,bwld->bcwl", E_v, E_walks)        # [B,C,W,L] cos
-        w = self.omega(K_idx).squeeze(-1)                       # [B,W,L] log-weight
-        w = w.masked_fill(~valid, float("-inf"))
-        alpha = torch.softmax(w, dim=-1)                        # [B,W,L] over positions
-        alpha = torch.nan_to_num(alpha, 0.0)                    # empty walk row -> 0
-        score_w = (s * alpha.unsqueeze(1)).sum(dim=-1)         # [B,C,W] per-walk
-        walk_valid = valid.any(dim=-1).float()                 # [B,W]
-        denom = walk_valid.sum(dim=-1).clamp_min(1.0)          # [B]
-        score = (score_w * walk_valid.unsqueeze(1)).sum(dim=-1) / denom.unsqueeze(1)
-        return self.logit_scale.clamp(1.0, 100.0) * score      # [B,C]
+        diff1 = E_u.unsqueeze(1) - h_v                           # [B, C, d]  E[u] vs h[v]
+        diff2 = E_v - h_u.unsqueeze(1)                           # [B, C, d]  E[v] vs h[u]
+        if self.dist == "l1":
+            d = diff1.abs().sum(dim=-1) + diff2.abs().sum(dim=-1)        # [B, C]
+        else:  # l2 (squared)
+            d = diff1.pow(2).sum(dim=-1) + diff2.pow(2).sum(dim=-1)      # [B, C]
+        return -self.logit_scale.clamp_min(1e-3) * d

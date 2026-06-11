@@ -1,0 +1,28 @@
+        # Negative samplers (training). The sampler's per-positive
+        # negative count is K_train under the new per-query ranking
+        # protocol — sampler's internal `num_neg_per_pos` kwarg
+        # name stays the same (sampler API is unchanged).
+        if config.hist_neg_ratio > 0:
+            self.neg_sampler_train: NegativeSampler = HistoricalNegativeSampler(
+                num_nodes=config.num_nodes,
+                num_neg_per_pos=config.K_train,
+                hist_ratio=config.hist_neg_ratio,
+                reservoir_size=config.reservoir_size,
+                dst_pool=config.dst_pool,
+                seed=config.seed,
+            )
+        else:
+            self.neg_sampler_train = UniformNegativeSampler(
+                num_neg_per_pos=config.K_train,
+                dst_pool=config.dst_pool,
+                seed=config.seed,
+            self.lr_scheduler.step()
+            self._global_step += 1
+
+        # Step 7: observe positives into reservoir (post-scoring).
+        if isinstance(self.neg_sampler_train, HistoricalNegativeSampler):
+            self.neg_sampler_train.observe(batch.src, batch.tgt)
+
+        # Step 8: ingest into Tempest (LAST).
+        self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
+

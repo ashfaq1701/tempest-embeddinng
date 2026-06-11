@@ -1,1 +1,1 @@
-from . import data, evaluator, negatives, walks, model, losses, trainer
+from . import data, evaluator, negatives, walks, model, link_pred_head, trainer

@@ -8,26 +8,18 @@ repeatedly with different CLI args.
 Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root
   Model:          --d-emb
-  Loss:           --tau-align, --tau-link, --gamma-recency,
-                  --k-train, --alignment-chunk-size
-  Walks:          --embedding-num-walks-per-node, --embedding-max-walk-len,
-                  --embedding-backward-walk-bias, --embedding-backward-start-bias,
-                  --link-pred-num-walks-per-node, --link-pred-max-walk-len,
-                  --link-pred-backward-walk-bias, --link-pred-backward-start-bias,
-                  --tempest-batch-window-multiplier
-                  (Both the embedding and link-pred sides are backward-only;
-                   graphs are treated as undirected.)
-  Optimisation:   --lr, --lr-min, --warmup-fraction, --warmup-steps-cap,
-                  --decay-horizon-epochs, --weight-decay, --batch-size,
-                  --eval-batch-size, --num-epochs, --early-stop-patience
+  Link/head:      --tau-link, --k-train, --dist
+  Walks:          --num-walks-per-node, --max-walk-len, --walk-bias,
+                  --start-bias, --tempest-batch-window-multiplier
+                  (backward-only; graphs are treated as undirected)
+  Optimisation:   --optimizer, --lr, --lr-min, --warmup-fraction,
+                  --warmup-steps-cap, --decay-horizon-epochs, --weight-decay,
+                  --batch-size, --eval-batch-size, --num-epochs,
+                  --early-stop-patience
   System:         --seed, --use-gpu, --use-gpu-tempest
 
-Derived from the dataset (not exposed):
-  num_nodes, dst_pool,
-  TrainStats (t_min, t_max, T_train, median_inter_arrival,
-              mean_inter_arrival) — see tempest_walks/data_stats.py.
-  recency_scale defaults to TrainStats.mean_inter_arrival and is
-  frozen (not learnable) — held as a plain Python float on the Trainer.
+Derived from the dataset (not exposed): num_nodes, dst_pool, and
+mean_inter_arrival (TrainStats) for the Tempest sliding-window cap.
 """
 
 import argparse
@@ -54,18 +46,6 @@ from tempest_walks.trainer import Trainer, TrainerConfig
 from tempest_walks.utils import compute_max_time_capacity, seed_all
 
 
-def _compute_train_deg(loaded: Loaded) -> np.ndarray:
-    """Per-node incidence count over the train split. Undirected:
-    each edge counts once on each endpoint. Used by inverse-degree
-    seed weighting in the alignment loss."""
-    deg = np.zeros(loaded.max_node_count, dtype=np.int64)
-    src = loaded.train.sources.astype(np.int64)
-    tgt = loaded.train.destinations.astype(np.int64)
-    np.add.at(deg, src, 1)
-    np.add.at(deg, tgt, 1)
-    return deg
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Tempest walks-supervised temporal embedding training"
@@ -80,90 +60,40 @@ def parse_args() -> argparse.Namespace:
     # Model.
     p.add_argument("--d-emb", default=128, type=int)
 
-    # Loss.
-    p.add_argument(
-        "--tau-align", default=0.5, type=float,
-        help="InfoNCE alignment temperature (walks-side contrastive).",
-    )
+    # Link loss / head.
     p.add_argument(
         "--tau-link", default=1.0, type=float,
-        help="Link-prediction softmax-CE temperature (per-query "
-             "ranking loss). Default 1.0 — pending a sweep.",
-    )
-    p.add_argument(
-        "--gamma-recency", default=0.4, type=float,
-        help="Convex-combination weight between hop and stationary-"
-             "recency profiles in the alignment-loss per-position "
-             "weight. γ=0 is hop-only; γ=1 is recency-only; default "
-             "0.4 mixes both. Recency_scale is data-driven from the "
-             "train split's median inter-arrival time and is NOT a CLI "
-             "knob — see tempest_walks/data_stats.py.",
+        help="Link-prediction softmax-CE temperature (per-query ranking loss).",
     )
     p.add_argument(
         "--k-train", type=int, default=100,
-        help="Per-query training negatives for the ranking link "
-             "loss. The link head sees [B, 1+K_train] candidates "
-             "per query; positive at column 0. Larger K_train means "
-             "harder per-query competition and stronger ranking "
-             "gradients, at proportional compute cost.",
+        help="Per-query training negatives. The head sees [B, 1+K_train] "
+             "candidates per query; positive at column 0.",
     )
     p.add_argument(
-        "--alignment-chunk-size", default=8192, type=int,
-        help="Slices the unique-pool dimension V when computing the "
-             "InfoNCE partition log Z. Each chunk's forward is "
-             "gradient-checkpointed, so backward peak memory is "
-             "bounded by O(NK·chunk_size) rather than O(NK·V). When "
-             "V ≤ chunk_size the loop runs once and behaviour reduces "
-             "to the dense path. Default 8192 fits wiki/coin in one "
-             "chunk and bounds review's pathological pools.",
+        "--dist", default="l2", choices=["l2", "l1", "cos"],
+        help="Cross comparison in the head: l2 (squared Euclidean), l1, or "
+             "cos. logit(u,v) = -scale*(D(E[u],h[v]) + D(E[v],h[u])) for "
+             "distances; +scale*(cos+cos) for cos.",
     )
 
-    # Walks.
-    # *-num-walks-per-node is K walks per seed. Both the embedding side
-    # and the link-pred head use the BACKWARD direction only (graphs are
-    # treated as undirected) and spend the full K on it. Backward + ExpW
-    # start lands on the seed's most recent predecessor (the tail / most
-    # predictive end), so ExpW + ExpW.
+    # Walks (link head; BACKWARD only, graphs treated as undirected).
     p.add_argument(
-        "--embedding-num-walks-per-node", default=10, type=int,
-        help="K for embedding-side walks per seed (all spent on the "
-             "single backward direction).",
+        "--num-walks-per-node", default=5, type=int,
+        help="K walks per node sampled for the head (sources + candidates).",
     )
     p.add_argument(
-        "--embedding-max-walk-len", default=20, type=int,
-        help="L for embedding-side walks.",
+        "--max-walk-len", default=20, type=int,
+        help="L, max walk length.",
     )
     p.add_argument(
-        "--embedding-backward-walk-bias", default="ExponentialWeight", type=str,
-        help="Per-hop edge bias for backward embedding-side walks.",
+        "--walk-bias", default="ExponentialWeight", type=str,
+        help="Per-hop edge bias for the backward walks.",
     )
     p.add_argument(
-        "--embedding-backward-start-bias", default="ExponentialWeight", type=str,
-        help="Initial-edge bias for backward embedding-side walks.",
+        "--start-bias", default="ExponentialWeight", type=str,
+        help="Initial-edge bias for the backward walks.",
     )
-    p.add_argument(
-        "--link-pred-num-walks-per-node", default=3, type=int,
-        help="K walks per seed for the link-pred head. The head consumes "
-             "BACKWARD walks (graphs treated as undirected) and spends "
-             "the full K on them.",
-    )
-    p.add_argument(
-        "--link-pred-max-walk-len", default=20, type=int,
-        help="L for link-pred-side walks.",
-    )
-    p.add_argument(
-        "--link-pred-backward-walk-bias", default="ExponentialWeight", type=str,
-        help="Per-hop edge bias for BACKWARD link-pred-side walks.",
-    )
-    p.add_argument(
-        "--link-pred-backward-start-bias", default="ExponentialWeight", type=str,
-        help="Initial-edge bias for BACKWARD link-pred-side walks.",
-    )
-    # Symmetric forward+backward embedding alignment and inverse-degree
-    # seed weighting are always on. Iter 6 analysis (analysis/REPORT.md)
-    # established both as load-bearing improvements over baseline (test
-    # +0.010 combined); there is no scenario where either should be off,
-    # so no CLI knob.
 
     # The link head (LinkPredHead) has no architecture knobs beyond
     # max_walk_len, which is set from --link-pred-max-walk-len.
@@ -180,20 +110,16 @@ def parse_args() -> argparse.Namespace:
              "the raw window depends on the dataset's calendar density.",
     )
 
-    # Optimisation. The link head trains on Prodigy (parameter-free; its
-    # peak is an internal multiplier, not a CLI knob). The embedding table E
-    # trains on RiemannianAdam on the unit sphere, with a REAL peak LR
-    # (--emb-lr). --lr-min / --weight-decay below are the HEAD knobs.
+    # Optimisation. One optimizer over {E, GRU, scale}.
     p.add_argument(
-        "--emb-lr", default=1e-3, type=float,
-        help="Peak learning rate for the embedding table E (RiemannianAdam "
-             "on the unit sphere). A real LR — Prodigy's auto-scale does "
-             "not apply to E. Re-tune jointly with --tau-align (the sphere "
-             "constraint changes the effective temperature).",
+        "--optimizer", default="adamw", choices=["adamw", "prodigy", "geometric"],
+        help="adamw / prodigy (Euclidean E) or geometric (RiemannianAdam, E "
+             "on the unit sphere). Single optimizer over all params.",
     )
     p.add_argument(
-        "--emb-lr-min", default=1e-5, type=float,
-        help="Minimum LR for E at the end of cosine decay (~emb-lr/100..1000).",
+        "--lr", default=1e-3, type=float,
+        help="Peak LR (real for adamw/geometric; prodigy uses 1.0 internally "
+             "and treats --lr-min as its multiplier floor).",
     )
     p.add_argument(
         "--lr-min", default=1e-5, type=float,
@@ -350,40 +276,27 @@ def main() -> Dict[str, Any]:
 
         d_emb=args.d_emb,
 
-        tau_align=args.tau_align,
         tau_link=args.tau_link,
-        gamma_recency=args.gamma_recency,
-        recency_scale=stats.mean_inter_arrival,
         K_train=args.k_train,
-        alignment_chunk_size=args.alignment_chunk_size,
+        dist=args.dist,
 
-        embedding_num_walks_per_node=args.embedding_num_walks_per_node,
-        embedding_max_walk_len=args.embedding_max_walk_len,
-        embedding_backward_walk_bias=args.embedding_backward_walk_bias,
-        embedding_backward_start_bias=args.embedding_backward_start_bias,
-        link_pred_num_walks_per_node=args.link_pred_num_walks_per_node,
-        link_pred_max_walk_len=args.link_pred_max_walk_len,
-        link_pred_backward_walk_bias=args.link_pred_backward_walk_bias,
-        link_pred_backward_start_bias=args.link_pred_backward_start_bias,
-        train_deg=_compute_train_deg(loaded),
-        t_min=stats.t_min,
-        T_train=stats.T_train,
-        t_max_full=stats.t_max_full,
-        T_full=stats.T_full,
+        num_walks_per_node=args.num_walks_per_node,
+        max_walk_len=args.max_walk_len,
+        walk_bias=args.walk_bias,
+        start_bias=args.start_bias,
         max_time_capacity=compute_max_time_capacity(
             args.tempest_batch_window_multiplier,
             args.batch_size,
             stats.mean_inter_arrival,
         ),
 
+        optimizer=args.optimizer,
+        lr=args.lr,
         lr_min=args.lr_min,
         warmup_fraction=args.warmup_fraction,
         warmup_steps_cap=args.warmup_steps_cap,
         decay_horizon_epochs=args.decay_horizon_epochs,
         weight_decay=args.weight_decay,
-        emb_lr=args.emb_lr,
-        emb_lr_min=args.emb_lr_min,
-        emb_weight_decay=0.0,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 
