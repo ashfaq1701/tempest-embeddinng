@@ -43,7 +43,7 @@ class Time2Vec(nn.Module):
 
 
 class CrossWalkGRUHead(nn.Module):
-    def __init__(self, d_emb: int, d_time: int = 16, num_layers: int = 1):
+    def __init__(self, d_emb: int, d_time: int = 16, num_layers: int = 2):
         super().__init__()
         self.t2v_walk = Time2Vec(d_time)                        # within-walk Δt
         self.gru = nn.GRU(d_emb + d_time, d_emb,
