@@ -69,6 +69,10 @@ class TrainerConfig:
     warmup_steps_cap: int = 500
     decay_horizon_epochs: int = 50
 
+    # Run control.
+    num_epochs: int = 50
+    early_stop_patience: int = 0   # 0 = no early stopping
+
     # System.
     seed: int = 42
     use_gpu: bool = False
