@@ -5,7 +5,7 @@ Per-batch ordering (training):
   2. candidates = [pos | negs]                       — [B, 1+K_train]
   3. logits = score(src, candidates)                 — sample K walks per unique
        node (sources + candidates), GRU-encode to h, score by the symmetric
-       cross geodesic  -scale*(d_g(E[u],ĥ[v]) + d_g(E[v],ĥ[u]))
+       cross chord  -scale*(‖E[u]-ĥ[v]‖ + ‖E[v]-ĥ[u]‖)
   4. L = cross_entropy(logits / tau_link, target=0)  — Bruch 2019, upper-bounds 1-MRR
   5. one backward + single optimizer step
   6. walk_gen.add_edges(batch)                        — post-scoring, LAST
@@ -48,7 +48,6 @@ class TrainerConfig:
     # Link loss / head.
     tau_link: float = 1.0       # softmax-CE temperature
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
-    dist: str = "geodesic"      # sphere distance: geodesic / l2sq / l2 (chord)
 
     # Walks (link head; BACKWARD only, undirected).
     num_walks_per_node: int = 5
@@ -85,8 +84,7 @@ class Trainer:
         self.embedding_table = EmbeddingTable(
             num_nodes=config.num_nodes, d_emb=config.d_emb,
         ).to(self.device)
-        self.link_head = CrossWalkGRUHead(
-            d_emb=int(config.d_emb), dist=config.dist).to(self.device)
+        self.link_head = CrossWalkGRUHead(d_emb=int(config.d_emb)).to(self.device)
 
         self.walk_gen = WalkGenerator(
             use_gpu=config.use_gpu_tempest,
@@ -143,7 +141,7 @@ class Trainer:
 
         Sample K walks for every UNIQUE node (sources + candidates), GRU-encode
         with the within-walk inter-event Δt (query-independent; seed = no-delta
-        marker) to h, score by the symmetric cross geodesic, and add the query-
+        marker) to h, score by the symmetric cross chord distance, and add the query-
         dependent recency (t_query - t_last[candidate]) at scoring time."""
         device = self.device
         B, C = cand_t.shape

@@ -1,16 +1,18 @@
-"""Cross walk-encoder link head (geodesic, on the unit sphere) with time.
+"""Cross walk-encoder link head (chord distance on the unit sphere) with time.
 
 Per batch the head is given, for every UNIQUE node, K Tempest walks of length L,
 plus the per-position inter-event Δt (log1p, query-INDEPENDENT) and, at scoring
 time, the query-dependent recency of each candidate.
 
-  encode:  GRU over [E(walk node) ‖ Time2Vec(Δt)] -> h[node]   (deduped per node)
-           the seed (rightmost) position carries Δt=0, a no-delta marker; its
-           real next edge is the scoring edge (query-dependent), injected below.
-  score:   logit(u, v) = -scale*( d_g(E[u], ĥ[v]) + d_g(E[v], ĥ[u]) )
+  encode:  GRU over [E(walk node) ‖ Time2Vec(Δt)] -> h[node], projected to the
+           unit sphere (deduped per node). The seed (rightmost) position carries
+           Δt=0, a no-delta marker; its real next edge is the scoring edge
+           (query-dependent), injected below.
+  score:   logit(u, v) = -scale*( ‖E[u]-ĥ[v]‖ + ‖E[v]-ĥ[u]‖ )
                          + rec_head( Time2Vec( log1p(t_query - t_last[v]) ) )
-           d_g(a,b) = arccos⟨a,b⟩ (great-circle distance; both operands on the
-           sphere). The recency term carries the query time the GRU is blind to.
+           ‖a-b‖ = √(2-2⟨a,b⟩) is the chord distance (both operands on the sphere;
+           a sweep found chord ≥ geodesic > cosine). The recency term carries the
+           query time the GRU is blind to.
 
 E is link-trained (no detach); GRU/Time2Vec/rec_head are Euclidean. E is the
 only manifold parameter.
@@ -41,12 +43,8 @@ class Time2Vec(nn.Module):
 
 
 class CrossWalkGRUHead(nn.Module):
-    def __init__(self, d_emb: int, d_time: int = 16, num_layers: int = 1,
-                 dist: str = "geodesic"):
+    def __init__(self, d_emb: int, d_time: int = 16, num_layers: int = 1):
         super().__init__()
-        if dist not in ("geodesic", "l2sq", "l2"):
-            raise ValueError(f"dist must be geodesic / l2sq / l2, got {dist!r}")
-        self.dist = dist
         self.t2v_walk = Time2Vec(d_time)                        # within-walk Δt
         self.gru = nn.GRU(d_emb + d_time, d_emb,
                           num_layers=num_layers, batch_first=True)
@@ -80,11 +78,8 @@ class CrossWalkGRUHead(nn.Module):
         eps = 1e-6
         c1 = (eu * hv).sum(dim=-1).clamp(-1 + eps, 1 - eps)
         c2 = (ev * hu).sum(dim=-1).clamp(-1 + eps, 1 - eps)
-        if self.dist == "geodesic":                                # arc length
-            d = torch.arccos(c1) + torch.arccos(c2)
-        elif self.dist == "l2sq":                                  # ‖a-b‖² = 2-2cos
-            d = (2.0 - 2.0 * c1) + (2.0 - 2.0 * c2)
-        else:                                                       # l2 chord = √(2-2cos)
-            d = torch.sqrt(2.0 - 2.0 * c1) + torch.sqrt(2.0 - 2.0 * c2)
+        # chord distance on the sphere: ‖a-b‖ = √(2-2⟨a,b⟩) (clamp keeps the
+        # sqrt gradient finite at coincidence). Closer => higher logit.
+        d = torch.sqrt(2.0 - 2.0 * c1) + torch.sqrt(2.0 - 2.0 * c2)  # [B, C]
         rec = self.rec_head(self.t2v_rec(rec_v_log)).squeeze(-1)    # [B, C]
         return -self.logit_scale.clamp_min(1e-3) * d + rec

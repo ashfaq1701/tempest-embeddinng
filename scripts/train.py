@@ -70,12 +70,6 @@ def parse_args() -> argparse.Namespace:
         help="Per-query training negatives. The head sees [B, 1+K_train] "
              "candidates per query; positive at column 0.",
     )
-    p.add_argument(
-        "--dist", default="geodesic", choices=["geodesic", "l2sq", "l2"],
-        help="Sphere distance in the cross head (E and h both unit): geodesic "
-             "(arccos), l2sq (2-2cos, == cosine ranking), or l2 (chord, "
-             "sqrt(2-2cos)).",
-    )
 
     # Walks (link head; BACKWARD only, graphs treated as undirected).
     p.add_argument(
@@ -269,7 +263,6 @@ def main() -> Dict[str, Any]:
 
         tau_link=args.tau_link,
         K_train=args.k_train,
-        dist=args.dist,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,
