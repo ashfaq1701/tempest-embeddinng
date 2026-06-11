@@ -71,10 +71,11 @@ def parse_args() -> argparse.Namespace:
              "candidates per query; positive at column 0.",
     )
     p.add_argument(
-        "--dist", default="l2", choices=["l2", "l1", "cos"],
-        help="Cross comparison in the head: l2 (squared Euclidean), l1, or "
-             "cos. logit(u,v) = -scale*(D(E[u],h[v]) + D(E[v],h[u])) for "
-             "distances; +scale*(cos+cos) for cos.",
+        "--dist", default="l2", choices=["l2", "l1", "cos", "geodesic"],
+        help="Cross comparison in the head: l2 (squared Euclidean) / l1 / cos / "
+             "geodesic. cos and geodesic project both E and h onto the unit "
+             "sphere (the proper geometric forms; pair geodesic with "
+             "--optimizer geometric). logit = -scale*(D(E[u],h[v])+D(E[v],h[u])).",
     )
 
     # Walks (link head; BACKWARD only, graphs treated as undirected).

@@ -23,12 +23,14 @@ import torch.nn.functional as F
 class CrossWalkGRUHead(nn.Module):
     def __init__(self, d_emb: int, dist: str = "l2", num_layers: int = 1):
         super().__init__()
-        if dist not in ("l2", "l1", "cos"):
-            raise ValueError(f"dist must be l2 / l1 / cos, got {dist!r}")
+        if dist not in ("l2", "l1", "cos", "geodesic"):
+            raise ValueError(f"dist must be l2 / l1 / cos / geodesic, got {dist!r}")
         self.dist = dist
         self.gru = nn.GRU(d_emb, d_emb, num_layers=num_layers, batch_first=True)
-        # cos sits in [-1,1] (needs a larger scale); distances are O(1-10).
-        self.logit_scale = nn.Parameter(torch.tensor(10.0 if dist == "cos" else 1.0))
+        # cos/geodesic operate on the unit sphere (bounded); raw distances are
+        # O(1-10) — start the temperature accordingly.
+        self.logit_scale = nn.Parameter(
+            torch.tensor(10.0 if dist in ("cos", "geodesic") else 1.0))
 
     def encode(self, walk_emb: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """walk_emb [M, K, L, d], valid [M, K, L] bool -> h [M, d].
@@ -45,13 +47,23 @@ class CrossWalkGRUHead(nn.Module):
     def forward(self, E_u: torch.Tensor, E_v: torch.Tensor,
                 h_u: torch.Tensor, h_v: torch.Tensor) -> torch.Tensor:
         """E_u/h_u [B, d]; E_v/h_v [B, C, d] -> [B, C] logits."""
-        if self.dist == "cos":
+        if self.dist in ("cos", "geodesic"):
+            # Sphere forms: project BOTH operands (incl. the GRU output h) onto
+            # the unit sphere so E and h are comparable manifold points.
             eu = F.normalize(E_u, dim=-1).unsqueeze(1)           # [B, 1, d]
             hu = F.normalize(h_u, dim=-1).unsqueeze(1)
             ev = F.normalize(E_v, dim=-1)                        # [B, C, d]
             hv = F.normalize(h_v, dim=-1)
-            s = (eu * hv).sum(dim=-1) + (ev * hu).sum(dim=-1)    # [B, C]
-            return self.logit_scale.clamp(1.0, 100.0) * s
+            c1 = (eu * hv).sum(dim=-1)                           # cos(E[u], ĥ[v])
+            c2 = (ev * hu).sum(dim=-1)                           # cos(E[v], ĥ[u])
+            if self.dist == "cos":
+                return self.logit_scale.clamp(1.0, 100.0) * (c1 + c2)
+            # geodesic: arc length d(a,b)=arccos⟨a,b⟩ (clamp keeps the acos
+            # gradient finite at ±1); closer => higher logit.
+            eps = 1e-6
+            g = (torch.arccos(c1.clamp(-1 + eps, 1 - eps))
+                 + torch.arccos(c2.clamp(-1 + eps, 1 - eps)))
+            return -self.logit_scale.clamp_min(1e-3) * g
 
         diff1 = E_u.unsqueeze(1) - h_v                           # [B, C, d]  E[u] vs h[v]
         diff2 = E_v - h_u.unsqueeze(1)                           # [B, C, d]  E[v] vs h[u]
