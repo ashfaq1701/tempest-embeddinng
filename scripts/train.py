@@ -8,11 +8,11 @@ repeatedly with different CLI args.
 Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root
   Model:          --d-emb
-  Link/head:      --tau-link, --k-train, --dist
+  Link/head:      --tau-link, --k-train
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias,
                   --start-bias, --tempest-batch-window-multiplier
                   (backward-only; graphs are treated as undirected)
-  Optimisation:   --optimizer, --lr, --lr-min, --warmup-fraction,
+  Optimisation:   --lr, --lr-min, --warmup-fraction,
                   --warmup-steps-cap, --decay-horizon-epochs, --weight-decay,
                   --batch-size, --eval-batch-size, --num-epochs,
                   --early-stop-patience
@@ -70,13 +70,6 @@ def parse_args() -> argparse.Namespace:
         help="Per-query training negatives. The head sees [B, 1+K_train] "
              "candidates per query; positive at column 0.",
     )
-    p.add_argument(
-        "--dist", default="l2", choices=["l2", "l1", "cos", "geodesic"],
-        help="Cross comparison in the head: l2 (squared Euclidean) / l1 / cos / "
-             "geodesic. cos and geodesic project both E and h onto the unit "
-             "sphere (the proper geometric forms; pair geodesic with "
-             "--optimizer geometric). logit = -scale*(D(E[u],h[v])+D(E[v],h[u])).",
-    )
 
     # Walks (link head; BACKWARD only, graphs treated as undirected).
     p.add_argument(
@@ -111,22 +104,13 @@ def parse_args() -> argparse.Namespace:
              "the raw window depends on the dataset's calendar density.",
     )
 
-    # Optimisation. One optimizer over {E, GRU, scale}.
+    # Optimisation. Single RiemannianAdam over {E (sphere), GRU, scale}.
     p.add_argument(
-        "--optimizer", default="adamw", choices=["adamw", "prodigy", "geometric"],
-        help="adamw / prodigy (Euclidean E) or geometric (RiemannianAdam, E "
-             "on the unit sphere). Single optimizer over all params.",
-    )
-    p.add_argument(
-        "--lr", default=1e-3, type=float,
-        help="Peak LR (real for adamw/geometric; prodigy uses 1.0 internally "
-             "and treats --lr-min as its multiplier floor).",
+        "--lr", default=1e-3, type=float, help="Peak LR (RiemannianAdam).",
     )
     p.add_argument(
         "--lr-min", default=1e-5, type=float,
-        help="Head Prodigy-multiplier cosine floor. Default 1e-5 follows "
-             "contrastive-SSL convention (SimCLR/MoCo/BYOL cosine to ~0; "
-             "we use 1e-5 ≈ peak/1000).",
+        help="Cosine-decay LR floor (~peak/1000).",
     )
     p.add_argument(
         "--warmup-fraction", default=0.05, type=float,
@@ -279,7 +263,6 @@ def main() -> Dict[str, Any]:
 
         tau_link=args.tau_link,
         K_train=args.k_train,
-        dist=args.dist,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,
@@ -291,7 +274,6 @@ def main() -> Dict[str, Any]:
             stats.mean_inter_arrival,
         ),
 
-        optimizer=args.optimizer,
         lr=args.lr,
         lr_min=args.lr_min,
         warmup_fraction=args.warmup_fraction,

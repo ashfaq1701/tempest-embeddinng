@@ -5,13 +5,14 @@ Per-batch ordering (training):
   2. candidates = [pos | negs]                       — [B, 1+K_train]
   3. logits = score(src, candidates)                 — sample K walks per unique
        node (sources + candidates), GRU-encode to h, score by the symmetric
-       cross cosine  scale*(cos(E[u],h[v]) + cos(E[v],h[u]))
+       cross geodesic  -scale*(d_g(E[u],ĥ[v]) + d_g(E[v],ĥ[u]))
   4. L = cross_entropy(logits / tau_link, target=0)  — Bruch 2019, upper-bounds 1-MRR
   5. one backward + single optimizer step
   6. walk_gen.add_edges(batch)                        — post-scoring, LAST
 
-E and the GRU are trained together by L (no alignment, no detach). One optimizer
-over all params — AdamW / Prodigy / RiemannianAdam(sphere) selected by config.
+E (on the unit sphere) and the GRU are trained together by L (no alignment, no
+detach) by a single RiemannianAdam: E gets the manifold update, the Euclidean
+GRU/scale get the ordinary update.
 
 Eval (no_grad): TGB per-positive negatives, score each [pos | ~999 negs] via the
 same path, official Evaluator MRR; advance Tempest with the full batch after.
@@ -24,7 +25,6 @@ import geoopt
 import numpy as np
 import torch
 import torch.nn.functional as F
-from prodigyopt import Prodigy
 from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
@@ -48,7 +48,6 @@ class TrainerConfig:
     # Link loss / head.
     tau_link: float = 1.0       # softmax-CE temperature
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
-    dist: str = "l2"            # cross comparison: l2 (squared) / l1 / cos
 
     # Walks (link head; BACKWARD only, undirected).
     num_walks_per_node: int = 5
@@ -57,14 +56,11 @@ class TrainerConfig:
     start_bias: str = "ExponentialWeight"
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
-    # Optimisation. One optimizer over {E, GRU, scale}:
-    #   "adamw"     — real LR, Euclidean E.
-    #   "prodigy"   — parameter-free, lr is a 1.0 multiplier, Euclidean E.
-    #   "geometric" — RiemannianAdam, E on the unit sphere (ManifoldParameter).
-    optimizer: str = "adamw"
-    lr: float = 1e-3            # peak LR (adamw / geometric; ignored scale by prodigy)
-    lr_min: float = 1e-5        # cosine floor (as a fraction path of peak)
-    weight_decay: float = 1e-4
+    # Optimisation. Single RiemannianAdam over {E, GRU, scale}: E (the lone
+    # ManifoldParameter) gets the sphere update, GRU/scale the Euclidean one.
+    lr: float = 1e-3            # peak LR
+    lr_min: float = 1e-5        # cosine floor
+    weight_decay: float = 1e-4  # applies to GRU/scale; a no-op on the sphere E
     warmup_fraction: float = 0.05
     warmup_steps_cap: int = 500
     decay_horizon_epochs: int = 50
@@ -85,13 +81,10 @@ class Trainer:
         self.device = device or torch.device(
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
-        sphere = config.optimizer == "geometric"
-
         self.embedding_table = EmbeddingTable(
-            num_nodes=config.num_nodes, d_emb=config.d_emb, sphere=sphere,
+            num_nodes=config.num_nodes, d_emb=config.d_emb,
         ).to(self.device)
-        self.link_head = CrossWalkGRUHead(
-            d_emb=int(config.d_emb), dist=config.dist).to(self.device)
+        self.link_head = CrossWalkGRUHead(d_emb=int(config.d_emb)).to(self.device)
 
         self.walk_gen = WalkGenerator(
             use_gpu=config.use_gpu_tempest,
@@ -105,23 +98,12 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # One optimizer over every trainable parameter.
+        # Single RiemannianAdam over every trainable parameter. E is a
+        # ManifoldParameter (sphere update); the GRU/scale are Euclidean
+        # (ordinary update). stabilize=10 periodically re-projects E.
         params = list(self.embedding_table.parameters()) + list(self.link_head.parameters())
-        if config.optimizer == "adamw":
-            self.opt = torch.optim.AdamW(
-                params, lr=config.lr, weight_decay=config.weight_decay)
-            self._peak_lr = float(config.lr)
-        elif config.optimizer == "prodigy":
-            self.opt = Prodigy(
-                params, lr=1.0, weight_decay=config.weight_decay,
-                decouple=True, safeguard_warmup=True)
-            self._peak_lr = 1.0
-        elif config.optimizer == "geometric":
-            self.opt = geoopt.optim.RiemannianAdam(
-                params, lr=config.lr, weight_decay=config.weight_decay, stabilize=10)
-            self._peak_lr = float(config.lr)
-        else:
-            raise ValueError(f"unknown optimizer {config.optimizer!r}")
+        self.opt = geoopt.optim.RiemannianAdam(
+            params, lr=config.lr, weight_decay=config.weight_decay, stabilize=10)
 
         self.sched: Optional[LambdaLR] = None
         self._global_step = 0
@@ -134,20 +116,19 @@ class Trainer:
         decay_steps = self.config.decay_horizon_epochs * max(batches_per_epoch, 1)
         warmup_steps = max(1, min(
             int(self.config.warmup_fraction * decay_steps), self.config.warmup_steps_cap))
-        floor = float(self.config.lr_min) if self.config.optimizer != "prodigy" \
-            else float(self.config.lr_min)
+        peak = float(self.config.lr)
+        floor = float(self.config.lr_min)
         for pg in self.opt.param_groups:
-            pg["lr"] = self._peak_lr
-            pg["initial_lr"] = self._peak_lr
-        ratio = floor / self._peak_lr if self._peak_lr > 0 else 0.0
+            pg["lr"] = peak
+            pg["initial_lr"] = peak
+        ratio = floor / peak if peak > 0 else 0.0
         self.sched = LambdaLR(
             self.opt, lr_lambda=make_lr_lambda(warmup_steps, decay_steps, ratio))
         self._global_step = 0
         print(
-            f"  LR schedule (warmup+cosine): optimizer={self.config.optimizer} "
-            f"peak={self._peak_lr:.2e} floor={floor:.2e}; warmup={warmup_steps} "
-            f"decay_horizon={decay_steps} ({self.config.decay_horizon_epochs}ep "
-            f"x {batches_per_epoch} batches)"
+            f"  LR schedule (warmup+cosine): peak={peak:.2e} floor={floor:.2e}; "
+            f"warmup={warmup_steps} decay_horizon={decay_steps} "
+            f"({self.config.decay_horizon_epochs}ep x {batches_per_epoch} batches)"
         )
 
     # ──────────────────────────────────────────────────────────────────
