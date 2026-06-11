@@ -135,11 +135,14 @@ class Trainer:
     # Scoring — shared by train + eval
     # ──────────────────────────────────────────────────────────────────
 
-    def _score(self, src_t: torch.Tensor, cand_t: torch.Tensor) -> torch.Tensor:
-        """src_t [B] long, cand_t [B, C] long -> logits [B, C].
+    def _score(self, src_t: torch.Tensor, cand_t: torch.Tensor,
+               t_query_t: torch.Tensor) -> torch.Tensor:
+        """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> logits [B, C].
 
         Sample K walks for every UNIQUE node (sources + candidates), GRU-encode
-        to h, and score by the symmetric cross cosine."""
+        with the within-walk inter-event Δt (query-independent; seed = no-delta
+        marker) to h, score by the symmetric cross geodesic, and add the query-
+        dependent recency (t_query - t_last[candidate]) at scoring time."""
         device = self.device
         B, C = cand_t.shape
         all_ids = torch.cat([src_t, cand_t.reshape(-1)])          # [B + B*C]
@@ -150,14 +153,36 @@ class Trainer:
         wd = self.walk_gen.walks_for_nodes(uniq.cpu().numpy())
         M, K, L = uniq.shape[0], wd.K, wd.nodes.shape[1]
         nodes = wd.nodes.to(device).view(M, K, L)                # [M, K, L]
+        ts = wd.timestamps.to(device).view(M, K, L).float()      # [M, K, L]
         lens = wd.lens.to(device).view(M, K)                     # [M, K]
         valid = torch.arange(L, device=device).view(1, 1, L) < lens.unsqueeze(-1)
+        # Context positions hold real edge times (the seed slot lens-1 is the
+        # INT64_MAX sentinel; padding is -1) — both excluded from time stats.
+        is_ctx = torch.arange(L, device=device).view(1, 1, L) < (lens - 1).unsqueeze(-1)
+
+        # Within-walk inter-event Δt = t[p] - t[p-1] over context positions
+        # (>=0; backward walks are oldest->recent). p=0, the seed, and padding
+        # all get Δt=0 (the seed is the no-delta marker). log1p-compressed.
+        dt = torch.zeros(M, K, L, device=device)
+        dt[..., 1:] = ts[..., 1:] - ts[..., :-1]
+        dt = (dt * is_ctx.float()).clamp_min(0.0)
+        dt_log = torch.log1p(dt)                                 # [M, K, L]
+
+        # t_last[node] = most recent context edge time over its K walks.
+        ts_ctx = ts.masked_fill(~is_ctx, float("-inf"))
+        t_last = ts_ctx.amax(dim=(1, 2))                        # [M]
+        t_last = t_last.masked_fill(t_last == float("-inf"), 0.0)  # cold node -> 0
+
         walk_emb = self.embedding_table(nodes.clamp_min(0)) * valid.unsqueeze(-1).float()
-        h_all = self.link_head.encode(walk_emb, valid)           # [M, d]
+        h_all = self.link_head.encode(walk_emb, dt_log, valid)  # [M, d]
+
+        # Query-dependent recency of each candidate (clamped >=0, log1p).
+        rec_v = (t_query_t.float().unsqueeze(1) - t_last[v_pos]).clamp_min(0.0)  # [B, C]
+        rec_v_log = torch.log1p(rec_v)
 
         E_u = self.embedding_table(src_t)                        # [B, d]
         E_v = self.embedding_table(cand_t)                       # [B, C, d]
-        return self.link_head(E_u, E_v, h_all[u_pos], h_all[v_pos])  # [B, C]
+        return self.link_head(E_u, E_v, h_all[u_pos], h_all[v_pos], rec_v_log)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
@@ -173,8 +198,9 @@ class Trainer:
             [batch.tgt.astype(np.int64)[:, None],
              np.ascontiguousarray(neg_tgt, dtype=np.int64)], axis=1)   # [B, 1+K]
         cand_t = torch.from_numpy(cand_np).to(device)
+        t_query_t = torch.from_numpy(batch.ts.astype(np.int64)).to(device)
 
-        logits = self._score(src_t, cand_t)                      # [B, 1+K]
+        logits = self._score(src_t, cand_t, t_query_t)           # [B, 1+K]
         target = torch.zeros(B, dtype=torch.long, device=device)
         loss = F.cross_entropy(logits / self.config.tau_link, target)
 
@@ -223,7 +249,8 @@ class Trainer:
 
                 src_t = torch.from_numpy(batch.src.astype(np.int64)).to(self.device)
                 cand_t = torch.from_numpy(cand_v_np).to(self.device)
-                logits = self._score(src_t, cand_t).cpu().numpy()
+                t_query_t = torch.from_numpy(batch.ts.astype(np.int64)).to(self.device)
+                logits = self._score(src_t, cand_t, t_query_t).cpu().numpy()
 
                 for i in range(B):
                     total += evaluator.score_to_metric(

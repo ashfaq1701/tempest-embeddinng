@@ -17,10 +17,13 @@ from temporal_random_walk import TemporalRandomWalk
 
 
 class WalkData(NamedTuple):
-    nodes: torch.Tensor   # [N*K, L] int64, padding = -1
-    lens: torch.Tensor    # [N*K] int64
-    seeds: torch.Tensor   # [N] int64
-    K: int                # walks per seed
+    nodes: torch.Tensor        # [N*K, L] int64, padding = -1
+    timestamps: torch.Tensor   # [N*K, L] int64; timestamps[p] = time of edge
+                               # (nodes[p], nodes[p+1]); INT64_MAX sentinel at
+                               # the seed slot (lens-1); padding = -1
+    lens: torch.Tensor         # [N*K] int64
+    seeds: torch.Tensor        # [N] int64
+    K: int                     # walks per seed
 
 
 class WalkGenerator:
@@ -60,7 +63,7 @@ class WalkGenerator:
         """K BACKWARD walks per seed. ``nodes`` is [N*K, L] with rows
         [i*K, (i+1)*K) = seed i's walks; seed at lens-1, padding = -1."""
         seed_arr = np.ascontiguousarray(seeds, dtype=np.int32)
-        nodes, _ts, lens, _ef = self.trw.get_random_walks_and_times_for_nodes(
+        nodes, ts, lens, _ef = self.trw.get_random_walks_and_times_for_nodes(
             seed_nodes=seed_arr,
             max_walk_len=self.max_walk_len,
             walk_bias=self.walk_bias,
@@ -70,6 +73,7 @@ class WalkGenerator:
         )
         return WalkData(
             nodes=torch.from_numpy(np.asarray(nodes).astype(np.int64)),
+            timestamps=torch.from_numpy(np.asarray(ts).astype(np.int64)),
             lens=torch.from_numpy(np.asarray(lens).astype(np.int64)),
             seeds=torch.from_numpy(seed_arr.astype(np.int64)),
             K=self.num_walks_per_node,
