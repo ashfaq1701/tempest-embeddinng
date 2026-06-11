@@ -41,8 +41,12 @@ class Time2Vec(nn.Module):
 
 
 class CrossWalkGRUHead(nn.Module):
-    def __init__(self, d_emb: int, d_time: int = 16, num_layers: int = 1):
+    def __init__(self, d_emb: int, d_time: int = 16, num_layers: int = 1,
+                 dist: str = "geodesic"):
         super().__init__()
+        if dist not in ("geodesic", "l2sq", "l2"):
+            raise ValueError(f"dist must be geodesic / l2sq / l2, got {dist!r}")
+        self.dist = dist
         self.t2v_walk = Time2Vec(d_time)                        # within-walk Δt
         self.gru = nn.GRU(d_emb + d_time, d_emb,
                           num_layers=num_layers, batch_first=True)
@@ -76,6 +80,11 @@ class CrossWalkGRUHead(nn.Module):
         eps = 1e-6
         c1 = (eu * hv).sum(dim=-1).clamp(-1 + eps, 1 - eps)
         c2 = (ev * hu).sum(dim=-1).clamp(-1 + eps, 1 - eps)
-        g = torch.arccos(c1) + torch.arccos(c2)                     # [B, C]
+        if self.dist == "geodesic":                                # arc length
+            d = torch.arccos(c1) + torch.arccos(c2)
+        elif self.dist == "l2sq":                                  # ‖a-b‖² = 2-2cos
+            d = (2.0 - 2.0 * c1) + (2.0 - 2.0 * c2)
+        else:                                                       # l2 chord = √(2-2cos)
+            d = torch.sqrt(2.0 - 2.0 * c1) + torch.sqrt(2.0 - 2.0 * c2)
         rec = self.rec_head(self.t2v_rec(rec_v_log)).squeeze(-1)    # [B, C]
-        return -self.logit_scale.clamp_min(1e-3) * g + rec
+        return -self.logit_scale.clamp_min(1e-3) * d + rec

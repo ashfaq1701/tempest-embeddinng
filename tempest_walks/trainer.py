@@ -48,6 +48,7 @@ class TrainerConfig:
     # Link loss / head.
     tau_link: float = 1.0       # softmax-CE temperature
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
+    dist: str = "geodesic"      # sphere distance: geodesic / l2sq / l2 (chord)
 
     # Walks (link head; BACKWARD only, undirected).
     num_walks_per_node: int = 5
@@ -84,7 +85,8 @@ class Trainer:
         self.embedding_table = EmbeddingTable(
             num_nodes=config.num_nodes, d_emb=config.d_emb,
         ).to(self.device)
-        self.link_head = CrossWalkGRUHead(d_emb=int(config.d_emb)).to(self.device)
+        self.link_head = CrossWalkGRUHead(
+            d_emb=int(config.d_emb), dist=config.dist).to(self.device)
 
         self.walk_gen = WalkGenerator(
             use_gpu=config.use_gpu_tempest,
