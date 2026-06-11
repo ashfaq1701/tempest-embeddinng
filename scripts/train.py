@@ -71,6 +71,25 @@ def parse_args() -> argparse.Namespace:
              "candidates per query; positive at column 0.",
     )
 
+    # Pair features (streaming store / walk-derived). Off by default => the
+    # baseline cross-GRU head is reproduced byte-identically.
+    p.add_argument(
+        "--use-pair-recency", action="store_true",
+        help="#1: exact pairwise (u,v) recency from a streaming store, added as "
+             "a Time2Vec logit term (keyed on the candidate PAIR, not the "
+             "candidate alone like the existing global recency head).",
+    )
+    p.add_argument(
+        "--use-pair-history", action="store_true",
+        help="#2: extend --use-pair-recency with the ever-interacted bit + "
+             "decayed log interaction-count (requires --use-pair-recency).",
+    )
+    p.add_argument(
+        "--use-ctx-term", action="store_true",
+        help="#5: add the context-context chord term h[u]<->h[v] (free; the "
+             "explicit common-neighbour channel the cross-only scoring lacks).",
+    )
+
     # Walks (link head; BACKWARD only, graphs treated as undirected).
     p.add_argument(
         "--num-walks-per-node", default=5, type=int,
@@ -263,6 +282,10 @@ def main() -> Dict[str, Any]:
 
         tau_link=args.tau_link,
         K_train=args.k_train,
+
+        use_pair_recency=args.use_pair_recency,
+        use_pair_history=args.use_pair_history,
+        use_ctx_term=args.use_ctx_term,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,

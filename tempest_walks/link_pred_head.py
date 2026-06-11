@@ -43,7 +43,9 @@ class Time2Vec(nn.Module):
 
 
 class CrossWalkGRUHead(nn.Module):
-    def __init__(self, d_emb: int, d_time: int = 16, num_layers: int = 2):
+    def __init__(self, d_emb: int, d_time: int = 16, num_layers: int = 2,
+                 use_pair_recency: bool = False, use_pair_history: bool = False,
+                 use_ctx_term: bool = False):
         super().__init__()
         self.t2v_walk = Time2Vec(d_time)                        # within-walk Δt
         self.gru = nn.GRU(d_emb + d_time, d_emb,
@@ -52,6 +54,24 @@ class CrossWalkGRUHead(nn.Module):
         # Query-dependent recency injected at scoring time.
         self.t2v_rec = Time2Vec(d_time)
         self.rec_head = nn.Linear(d_time, 1)
+
+        # Feature #1/#2: exact pairwise (u,v) recurrence from the streaming store.
+        # An additive logit term (mirrors rec_head) keyed on the candidate pair,
+        # not the candidate alone. use_pair_history extends it with the ever-bit
+        # + decayed log-count (#2). Zero new params / identical logits when off.
+        self.use_pair_recency = use_pair_recency
+        self.use_pair_history = use_pair_history
+        if use_pair_recency:
+            self.t2v_pair = Time2Vec(d_time)
+            extra = 2 if use_pair_history else 0
+            self.pair_head = nn.Linear(d_time + extra, 1)
+
+        # Feature #5: context-context chord term h[u]<->h[v] (free; the missing
+        # explicit common-neighbour channel). Own learnable scale so it can
+        # vanish if unhelpful.
+        self.use_ctx_term = use_ctx_term
+        if use_ctx_term:
+            self.logit_scale_ctx = nn.Parameter(torch.tensor(1.0))
 
     def encode(self, walk_emb: torch.Tensor, dt_log: torch.Tensor,
                valid: torch.Tensor) -> torch.Tensor:
@@ -69,8 +89,13 @@ class CrossWalkGRUHead(nn.Module):
 
     def forward(self, E_u: torch.Tensor, E_v: torch.Tensor,
                 h_u: torch.Tensor, h_v: torch.Tensor,
-                rec_v_log: torch.Tensor) -> torch.Tensor:
-        """E_u/h_u [B, d]; E_v/h_v [B, C, d]; rec_v_log [B, C] -> [B, C]."""
+                rec_v_log: torch.Tensor,
+                pair_rec_log: torch.Tensor = None,
+                pair_ever: torch.Tensor = None,
+                pair_count_log: torch.Tensor = None) -> torch.Tensor:
+        """E_u/h_u [B, d]; E_v/h_v [B, C, d]; rec_v_log [B, C] -> [B, C].
+        pair_* [B, C] are the streaming-store features (used iff the matching
+        flag is on)."""
         eu = F.normalize(E_u, dim=-1).unsqueeze(1)
         hu = F.normalize(h_u, dim=-1).unsqueeze(1)
         ev = F.normalize(E_v, dim=-1)
@@ -82,4 +107,19 @@ class CrossWalkGRUHead(nn.Module):
         # sqrt gradient finite at coincidence). Closer => higher logit.
         d = torch.sqrt(2.0 - 2.0 * c1) + torch.sqrt(2.0 - 2.0 * c2)  # [B, C]
         rec = self.rec_head(self.t2v_rec(rec_v_log)).squeeze(-1)    # [B, C]
-        return -self.logit_scale.clamp_min(1e-3) * d + rec
+        logit = -self.logit_scale.clamp_min(1e-3) * d + rec
+
+        if self.use_ctx_term:
+            c3 = (hu * hv).sum(dim=-1).clamp(-1 + eps, 1 - eps)     # [B, C]
+            logit = logit - self.logit_scale_ctx.clamp_min(1e-3) * torch.sqrt(
+                2.0 - 2.0 * c3)
+
+        if self.use_pair_recency:
+            feat = self.t2v_pair(pair_rec_log)                     # [B, C, d_time]
+            if self.use_pair_history:
+                feat = torch.cat(
+                    [feat, pair_ever.unsqueeze(-1), pair_count_log.unsqueeze(-1)],
+                    dim=-1)
+            logit = logit + self.pair_head(feat).squeeze(-1)       # [B, C]
+
+        return logit
