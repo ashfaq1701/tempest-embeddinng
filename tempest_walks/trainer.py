@@ -1,11 +1,10 @@
-"""Strict-causal training + eval loop — link-supervised cross walk-encoder.
+"""Strict-causal training + eval loop — link-supervised source-side walk-encoder.
 
 Per-batch ordering (training):
   1. neg = neg_sampler.sample(batch)                 — [B, K_train] uniform negs
   2. candidates = [pos | negs]                       — [B, 1+K_train]
-  3. logits = score(src, candidates)                 — sample K walks per unique
-       node (sources + candidates), GRU-encode to h, score by the symmetric
-       cross chord  -scale*(‖E[u]-ĥ[v]‖ + ‖E[v]-ĥ[u]‖)
+  3. logits = score(src, candidates)                 — sample K walks for the SOURCES
+       only, GRU-encode to h[u], score by the chord  -scale*‖ĥ[u] - E[v]‖
   4. L = cross_entropy(logits / tau_link, target=0)  — Bruch 2019, upper-bounds 1-MRR
   5. one backward + single optimizer step
   6. walk_gen.add_edges(batch)                        — post-scoring, LAST
@@ -29,7 +28,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
-from .link_pred_head import CrossWalkGRUHead
+from .link_pred_head import SourceWalkGRUHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
 from .pair_store import NodeLastSeenStore, PairRecencyStore
@@ -89,7 +88,7 @@ class Trainer:
         self.embedding_table = EmbeddingTable(
             num_nodes=config.num_nodes, d_emb=config.d_emb,
         ).to(self.device)
-        self.link_head = CrossWalkGRUHead(
+        self.link_head = SourceWalkGRUHead(
             d_emb=int(config.d_emb),
             use_pair_features=config.use_pair_features,
         ).to(self.device)

@@ -53,7 +53,7 @@ class Time2Vec(nn.Module):
         return torch.cat([lin, per], dim=-1)                    # [..., dim]
 
 
-class CrossWalkGRUHead(nn.Module):
+class SourceWalkGRUHead(nn.Module):
     def __init__(self, d_emb: int, d_time: int = 16, num_layers: int = 2,
                  use_pair_features: bool = False):
         super().__init__()
