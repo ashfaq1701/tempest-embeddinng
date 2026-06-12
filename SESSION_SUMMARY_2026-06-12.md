@@ -172,3 +172,43 @@ d01ca34 feat: pair features #1/#2/#5 + scalable pair store
                                        returns, TPNet pair-feature inventory
 67af560 / 94a9ecb / 2e271f7 / 96f6f95  TPNet knowledge base + motivation/plan
 ```
+
+---
+
+## 8. Follow-up — source-side-only link head (a clear win)
+
+Branch `feature/source-side-walks-only` (off master). Changed the link head from the
+**symmetric cross** encoder (sample walks for every unique node = sources + candidates;
+score `-scale·(‖E[u]-ĥ[v]‖ + ‖E[v]-ĥ[u]‖)`) to a **source-side-only** head: sample walks
+for the **sources alone**, GRU-encode to `h[u]`, and score the single chord
+`-scale·‖ĥ[u] - E[v]‖` — "does the candidate's raw embedding match the source's recent
+walk context". Candidate recency (`t_query - t_last[v]`) now comes from a per-node
+last-seen store (`NodeLastSeenStore`, reuses `SparseStreamStore`) since candidate walks
+are gone; pair features unchanged (kept as the `--use-pair-features` flag).
+
+Runs at TPNet's bs (train 200 / eval 20, seed 42):
+
+| head | pair feats | peak val / test | peak ep | per-epoch | GPU |
+|---|---|---|---|---|---|
+| **source-side** | **on** | **0.8064 / 0.7791** | ep3 | ~100 s | 0.7 GB |
+| cross (master) | on | 0.8025 / 0.7744 | ep3 | ~210 s | 3.5 GB |
+| **source-side** | off | 0.7948 / 0.7659 | ep7 | ~100 s | 0.7 GB |
+| cross (master) | off | 0.7928 / 0.7597 | ep7 | — | — |
+
+### Findings
+
+1. **The source-side head beats the symmetric cross head in BOTH regimes** — with pair
+   features (+0.0039 val / +0.0047 test) and without (+0.0020 val / **+0.0062 test**).
+   It's the head design itself, not an interaction with pair features. Single-seed;
+   multi-seed confirmation is the natural follow-up.
+2. **~2× faster and ~5× less GPU memory** (~100 s/epoch vs ~210 s; 0.7 GB vs 3.5 GB):
+   candidate-walk sampling + encoding — the dominant cost — is removed. Walks are now
+   sampled for ≤ B unique sources instead of B + B·C unique nodes.
+3. **Stable curves** — gentle post-peak tails like master's (source+pf:
+   0.8064→0.8059→0.8045→0.8018, −0.0046/3 ep).
+4. **source-side + pair features (0.8064 / 0.7791) is the new best on wiki**, narrowing
+   the gap to TPNet (~0.84) to ~0.034 val / ~0.05 test — while being far cheaper to run.
+
+Net: a strictly better, simpler, cheaper head. Merged to master (single-seed; the
++0.004–0.006 MRR gain plus the large speed/memory win justified shipping; multi-seed
+confirmation tracked as follow-up).
