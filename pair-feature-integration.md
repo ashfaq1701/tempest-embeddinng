@@ -37,13 +37,63 @@ Base: `74a6bae` (cross-GRU link-supervised + sphere-E + time + chord + 2-layer G
 3. **The joint pair-MLP interaction decoder overfits** (peak ep4 then drifts, −0.010
    vs additive) — the conditional "co-reach gated by new-edge" signal isn't there to
    extract; the extra capacity just memorises train pair patterns. Additive wins.
-4. **0.83 was not reached (best 0.758).** Root cause is the OPPOSITE of TPNet's regime:
-   our GRU base is *strong* (0.736), so pair features are largely redundant; TPNet's
-   base is *weak* (~0.34), so its pair features are load-bearing (→0.84). On a strong
-   walk-encoder base, the headroom for structural pair features is small — exact
-   recurrence captures essentially all of it. The remaining gap to 0.83 lives in the
-   core encoder/decoder, not in more pair features. (Multi-seed confirmation of the
-   +0.022 win on seeds {1,7} in progress.)
+4. **0.83 was not reached (best 0.758 @ bs50, 0.771 @ bs25).** Root cause is the
+   OPPOSITE of TPNet's regime: our GRU base is *strong* (0.736), so pair features are
+   largely redundant; TPNet's base is *weak* (~0.34), so its pair features are
+   load-bearing (→0.84). On a strong walk-encoder base, the headroom for structural
+   pair features is small — exact recurrence captures essentially all of it. The
+   remaining gap lives in the core encoder/decoder, not in more pair features.
+
+### Multi-seed confirmation (seeds 42, 1, 7; eval-bs 50)
+
+| seed | base test | e2_hist test | Δtest |
+|---|---|---|---|
+| 42 | 0.7362 | 0.7581 | +0.0219 |
+| 1 | 0.7337 | 0.7541 | +0.0204 |
+| 7 | 0.7384 | 0.7567 | +0.0183 |
+
+**Δtest = +0.0202 ± 0.0015, Δval = +0.0121 ± 0.0011 across 3 seeds** — tight,
+consistent, well clear of the noise band. Recurrence+history is a robust, shippable win.
+
+### Eval-granularity sensitivity (and the fair TPNet comparison)
+
+MRR depends strongly on eval-batch-size: smaller batches refresh the strict-causal
+graph state (and the recurrence store / resampled walks) more often, so each query
+sees fresher past edges. This is legitimate online eval (no leakage — a batch is
+always scored before its own edges are ingested), but it is a *protocol choice* that
+must be matched across methods.
+
+| eval-bs | 200 | 100 | 50 | 25 |
+|---|---|---|---|---|
+| base — test | 0.6932 | 0.7111 | 0.7362 | 0.7513 |
+| base — val  | 0.7339 | 0.7538 | 0.7715 | 0.7848 |
+| e2_hist — test | 0.7217 | 0.7419 | 0.7581 | 0.7710 |
+| e2_hist — val  | 0.7524 | 0.7697 | 0.7851 | **0.7972** |
+
+Two things this settles:
+- **`base @ bs=200` (val 0.7339) ≈ the project doc's 0.7345** → the doc used the
+  bs=200 default. That is the entire source of the "base looks higher than the doc"
+  discrepancy: this campaign ran eval-bs 50.
+- **TPNet evaluates tgbl-wiki at `batch_size=20`** (verified in
+  `TGB_TPNet/evaluate_link_prediction.py:96` — a wiki/review-specific branch, not the
+  bs=200 default). So the protocol-matched comparison is eval-bs ≈ 20–25:
+  **our best = e2_hist @ bs=25 = val 0.7972 / test 0.7710 vs TPNet 0.84.** The gap is
+  **real (~0.07 test), not an eval artifact** — TPNet already uses fine-grained eval.
+  (Our initial bs=50 was *coarser* than TPNet's bs=20, i.e. we were mildly
+  under-reporting; the correct protocol for this dataset is bs≈20.)
+
+### Bottom line
+
+- **Ship `--use-pair-recency --use-pair-history`** (exact recurrence + ever-bit/count):
+  +0.020 test, 3-seed confirmed, smooth. Report at eval-bs 20–25 to match TPNet.
+- **Do not ship** co-reach (#3/#5) or the pair-MLP — falsified (redundant/overfit).
+- **The remaining ~0.07 to TPNet is a core-model gap, not a pair-feature gap.** Closing
+  it needs encoder/decoder work (e.g. TPNet's MLP-Mixer backbone + joint
+  `MLP([h_u,h_v,f_uv])` decoder over a *link-trained* representation), which is out of
+  scope for "pair features on the existing cross-GRU base."
+- **Infrastructure delivered & reusable:** `SparseStreamStore` (pandas, O(#keys),
+  scales to tgbl-comment), `coreach.py` (scipy), all flag-gated; the store base is
+  ready for any future per-node/per-pair streaming feature.
 
 ## Where we are
 
