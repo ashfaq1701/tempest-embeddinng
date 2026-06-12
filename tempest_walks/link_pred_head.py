@@ -10,12 +10,20 @@ time, the query-dependent recency of each candidate.
            (query-dependent), injected below.
   score:   logit(u, v) = -scale*( ‖E[u]-ĥ[v]‖ + ‖E[v]-ĥ[u]‖ )
                          + rec_head( Time2Vec( log1p(t_query - t_last[v]) ) )
+                         [ + pair_head( pair features )  if use_pair_features ]
            ‖a-b‖ = √(2-2⟨a,b⟩) is the chord distance (both operands on the sphere;
            a sweep found chord ≥ geodesic > cosine). The recency term carries the
            query time the GRU is blind to.
 
-E is link-trained (no detach); GRU/Time2Vec/rec_head are Euclidean. E is the
-only manifold parameter.
+Pair features (optional, `use_pair_features`): exact pairwise (u,v) recurrence +
+history from the streaming PairRecencyStore — Time2Vec(time-since-last (u,v)
+interaction) ‖ ever-interacted bit ‖ decayed log interaction-count — added as one
+extra logit term (additive, keyed on the candidate PAIR rather than the candidate
+alone like rec_head). Multi-seed confirmed +~0.02 test on tgbl-wiki; byte-identical
+to the baseline when off.
+
+E is link-trained (no detach); GRU/Time2Vec/heads are Euclidean. E is the only
+manifold parameter.
 """
 import torch
 import torch.nn as nn
@@ -43,7 +51,8 @@ class Time2Vec(nn.Module):
 
 
 class CrossWalkGRUHead(nn.Module):
-    def __init__(self, d_emb: int, d_time: int = 16, num_layers: int = 2):
+    def __init__(self, d_emb: int, d_time: int = 16, num_layers: int = 2,
+                 use_pair_features: bool = False):
         super().__init__()
         self.t2v_walk = Time2Vec(d_time)                        # within-walk Δt
         self.gru = nn.GRU(d_emb + d_time, d_emb,
@@ -52,6 +61,15 @@ class CrossWalkGRUHead(nn.Module):
         # Query-dependent recency injected at scoring time.
         self.t2v_rec = Time2Vec(d_time)
         self.rec_head = nn.Linear(d_time, 1)
+
+        # Exact pairwise (u,v) recurrence + history from the streaming store, as a
+        # single additive logit term: Time2Vec(log1p(t_query - last_ts[u,v])) ‖
+        # ever-interacted bit ‖ log1p(count[u,v]). Byte-identical to the baseline
+        # when off.
+        self.use_pair_features = use_pair_features
+        if use_pair_features:
+            self.t2v_pair = Time2Vec(d_time)
+            self.pair_head = nn.Linear(d_time + 2, 1)
 
     def encode(self, walk_emb: torch.Tensor, dt_log: torch.Tensor,
                valid: torch.Tensor) -> torch.Tensor:
@@ -69,8 +87,12 @@ class CrossWalkGRUHead(nn.Module):
 
     def forward(self, E_u: torch.Tensor, E_v: torch.Tensor,
                 h_u: torch.Tensor, h_v: torch.Tensor,
-                rec_v_log: torch.Tensor) -> torch.Tensor:
-        """E_u/h_u [B, d]; E_v/h_v [B, C, d]; rec_v_log [B, C] -> [B, C]."""
+                rec_v_log: torch.Tensor,
+                pair_rec_log: torch.Tensor = None,
+                pair_ever: torch.Tensor = None,
+                pair_count_log: torch.Tensor = None) -> torch.Tensor:
+        """E_u/h_u [B, d]; E_v/h_v [B, C, d]; rec_v_log [B, C] -> [B, C].
+        pair_* [B, C] are the streaming-store features (used iff use_pair_features)."""
         eu = F.normalize(E_u, dim=-1).unsqueeze(1)
         hu = F.normalize(h_u, dim=-1).unsqueeze(1)
         ev = F.normalize(E_v, dim=-1)
@@ -82,4 +104,13 @@ class CrossWalkGRUHead(nn.Module):
         # sqrt gradient finite at coincidence). Closer => higher logit.
         d = torch.sqrt(2.0 - 2.0 * c1) + torch.sqrt(2.0 - 2.0 * c2)  # [B, C]
         rec = self.rec_head(self.t2v_rec(rec_v_log)).squeeze(-1)    # [B, C]
-        return -self.logit_scale.clamp_min(1e-3) * d + rec
+        logit = -self.logit_scale.clamp_min(1e-3) * d + rec
+
+        if self.use_pair_features:
+            feat = torch.cat(
+                [self.t2v_pair(pair_rec_log),
+                 pair_ever.unsqueeze(-1), pair_count_log.unsqueeze(-1)],
+                dim=-1)                                             # [B, C, d_time+2]
+            logit = logit + self.pair_head(feat).squeeze(-1)       # [B, C]
+
+        return logit

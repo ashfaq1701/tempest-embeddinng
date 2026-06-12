@@ -32,6 +32,7 @@ from .evaluator import Evaluator
 from .link_pred_head import CrossWalkGRUHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
+from .pair_store import PairRecencyStore
 from .utils import make_lr_lambda
 from .walks import WalkGenerator
 
@@ -48,6 +49,10 @@ class TrainerConfig:
     # Link loss / head.
     tau_link: float = 1.0       # softmax-CE temperature
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
+
+    # Exact pairwise (u,v) recurrence + history from the streaming store, added as
+    # one logit term. Off by default => baseline byte-identical.
+    use_pair_features: bool = False
 
     # Walks (link head; BACKWARD only, undirected).
     num_walks_per_node: int = 5
@@ -84,7 +89,18 @@ class Trainer:
         self.embedding_table = EmbeddingTable(
             num_nodes=config.num_nodes, d_emb=config.d_emb,
         ).to(self.device)
-        self.link_head = CrossWalkGRUHead(d_emb=int(config.d_emb)).to(self.device)
+        self.link_head = CrossWalkGRUHead(
+            d_emb=int(config.d_emb),
+            use_pair_features=config.use_pair_features,
+        ).to(self.device)
+
+        # Streaming pairwise-interaction store feeding the pair features. Lifecycle
+        # mirrors walk_gen: reset() per epoch, update() after scoring, query() at
+        # scoring time.
+        self.pair_store = (
+            PairRecencyStore(num_nodes=config.num_nodes)
+            if config.use_pair_features else None
+        )
 
         self.walk_gen = WalkGenerator(
             use_gpu=config.use_gpu_tempest,
@@ -182,7 +198,18 @@ class Trainer:
 
         E_u = self.embedding_table(src_t)                        # [B, d]
         E_v = self.embedding_table(cand_t)                       # [B, C, d]
-        return self.link_head(E_u, E_v, h_all[u_pos], h_all[v_pos], rec_v_log)
+
+        # Pair features (recurrence + history) from the streaming store, queried at
+        # scoring time = pre-ingest (strict-causal).
+        pair_rec_log = pair_ever = pair_count_log = None
+        if self.pair_store is not None:
+            pair_rec_log, pair_ever, pair_count_log = self.pair_store.query(
+                src_t, cand_t, t_query_t)
+
+        return self.link_head(
+            E_u, E_v, h_all[u_pos], h_all[v_pos], rec_v_log,
+            pair_rec_log=pair_rec_log, pair_ever=pair_ever,
+            pair_count_log=pair_count_log)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
@@ -213,6 +240,8 @@ class Trainer:
 
         # Strict-causal: ingest into Tempest LAST.
         self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
+        if self.pair_store is not None:
+            self.pair_store.update(batch.src, batch.tgt, batch.ts)
 
         return {
             "link": float(loss.detach()),
@@ -233,6 +262,8 @@ class Trainer:
                 if B == 0:
                     self.walk_gen.add_edges(
                         batch.src, batch.tgt, batch.ts, batch.edge_feat)
+                    if self.pair_store is not None:
+                        self.pair_store.update(batch.src, batch.tgt, batch.ts)
                     continue
 
                 _, neg_tgt_list = evaluator.sample_negatives(batch)
@@ -259,6 +290,8 @@ class Trainer:
 
                 self.walk_gen.add_edges(
                     batch.src, batch.tgt, batch.ts, batch.edge_feat)
+                if self.pair_store is not None:
+                    self.pair_store.update(batch.src, batch.tgt, batch.ts)
         return total / max(n, 1)
 
     # ──────────────────────────────────────────────────────────────────
@@ -305,6 +338,8 @@ class Trainer:
 
         for ep in range(1, n_epochs + 1):
             self.walk_gen.reset()
+            if self.pair_store is not None:
+                self.pair_store.reset()
             self.embedding_table.train()
             self.link_head.train()
 
