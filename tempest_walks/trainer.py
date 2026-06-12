@@ -29,6 +29,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
+from .coreach import coreach_feature
 from .link_pred_head import CrossWalkGRUHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
@@ -54,6 +55,7 @@ class TrainerConfig:
     use_pair_recency: bool = False   # #1 exact pairwise (u,v) recency, additive logit
     use_pair_history: bool = False   # #2 extend #1 with ever-bit + decayed log-count
     use_ctx_term: bool = False       # #5 context-context chord term h[u]<->h[v]
+    use_coreach: bool = False        # #3 walk-derived time-decayed co-reachability
 
     # Walks (link head; BACKWARD only, undirected).
     num_walks_per_node: int = 5
@@ -95,6 +97,7 @@ class Trainer:
             use_pair_recency=config.use_pair_recency,
             use_pair_history=config.use_pair_history,
             use_ctx_term=config.use_ctx_term,
+            use_coreach=config.use_coreach,
         ).to(self.device)
 
         # Streaming pairwise-interaction store (#1/#2). Lifecycle mirrors walk_gen:
@@ -207,10 +210,17 @@ class Trainer:
             pair_rec_log, pair_ever, pair_count_log = self.pair_store.query(
                 src_t, cand_t, t_query_t)
 
+        # Walk-derived co-reachability (#3) from the SAME walks (cpu, [M,K,L]).
+        coreach_log = None
+        if self.config.use_coreach:
+            coreach_log = coreach_feature(
+                wd.nodes.view(M, K, L), wd.lens.view(M, K),
+                self.config.num_nodes, u_pos, v_pos).to(device)
+
         return self.link_head(
             E_u, E_v, h_all[u_pos], h_all[v_pos], rec_v_log,
             pair_rec_log=pair_rec_log, pair_ever=pair_ever,
-            pair_count_log=pair_count_log)
+            pair_count_log=pair_count_log, coreach_log=coreach_log)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step

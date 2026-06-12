@@ -45,7 +45,7 @@ class Time2Vec(nn.Module):
 class CrossWalkGRUHead(nn.Module):
     def __init__(self, d_emb: int, d_time: int = 16, num_layers: int = 2,
                  use_pair_recency: bool = False, use_pair_history: bool = False,
-                 use_ctx_term: bool = False):
+                 use_ctx_term: bool = False, use_coreach: bool = False):
         super().__init__()
         self.t2v_walk = Time2Vec(d_time)                        # within-walk Δt
         self.gru = nn.GRU(d_emb + d_time, d_emb,
@@ -73,6 +73,12 @@ class CrossWalkGRUHead(nn.Module):
         if use_ctx_term:
             self.logit_scale_ctx = nn.Parameter(torch.tensor(1.0))
 
+        # Feature #3: exact walk-derived time-decayed co-reachability (TPNet analog)
+        # as an additive logit term on log1p(shared-neighbour weight).
+        self.use_coreach = use_coreach
+        if use_coreach:
+            self.coreach_head = nn.Linear(1, 1)
+
     def encode(self, walk_emb: torch.Tensor, dt_log: torch.Tensor,
                valid: torch.Tensor) -> torch.Tensor:
         """walk_emb [M, K, L, d], dt_log [M, K, L] (log1p Δt; 0 at seed/padding),
@@ -92,7 +98,8 @@ class CrossWalkGRUHead(nn.Module):
                 rec_v_log: torch.Tensor,
                 pair_rec_log: torch.Tensor = None,
                 pair_ever: torch.Tensor = None,
-                pair_count_log: torch.Tensor = None) -> torch.Tensor:
+                pair_count_log: torch.Tensor = None,
+                coreach_log: torch.Tensor = None) -> torch.Tensor:
         """E_u/h_u [B, d]; E_v/h_v [B, C, d]; rec_v_log [B, C] -> [B, C].
         pair_* [B, C] are the streaming-store features (used iff the matching
         flag is on)."""
@@ -121,5 +128,9 @@ class CrossWalkGRUHead(nn.Module):
                     [feat, pair_ever.unsqueeze(-1), pair_count_log.unsqueeze(-1)],
                     dim=-1)
             logit = logit + self.pair_head(feat).squeeze(-1)       # [B, C]
+
+        if self.use_coreach:
+            logit = logit + self.coreach_head(
+                coreach_log.unsqueeze(-1)).squeeze(-1)             # [B, C]
 
         return logit

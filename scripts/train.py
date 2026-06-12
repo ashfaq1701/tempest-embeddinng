@@ -89,6 +89,12 @@ def parse_args() -> argparse.Namespace:
         help="#5: add the context-context chord term h[u]<->h[v] (free; the "
              "explicit common-neighbour channel the cross-only scoring lacks).",
     )
+    p.add_argument(
+        "--use-coreach", action="store_true",
+        help="#3: exact walk-derived time-decayed co-reachability (shared-neighbour "
+             "count from the sampled walks; the TPNet co-reachability analog) added "
+             "as a log1p logit term. Closes the new-edge slice recurrence can't.",
+    )
 
     # Walks (link head; BACKWARD only, graphs treated as undirected).
     p.add_argument(
@@ -286,6 +292,7 @@ def main() -> Dict[str, Any]:
         use_pair_recency=args.use_pair_recency,
         use_pair_history=args.use_pair_history,
         use_ctx_term=args.use_ctx_term,
+        use_coreach=args.use_coreach,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,
