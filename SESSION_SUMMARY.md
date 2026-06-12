@@ -299,3 +299,40 @@ regardless of pair features.** Untried levers if revisited: a small `λ_align` w
 (light regulariser), warmup-then-decay, γ/τ sweep, or — the one regime not yet tested —
 a genuinely cold-start dataset (tgbl-review) where the link head isn't already capturing
 the geometry.
+
+---
+
+## 10. Follow-up — multi-bias walks (falsified on wiki)
+
+> Documentation only. The CODE lives on branch `feature/multi-bias-walks-v2`
+> (off the source-side master) and was **not merged** — the experiment falsified it.
+
+Idea: instead of sampling all walks under one bias, sample some walks under EACH of
+several `(start_bias, walk_bias)` configs and merge them, giving the GRU a mix of walk
+"shapes". Built `walks.merge_walks(*walks)` (vararg, merges multiple Tempest results
+into one, preserving per-seed row grouping, pads to common L) and
+`walks.multi_bias_walks(trw, seeds, bias_configs, K, L)` (one Tempest call per config +
+merge). `--num-walks-per-node` → `--num-walks-per-node-per-bias` (default 3, so each
+seed gets `3 × len(configs)` mixed-bias walks); `--walk-bias`/`--start-bias` removed
+(configs in `walks.MULTI_BIAS_CONFIGS`, env-overridable via `MULTI_BIAS_CONFIGS`).
+
+Runs on the source-side head + pair features, TPNet bs (train 200 / eval 20, seed 42):
+
+| walk config | peak val / test | peak ep | vs single-bias |
+|---|---|---|---|
+| **single bias (ExpW)** | **0.8064 / 0.7791** | ep3 | — |
+| mixed-walk: start=ExpW; walk ∈ {ExpW, Uniform, Linear} | 0.8016 / 0.7772 | ep2 | −0.0048 / −0.0019 |
+| homogeneous: {ExpW/ExpW, Linear/Linear, Uniform/Uniform} | 0.7945 / 0.7722 | ep3 | −0.0119 / −0.0069 |
+
+### Finding — multi-bias walks hurt, monotonically with ExpW dilution
+
+The more Uniform/Linear walks in the mix, the lower the peak: single-bias ExpW (0/3
+diluted) > mixed-walk (2/3 walk-bias diluted) > homogeneous (2/3 fully non-ExpW). On
+this recurrence-heavy dataset **ExponentialWeight (recency-biased sampling) is the
+load-bearing sampler**; Uniform/Linear walks are noise the GRU has to average over, so
+adding them dilutes rather than diversifies. Both multi-bias variants also peak ~1
+epoch earlier and aren't more stable. Cost: ~15% slower per epoch (3 Tempest calls +
+9 vs 5 walks/seed; source-side keeps it cheap). **Single-bias ExpW stays the winner;
+the branch is a documented negative result.** The `merge_walks` / `multi_bias_walks` /
+env-selectable-config infrastructure is reusable if multi-bias is ever wanted on a
+dataset where a single bias isn't dominant.
