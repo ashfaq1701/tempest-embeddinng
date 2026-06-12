@@ -82,6 +82,33 @@ Two things this settles:
   (Our initial bs=50 was *coarser* than TPNet's bs=20, i.e. we were mildly
   under-reporting; the correct protocol for this dataset is bs≈20.)
 
+### Apples-to-apples at TPNet's EXACT batch sizes (train 200 / eval 20)
+
+TPNet's wiki config (verified in `train_link_prediction.py:97` + `:99-102`): **train
+`batch_size=200`, val/test `batch_size=20`** (a wiki/review-specific inference shrink).
+Re-ran base (master) and e2_hist at that exact protocol, seed 42:
+
+| config | val | test |
+|---|---|---|
+| base (master, no pair feats) | 0.7928 | 0.7597 |
+| **e2_hist (#1+#2)** | **0.8025** | **0.7744** |
+| **Δ pair features** | **+0.0097** | **+0.0147** |
+| gap to TPNet (reported ~0.84 / ~0.83†) | ~−0.038 | ~−0.056 |
+
+† TPNet's exact reported wiki MRR should be taken from the official TGB leaderboard /
+their paper — not asserted here from memory. Their *eval protocol* (bs=20) is verified
+from code; the headline figure is cited as "reported ~0.84" pending that confirmation.
+
+Two honest take-aways:
+- **At matched protocol our best is val 0.8025 / test 0.7744** — much closer to TPNet
+  than the bs=50 numbers suggested. My earlier bs=50 was *coarser* than TPNet's bs=20,
+  so it under-reported the model.
+- **The pair-feature Δ SHRINKS at finer granularity: +0.0147 test @ bs20 vs +0.0202 @
+  bs50.** Coherent: at fine eval granularity the base already sees very fresh causal
+  state and captures much of the recency signal implicitly, so the explicit recurrence
+  feature has less to add. The win is real at every protocol, but smaller the finer you
+  evaluate.
+
 ### Bottom line
 
 - **Ship `--use-pair-recency --use-pair-history`** (exact recurrence + ever-bit/count):
