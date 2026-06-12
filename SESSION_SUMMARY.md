@@ -336,3 +336,30 @@ epoch earlier and aren't more stable. Cost: ~15% slower per epoch (3 Tempest cal
 the branch is a documented negative result.** The `merge_walks` / `multi_bias_walks` /
 env-selectable-config infrastructure is reusable if multi-bias is ever wanted on a
 dataset where a single bias isn't dominant.
+
+---
+
+## 11. Tempest sliding-window sweep (`--tempest-batch-window-multiplier`)
+
+On master (source-side head + pair features), TPNet bs (train 200 / eval 20, seed 42).
+The multiplier caps Tempest's retained history: `max_time_capacity =
+round(mult · batch_size · mean_inter_arrival)`; `-1` = unbounded.
+
+| window | max_time_capacity | peak val / test | peak ep | vs unbounded |
+|---|---|---|---|---|
+| mult = −1 (unbounded) | ∞ | 0.8064 / 0.7791 | ep3 | — |
+| mult = 3 | 10,452 | 0.8073 / 0.7803 | ep3 | +0.0009 / +0.0012 |
+| **mult = 5** | 17,420 | **0.8074 / 0.7811** | ep3 | +0.0010 / +0.0020 |
+
+### Finding — a bounded window marginally beats unbounded (within noise)
+
+Both bounded windows edge out unbounded by ~+0.001 val / +0.001–0.002 test, with the
+larger window (mult=5) slightly best. The bounded runs start *lower* at ep1 (~0.789 vs
+0.798 — sparser walks early) but catch up and crest marginally higher at the same epoch,
+with the same stable gentle tail. Two take-aways: (1) a sliding window does **not**
+starve the source-side walks — the peak is unaffected-to-slightly-better; (2) the old
+model's "unbounded is best" max-time-capacity finding does **not** carry over to the
+source-side + pf stack. The gains are **single-seed and inside the noise band**, so not
+a confirmed win — multi-seed on mult=5 (or a slightly larger window, mult=8/10) would
+be needed to tell signal from noise. No code change (the flag already exists);
+documented for the record.
