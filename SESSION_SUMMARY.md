@@ -212,3 +212,90 @@ Runs at TPNet's bs (train 200 / eval 20, seed 42):
 Net: a strictly better, simpler, cheaper head. Merged to master (single-seed; the
 +0.004–0.006 MRR gain plus the large speed/memory win justified shipping; multi-seed
 confirmation tracked as follow-up).
+
+---
+
+## 9. Follow-up — re-adding the source-seeded alignment loss
+
+> Documentation only. The alignment-loss CODE lives on branch
+> `feature/readd-alignment-loss` and was **not merged** (the experiment falsified it);
+> only this writeup is on master, for the record.
+
+Branch `feature/readd-alignment-loss` (off the merged master). Ported the InfoNCE
+**alignment loss** verbatim from the alignment+uniformity backup
+(`tempest-embeddinng-bak/` @ detached `9208aff`, "source-seeded alignment"):
+`L_total = L_link + L_align`, single RiemannianAdam (E is the sphere ManifoldParameter,
+so alignment's gradient on E goes through the manifold-aware optimizer). L_align pulls
+`E[seed]` toward its backward-walk context nodes — word2vec NEG partition over the batch
+pool (`c(v)^0.75`), per-position weight `(1-γ)·hop + γ·recency`, chunked +
+gradient-checkpointed partition. `--use-alignment`; `--detach-link-e` toggles regime.
+**Link-pred head unchanged.** Two runs at TPNet's bs (train 200 / eval 20), seed 42,
+**with `--use-pair-features`**. γ=0.4, τ=0.5, recency_scale = train mean inter-arrival.
+(These numbers predate the source-side head — the "baseline" here is the cross head.)
+
+| variant | flags | peak (ep) | val | test | post-peak val decline (4 ep) |
+|---|---|---|---|---|---|
+| **baseline** (pair-feats only) | — | ep3 | **0.8025** | **0.7744** | −0.008 (gentle) |
+| no-detach (E ← link + align) | `--use-alignment` | ep2 | 0.8005 | 0.7743 | −0.021 |
+| detach (E ← align only) | `--use-alignment --detach-link-e` | ep2 | 0.8002 | 0.7724 | −0.024 |
+
+Full val curves: detach 0.7944→**0.8002**→0.7990→0.7933→0.7872→0.7767→0.7644;
+no-detach 0.7943→**0.8005**→0.8004→0.7974→0.7935→0.7798. Both early-stopped ~ep7.
+
+### Findings
+
+1. **Alignment does not help on top of the link + pair-features stack** (this protocol,
+   single seed). Both variants peak at-or-below the pair-features-only baseline (val
+   ~−0.002; no-detach ties on test at 0.7743) **and are less stable** — they peak early
+   (ep2) and decline faster than the baseline's gentle tail.
+2. **no-detach > detach** on both axes: higher peak test (0.7743 vs 0.7724) and a
+   gentler post-peak decline. Keeping the link gradient on E (alignment as a
+   regulariser) beats letting alignment shape E alone.
+3. **Mechanism (visible in the logs):** every epoch the align loss falls and val drops
+   in lockstep — alignment pulls E toward walk-context-optimal geometry, which is
+   slightly *off* the link-optimal geometry the strong cross-GRU + pair-features stack
+   wants. detach (E ← align only) drifts fastest; no-detach's link gradient slows but
+   doesn't prevent it. This is the inverse of the regime where alignment originally
+   helped (a weak link head needing E pre-shaped).
+4. **Overhead negligible:** ~+2 s/epoch (train 63.8 → 65.7 s); eval unchanged
+   (alignment is train-only). bs=20 eval (~146 s) dominates per-epoch time.
+
+### Control: alignment WITHOUT pair features (isolating the alignment effect)
+
+To test whether alignment was redundant only *because* pair features already shaped E,
+re-ran all three variants with **no pair features** (same protocol, seed 42). If
+alignment helps a weaker base, the no-pair alignment runs should beat the no-pair base.
+
+| (no pair features) | peak val / test | peak ep | post-peak val tail (stability) |
+|---|---|---|---|
+| **base** | **0.7921 / 0.7597** | ep7 | −0.010 (stable) |
+| no-detach align | 0.7878 / 0.7582 | ep3 | −0.043 (steep) |
+| detach align | 0.7842 / 0.7557 | ep3 | −0.045 (steepest) |
+
+Full 2×3 landscape (peak val/test; tail = val decline over the 4 epochs after the peak):
+
+| regime | base | + no-detach align | + detach align |
+|---|---|---|---|
+| **no pair feats** | 0.7921 / 0.7597 (stable, −0.010) | 0.7878 / 0.7582 (−0.043) | 0.7842 / 0.7557 (−0.045) |
+| **+ pair feats** | 0.8025 / 0.7744 (stable, −0.008) | 0.8005 / 0.7743 (−0.021) | 0.8002 / 0.7724 (−0.024) |
+
+### Verdict — alignment does NOT help, on both axes, in both regimes
+
+- **Peak:** in *both* columns `base > no-detach > detach`. Alignment **lowers** the peak
+  with OR without pair features (−0.004 val no-pair, −0.002 val with-pair). The
+  "alignment helps the weaker base" hypothesis is **refuted** — the no-pair base is
+  weaker (0.792 vs 0.802) yet alignment hurts it *more* (−0.004 vs −0.002), not less.
+- **Stability:** the plain base is the most stable in both regimes (gentle ~−0.01 tail).
+  Every alignment run peaks **earlier** and falls into a **much steeper** decline
+  (−0.02 to −0.045) — val drops in lockstep as `L_align` minimises, i.e. alignment pulls
+  E off the link-optimal geometry from the start. detach (E ← align only) drifts fastest.
+- **no-detach > detach** everywhere (higher peak, gentler tail) — so it's the variant to
+  keep IF pursued, but as configured (γ=0.4, τ=0.5, full-weight `L_align`) it is a net
+  cost in every cell.
+
+**Recommendation: ship pair-features alone; the source-seeded alignment loss is not
+additive and not a standalone win on wiki — it lowers the peak and destabilises training
+regardless of pair features.** Untried levers if revisited: a small `λ_align` weight
+(light regulariser), warmup-then-decay, γ/τ sweep, or — the one regime not yet tested —
+a genuinely cold-start dataset (tgbl-review) where the link head isn't already capturing
+the geometry.
