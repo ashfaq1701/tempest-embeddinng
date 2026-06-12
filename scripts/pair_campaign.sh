@@ -12,9 +12,10 @@ OUT=logs/pair_features
 mkdir -p "$OUT"
 RES="$OUT/RESULTS.tsv"
 EVAL_BS="${EVAL_BS:-50}"   # override to sweep eval granularity (smaller = fresher causal state)
+TRAIN_BS="${TRAIN_BS:-500}"  # override to match a baseline's train batch size
 SEED="${SEED:-42}"
 COMMON="--dataset tgbl-wiki --use-gpu --use-gpu-tempest --num-epochs 20 \
-        --early-stop-patience 5 --eval-batch-size ${EVAL_BS} --seed ${SEED}"
+        --early-stop-patience 5 --batch-size ${TRAIN_BS} --eval-batch-size ${EVAL_BS} --seed ${SEED}"
 
 wave="$1"; shift
 echo "### WAVE $wave  $(date '+%F %T')" >> "$RES"
