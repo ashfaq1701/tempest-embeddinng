@@ -32,7 +32,7 @@ from .evaluator import Evaluator
 from .link_pred_head import CrossWalkGRUHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
-from .pair_store import PairRecencyStore
+from .pair_store import NodeLastSeenStore, PairRecencyStore
 from .utils import make_lr_lambda
 from .walks import WalkGenerator
 
@@ -102,6 +102,10 @@ class Trainer:
             if config.use_pair_features else None
         )
 
+        # Per-node last-seen store: supplies the candidate recency term without
+        # sampling candidate walks (source-side-only head). Always on.
+        self.node_last = NodeLastSeenStore()
+
         self.walk_gen = WalkGenerator(
             use_gpu=config.use_gpu_tempest,
             walk_bias=config.walk_bias,
@@ -155,22 +159,21 @@ class Trainer:
                t_query_t: torch.Tensor) -> torch.Tensor:
         """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> logits [B, C].
 
-        Sample K walks for every UNIQUE node (sources + candidates), GRU-encode
-        with the within-walk inter-event Δt (query-independent; seed = no-delta
-        marker) to h, score by the symmetric cross chord distance, and add the query-
-        dependent recency (t_query - t_last[candidate]) at scoring time."""
+        SOURCE-SIDE ONLY: sample K walks for the unique SOURCES only, GRU-encode to
+        h[u], and score by the chord distance between h[u] and each candidate's raw
+        embedding E[v]. Candidate recency (t_query - t_last[v]) comes from the per-node
+        last-seen store (no candidate walks). Strict-causal: walks + store reflect the
+        pre-ingest state."""
         device = self.device
         B, C = cand_t.shape
-        all_ids = torch.cat([src_t, cand_t.reshape(-1)])          # [B + B*C]
-        uniq, inv = torch.unique(all_ids, return_inverse=True)    # uniq [M]
-        u_pos = inv[:B]                                           # [B]
-        v_pos = inv[B:].reshape(B, C)                             # [B, C]
 
-        wd = self.walk_gen.walks_for_nodes(uniq.cpu().numpy())
-        M, K, L = uniq.shape[0], wd.K, wd.nodes.shape[1]
-        nodes = wd.nodes.to(device).view(M, K, L)                # [M, K, L]
-        ts = wd.timestamps.to(device).view(M, K, L).float()      # [M, K, L]
-        lens = wd.lens.to(device).view(M, K)                     # [M, K]
+        # Walks for the unique SOURCES only.
+        uniq_s, u_pos = torch.unique(src_t, return_inverse=True)  # uniq_s [Ms], u_pos [B]
+        wd = self.walk_gen.walks_for_nodes(uniq_s.cpu().numpy())
+        Ms, K, L = uniq_s.shape[0], wd.K, wd.nodes.shape[1]
+        nodes = wd.nodes.to(device).view(Ms, K, L)               # [Ms, K, L]
+        ts = wd.timestamps.to(device).view(Ms, K, L).float()     # [Ms, K, L]
+        lens = wd.lens.to(device).view(Ms, K)                    # [Ms, K]
         valid = torch.arange(L, device=device).view(1, 1, L) < lens.unsqueeze(-1)
         # Context positions hold real edge times (the seed slot lens-1 is the
         # INT64_MAX sentinel; padding is -1) — both excluded from time stats.
@@ -179,35 +182,27 @@ class Trainer:
         # Within-walk inter-event Δt = t[p] - t[p-1] over context positions
         # (>=0; backward walks are oldest->recent). p=0, the seed, and padding
         # all get Δt=0 (the seed is the no-delta marker). log1p-compressed.
-        dt = torch.zeros(M, K, L, device=device)
+        dt = torch.zeros(Ms, K, L, device=device)
         dt[..., 1:] = ts[..., 1:] - ts[..., :-1]
         dt = (dt * is_ctx.float()).clamp_min(0.0)
-        dt_log = torch.log1p(dt)                                 # [M, K, L]
-
-        # t_last[node] = most recent context edge time over its K walks.
-        ts_ctx = ts.masked_fill(~is_ctx, float("-inf"))
-        t_last = ts_ctx.amax(dim=(1, 2))                        # [M]
-        t_last = t_last.masked_fill(t_last == float("-inf"), 0.0)  # cold node -> 0
+        dt_log = torch.log1p(dt)                                 # [Ms, K, L]
 
         walk_emb = self.embedding_table(nodes.clamp_min(0)) * valid.unsqueeze(-1).float()
-        h_all = self.link_head.encode(walk_emb, dt_log, valid)  # [M, d]
+        h_src = self.link_head.encode(walk_emb, dt_log, valid)   # [Ms, d]
+        h_u = h_src[u_pos]                                       # [B, d]
 
-        # Query-dependent recency of each candidate (clamped >=0, log1p).
-        rec_v = (t_query_t.float().unsqueeze(1) - t_last[v_pos]).clamp_min(0.0)  # [B, C]
-        rec_v_log = torch.log1p(rec_v)
-
-        E_u = self.embedding_table(src_t)                        # [B, d]
         E_v = self.embedding_table(cand_t)                       # [B, C, d]
 
-        # Pair features (recurrence + history) from the streaming store, queried at
-        # scoring time = pre-ingest (strict-causal).
+        # Candidate recency from the per-node last-seen store (replaces the
+        # candidate-walk t_last); pair features from the pairwise store.
+        rec_v_log = self.node_last.query(cand_t, t_query_t)      # [B, C]
         pair_rec_log = pair_ever = pair_count_log = None
         if self.pair_store is not None:
             pair_rec_log, pair_ever, pair_count_log = self.pair_store.query(
                 src_t, cand_t, t_query_t)
 
         return self.link_head(
-            E_u, E_v, h_all[u_pos], h_all[v_pos], rec_v_log,
+            h_u, E_v, rec_v_log,
             pair_rec_log=pair_rec_log, pair_ever=pair_ever,
             pair_count_log=pair_count_log)
 
@@ -242,6 +237,7 @@ class Trainer:
         self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
         if self.pair_store is not None:
             self.pair_store.update(batch.src, batch.tgt, batch.ts)
+        self.node_last.update(batch.src, batch.tgt, batch.ts)
 
         return {
             "link": float(loss.detach()),
@@ -264,6 +260,7 @@ class Trainer:
                         batch.src, batch.tgt, batch.ts, batch.edge_feat)
                     if self.pair_store is not None:
                         self.pair_store.update(batch.src, batch.tgt, batch.ts)
+                    self.node_last.update(batch.src, batch.tgt, batch.ts)
                     continue
 
                 _, neg_tgt_list = evaluator.sample_negatives(batch)
@@ -292,6 +289,7 @@ class Trainer:
                     batch.src, batch.tgt, batch.ts, batch.edge_feat)
                 if self.pair_store is not None:
                     self.pair_store.update(batch.src, batch.tgt, batch.ts)
+                self.node_last.update(batch.src, batch.tgt, batch.ts)
         return total / max(n, 1)
 
     # ──────────────────────────────────────────────────────────────────
@@ -340,6 +338,7 @@ class Trainer:
             self.walk_gen.reset()
             if self.pair_store is not None:
                 self.pair_store.reset()
+            self.node_last.reset()
             self.embedding_table.train()
             self.link_head.train()
 
