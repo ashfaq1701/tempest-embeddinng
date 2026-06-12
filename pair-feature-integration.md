@@ -3,6 +3,48 @@
 Branch: `feature/pair-feature-integration-attempt-2`
 Base: `74a6bae` (cross-GRU link-supervised + sphere-E + time + chord + 2-layer GRU).
 
+---
+
+## CAMPAIGN RESULTS (2026-06-12, tgbl-wiki, seed 42, eval-bs 50)
+
+> All runs share the same harness/eval-bs, so deltas are clean vs the in-campaign
+> `base` (eval-bs 50 lifts base to 0.7715/0.7362 vs the doc's 0.7345 — smaller eval
+> batches = fresher strict-causal state; not comparable to the 0.7345 doc number).
+
+| feature(s) | flags | val | test | Δtest | verdict |
+|---|---|---|---|---|---|
+| base | — | 0.7715 | 0.7362 | — | reference |
+| **#1 recurrence** | `--use-pair-recency` | 0.7857 | 0.7555 | **+0.0193** | win |
+| **#1+#2 recurrence+history** | `+ --use-pair-history` | 0.7851 | **0.7581** | **+0.0219** | **WINNER (ship)** |
+| #5 ctx (learned co-reach) | `--use-ctx-term` | 0.7680 | 0.7322 | −0.0040 | hurts |
+| #1+#5 | | 0.7845 | 0.7553 | +0.0191 | #5 drags #1 |
+| #1+#2+#5 | | 0.7842 | 0.7578 | +0.0216 | #5 drags |
+| #3 co-reach (exact) alone | `--use-coreach` | 0.7670 | 0.7292 | −0.0070 | hurts |
+| #1+#3 | | 0.7839 | 0.7525 | +0.0163 | #3 drags #1 |
+| #1+#2+#3 | | 0.7853 | 0.7585 | +0.0223 | #3 = noise (+0.0004) |
+| #1+#2+#3 joint pair-MLP | `--use-pair-mlp` | 0.7717 | 0.7484 | +0.0122 | overfits (peak ep4) |
+
+### Findings
+
+1. **Exact recurrence (#1) + history (#2) is the only real win: +0.022 test, smooth
+   curve.** The ever-bit + decayed count (#2) adds +0.0026 over #1 alone by
+   disambiguating historical negatives. **Ship `--use-pair-recency --use-pair-history`.**
+2. **Co-reachability is redundant-to-harmful on wiki — both the learned `h[u]·h[v]`
+   (#5) and the EXACT walk-derived version (#3).** Alone each *hurts* (−0.004 / −0.007);
+   added to recurrence each *drags* it; added to #1+#2 it is pure noise (+0.0004). The
+   GRU walk-encoder already extracts the shared-neighbour signal, so an explicit
+   co-reach channel only adds variance the model must learn to ignore.
+3. **The joint pair-MLP interaction decoder overfits** (peak ep4 then drifts, −0.010
+   vs additive) — the conditional "co-reach gated by new-edge" signal isn't there to
+   extract; the extra capacity just memorises train pair patterns. Additive wins.
+4. **0.83 was not reached (best 0.758).** Root cause is the OPPOSITE of TPNet's regime:
+   our GRU base is *strong* (0.736), so pair features are largely redundant; TPNet's
+   base is *weak* (~0.34), so its pair features are load-bearing (→0.84). On a strong
+   walk-encoder base, the headroom for structural pair features is small — exact
+   recurrence captures essentially all of it. The remaining gap to 0.83 lives in the
+   core encoder/decoder, not in more pair features. (Multi-seed confirmation of the
+   +0.022 win on seeds {1,7} in progress.)
+
 ## Where we are
 
 Current best stack on wiki (`tgbl-wiki`, single seed 42):
