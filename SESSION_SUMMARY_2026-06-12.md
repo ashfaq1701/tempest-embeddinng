@@ -117,10 +117,13 @@ confirmation against the official TGB leaderboard — not asserted from memory.
 
 ## 4. Findings
 
-1. **Ship `--use-pair-recency --use-pair-history`** — exact pairwise `(u,v)` recurrence
+1. **Ship `--use-pair-features`** — exact pairwise `(u,v)` recurrence
    (time-since-last-interaction) + ever-bit + decayed count, from the streaming store,
    added additively to the chord logit. **+0.015–0.020 test, 3-seed confirmed, smooth.**
    This is exactly TPNet's `A^(1)_{u,v}` recurrence block, computed exactly (no JL sketch).
+   (During the campaign these were two flags `--use-pair-recency` + `--use-pair-history`;
+   post-campaign they were collapsed into the single `--use-pair-features` flag and all
+   falsified code — co-reach, ctx-term, pair-MLP — was removed from the branch.)
 2. **Do NOT ship** co-reach (#3 exact, #5 learned) or the pair-MLP — all
    neutral-to-harmful. The GRU walk-encoder already captures shared-neighbour structure,
    so explicit co-reach only adds variance; the MLP overfits.

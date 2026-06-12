@@ -28,7 +28,8 @@ Base: `74a6bae` (cross-GRU link-supervised + sphere-E + time + chord + 2-layer G
 
 1. **Exact recurrence (#1) + history (#2) is the only real win: +0.022 test, smooth
    curve.** The ever-bit + decayed count (#2) adds +0.0026 over #1 alone by
-   disambiguating historical negatives. **Ship `--use-pair-recency --use-pair-history`.**
+   disambiguating historical negatives. **Ship `--use-pair-features`** (the two were
+   collapsed into one flag post-campaign).
 2. **Co-reachability is redundant-to-harmful on wiki — both the learned `h[u]·h[v]`
    (#5) and the EXACT walk-derived version (#3).** Alone each *hurts* (−0.004 / −0.007);
    added to recurrence each *drags* it; added to #1+#2 it is pure noise (+0.0004). The
@@ -111,8 +112,11 @@ Two honest take-aways:
 
 ### Bottom line
 
-- **Ship `--use-pair-recency --use-pair-history`** (exact recurrence + ever-bit/count):
+- **Ship `--use-pair-features`** (exact recurrence + ever-bit/count, one flag):
   +0.020 test, 3-seed confirmed, smooth. Report at eval-bs 20–25 to match TPNet.
+  (Post-campaign the two campaign flags `--use-pair-recency`/`--use-pair-history` were
+  collapsed into this single `--use-pair-features` flag; the falsified features below
+  were removed from the branch.)
 - **Do not ship** co-reach (#3/#5) or the pair-MLP — falsified (redundant/overfit).
 - **The remaining ~0.07 to TPNet is a core-model gap, not a pair-feature gap.** Closing
   it needs encoder/decoder work (e.g. TPNet's MLP-Mixer backbone + joint

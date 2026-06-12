@@ -29,7 +29,6 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
-from .coreach import coreach_feature
 from .link_pred_head import CrossWalkGRUHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
@@ -51,12 +50,9 @@ class TrainerConfig:
     tau_link: float = 1.0       # softmax-CE temperature
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
 
-    # Pair features (off by default => baseline byte-identical).
-    use_pair_recency: bool = False   # #1 exact pairwise (u,v) recency, additive logit
-    use_pair_history: bool = False   # #2 extend #1 with ever-bit + decayed log-count
-    use_ctx_term: bool = False       # #5 context-context chord term h[u]<->h[v]
-    use_coreach: bool = False        # #3 walk-derived time-decayed co-reachability
-    use_pair_mlp: bool = False       # joint interaction decoder over the pair features
+    # Exact pairwise (u,v) recurrence + history from the streaming store, added as
+    # one logit term. Off by default => baseline byte-identical.
+    use_pair_features: bool = False
 
     # Walks (link head; BACKWARD only, undirected).
     num_walks_per_node: int = 5
@@ -95,23 +91,15 @@ class Trainer:
         ).to(self.device)
         self.link_head = CrossWalkGRUHead(
             d_emb=int(config.d_emb),
-            use_pair_recency=config.use_pair_recency,
-            use_pair_history=config.use_pair_history,
-            use_ctx_term=config.use_ctx_term,
-            use_coreach=config.use_coreach,
-            use_pair_mlp=config.use_pair_mlp,
+            use_pair_features=config.use_pair_features,
         ).to(self.device)
 
-        # The joint pair-MLP consumes the store features AND co-reach, so it needs
-        # both computed regardless of the individual additive flags.
-        self._need_store = config.use_pair_recency or config.use_pair_mlp
-        self._need_coreach = config.use_coreach or config.use_pair_mlp
-
-        # Streaming pairwise-interaction store (#1/#2). Lifecycle mirrors walk_gen:
-        # reset() per epoch, update() after scoring, query() at scoring time.
+        # Streaming pairwise-interaction store feeding the pair features. Lifecycle
+        # mirrors walk_gen: reset() per epoch, update() after scoring, query() at
+        # scoring time.
         self.pair_store = (
             PairRecencyStore(num_nodes=config.num_nodes)
-            if self._need_store else None
+            if config.use_pair_features else None
         )
 
         self.walk_gen = WalkGenerator(
@@ -211,23 +199,17 @@ class Trainer:
         E_u = self.embedding_table(src_t)                        # [B, d]
         E_v = self.embedding_table(cand_t)                       # [B, C, d]
 
-        # Streaming-store pair features (#1/#2), queried at scoring time = pre-ingest.
+        # Pair features (recurrence + history) from the streaming store, queried at
+        # scoring time = pre-ingest (strict-causal).
         pair_rec_log = pair_ever = pair_count_log = None
         if self.pair_store is not None:
             pair_rec_log, pair_ever, pair_count_log = self.pair_store.query(
                 src_t, cand_t, t_query_t)
 
-        # Walk-derived co-reachability (#3) from the SAME walks (cpu, [M,K,L]).
-        coreach_log = None
-        if self._need_coreach:
-            coreach_log = coreach_feature(
-                wd.nodes.view(M, K, L), wd.lens.view(M, K),
-                self.config.num_nodes, u_pos, v_pos).to(device)
-
         return self.link_head(
             E_u, E_v, h_all[u_pos], h_all[v_pos], rec_v_log,
             pair_rec_log=pair_rec_log, pair_ever=pair_ever,
-            pair_count_log=pair_count_log, coreach_log=coreach_log)
+            pair_count_log=pair_count_log)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step

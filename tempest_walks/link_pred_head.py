@@ -10,12 +10,20 @@ time, the query-dependent recency of each candidate.
            (query-dependent), injected below.
   score:   logit(u, v) = -scale*( ‖E[u]-ĥ[v]‖ + ‖E[v]-ĥ[u]‖ )
                          + rec_head( Time2Vec( log1p(t_query - t_last[v]) ) )
+                         [ + pair_head( pair features )  if use_pair_features ]
            ‖a-b‖ = √(2-2⟨a,b⟩) is the chord distance (both operands on the sphere;
            a sweep found chord ≥ geodesic > cosine). The recency term carries the
            query time the GRU is blind to.
 
-E is link-trained (no detach); GRU/Time2Vec/rec_head are Euclidean. E is the
-only manifold parameter.
+Pair features (optional, `use_pair_features`): exact pairwise (u,v) recurrence +
+history from the streaming PairRecencyStore — Time2Vec(time-since-last (u,v)
+interaction) ‖ ever-interacted bit ‖ decayed log interaction-count — added as one
+extra logit term (additive, keyed on the candidate PAIR rather than the candidate
+alone like rec_head). Multi-seed confirmed +~0.02 test on tgbl-wiki; byte-identical
+to the baseline when off.
+
+E is link-trained (no detach); GRU/Time2Vec/heads are Euclidean. E is the only
+manifold parameter.
 """
 import torch
 import torch.nn as nn
@@ -44,9 +52,7 @@ class Time2Vec(nn.Module):
 
 class CrossWalkGRUHead(nn.Module):
     def __init__(self, d_emb: int, d_time: int = 16, num_layers: int = 2,
-                 use_pair_recency: bool = False, use_pair_history: bool = False,
-                 use_ctx_term: bool = False, use_coreach: bool = False,
-                 use_pair_mlp: bool = False):
+                 use_pair_features: bool = False):
         super().__init__()
         self.t2v_walk = Time2Vec(d_time)                        # within-walk Δt
         self.gru = nn.GRU(d_emb + d_time, d_emb,
@@ -56,38 +62,14 @@ class CrossWalkGRUHead(nn.Module):
         self.t2v_rec = Time2Vec(d_time)
         self.rec_head = nn.Linear(d_time, 1)
 
-        # Feature #1/#2: exact pairwise (u,v) recurrence from the streaming store.
-        # An additive logit term (mirrors rec_head) keyed on the candidate pair,
-        # not the candidate alone. use_pair_history extends it with the ever-bit
-        # + decayed log-count (#2). Zero new params / identical logits when off.
-        self.use_pair_recency = use_pair_recency
-        self.use_pair_history = use_pair_history
-        if use_pair_recency:
+        # Exact pairwise (u,v) recurrence + history from the streaming store, as a
+        # single additive logit term: Time2Vec(log1p(t_query - last_ts[u,v])) ‖
+        # ever-interacted bit ‖ log1p(count[u,v]). Byte-identical to the baseline
+        # when off.
+        self.use_pair_features = use_pair_features
+        if use_pair_features:
             self.t2v_pair = Time2Vec(d_time)
-            extra = 2 if use_pair_history else 0
-            self.pair_head = nn.Linear(d_time + extra, 1)
-
-        # Feature #5: context-context chord term h[u]<->h[v] (free; the missing
-        # explicit common-neighbour channel). Own learnable scale so it can
-        # vanish if unhelpful.
-        self.use_ctx_term = use_ctx_term
-        if use_ctx_term:
-            self.logit_scale_ctx = nn.Parameter(torch.tensor(1.0))
-
-        # Feature #3: exact walk-derived time-decayed co-reachability (TPNet analog)
-        # as an additive logit term on log1p(shared-neighbour weight).
-        self.use_coreach = use_coreach
-        if use_coreach:
-            self.coreach_head = nn.Linear(1, 1)
-
-        # Joint pair-MLP (TPNet-style interaction decoder): instead of summing the
-        # structural pair terms, mix [pair_rec, ever, count, coreach] through a small
-        # MLP so they can INTERACT (e.g. co-reach gated by absence of history). When
-        # on, it replaces the additive pair_head/coreach_head terms.
-        self.use_pair_mlp = use_pair_mlp
-        if use_pair_mlp:
-            self.pair_mlp = nn.Sequential(
-                nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1))
+            self.pair_head = nn.Linear(d_time + 2, 1)
 
     def encode(self, walk_emb: torch.Tensor, dt_log: torch.Tensor,
                valid: torch.Tensor) -> torch.Tensor:
@@ -108,11 +90,9 @@ class CrossWalkGRUHead(nn.Module):
                 rec_v_log: torch.Tensor,
                 pair_rec_log: torch.Tensor = None,
                 pair_ever: torch.Tensor = None,
-                pair_count_log: torch.Tensor = None,
-                coreach_log: torch.Tensor = None) -> torch.Tensor:
+                pair_count_log: torch.Tensor = None) -> torch.Tensor:
         """E_u/h_u [B, d]; E_v/h_v [B, C, d]; rec_v_log [B, C] -> [B, C].
-        pair_* [B, C] are the streaming-store features (used iff the matching
-        flag is on)."""
+        pair_* [B, C] are the streaming-store features (used iff use_pair_features)."""
         eu = F.normalize(E_u, dim=-1).unsqueeze(1)
         hu = F.normalize(h_u, dim=-1).unsqueeze(1)
         ev = F.normalize(E_v, dim=-1)
@@ -126,28 +106,11 @@ class CrossWalkGRUHead(nn.Module):
         rec = self.rec_head(self.t2v_rec(rec_v_log)).squeeze(-1)    # [B, C]
         logit = -self.logit_scale.clamp_min(1e-3) * d + rec
 
-        if self.use_ctx_term:
-            c3 = (hu * hv).sum(dim=-1).clamp(-1 + eps, 1 - eps)     # [B, C]
-            logit = logit - self.logit_scale_ctx.clamp_min(1e-3) * torch.sqrt(
-                2.0 - 2.0 * c3)
-
-        if self.use_pair_mlp:
-            # Joint interaction decoder over the structural pair features.
-            feats = torch.stack(
-                [pair_rec_log, pair_ever, pair_count_log, coreach_log], dim=-1)
-            logit = logit + self.pair_mlp(feats).squeeze(-1)       # [B, C]
-            return logit
-
-        if self.use_pair_recency:
-            feat = self.t2v_pair(pair_rec_log)                     # [B, C, d_time]
-            if self.use_pair_history:
-                feat = torch.cat(
-                    [feat, pair_ever.unsqueeze(-1), pair_count_log.unsqueeze(-1)],
-                    dim=-1)
+        if self.use_pair_features:
+            feat = torch.cat(
+                [self.t2v_pair(pair_rec_log),
+                 pair_ever.unsqueeze(-1), pair_count_log.unsqueeze(-1)],
+                dim=-1)                                             # [B, C, d_time+2]
             logit = logit + self.pair_head(feat).squeeze(-1)       # [B, C]
-
-        if self.use_coreach:
-            logit = logit + self.coreach_head(
-                coreach_log.unsqueeze(-1)).squeeze(-1)             # [B, C]
 
         return logit
