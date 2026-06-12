@@ -45,7 +45,8 @@ class Time2Vec(nn.Module):
 class CrossWalkGRUHead(nn.Module):
     def __init__(self, d_emb: int, d_time: int = 16, num_layers: int = 2,
                  use_pair_recency: bool = False, use_pair_history: bool = False,
-                 use_ctx_term: bool = False, use_coreach: bool = False):
+                 use_ctx_term: bool = False, use_coreach: bool = False,
+                 use_pair_mlp: bool = False):
         super().__init__()
         self.t2v_walk = Time2Vec(d_time)                        # within-walk Δt
         self.gru = nn.GRU(d_emb + d_time, d_emb,
@@ -78,6 +79,15 @@ class CrossWalkGRUHead(nn.Module):
         self.use_coreach = use_coreach
         if use_coreach:
             self.coreach_head = nn.Linear(1, 1)
+
+        # Joint pair-MLP (TPNet-style interaction decoder): instead of summing the
+        # structural pair terms, mix [pair_rec, ever, count, coreach] through a small
+        # MLP so they can INTERACT (e.g. co-reach gated by absence of history). When
+        # on, it replaces the additive pair_head/coreach_head terms.
+        self.use_pair_mlp = use_pair_mlp
+        if use_pair_mlp:
+            self.pair_mlp = nn.Sequential(
+                nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1))
 
     def encode(self, walk_emb: torch.Tensor, dt_log: torch.Tensor,
                valid: torch.Tensor) -> torch.Tensor:
@@ -120,6 +130,13 @@ class CrossWalkGRUHead(nn.Module):
             c3 = (hu * hv).sum(dim=-1).clamp(-1 + eps, 1 - eps)     # [B, C]
             logit = logit - self.logit_scale_ctx.clamp_min(1e-3) * torch.sqrt(
                 2.0 - 2.0 * c3)
+
+        if self.use_pair_mlp:
+            # Joint interaction decoder over the structural pair features.
+            feats = torch.stack(
+                [pair_rec_log, pair_ever, pair_count_log, coreach_log], dim=-1)
+            logit = logit + self.pair_mlp(feats).squeeze(-1)       # [B, C]
+            return logit
 
         if self.use_pair_recency:
             feat = self.t2v_pair(pair_rec_log)                     # [B, C, d_time]

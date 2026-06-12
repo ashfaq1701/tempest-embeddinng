@@ -95,6 +95,13 @@ def parse_args() -> argparse.Namespace:
              "count from the sampled walks; the TPNet co-reachability analog) added "
              "as a log1p logit term. Closes the new-edge slice recurrence can't.",
     )
+    p.add_argument(
+        "--use-pair-mlp", action="store_true",
+        help="Joint interaction decoder: mix [pair_rec, ever, count, coreach] through "
+             "a small MLP instead of summing them, so the structural pair features "
+             "can interact (e.g. co-reach gated by absence of history). Auto-computes "
+             "the store + co-reach features it needs.",
+    )
 
     # Walks (link head; BACKWARD only, graphs treated as undirected).
     p.add_argument(
@@ -293,6 +300,7 @@ def main() -> Dict[str, Any]:
         use_pair_history=args.use_pair_history,
         use_ctx_term=args.use_ctx_term,
         use_coreach=args.use_coreach,
+        use_pair_mlp=args.use_pair_mlp,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,

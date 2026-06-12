@@ -56,6 +56,7 @@ class TrainerConfig:
     use_pair_history: bool = False   # #2 extend #1 with ever-bit + decayed log-count
     use_ctx_term: bool = False       # #5 context-context chord term h[u]<->h[v]
     use_coreach: bool = False        # #3 walk-derived time-decayed co-reachability
+    use_pair_mlp: bool = False       # joint interaction decoder over the pair features
 
     # Walks (link head; BACKWARD only, undirected).
     num_walks_per_node: int = 5
@@ -98,13 +99,19 @@ class Trainer:
             use_pair_history=config.use_pair_history,
             use_ctx_term=config.use_ctx_term,
             use_coreach=config.use_coreach,
+            use_pair_mlp=config.use_pair_mlp,
         ).to(self.device)
+
+        # The joint pair-MLP consumes the store features AND co-reach, so it needs
+        # both computed regardless of the individual additive flags.
+        self._need_store = config.use_pair_recency or config.use_pair_mlp
+        self._need_coreach = config.use_coreach or config.use_pair_mlp
 
         # Streaming pairwise-interaction store (#1/#2). Lifecycle mirrors walk_gen:
         # reset() per epoch, update() after scoring, query() at scoring time.
         self.pair_store = (
             PairRecencyStore(num_nodes=config.num_nodes)
-            if config.use_pair_recency else None
+            if self._need_store else None
         )
 
         self.walk_gen = WalkGenerator(
@@ -212,7 +219,7 @@ class Trainer:
 
         # Walk-derived co-reachability (#3) from the SAME walks (cpu, [M,K,L]).
         coreach_log = None
-        if self.config.use_coreach:
+        if self._need_coreach:
             coreach_log = coreach_feature(
                 wd.nodes.view(M, K, L), wd.lens.view(M, K),
                 self.config.num_nodes, u_pos, v_pos).to(device)
