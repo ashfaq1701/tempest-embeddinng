@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
-from .link_pred_head import SourceWalkGRUHead
+from .link_pred_head import SourceWalkAttnHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
 from .pair_store import NodeLastSeenStore, PairRecencyStore
@@ -88,7 +88,7 @@ class Trainer:
         self.embedding_table = EmbeddingTable(
             num_nodes=config.num_nodes, d_emb=config.d_emb,
         ).to(self.device)
-        self.link_head = SourceWalkGRUHead(
+        self.link_head = SourceWalkAttnHead(
             d_emb=int(config.d_emb),
             use_pair_features=config.use_pair_features,
         ).to(self.device)
@@ -158,11 +158,13 @@ class Trainer:
                t_query_t: torch.Tensor) -> torch.Tensor:
         """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> logits [B, C].
 
-        SOURCE-SIDE ONLY: sample K walks for the unique SOURCES only, GRU-encode to
-        h[u], and score by the chord distance between h[u] and each candidate's raw
-        embedding E[v]. Candidate recency (t_query - t_last[v]) comes from the per-node
-        last-seen store (no candidate walks). Strict-causal: walks + store reflect the
-        pre-ingest state."""
+        SOURCE-SIDE ONLY: sample K walks for the unique SOURCES only and expose each
+        source's CONTEXT walk-neighbours as a flat token set {w_i} (seed + padding
+        excluded). Each candidate v attends over those tokens and pulls a
+        candidate-specific sphere log-map residual (the attention channel), while
+        E[u] enters once as a direct chord(E[u], E[v]) base channel. Candidate recency
+        (t_query - t_last[v]) comes from the per-node last-seen store (no candidate
+        walks). Strict-causal: walks + store reflect the pre-ingest state."""
         device = self.device
         B, C = cand_t.shape
 
@@ -173,9 +175,10 @@ class Trainer:
         nodes = wd.nodes.to(device).view(Ms, K, L)               # [Ms, K, L]
         ts = wd.timestamps.to(device).view(Ms, K, L).float()     # [Ms, K, L]
         lens = wd.lens.to(device).view(Ms, K)                    # [Ms, K]
-        valid = torch.arange(L, device=device).view(1, 1, L) < lens.unsqueeze(-1)
         # Context positions hold real edge times (the seed slot lens-1 is the
-        # INT64_MAX sentinel; padding is -1) — both excluded from time stats.
+        # INT64_MAX sentinel; padding is -1). is_ctx is BOTH the time-stat mask AND
+        # the token mask — it excludes the seed (= u itself), so u never enters the
+        # attention pool. u's identity lives only in the base chord channel.
         is_ctx = torch.arange(L, device=device).view(1, 1, L) < (lens - 1).unsqueeze(-1)
 
         # Within-walk inter-event Δt = t[p] - t[p-1] over context positions
@@ -186,11 +189,21 @@ class Trainer:
         dt = (dt * is_ctx.float()).clamp_min(0.0)
         dt_log = torch.log1p(dt)                                 # [Ms, K, L]
 
-        walk_emb = self.embedding_table(nodes.clamp_min(0)) * valid.unsqueeze(-1).float()
-        h_src = self.link_head.encode(walk_emb, dt_log, valid)   # [Ms, d]
-        h_u = h_src[u_pos]                                       # [B, d]
+        # Flatten the (K, L) walk axes into one per-source token set [Ms, n]. The
+        # head only ever sees a flat token set + mask; tok_mask = is_ctx keeps the
+        # seed and padding out of the softmax (their embeddings/Δt are present but
+        # contribute zero attention weight).
+        n = K * L
+        tok_emb_all = self.embedding_table(nodes.clamp_min(0)).view(Ms, n, -1)  # [Ms,n,d]
+        tok_dt_all = dt_log.view(Ms, n)                          # [Ms, n]
+        tok_mask_all = is_ctx.view(Ms, n)                        # [Ms, n] bool
 
-        E_v = self.embedding_table(cand_t)                       # [B, C, d]
+        tok_emb = tok_emb_all[u_pos]                            # [B, n, d]
+        tok_dt = tok_dt_all[u_pos]                              # [B, n]
+        tok_mask = tok_mask_all[u_pos]                          # [B, n]
+
+        E_u = self.embedding_table(src_t)                       # [B, d]   base channel
+        E_v = self.embedding_table(cand_t)                      # [B, C, d]
 
         # Candidate recency from the per-node last-seen store (replaces the
         # candidate-walk t_last); pair features from the pairwise store.
@@ -201,7 +214,7 @@ class Trainer:
                 src_t, cand_t, t_query_t)
 
         return self.link_head(
-            h_u, E_v, rec_v_log,
+            tok_emb, tok_dt, tok_mask, E_u, E_v, rec_v_log,
             pair_rec_log=pair_rec_log, pair_ever=pair_ever,
             pair_count_log=pair_count_log)
 
@@ -247,7 +260,12 @@ class Trainer:
     # Eval — strict-causal, no_grad
     # ──────────────────────────────────────────────────────────────────
 
-    def _eval(self, evaluator: Evaluator, batches: Iterable[Batch]) -> float:
+    def _eval(self, evaluator: Evaluator, batches: Iterable[Batch],
+              recorder=None) -> float:
+        """Strict-causal test/val eval. `recorder` (optional, for analysis only —
+        default None reproduces the eval byte-identically) gets, per batch, the
+        hooks before_batch(batch) [pre-ingest], on_positive(batch, i, rr) per
+        positive, and after_batch(batch) [after the model stores are updated]."""
         self.embedding_table.eval()
         self.link_head.eval()
         total, n = 0.0, 0
@@ -260,6 +278,8 @@ class Trainer:
                     if self.pair_store is not None:
                         self.pair_store.update(batch.src, batch.tgt, batch.ts)
                     self.node_last.update(batch.src, batch.tgt, batch.ts)
+                    if recorder is not None:
+                        recorder.after_batch(batch)
                     continue
 
                 _, neg_tgt_list = evaluator.sample_negatives(batch)
@@ -279,9 +299,16 @@ class Trainer:
                 t_query_t = torch.from_numpy(batch.ts.astype(np.int64)).to(self.device)
                 logits = self._score(src_t, cand_t, t_query_t).cpu().numpy()
 
+                # Analysis metadata is queried PRE-ingest (stores still reflect the
+                # pre-batch state — same state _score saw).
+                if recorder is not None:
+                    recorder.before_batch(batch)
                 for i in range(B):
-                    total += evaluator.score_to_metric(
+                    rr = evaluator.score_to_metric(
                         float(logits[i, 0]), logits[i, 1:1 + counts[i]])
+                    total += rr
+                    if recorder is not None:
+                        recorder.on_positive(batch, i, rr)
                 n += B
 
                 self.walk_gen.add_edges(
@@ -289,6 +316,8 @@ class Trainer:
                 if self.pair_store is not None:
                     self.pair_store.update(batch.src, batch.tgt, batch.ts)
                 self.node_last.update(batch.src, batch.tgt, batch.ts)
+                if recorder is not None:
+                    recorder.after_batch(batch)
         return total / max(n, 1)
 
     # ──────────────────────────────────────────────────────────────────
