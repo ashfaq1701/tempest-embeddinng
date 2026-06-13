@@ -17,25 +17,26 @@ Pipeline for one (source u, candidate v):
                    a_i = softmax_i(q·k_i / sqrt(d_head)).  ONE tied projection W on
                    the embedding side (fixed temperature) decides WHICH neighbours
                    are relevant to this candidate.
-  3. value         the AMBIENT residual (w_i − v) — the flat chord displacement in
-                   R^d. (Variant: the manifold log-map Log_v(w_i) was tried and is the
-                   curvature-correct version; on wiki's small angular spread the chord
-                   agrees with it to second order. This head uses the chord to test
-                   whether the curvature correction earned its keep.)
-  4. pool          r(u,v) = Σ_i a_i · (w_i − v)  — a d-dim residual.
-                   r ≈ 0 when v sits on top of the neighbours it attends to (a clean
-                   fit); large + structured when it doesn't.
-  5. readout       small MLP: r -> scalar logit. Plus the proven recency + pair
-                   terms, unchanged.
+  3. value         the scalar GEODESIC distance θ_i = arccos⟨v, w_i⟩ — "how far is
+                   w_i from v along the sphere". (Earlier variants reduced the
+                   neighbourhood to a d-dim tangent residual + MLP — log-map then flat
+                   chord; both tied, and both answered a CENTROID question. Here the
+                   value is a scalar distance, no vector, no MLP.)
+  4. pool          d(u,v) = −τ·log Σ_i a_i exp(−θ_i/τ)  — an attention-weighted
+                   SOFT-MIN. Driven by the nearest attended neighbour ("is v close to
+                   SOME node u touched"), not the centroid. Scalar θ_i ≥ 0 ⇒ no vector
+                   cancellation; the log-map's r≈0 ambiguity is gone.
+  5. readout       logit = −scale · d(u,v). No MLP (dropped ~17k params, the suspected
+                   overfit surface). Plus the proven recency + pair terms, unchanged.
 
 Base channel (E[u]): u's own identity is deliberately NOT a token in the attention
 pool — that channel answers "is v like u's NEIGHBOURS". u enters once, as a plain
 chord(E[u], E[v]) term ("is v like u DIRECTLY"), the repeat-slice workhorse. Keeping
 the two questions on separate, non-competing terms is the whole point of the split.
 
-FAST: we never build the [B, C, n, d] residual tensor. The pooled residual has a
-closed form that lets the d-axis appear only in a final [B,C,n]·[B,n,d] contraction
-(see `_pooled_residual`). The only big intermediates are scalar-per-token [B, C, n].
+FAST: the value is a scalar per token, so the d-axis only appears in the [B,C,n]
+inner-product `⟨v, w_i⟩` (one einsum). Everything after — arccos, the soft-min — is
+scalar-per-token [B, C, n]; no [B, C, n, d] tensor is ever built.
 
 E stays the single sphere-trained parameter (link-trained, no detach). W / time /
 readout are Euclidean.
@@ -67,7 +68,6 @@ class Time2Vec(nn.Module):
 
 class SourceWalkAttnHead(nn.Module):
     def __init__(self, d_emb: int, d_time: int = 16, d_head: int = 64,
-                 readout_hidden: int = None, dropout: float = 0.15,
                  use_pair_features: bool = False):
         super().__init__()
         self.d_emb = d_emb
@@ -90,14 +90,15 @@ class SourceWalkAttnHead(nn.Module):
         # easy-transductive mass. Kept separate so the two questions don't compete.
         self.logit_scale = nn.Parameter(torch.tensor(10.0))
 
-        # --- readout (turns the geometric residual into a logit) ----------------
-        hid = readout_hidden or d_emb
-        self.readout = nn.Sequential(
-            nn.Linear(d_emb, hid),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hid, 1),
-        )
+        # --- readout: attention-weighted SOFT-MIN GEODESIC distance -------------
+        # No MLP. The attention channel's value is now the scalar geodesic distance
+        # θ_i = arccos⟨v,w_i⟩; we aggregate with a soft-min (weighted LogSumExp over
+        # neighbours) so the logit is driven by the NEAREST attended neighbour, not
+        # the centroid — "is v close to SOME node u touched". One learnable
+        # temperature (τ) for the soft-min sharpness, one scale for the logit. Drops
+        # the ~17k-param readout MLP (the suspected overfit surface).
+        self.attn_scale = nn.Parameter(torch.tensor(10.0))
+        self.log_tau = nn.Parameter(torch.zeros(1))     # τ = softplus(log_tau)
 
         # --- proven extra terms, unchanged from the base head -------------------
         self.t2v_rec = Time2Vec(d_time)
@@ -124,23 +125,26 @@ class SourceWalkAttnHead(nn.Module):
         return torch.nan_to_num(a, nan=0.0)
 
     # ----------------------------------------------------------------------
-    # Pooled AMBIENT chord residual (the flat displacement, no curvature).
+    # Attention-weighted SOFT-MIN geodesic distance (scalar; NO d-dim residual).
     #
-    #   residual_i = w_i − v        (the chord through the ball, in R^d)
-    #   r = Σ_i a_i (w_i − v)
-    #     = Σ_i a_i w_i  −  (Σ_i a_i) v
-    #     = einsum(a, w) −  s · v ,   s = Σ_i a_i  (= 1 for live rows, 0 cold-start)
-    # Same [B,C,n]·[B,n,d] contraction as the log-map, but no arccos / θ-over-sinθ:
-    # at the small angular scales wiki embeddings occupy, the chord and the geodesic
-    # log-map agree to second order — this tests whether the curvature correction was
-    # buying anything.
+    #   θ_i  = arccos⟨v, w_i⟩                geodesic distance v→w_i on the sphere
+    #   d    = −τ · log( Σ_i a_i exp(−θ_i / τ) )
+    # A weighted LogSumExp soft-min: as τ→0, d→min_i θ_i over the attended
+    # neighbours (nearest-neighbour distance); larger τ blends toward the weighted
+    # mean. Scalar θ_i ≥ 0 means no vector cancellation (the log-map's r≈0 ambiguity
+    # is gone). For live rows Σa_i=1 so the inner sum ∈ (0,1]; cold-start rows
+    # (Σa_i=0) are returned as d=0 (neutral — logit falls back to base+recency+pair).
     # ----------------------------------------------------------------------
-    def _pooled_residual(self, ev: torch.Tensor, ew: torch.Tensor,
-                         a: torch.Tensor) -> torch.Tensor:
-        """ev [B,C,d] (unit), ew [B,n,d] (unit), a [B,C,n] -> r [B,C,d] (ambient)."""
-        s = a.sum(dim=-1, keepdim=True)                            # [B,C,1]; 1 or 0
-        r = torch.einsum("bcn,bnd->bcd", a, ew) - s * ev          # [B,C,d]
-        return r
+    def _softmin_geodesic(self, ev: torch.Tensor, ew: torch.Tensor,
+                          a: torch.Tensor) -> torch.Tensor:
+        """ev [B,C,d] (unit), ew [B,n,d] (unit), a [B,C,n] -> d [B,C] (>= 0)."""
+        cos = torch.einsum("bcd,bnd->bcn", ev, ew).clamp(-1 + self.eps, 1 - self.eps)
+        theta = torch.arccos(cos)                                  # [B,C,n] ≥ 0
+        tau = F.softplus(self.log_tau) + self.eps                 # scalar > 0
+        inner = (a * torch.exp(-theta / tau)).sum(dim=-1)         # [B,C] ∈ (0,1]/{0}
+        live = a.sum(dim=-1) > 0                                  # [B,C] cold-start mask
+        d = -tau * torch.log(inner.clamp_min(self.eps))          # [B,C] ≥ 0
+        return torch.where(live, d, torch.zeros_like(d))
 
     # ----------------------------------------------------------------------
     def forward(self, tok_emb: torch.Tensor, tok_dt: torch.Tensor,
@@ -163,10 +167,13 @@ class SourceWalkAttnHead(nn.Module):
         ew = F.normalize(tok_emb, dim=-1)                           # [B, n, d]
         eu = F.normalize(E_u, dim=-1).unsqueeze(1)                  # [B, 1, d]
 
-        # --- attention channel: is v like u's NEIGHBOURS -----------------------
+        # --- attention channel: is v close to SOME node u touched --------------
+        # candidate-conditioned attention picks the relevant neighbours; the value
+        # is their geodesic distance, soft-min-pooled to the nearest one; closer =>
+        # higher logit.
         a = self._attention(ev, ew, tok_dt, tok_mask)              # [B, C, n]
-        r = self._pooled_residual(ev, ew, a)                       # [B, C, d]
-        logit = self.readout(r).squeeze(-1)                        # [B, C]
+        d_attn = self._softmin_geodesic(ev, ew, a)                # [B, C] ≥ 0
+        logit = -self.attn_scale.clamp_min(1e-3) * d_attn         # [B, C]
 
         # --- base channel: is v like u DIRECTLY (chord on the sphere) ----------
         # ‖a-b‖ = √(2-2⟨a,b⟩); closer => higher logit. u enters ONLY here.

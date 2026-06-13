@@ -1,0 +1,56 @@
+=== tempest-embedding training ===
+dataset: tgbl-wiki
+device:  cuda
+seed:    42
+loaded in 1.2s
+  num_nodes:     9,227
+  dst_pool:      952 unique destinations
+  t_min:         0
+  t_max:         1862652
+  T_train:       1862652
+  t_max_full:    2678373
+  T_full:        2678373
+  median_inter_arrival: 12.0
+  mean_inter_arrival:   17.4
+  train edges:   110,232
+  val edges:     23,621
+  test edges:    23,621
+
+=== Config ===
+  num_nodes: 9227
+  dst_pool: <ndarray shape=(952,) dtype=int32>
+  d_emb: 128
+  tau_link: 1.0
+  K_train: 100
+  use_pair_features: True
+  num_walks_per_node: 5
+  max_walk_len: 20
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  max_time_capacity: -1
+  lr: 0.001
+  lr_min: 1e-05
+  weight_decay: 0.0001
+  warmup_fraction: 0.05
+  warmup_steps_cap: 500
+  decay_horizon_epochs: 50
+  num_epochs: 20
+  early_stop_patience: 5
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  embedding_table:    1,181,056
+  link_head:              9,415
+  TOTAL trainable:    1,190,471
+
+=== Training ===
+  LR schedule (warmup+cosine): peak=1.00e-03 floor=1.00e-05; warmup=500 decay_horizon=27600 (50ep x 552 batches)
+epoch 1/20  link=1.3450  lr=1.00e-03  train 23.7s  val 0.7897  test 0.7664 (new best)  eval 77.7s
+epoch 2/20  link=1.2149  lr=9.99e-04  train 19.4s  val 0.7979  test 0.7770 (new best)  eval 78.8s
+epoch 3/20  link=1.1556  lr=9.96e-04  train 19.6s  val 0.8019  test 0.7809 (new best)  eval 79.1s
+epoch 4/20  link=1.1003  lr=9.90e-04  train 19.3s  val 0.8049  test 0.7840 (new best)  eval 79.9s
+epoch 5/20  link=1.0602  lr=9.83e-04  train 19.8s  val 0.8054  test 0.7844 (new best)  eval 82.2s
+epoch 6/20  link=1.0213  lr=9.74e-04  train 19.7s  val 0.8055  test 0.7842 (new best)  eval 82.2s
+epoch 7/20  link=0.9793  lr=9.63e-04  train 20.3s  val 0.8031  patience 1/5  eval 82.2s
