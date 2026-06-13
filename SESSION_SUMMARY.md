@@ -423,31 +423,46 @@ cross-attention are exhausted on this slice.
 
 ---
 
-## Geometric link heads: Point vs Gaussian × unbounded vs window-5 (2026-06-13)
+## Link heads: Point vs Gaussian vs Attention × unbounded vs window-5 (2026-06-13)
 
-A 2×2 on tgbl-wiki of the two tangent-space geometric link heads
-(`GeometricPointHead` on master `57ebbd7`; `GeometricGaussianHead` on branch
-`feature/geometric-gaussian-head` `a984e79`) crossed with the Tempest history
-window. Both heads share the same base-point construction: `p = E[u]`, log-map
-u's recency-weighted walk-neighbours into `T_{E[u]}`, predict a mean
-`μ = Σ softmax(−λ·age)·Log_p(E[node])`. The **Point** head scores by
-`−α‖ν−μ‖ − β·angle`; the **Gaussian** head fits a recency-weighted covariance
-`C` over the same neighbour tangents and scores by Mahalanobis
-`(ν−μ)ᵀ(C+τI)⁻¹(ν−μ)` (Woodbury, only an `[n,n]` inverse). All runs: walks10,
-no pair features, bs 200 / eval-bs 20, lr 1e-3 → 1e-5, seed 42.
+**Decision: the Point head is the one we build on going forward.** It has the
+highest peak (tied with Gaussian, above Attention), is the *only* monotone one
+(no overfit-drift), is the cheapest at Gaussian-equivalent accuracy, and degrades
+the most gracefully under windowing.
+
+Three link heads on tgbl-wiki, each crossed with the Tempest history window. The
+two **geometric** heads share a base-point construction: `p = E[u]`, log-map u's
+recency-weighted walk-neighbours into `T_{E[u]}`, predict a mean
+`μ = Σ softmax(−λ·age)·Log_p(E[node])`. The **Point** head
+(`GeometricPointHead`, master `57ebbd7`) scores by `−α‖ν−μ‖ − β·angle`; the
+**Gaussian** head (`GeometricGaussianHead`, branch `feature/geometric-gaussian-head`
+`a984e79`) fits a recency-weighted covariance `C` and scores by Mahalanobis
+`(ν−μ)ᵀ(C+τI)⁻¹(ν−μ)` (Woodbury, only an `[n,n]` inverse). The **Attention** head
+(`SourceWalkAttnHead`, "Option A" — query-relative pre-softmax recency-biased
+attention over the source walk-neighbours; tag `source-walk-attn-head`, branch
+`feature/source-attention`, commit `790f51c`, the pre-geometric baseline) is the
+contrast: a learned attention pool instead of a fixed geometric statistic. All
+runs: walks10, no pair features, bs 200 / eval-bs 20, lr 1e-3 → 1e-5, seed 42,
+30 epochs, patience 5, decay-horizon 30 (except the two early geometric runs,
+noted below).
 
 ### Peaks (best-val, restored)
 
 | head | **unbounded** (val / test) | **window-5** (val / test) | Δ window−unbounded |
 |---|---|---|---|
-| **Point**    | **0.8057 / 0.7720** (ep20*) | 0.7965 / 0.7491 (ep37) | −0.009 / **−0.023** |
-| **Gaussian** | **0.8050 / 0.7719** (ep30)  | ~0.795 / ~0.749 (proj†) | ≈ −0.010 / **≈ −0.023** |
+| **Point**     | **0.8057 / 0.7720** (ep20*) | 0.7965 / 0.7491 (ep37) | −0.009 / **−0.023** |
+| **Gaussian**  | **0.8050 / 0.7719** (ep30)  | ~0.795 / ~0.749 (proj†) | ≈ −0.010 / **≈ −0.023** |
+| **Attention** | 0.7966 / 0.7703 (ep10‡)     | ~0.7630 / ~0.7144 (ep11§) | **−0.034 / −0.056** |
 
 \* Point unbounded hit its 20-epoch cap *still climbing* (not fully converged),
 yet already matched Gaussian's converged ep30 peak.
 † Gaussian window-5 was stopped manually at **ep15 (val 0.7828 / test 0.7352,
 still climbing)**; the plateau is projected from its step-for-step tracking of
 the Point window-5 curve, which peaked 0.7965/0.7491 at ep37.
+‡ Attention unbounded peaked at ep10 then **overfit-drifted** (val 0.7966→0.7914)
+and early-stopped at ep15 — the only head that is *not* monotone.
+§ Attention window-5 was stopped manually at ep12 (peak ep11), already plateauing
+(ep12 patience 1/5); it does not climb on like the geometric window-5 runs.
 
 ### Window-5 epoch overlay (Point vs Gaussian, the clean A/B)
 
@@ -488,12 +503,53 @@ Gaussian's 30 — so compare ep1–12 as apples-to-apples and peaks otherwise.)
    eval) but caps ~0.023 test lower — a pure speed/accuracy trade, same for both
    heads.
 
-### Takeaway
+### Attention head — front-loads, overfit-drifts, most window-fragile
 
-For this head family on tgbl-wiki: **ship Point + unbounded.** Unbounded beats
-window-5 by ~0.023 test for both variants; Point matches Gaussian on accuracy at
-lower cost; the Gaussian covariance neither improves accuracy nor adds the
-window-robustness it was hypothesised to. The only way to make the geometric
-channel less window-sensitive is to feed `μ`/`C` from an un-evicted per-node
-neighbour buffer (decouple the head's neighbour set from Tempest eviction) — not
-to switch Point→Gaussian. Logs: `logs/manifold/run_{point,gauss}_*` (gitignored).
+The attention head behaves *qualitatively* differently from the geometric pair:
+
+1. **Front-loads hard.** Unbounded ep1 = **0.7891 / 0.7621** — a huge head-start
+   (geometric heads start ~0.773 / ~0.740) and already within ~0.01 of the
+   geometric *converged* peak. It is near-peak by ep10.
+2. **Not monotone — it overfit-drifts.** Unbounded peaks **0.7966 / 0.7703 @
+   ep10**, then val falls (0.7966→0.7914) while link loss keeps dropping →
+   early-stop ep15. This is the classic walk-tower drift, delayed to ep10. The
+   geometric heads, by contrast, climb cleanly to ep30 with no drift. **Point/
+   Gaussian are monotone; Attention is not.**
+3. **Lower ceiling than geometric.** Peak test 0.7703 sits just *under* the
+   geometric 0.7719/0.7720, and on val it is clearly lower (0.7966 vs ~0.8055).
+   It reaches its (lower) peak fast (ep10) where the geometric heads need ~ep25–30
+   to reach their (higher) one — fast-but-lower-ceiling vs slow-but-higher.
+4. **Most window-fragile of the three — by ~3×.** Window penalty **−0.034 val /
+   −0.056 test**, vs ~−0.009 / ~−0.023 for the geometric heads. Window-5 caps it
+   at ~0.763 val — *below even the geometric window-5* (~0.795). Under window-5 it
+   matches the Point window-5 curve for ep1–7 (it even *leads* by ~0.004 early —
+   its fast-start edge survives), then crosses at ep7 and plateaus while Point
+   climbs on. Mechanism: the attention head's whole value is *reading a rich
+   neighbourhood* (the source of its unbounded head-start); windowing starves
+   exactly what it is best at, so it collapses to the lowest windowed ceiling. The
+   geometric heads lean on a simpler statistic (μ) that degrades far more
+   gracefully — confirming windowing is *not* a regularizer that rescues the
+   attention head's drift; it just lowers the ceiling.
+5. **Speed:** Point-class (~100s/epoch unbounded, ~24s/epoch windowed).
+
+### Takeaway — Point is the head we build on
+
+On tgbl-wiki, no pair features, across all three heads and both window regimes:
+
+- **Point ≈ Gaussian on accuracy** (tie within 0.001 unbounded; track
+  epoch-for-epoch windowed) — the Gaussian covariance buys nothing and costs the
+  `[n,n]` inverse, and gives no window-robustness either.
+- **Attention front-loads but loses**: non-monotone (overfit-drift), a slightly
+  lower test ceiling (0.7703 vs 0.7719/0.7720), clearly lower val, and ~3× the
+  window penalty.
+- **Windowing hurts every head** — unbounded wins for all three (Point/Gaussian by
+  ~0.023 test, Attention by ~0.056). The window is the ceiling, not the head.
+
+⇒ **Build on the Point head, unbounded.** Highest peak, the only clean monotone
+climb (no overfit babysitting), cheapest at top accuracy, and most window-tolerant.
+Gaussian is a no-gain complexity tax; Attention is a fast-but-overfitting,
+window-fragile alternative. If window-insensitivity is ever needed, the lever is
+feeding μ from an un-evicted per-node neighbour buffer — not switching heads.
+
+Logs: `logs/manifold/run_{point,gauss,attn}_*` (gitignored). Heads preserved at
+tags `geometric-point-head`, `geometric-gaussian-head`, `source-walk-attn-head`.
