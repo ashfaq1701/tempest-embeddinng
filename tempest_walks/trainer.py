@@ -260,12 +260,7 @@ class Trainer:
     # Eval — strict-causal, no_grad
     # ──────────────────────────────────────────────────────────────────
 
-    def _eval(self, evaluator: Evaluator, batches: Iterable[Batch],
-              recorder=None) -> float:
-        """Strict-causal test/val eval. `recorder` (optional, for analysis only —
-        default None reproduces the eval byte-identically) gets, per batch, the
-        hooks before_batch(batch) [pre-ingest], on_positive(batch, i, rr) per
-        positive, and after_batch(batch) [after the model stores are updated]."""
+    def _eval(self, evaluator: Evaluator, batches: Iterable[Batch]) -> float:
         self.embedding_table.eval()
         self.link_head.eval()
         total, n = 0.0, 0
@@ -278,8 +273,6 @@ class Trainer:
                     if self.pair_store is not None:
                         self.pair_store.update(batch.src, batch.tgt, batch.ts)
                     self.node_last.update(batch.src, batch.tgt, batch.ts)
-                    if recorder is not None:
-                        recorder.after_batch(batch)
                     continue
 
                 _, neg_tgt_list = evaluator.sample_negatives(batch)
@@ -299,16 +292,9 @@ class Trainer:
                 t_query_t = torch.from_numpy(batch.ts.astype(np.int64)).to(self.device)
                 logits = self._score(src_t, cand_t, t_query_t).cpu().numpy()
 
-                # Analysis metadata is queried PRE-ingest (stores still reflect the
-                # pre-batch state — same state _score saw).
-                if recorder is not None:
-                    recorder.before_batch(batch)
                 for i in range(B):
-                    rr = evaluator.score_to_metric(
+                    total += evaluator.score_to_metric(
                         float(logits[i, 0]), logits[i, 1:1 + counts[i]])
-                    total += rr
-                    if recorder is not None:
-                        recorder.on_positive(batch, i, rr)
                 n += B
 
                 self.walk_gen.add_edges(
@@ -316,8 +302,6 @@ class Trainer:
                 if self.pair_store is not None:
                     self.pair_store.update(batch.src, batch.tgt, batch.ts)
                 self.node_last.update(batch.src, batch.tgt, batch.ts)
-                if recorder is not None:
-                    recorder.after_batch(batch)
         return total / max(n, 1)
 
     # ──────────────────────────────────────────────────────────────────
