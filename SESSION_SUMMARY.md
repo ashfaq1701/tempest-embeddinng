@@ -363,3 +363,60 @@ source-side + pf stack. The gains are **single-seed and inside the noise band**,
 a confirmed win — multi-seed on mult=5 (or a slightly larger window, mult=8/10) would
 be needed to tell signal from noise. No code change (the flag already exists);
 documented for the record.
+
+---
+
+## 12. Localizing the TPNet gap — test-MRR stratification
+
+Branch `feature/stratify-test-errors` (code: a `Trainer._eval` recorder hook +
+`scripts/stratify_test_errors.py`; doc-only here). Re-ran the current best model's
+(source-side + pf) **test** eval capturing, per positive, the reciprocal rank +
+strict-causal metadata (endpoint-seen, pair-seen/count, degree), and stratified it.
+Sanity-checked: stratified MRR 0.7786 == `_eval` return; partitions reconstruct ±1e-4.
+
+| slice | frac | mean_rr | verdict |
+|---|---|---|---|
+| repeat-pair | 87.4% | **0.887** | solved — the gap is NOT decoder capacity |
+| **new × both-seen** | 8.0% | **0.022** | the co-reachability cell (+0.063 headroom) |
+| new × u-only-inductive | 4.5% | 0.043 | cold-start / bootstrap (+0.035) |
+
+**The entire +0.048 test gap to TPNet is the 12.6% new-pair slice** (mean_rr ~0.03);
+the 87% repeat majority is already at 0.887. The decisive cell is `new × both-seen`
+(both endpoints known, never linked).
+
+## 13. Attacking the new-pair slice (co-reach + cross-attention) — all dead
+
+Targeted the `new × both-seen` cell three ways; **all three hit the same floor**, so
+its headroom is **not recoverable from graph / neighbourhood structure** — it is
+content / cold-start signal (page text, node features). Judged on the SLICE via the
+recorder, never aggregate (the 8% slice is swamped in aggregate — the exact trap that
+buried earlier co-reach).
+
+1. **Step-0 exact co-reach precondition** (branch `feature/gated-coreach`,
+   `scripts/coreach_precondition.py`). Scored the slice's candidates by exact causal
+   co-reach (streamed adjacency, no walk-sampling noise), through the TGB scorer.
+   Caught a **bipartite confound**: tgbl-wiki is user×page, so even-power co-reach
+   (`A^2`,`A^4`) is structurally 0; the cross-side signal is odd powers. **Ceiling =
+   `A^3` 0.0414** (`A^5` 0.0361; time-decay dead) — far below the 0.10 dead bar, only
+   ~2× the model's 0.022. The new positives aren't co-reach-separable from negatives
+   (TGB negs include pages MORE co-reachable with u than the genuinely-new positive).
+2. **Aggregate co-reach** (Wave-2/3, §3) — already falsified: redundant with the GRU.
+3. **u-v metric cross-attention** (branch `feature/xattn-uv`, off `6922976` cross head;
+   `scripts/xattn_run.py`). Re-test of the previously-falsified cross-attention head,
+   bugfixed (tied `Wqk`, ONE fixed temp `1/√d_head`, candidate-aware slots) on the
+   CLEAN link-trained regime (no alignment, no detach), gated to new pairs. C1 @ TPNet
+   bs: aggregate 0.7762 (cleared the cross-head baseline ~0.774), repeat-slice guard
+   held (0.8845 — the gate makes repeats byte-identical), but the **`new × both-seen`
+   slice did NOT move: 0.0204 ≈ 0.022**. Un-collapsed token-level neighbourhood overlap
+   carries no signal the pooled-mean discarded. Curve was the healthy gentle shape (no
+   drift), so the channel is well-behaved — it just finds nothing.
+
+**Bonus (regime attribution):** the old cross-attention died under detached-E +
+alignment; this one runs in the clean no-detach regime and *still* finds nothing on the
+slice ⇒ the **detached-E regime was NOT the cause** of the old failure — the mechanism
+simply doesn't carry signal here (so C2/C3/C4 were moot).
+
+**Conclusion:** the new-pair headroom is triply-confirmed not-in-the-graph. Closing the
+TPNet gap on wiki needs **content / node features** (page identity/text, cold-start
+priors), not more walk/graph structure. Walk-based pair features and metric
+cross-attention are exhausted on this slice.
