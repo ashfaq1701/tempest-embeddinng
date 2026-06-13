@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
-from .link_pred_head import SourceWalkAttnHead
+from .link_pred_head import GeometricGaussianHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
 from .pair_store import NodeLastSeenStore, PairRecencyStore
@@ -88,7 +88,7 @@ class Trainer:
         self.embedding_table = EmbeddingTable(
             num_nodes=config.num_nodes, d_emb=config.d_emb,
         ).to(self.device)
-        self.link_head = SourceWalkAttnHead(
+        self.link_head = GeometricGaussianHead(
             d_emb=int(config.d_emb),
             use_pair_features=config.use_pair_features,
         ).to(self.device)
@@ -181,42 +181,30 @@ class Trainer:
         # attention pool. u's identity lives only in the base chord channel.
         is_ctx = torch.arange(L, device=device).view(1, 1, L) < (lens - 1).unsqueeze(-1)
 
-        # Within-walk inter-event Δt = t[p] - t[p-1] over context positions
-        # (>=0; backward walks are oldest->recent). p=0, the seed, and padding
-        # all get Δt=0 (the seed is the no-delta marker). log1p-compressed.
-        dt = torch.zeros(Ms, K, L, device=device)
-        dt[..., 1:] = ts[..., 1:] - ts[..., :-1]
-        dt = (dt * is_ctx.float()).clamp_min(0.0)
-        dt_log = torch.log1p(dt)                                 # [Ms, K, L]
-
         # Flatten the (K, L) walk axes into one per-source token set [Ms, n]. The
-        # head only ever sees a flat token set + mask; tok_mask = is_ctx keeps the
-        # seed and padding out of the softmax (their embeddings/Δt are present but
-        # contribute zero attention weight).
+        # head sees a flat token set + mask; tok_mask = is_ctx keeps the seed and
+        # padding out (their embeddings are present but get zero recency weight).
         n = K * L
         tok_emb_all = self.embedding_table(nodes.clamp_min(0)).view(Ms, n, -1)  # [Ms,n,d]
-        tok_dt_all = dt_log.view(Ms, n)                          # [Ms, n]
-        tok_ts_all = ts.view(Ms, n)                              # [Ms, n] edge times
-        tok_mask_all = is_ctx.view(Ms, n)                        # [Ms, n] bool
+        tok_ts_all = ts.view(Ms, n)                             # [Ms, n] edge times
+        tok_mask_all = is_ctx.view(Ms, n)                       # [Ms, n] bool
 
         tok_emb = tok_emb_all[u_pos]                            # [B, n, d]
-        tok_dt = tok_dt_all[u_pos]                              # [B, n]
         tok_ts = tok_ts_all[u_pos]                              # [B, n]
         tok_mask = tok_mask_all[u_pos]                          # [B, n]
 
-        # Per-token query staleness: log1p(t_query − t_token), t_token = ts[p] (the
-        # token's own edge time). clamp_min(0) neutralises the seed's INT64_MAX
-        # sentinel (huge-negative → 0, no log1p-of-negative NaN); the mask zeroes
-        # padding's bogus positive. Finite everywhere → safe for the head's bias.
-        tok_age = torch.log1p(
-            (t_query_t.unsqueeze(1).float() - tok_ts).clamp_min(0.0)
-        ) * tok_mask.float()                                    # [B, n]
+        # Per-token RAW query staleness age = t_query − t_token (t_token = ts[p], the
+        # token's own edge time), for the geometric recency weighting softmax(−λ·age).
+        # clamp_min(0) neutralises the seed's INT64_MAX sentinel (→ 0); the mask zeroes
+        # padding's bogus positive — finite everywhere, and masked entries are −∞'d in
+        # the head's softmax anyway.
+        tok_age = (t_query_t.unsqueeze(1).float() - tok_ts).clamp_min(0.0) * tok_mask.float()
 
-        E_u = self.embedding_table(src_t)                       # [B, d]   base channel
+        E_u = self.embedding_table(src_t)                       # [B, d]   base point E[u]
         E_v = self.embedding_table(cand_t)                      # [B, C, d]
 
-        # Candidate recency from the per-node last-seen store (replaces the
-        # candidate-walk t_last); pair features from the pairwise store.
+        # Candidate recency from the per-node last-seen store; pair features from the
+        # pairwise store. Both are optional additive logit terms in the head.
         rec_v_log = self.node_last.query(cand_t, t_query_t)      # [B, C]
         pair_rec_log = pair_ever = pair_count_log = None
         if self.pair_store is not None:
@@ -224,7 +212,7 @@ class Trainer:
                 src_t, cand_t, t_query_t)
 
         return self.link_head(
-            tok_emb, tok_dt, tok_age, tok_mask, E_u, E_v, rec_v_log,
+            tok_emb, tok_age, tok_mask, E_u, E_v, rec_v_log,
             pair_rec_log=pair_rec_log, pair_ever=pair_ever,
             pair_count_log=pair_count_log)
 

@@ -1,47 +1,41 @@
-"""Candidate-conditioned sphere-attention link head.
+"""Geometric link head — soft / probabilistic (tangent-space Gaussian + Mahalanobis).
 
-Replaces the GRU mean-pool readout. There is NO precomputed h[u] anymore: the
-source's neighbourhood is not collapsed up-front. Instead, *each candidate v
-attends, separately, over the source's walk-neighbour tokens* {w_i}, and pulls a
-candidate-specific residual that a small head turns into a logit.
+The robust member of the family. Same crafted idea as the point version
+(base point E[u]; u's temporal-walk neighbours log-mapped into the flat tangent
+space T_{E[u]}; a recency-weighted prediction of "where v should belong"), but
+instead of a single point μ scored by separate distance + angle, we fit a
+recency-weighted GAUSSIAN N(μ, C) over the neighbour tangents and score the
+candidate by its MAHALANOBIS distance to it:
 
-Pipeline for one (source u, candidate v):
+  base point   p = E[u]
+  neighbours   g_i = Log_{E[u]}(E[node_i])          tangent vectors at E[u]
+  candidate    ν   = Log_{E[u]}(E[v])
+  recency      w_i = softmax_i(−λ·age_i)            (λ ≥ 0 learnable; Σ w_i = 1)
+  mean         μ   = Σ_i w_i g_i                    predicted position
+  covariance   C   = Σ_i w_i (g_i−μ)(g_i−μ)ᵀ        recency-weighted spread
+  score        m²  = (ν−μ)ᵀ (C + τI)⁻¹ (ν−μ)        Mahalanobis (τ = shrinkage ≥ 0)
+  logit        = −scale · √m²
 
-  1. tokens        u's CONTEXT walk-neighbours w_i (seed + padding excluded), each
-                   carrying E[w_i] and its within-walk recency Time2Vec(Δt_i).
-                   (No K / walk axis yet — tokens arrive flattened per source as
-                   [n, d]. The K split can be re-added later without touching this
-                   head: it only ever sees a flat token set + mask.)
-  2. attention     q = W·E[v]  (the candidate asks),
-                   k_i = W·E[w_i] + time(Δt_i)  (each neighbour answers).
-                   a_i = softmax_i(q·k_i / sqrt(d_head) − λ·age_i).  ONE tied
-                   projection W on the embedding side decides WHICH neighbours are
-                   relevant; a learned recency bias −λ·age_i (λ≥0, age = query
-                   staleness of the neighbour) tilts the softmax toward neighbours u
-                   touched recently before the query. λ→0 recovers the agnostic head.
-  3. value         the scalar GEODESIC distance θ_i = arccos⟨v, w_i⟩ — "how far is
-                   w_i from v along the sphere". (Earlier variants reduced the
-                   neighbourhood to a d-dim tangent residual + MLP — log-map then flat
-                   chord; both tied, and both answered a CENTROID question. Here the
-                   value is a scalar distance, no vector, no MLP.)
-  4. pool          d(u,v) = −τ·log Σ_i a_i exp(−θ_i/τ)  — an attention-weighted
-                   SOFT-MIN. Driven by the nearest attended neighbour ("is v close to
-                   SOME node u touched"), not the centroid. Scalar θ_i ≥ 0 ⇒ no vector
-                   cancellation; the log-map's r≈0 ambiguity is gone.
-  5. readout       logit = −scale · d(u,v). No MLP (dropped ~17k params, the suspected
-                   overfit surface). Plus the proven recency + pair terms, unchanged.
+Why Mahalanobis (vs the point head's −α‖ν−μ‖ − β·angle):
+  - It is direction-aware distance: deviations along axes where u's neighbourhood
+    is SPREAD are cheap, deviations along axes where it is TIGHT are expensive. So
+    it fuses "distance" and "angle" into one quantity rather than two scalars.
+  - A near-degenerate "narrow line" neighbourhood is just a high-variance axis +
+    tight perpendicular axes — the ellipse handles it smoothly, with NO unstable
+    eigenvector/line fit. That is the whole reason to prefer this variant.
 
-Base channel (E[u]): u's own identity is deliberately NOT a token in the attention
-pool — that channel answers "is v like u's NEIGHBOURS". u enters once, as a plain
-chord(E[u], E[v]) term ("is v like u DIRECTLY"), the repeat-slice workhorse. Keeping
-the two questions on separate, non-competing terms is the whole point of the split.
+The shrinkage τ is also the dial back to the simpler heads:
+  τ → ∞  ⇒  (C+τI)⁻¹ → (1/τ)I  ⇒  m² → ‖ν−μ‖²/τ  ⇒  the plain mean-distance head.
+  τ → 0  ⇒  full Mahalanobis (most direction-aware, least regularised).
 
-FAST: the value is a scalar per token, so the d-axis only appears in the [B,C,n]
-inner-product `⟨v, w_i⟩` (one einsum). Everything after — arccos, the soft-min — is
-scalar-per-token [B, C, n]; no [B, C, n, d] tensor is ever built.
+FAST: C is rank ≤ n (n = #neighbours ≪ d), so we NEVER form or invert the [d,d]
+covariance. By Woodbury, (C+τI)⁻¹ needs only an [n,n] inverse:
+  m² = (1/τ)[ ‖δ‖² − (Aδ)ᵀ G (Aδ) ],   δ = ν−μ,  A_i = √w_i (g_i−μ),  G = (τI_n + AAᵀ)⁻¹
+G and μ, A are per-source (candidate-independent); only the [n]-vectors Aδ are
+per-candidate. The [d,d] object is never built.
 
-E stays the single sphere-trained parameter (link-trained, no detach). W / time /
-readout are Euclidean.
+E stays the single sphere parameter (link-trained, no detach). λ, τ, scale are the
+only geometric parameters (plus the optional proven recency/pair terms).
 """
 import math
 
@@ -51,8 +45,7 @@ import torch.nn.functional as F
 
 
 class Time2Vec(nn.Module):
-    """Time2Vec (Kazemi et al. 2019): scalar τ -> [linear, sin(ω₁τ+φ₁), …].
-    First channel linear, rest periodic. τ is fed pre-normalised (log1p of a Δ)."""
+    """Time2Vec (Kazemi et al. 2019): scalar τ -> [linear, sin(ω₁τ+φ₁), …]."""
 
     def __init__(self, dim: int):
         super().__init__()
@@ -62,54 +55,28 @@ class Time2Vec(nn.Module):
         self.b = nn.Parameter(torch.rand(dim - 1) * 2 * math.pi)
 
     def forward(self, tau: torch.Tensor) -> torch.Tensor:
-        tau = tau.unsqueeze(-1)                          # [..., 1]
-        lin = self.w0 * tau + self.b0                    # [..., 1]
-        per = torch.sin(tau * self.w + self.b)           # [..., dim-1]
-        return torch.cat([lin, per], dim=-1)             # [..., dim]
+        tau = tau.unsqueeze(-1)
+        lin = self.w0 * tau + self.b0
+        per = torch.sin(tau * self.w + self.b)
+        return torch.cat([lin, per], dim=-1)
 
 
-class SourceWalkAttnHead(nn.Module):
-    def __init__(self, d_emb: int, d_time: int = 16, d_head: int = 64,
+class GeometricGaussianHead(nn.Module):
+    def __init__(self, d_emb: int, d_time: int = 16,
                  use_pair_features: bool = False):
         super().__init__()
         self.d_emb = d_emb
-        self.d_head = d_head
         self.eps = 1e-6
 
-        # --- attention (decides WHICH neighbours matter to a candidate) ---------
-        # ONE tied projection on the embedding side: the candidate and every
-        # neighbour token go through the SAME W, so the query/key metric is shared
-        # (no untied-projection drift). Time augments the KEY only — a neighbour's
-        # relevance may depend on how recently u touched it.
-        self.W = nn.Linear(d_emb, d_head, bias=False)
-        self.t2v_walk = Time2Vec(d_time)
-        self.time_key = nn.Linear(d_time, d_head)
-        # Query-relative recency bias (A): a learned, sign-constrained decay added to
-        # the score BEFORE softmax. λ = softplus(log_lambda) ≥ 0 guarantees the
-        # direction (older neighbour → more negative → less weight). λ→0 (log_lambda
-        # → −∞) recovers the time-agnostic head exactly. Distinct from t2v_walk above
-        # (within-walk Δt, a token property) and from rec_head below (candidate
-        # staleness): this is each NEIGHBOUR's staleness as of the query.
-        self.log_lambda = nn.Parameter(torch.zeros(1))   # λ ≈ 0.69 at init
+        # --- geometric channel (the whole model) -------------------------------
+        # u enters as the BASE POINT (everything is relative to E[u]); no separate
+        # u-vs-v term is needed. Three scalars: recency decay, covariance shrinkage,
+        # logit scale.
+        self.log_lambda = nn.Parameter(torch.zeros(1))   # λ = softplus(·) ≥ 0
+        self.log_tau = nn.Parameter(torch.zeros(1))      # τ = softplus(·) ≥ 0  (shrinkage / dial)
+        self.scale = nn.Parameter(torch.tensor(10.0))    # logit = −scale·√m²
 
-        # --- base channel: direct u-vs-v chord on the sphere --------------------
-        # E[u] is deliberately NOT a token in the attention pool (that channel
-        # answers "is v like u's NEIGHBOURS"). u's own identity enters here instead:
-        # a plain chord(E[u], E[v]) — "is v like u directly". Strong on the repeat /
-        # easy-transductive mass. Kept separate so the two questions don't compete.
-        self.logit_scale = nn.Parameter(torch.tensor(10.0))
-
-        # --- readout: attention-weighted SOFT-MIN GEODESIC distance -------------
-        # No MLP. The attention channel's value is now the scalar geodesic distance
-        # θ_i = arccos⟨v,w_i⟩; we aggregate with a soft-min (weighted LogSumExp over
-        # neighbours) so the logit is driven by the NEAREST attended neighbour, not
-        # the centroid — "is v close to SOME node u touched". One learnable
-        # temperature (τ) for the soft-min sharpness, one scale for the logit. Drops
-        # the ~17k-param readout MLP (the suspected overfit surface).
-        self.attn_scale = nn.Parameter(torch.tensor(10.0))
-        self.log_tau = nn.Parameter(torch.zeros(1))     # τ = softplus(log_tau)
-
-        # --- proven extra terms, unchanged from the base head -------------------
+        # --- proven extra terms (optional, additive) ---------------------------
         self.t2v_rec = Time2Vec(d_time)
         self.rec_head = nn.Linear(d_time, 1)
         self.use_pair_features = use_pair_features
@@ -118,95 +85,76 @@ class SourceWalkAttnHead(nn.Module):
             self.pair_head = nn.Linear(d_time + 2, 1)
 
     # ----------------------------------------------------------------------
-    # Attention weights:  q = W·v ,  k_i = W·w_i + time(Δt_i) ,  − λ·age_i bias
+    # Sphere log-map at base point p (closed form; equals geoopt.Sphere().logmap,
+    # validated). p [.,d] unit, x [.,d] unit -> tangent vector at p [.,d].
     # ----------------------------------------------------------------------
-    def _attention(self, ev: torch.Tensor, ew: torch.Tensor, tok_dt: torch.Tensor,
-                   tok_age: torch.Tensor, tok_mask: torch.Tensor) -> torch.Tensor:
-        """ev [B,C,d] (unit), ew [B,n,d] (unit), tok_dt [B,n], tok_age [B,n] (finite,
-        masked→0), tok_mask [B,n] bool -> a [B,C,n] (softmax over neighbours)."""
-        q = self.W(ev)                                              # [B, C, dh]
-        k = self.W(ew) + self.time_key(self.t2v_walk(tok_dt))       # [B, n, dh]
-        scores = torch.einsum("bcd,bnd->bcn", q, k) / math.sqrt(self.d_head)
-        # Recency bias (A): older neighbour → more negative → less weight. λ ≥ 0
-        # (softplus) fixes the sign; content match q·k can still outvote it. age is
-        # finite everywhere (sentinel/padding zeroed upstream), so no NaN leaks in;
-        # masked entries are then set to −∞ regardless.
-        lam = F.softplus(self.log_lambda)                          # ≥ 0
-        scores = scores - lam * tok_age.unsqueeze(1)               # [B,C,n] − [B,1,n]
-        scores = scores.masked_fill(~tok_mask.unsqueeze(1), float("-inf"))
-        a = torch.softmax(scores, dim=-1)                           # [B, C, n]
-        # Sources with zero valid tokens (cold start) softmax to NaN -> set to 0;
-        # their distance becomes 0 and the logit falls back to base + recency + pair.
-        return torch.nan_to_num(a, nan=0.0)
+    def _logmap(self, p: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        c = (p * x).sum(-1, keepdim=True).clamp(-1 + self.eps, 1 - self.eps)
+        theta = torch.arccos(c)
+        orth = x - c * p
+        return theta * orth / orth.norm(dim=-1, keepdim=True).clamp_min(self.eps)
 
     # ----------------------------------------------------------------------
-    # Attention-weighted SOFT-MIN geodesic distance (scalar; NO d-dim residual).
-    #
-    #   θ_i  = arccos⟨v, w_i⟩                geodesic distance v→w_i on the sphere
-    #   d    = −τ · log( Σ_i a_i exp(−θ_i / τ) )
-    # A weighted LogSumExp soft-min: as τ→0, d→min_i θ_i over the attended
-    # neighbours (nearest-neighbour distance); larger τ blends toward the weighted
-    # mean. Scalar θ_i ≥ 0 means no vector cancellation (the log-map's r≈0 ambiguity
-    # is gone). For live rows Σa_i=1 so the inner sum ∈ (0,1]; cold-start rows
-    # (Σa_i=0) are returned as d=0 (neutral — logit falls back to base+recency+pair).
-    # ----------------------------------------------------------------------
-    def _softmin_geodesic(self, ev: torch.Tensor, ew: torch.Tensor,
-                          a: torch.Tensor) -> torch.Tensor:
-        """ev [B,C,d] (unit), ew [B,n,d] (unit), a [B,C,n] -> d [B,C] (>= 0)."""
-        cos = torch.einsum("bcd,bnd->bcn", ev, ew).clamp(-1 + self.eps, 1 - self.eps)
-        theta = torch.arccos(cos)                                  # [B,C,n] ≥ 0
-        tau = F.softplus(self.log_tau) + self.eps                 # scalar > 0
-        inner = (a * torch.exp(-theta / tau)).sum(dim=-1)         # [B,C] ∈ (0,1]/{0}
-        live = a.sum(dim=-1) > 0                                  # [B,C] cold-start mask
-        d = -tau * torch.log(inner.clamp_min(self.eps))          # [B,C] ≥ 0
-        return torch.where(live, d, torch.zeros_like(d))
-
-    # ----------------------------------------------------------------------
-    def forward(self, tok_emb: torch.Tensor, tok_dt: torch.Tensor,
-                tok_age: torch.Tensor, tok_mask: torch.Tensor,
-                E_u: torch.Tensor, E_v: torch.Tensor,
+    def forward(self, tok_emb: torch.Tensor, tok_age: torch.Tensor,
+                tok_mask: torch.Tensor, E_u: torch.Tensor, E_v: torch.Tensor,
                 rec_v_log: torch.Tensor,
                 pair_rec_log: torch.Tensor = None,
                 pair_ever: torch.Tensor = None,
                 pair_count_log: torch.Tensor = None) -> torch.Tensor:
-        """tok_emb [B,n,d]  source walk-neighbour embeddings (context only; the
-                            trainer gathers these per batch row via u_pos and zeroes
-                            the seed + padding, which `tok_mask` marks invalid).
-           tok_dt  [B,n]    log1p within-walk Δt per token (0 where masked).
-           tok_age [B,n]    log1p(t_query − t_token) per token (query staleness;
-                            finite, 0 where masked). Drives the recency bias.
+        """tok_emb [B,n,d]  source walk-neighbour embeddings (context only; seed +
+                            padding excluded, marked by tok_mask).
+           tok_age [B,n]    age = t_query − t_node per token (≥0; 0 where masked).
            tok_mask[B,n]    bool, True at real neighbour positions.
-           E_u     [B,d]    source embeddings (the base chord channel; NOT a token).
+           E_u     [B,d]    source embeddings (the tangent-space BASE POINT).
            E_v     [B,C,d]  candidate embeddings.
            rec_v_log [B,C]  log1p(t_query − t_last[v]) candidate recency.
            -> logits [B, C].
         """
-        ev = F.normalize(E_v, dim=-1)                               # [B, C, d]
-        ew = F.normalize(tok_emb, dim=-1)                           # [B, n, d]
-        eu = F.normalize(E_u, dim=-1).unsqueeze(1)                  # [B, 1, d]
+        eu = F.normalize(E_u, dim=-1)                              # [B, d]
+        ev = F.normalize(E_v, dim=-1)                              # [B, C, d]
+        ew = F.normalize(tok_emb, dim=-1)                          # [B, n, d]
+        B, n, d = ew.shape
+        m = tok_mask.float()                                       # [B, n]
 
-        # --- attention channel: is v close to SOME node u touched --------------
-        # candidate-conditioned attention picks the relevant neighbours; the value
-        # is their geodesic distance, soft-min-pooled to the nearest one; closer =>
-        # higher logit.
-        a = self._attention(ev, ew, tok_dt, tok_age, tok_mask)     # [B, C, n]
-        d_attn = self._softmin_geodesic(ev, ew, a)                # [B, C] ≥ 0
-        logit = -self.attn_scale.clamp_min(1e-3) * d_attn         # [B, C]
+        # --- map neighbours + candidates into T_{E[u]} -------------------------
+        g = self._logmap(eu.unsqueeze(1), ew)                     # [B, n, d]
+        nu = self._logmap(eu.unsqueeze(1), ev)                    # [B, C, d]
 
-        # --- base channel: is v like u DIRECTLY (chord on the sphere) ----------
-        # ‖a-b‖ = √(2-2⟨a,b⟩); closer => higher logit. u enters ONLY here.
-        c = (eu * ev).sum(dim=-1).clamp(-1 + self.eps, 1 - self.eps)   # [B, C]
-        chord = torch.sqrt(2.0 - 2.0 * c)                          # [B, C]
-        logit = logit - self.logit_scale.clamp_min(1e-3) * chord
+        # --- recency-weighted Gaussian over the neighbour tangents -------------
+        lam = F.softplus(self.log_lambda)
+        wlog = (-lam * tok_age).masked_fill(~tok_mask, float("-inf"))   # [B, n]
+        w = torch.softmax(wlog, dim=-1)                           # [B, n] (Σ=1; cold→nan)
+        w = torch.nan_to_num(w, nan=0.0)                          # cold source -> all 0
+        mu = (w.unsqueeze(-1) * g).sum(dim=1)                     # [B, d]  predicted position
 
-        # Proven query-time recency term (the walks are blind to query time).
+        # weighted-centered neighbour matrix A_i = √w_i (g_i − μ);  C = Aᵀ A.
+        # clamp_min before sqrt: softmax weights underflow to EXACTLY 0 for old /
+        # masked tokens, and √(·) has an infinite (NaN) backward at 0 — the clamp
+        # keeps the gradient finite without changing the math (those weights ≈ 0).
+        A = torch.sqrt(w.clamp_min(self.eps)).unsqueeze(-1) * (g - mu.unsqueeze(1))  # [B,n,d]
+        A = A * m.unsqueeze(-1)                                   # zero padded rows
+
+        # --- Mahalanobis via Woodbury (only an [n,n] inverse) ------------------
+        # m² = (1/τ)[ ‖δ‖² − (Aδ)ᵀ (τI_n + AAᵀ)⁻¹ (Aδ) ],  δ = ν − μ
+        tau = F.softplus(self.log_tau) + self.eps                # scalar > 0
+        AAt = torch.einsum("bnd,bmd->bnm", A, A)                  # [B, n, n]  (rank ≤ n)
+        G = torch.linalg.inv(AAt + tau * torch.eye(n, device=A.device).unsqueeze(0))  # [B,n,n]
+
+        delta = nu - mu.unsqueeze(1)                              # [B, C, d]
+        q = torch.einsum("bnd,bcd->bcn", A, delta)               # [B, C, n] = Aδ
+        quad = torch.einsum("bcn,bnm,bcm->bc", q, G, q)          # [B, C] = (Aδ)ᵀ G (Aδ)
+        sq = (delta * delta).sum(-1)                             # [B, C] = ‖δ‖²
+        m2 = (sq - quad) / tau                                   # [B, C] = Mahalanobis²  (≥0)
+        maha = torch.sqrt(m2.clamp_min(self.eps))                # [B, C]
+
+        logit = -self.scale.clamp_min(1e-3) * maha               # [B, C]
+
+        # --- proven additive terms (optional) ----------------------------------
         logit = logit + self.rec_head(self.t2v_rec(rec_v_log)).squeeze(-1)
-
         if self.use_pair_features:
             feat = torch.cat(
                 [self.t2v_pair(pair_rec_log),
                  pair_ever.unsqueeze(-1), pair_count_log.unsqueeze(-1)],
-                dim=-1)                                             # [B, C, d_time+2]
+                dim=-1)
             logit = logit + self.pair_head(feat).squeeze(-1)
-
         return logit
