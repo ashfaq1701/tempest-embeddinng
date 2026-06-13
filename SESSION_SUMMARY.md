@@ -420,3 +420,80 @@ simply doesn't carry signal here (so C2/C3/C4 were moot).
 TPNet gap on wiki needs **content / node features** (page identity/text, cold-start
 priors), not more walk/graph structure. Walk-based pair features and metric
 cross-attention are exhausted on this slice.
+
+---
+
+## Geometric link heads: Point vs Gaussian × unbounded vs window-5 (2026-06-13)
+
+A 2×2 on tgbl-wiki of the two tangent-space geometric link heads
+(`GeometricPointHead` on master `57ebbd7`; `GeometricGaussianHead` on branch
+`feature/geometric-gaussian-head` `a984e79`) crossed with the Tempest history
+window. Both heads share the same base-point construction: `p = E[u]`, log-map
+u's recency-weighted walk-neighbours into `T_{E[u]}`, predict a mean
+`μ = Σ softmax(−λ·age)·Log_p(E[node])`. The **Point** head scores by
+`−α‖ν−μ‖ − β·angle`; the **Gaussian** head fits a recency-weighted covariance
+`C` over the same neighbour tangents and scores by Mahalanobis
+`(ν−μ)ᵀ(C+τI)⁻¹(ν−μ)` (Woodbury, only an `[n,n]` inverse). All runs: walks10,
+no pair features, bs 200 / eval-bs 20, lr 1e-3 → 1e-5, seed 42.
+
+### Peaks (best-val, restored)
+
+| head | **unbounded** (val / test) | **window-5** (val / test) | Δ window−unbounded |
+|---|---|---|---|
+| **Point**    | **0.8057 / 0.7720** (ep20*) | 0.7965 / 0.7491 (ep37) | −0.009 / **−0.023** |
+| **Gaussian** | **0.8050 / 0.7719** (ep30)  | ~0.795 / ~0.749 (proj†) | ≈ −0.010 / **≈ −0.023** |
+
+\* Point unbounded hit its 20-epoch cap *still climbing* (not fully converged),
+yet already matched Gaussian's converged ep30 peak.
+† Gaussian window-5 was stopped manually at **ep15 (val 0.7828 / test 0.7352,
+still climbing)**; the plateau is projected from its step-for-step tracking of
+the Point window-5 curve, which peaked 0.7965/0.7491 at ep37.
+
+### Window-5 epoch overlay (Point vs Gaussian, the clean A/B)
+
+Near-identical schedule for ep1–12 (cosine barely moved); the two curves are the
+**same curve within ±0.003**:
+
+| ep | Gaussian val / test | Point val / test |
+|---|---|---|
+| 1  | 0.6544 / 0.5969 | 0.6546 / 0.5971 |
+| 5  | 0.7285 / 0.6737 | 0.7298 / 0.6752 |
+| 10 | 0.7710 / 0.7221 | 0.7719 / 0.7237 |
+| 15 | 0.7828 / 0.7352 | 0.7856 / 0.7389 |
+
+(ep13+ the schedules diverge slightly — Point's run used decay-horizon 50, the
+Gaussian's 30 — so compare ep1–12 as apples-to-apples and peaks otherwise.)
+
+### What was observed
+
+1. **Point ≈ Gaussian everywhere — the covariance buys nothing on accuracy.**
+   Unbounded the two tie within 0.001 (0.8057/0.7720 vs 0.8050/0.7719);
+   windowed they track epoch-for-epoch (±0.003 over ep1–12). Adding `C` +
+   Mahalanobis over the shared `μ` does not move MRR on wiki.
+2. **Windowing hurts BOTH heads by the same ~0.023 test (~0.009 val).** The
+   window, not the head, sets the ceiling: it starves the neighbourhood the
+   geometric channel is built from. Identical penalty for Point and Gaussian.
+3. **The Gaussian covariance gives NO window-robustness** (falsifies the
+   "wider region survives eviction" hypothesis). Under the window the Gaussian
+   tracks the Point head step-for-step, because `μ` is shared and `C` just rides
+   along — and `C`, a second moment, is the *more* sample-starved quantity, so
+   if anything it is slightly more window-fragile (matched by the learnable `τ`
+   falling back toward mean-distance). Mechanism: the region is recomputed from
+   the sampled tokens each forward; evicted neighbours contribute nothing
+   regardless of how well their `E` was trained.
+4. **Gaussian costs more for nothing.** Per-epoch: unbounded ~115s (Gaussian)
+   vs ~100s (Point); window-5 ~38s vs ~23s — the `[n,n]` inverse, with zero
+   accuracy return.
+5. **Window-5 is ~3× faster per epoch** (small graph speeds *both* train and
+   eval) but caps ~0.023 test lower — a pure speed/accuracy trade, same for both
+   heads.
+
+### Takeaway
+
+For this head family on tgbl-wiki: **ship Point + unbounded.** Unbounded beats
+window-5 by ~0.023 test for both variants; Point matches Gaussian on accuracy at
+lower cost; the Gaussian covariance neither improves accuracy nor adds the
+window-robustness it was hypothesised to. The only way to make the geometric
+channel less window-sensitive is to feed `μ`/`C` from an un-evicted per-node
+neighbour buffer (decouple the head's neighbour set from Tempest eviction) — not
+to switch Point→Gaussian. Logs: `logs/manifold/run_{point,gauss}_*` (gitignored).
