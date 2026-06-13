@@ -196,11 +196,21 @@ class Trainer:
         n = K * L
         tok_emb_all = self.embedding_table(nodes.clamp_min(0)).view(Ms, n, -1)  # [Ms,n,d]
         tok_dt_all = dt_log.view(Ms, n)                          # [Ms, n]
+        tok_ts_all = ts.view(Ms, n)                              # [Ms, n] edge times
         tok_mask_all = is_ctx.view(Ms, n)                        # [Ms, n] bool
 
         tok_emb = tok_emb_all[u_pos]                            # [B, n, d]
         tok_dt = tok_dt_all[u_pos]                              # [B, n]
+        tok_ts = tok_ts_all[u_pos]                              # [B, n]
         tok_mask = tok_mask_all[u_pos]                          # [B, n]
+
+        # Per-token query staleness: log1p(t_query − t_token), t_token = ts[p] (the
+        # token's own edge time). clamp_min(0) neutralises the seed's INT64_MAX
+        # sentinel (huge-negative → 0, no log1p-of-negative NaN); the mask zeroes
+        # padding's bogus positive. Finite everywhere → safe for the head's bias.
+        tok_age = torch.log1p(
+            (t_query_t.unsqueeze(1).float() - tok_ts).clamp_min(0.0)
+        ) * tok_mask.float()                                    # [B, n]
 
         E_u = self.embedding_table(src_t)                       # [B, d]   base channel
         E_v = self.embedding_table(cand_t)                      # [B, C, d]
@@ -214,7 +224,7 @@ class Trainer:
                 src_t, cand_t, t_query_t)
 
         return self.link_head(
-            tok_emb, tok_dt, tok_mask, E_u, E_v, rec_v_log,
+            tok_emb, tok_dt, tok_age, tok_mask, E_u, E_v, rec_v_log,
             pair_rec_log=pair_rec_log, pair_ever=pair_ever,
             pair_count_log=pair_count_log)
 

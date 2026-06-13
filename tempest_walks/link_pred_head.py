@@ -14,9 +14,11 @@ Pipeline for one (source u, candidate v):
                    head: it only ever sees a flat token set + mask.)
   2. attention     q = W·E[v]  (the candidate asks),
                    k_i = W·E[w_i] + time(Δt_i)  (each neighbour answers).
-                   a_i = softmax_i(q·k_i / sqrt(d_head)).  ONE tied projection W on
-                   the embedding side (fixed temperature) decides WHICH neighbours
-                   are relevant to this candidate.
+                   a_i = softmax_i(q·k_i / sqrt(d_head) − λ·age_i).  ONE tied
+                   projection W on the embedding side decides WHICH neighbours are
+                   relevant; a learned recency bias −λ·age_i (λ≥0, age = query
+                   staleness of the neighbour) tilts the softmax toward neighbours u
+                   touched recently before the query. λ→0 recovers the agnostic head.
   3. value         the scalar GEODESIC distance θ_i = arccos⟨v, w_i⟩ — "how far is
                    w_i from v along the sphere". (Earlier variants reduced the
                    neighbourhood to a d-dim tangent residual + MLP — log-map then flat
@@ -82,6 +84,13 @@ class SourceWalkAttnHead(nn.Module):
         self.W = nn.Linear(d_emb, d_head, bias=False)
         self.t2v_walk = Time2Vec(d_time)
         self.time_key = nn.Linear(d_time, d_head)
+        # Query-relative recency bias (A): a learned, sign-constrained decay added to
+        # the score BEFORE softmax. λ = softplus(log_lambda) ≥ 0 guarantees the
+        # direction (older neighbour → more negative → less weight). λ→0 (log_lambda
+        # → −∞) recovers the time-agnostic head exactly. Distinct from t2v_walk above
+        # (within-walk Δt, a token property) and from rec_head below (candidate
+        # staleness): this is each NEIGHBOUR's staleness as of the query.
+        self.log_lambda = nn.Parameter(torch.zeros(1))   # λ ≈ 0.69 at init
 
         # --- base channel: direct u-vs-v chord on the sphere --------------------
         # E[u] is deliberately NOT a token in the attention pool (that channel
@@ -109,19 +118,25 @@ class SourceWalkAttnHead(nn.Module):
             self.pair_head = nn.Linear(d_time + 2, 1)
 
     # ----------------------------------------------------------------------
-    # Attention weights:  q = W·v ,  k_i = W·w_i + time(Δt_i)
+    # Attention weights:  q = W·v ,  k_i = W·w_i + time(Δt_i) ,  − λ·age_i bias
     # ----------------------------------------------------------------------
-    def _attention(self, ev: torch.Tensor, ew: torch.Tensor,
-                   tok_dt: torch.Tensor, tok_mask: torch.Tensor) -> torch.Tensor:
-        """ev [B,C,d] (unit), ew [B,n,d] (unit), tok_dt [B,n], tok_mask [B,n] bool
-        -> a [B,C,n] attention weights (softmax over neighbours, padding-safe)."""
+    def _attention(self, ev: torch.Tensor, ew: torch.Tensor, tok_dt: torch.Tensor,
+                   tok_age: torch.Tensor, tok_mask: torch.Tensor) -> torch.Tensor:
+        """ev [B,C,d] (unit), ew [B,n,d] (unit), tok_dt [B,n], tok_age [B,n] (finite,
+        masked→0), tok_mask [B,n] bool -> a [B,C,n] (softmax over neighbours)."""
         q = self.W(ev)                                              # [B, C, dh]
         k = self.W(ew) + self.time_key(self.t2v_walk(tok_dt))       # [B, n, dh]
         scores = torch.einsum("bcd,bnd->bcn", q, k) / math.sqrt(self.d_head)
+        # Recency bias (A): older neighbour → more negative → less weight. λ ≥ 0
+        # (softplus) fixes the sign; content match q·k can still outvote it. age is
+        # finite everywhere (sentinel/padding zeroed upstream), so no NaN leaks in;
+        # masked entries are then set to −∞ regardless.
+        lam = F.softplus(self.log_lambda)                          # ≥ 0
+        scores = scores - lam * tok_age.unsqueeze(1)               # [B,C,n] − [B,1,n]
         scores = scores.masked_fill(~tok_mask.unsqueeze(1), float("-inf"))
         a = torch.softmax(scores, dim=-1)                           # [B, C, n]
         # Sources with zero valid tokens (cold start) softmax to NaN -> set to 0;
-        # their residual becomes 0 and the logit falls back to base + recency + pair.
+        # their distance becomes 0 and the logit falls back to base + recency + pair.
         return torch.nan_to_num(a, nan=0.0)
 
     # ----------------------------------------------------------------------
@@ -148,7 +163,8 @@ class SourceWalkAttnHead(nn.Module):
 
     # ----------------------------------------------------------------------
     def forward(self, tok_emb: torch.Tensor, tok_dt: torch.Tensor,
-                tok_mask: torch.Tensor, E_u: torch.Tensor, E_v: torch.Tensor,
+                tok_age: torch.Tensor, tok_mask: torch.Tensor,
+                E_u: torch.Tensor, E_v: torch.Tensor,
                 rec_v_log: torch.Tensor,
                 pair_rec_log: torch.Tensor = None,
                 pair_ever: torch.Tensor = None,
@@ -157,6 +173,8 @@ class SourceWalkAttnHead(nn.Module):
                             trainer gathers these per batch row via u_pos and zeroes
                             the seed + padding, which `tok_mask` marks invalid).
            tok_dt  [B,n]    log1p within-walk Δt per token (0 where masked).
+           tok_age [B,n]    log1p(t_query − t_token) per token (query staleness;
+                            finite, 0 where masked). Drives the recency bias.
            tok_mask[B,n]    bool, True at real neighbour positions.
            E_u     [B,d]    source embeddings (the base chord channel; NOT a token).
            E_v     [B,C,d]  candidate embeddings.
@@ -171,7 +189,7 @@ class SourceWalkAttnHead(nn.Module):
         # candidate-conditioned attention picks the relevant neighbours; the value
         # is their geodesic distance, soft-min-pooled to the nearest one; closer =>
         # higher logit.
-        a = self._attention(ev, ew, tok_dt, tok_mask)              # [B, C, n]
+        a = self._attention(ev, ew, tok_dt, tok_age, tok_mask)     # [B, C, n]
         d_attn = self._softmin_geodesic(ev, ew, a)                # [B, C] ≥ 0
         logit = -self.attn_scale.clamp_min(1e-3) * d_attn         # [B, C]
 
