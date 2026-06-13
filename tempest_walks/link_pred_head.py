@@ -17,17 +17,14 @@ Pipeline for one (source u, candidate v):
                    a_i = softmax_i(q·k_i / sqrt(d_head)).  ONE tied projection W on
                    the embedding side (fixed temperature) decides WHICH neighbours
                    are relevant to this candidate.
-  3. value         the GEOMETRY: Log_v(w_i), the sphere's own "w_i seen from v" — a
-                   tangent vector at v whose length is the geodesic distance to w_i.
-                   (Plain (E[v]-E[w_i])^2 is the flat chord through the ball and
-                   ignores the curvature E is trained on; the log-map is the
-                   manifold-correct residual.)
-  4. pool          r(u,v) = Σ_i a_i · Log_v(w_i)  — a d-dim tangent residual.
-                   Because the base point is v for every term, all the log-maps live
-                   in the SAME tangent space T_v, so this sum is exact (no
-                   parallel-transport approximation). r ≈ 0 when v sits on top of the
-                   neighbours it attends to (a clean fit); large + structured when it
-                   doesn't.
+  3. value         the AMBIENT residual (w_i − v) — the flat chord displacement in
+                   R^d. (Variant: the manifold log-map Log_v(w_i) was tried and is the
+                   curvature-correct version; on wiki's small angular spread the chord
+                   agrees with it to second order. This head uses the chord to test
+                   whether the curvature correction earned its keep.)
+  4. pool          r(u,v) = Σ_i a_i · (w_i − v)  — a d-dim residual.
+                   r ≈ 0 when v sits on top of the neighbours it attends to (a clean
+                   fit); large + structured when it doesn't.
   5. readout       small MLP: r -> scalar logit. Plus the proven recency + pair
                    terms, unchanged.
 
@@ -36,9 +33,9 @@ pool — that channel answers "is v like u's NEIGHBOURS". u enters once, as a pl
 chord(E[u], E[v]) term ("is v like u DIRECTLY"), the repeat-slice workhorse. Keeping
 the two questions on separate, non-competing terms is the whole point of the split.
 
-FAST: we never build the [B, C, n, d] log-map tensor. The sphere log-map has a
+FAST: we never build the [B, C, n, d] residual tensor. The pooled residual has a
 closed form that lets the d-axis appear only in a final [B,C,n]·[B,n,d] contraction
-(see `_pooled_logmap`). The only big intermediates are scalar-per-token [B, C, n].
+(see `_pooled_residual`). The only big intermediates are scalar-per-token [B, C, n].
 
 E stays the single sphere-trained parameter (link-trained, no detach). W / time /
 readout are Euclidean.
@@ -127,25 +124,23 @@ class SourceWalkAttnHead(nn.Module):
         return torch.nan_to_num(a, nan=0.0)
 
     # ----------------------------------------------------------------------
-    # Pooled sphere log-map (the geometry), computed WITHOUT [B,C,n,d].
+    # Pooled AMBIENT chord residual (the flat displacement, no curvature).
     #
-    #   Log_v(w_i) = g_i · (w_i − cosθ_i · v),   g_i = θ_i / sinθ_i,  cosθ_i=⟨v,w_i⟩
-    #   r = Σ_i a_i Log_v(w_i)
-    #     = Σ_i (a_i g_i) w_i  −  (Σ_i a_i g_i cosθ_i) v
-    #     = einsum(β, w)       −  α · v
-    # so the d-axis only appears in the final [B,C,n]·[B,n,d] contraction.
+    #   residual_i = w_i − v        (the chord through the ball, in R^d)
+    #   r = Σ_i a_i (w_i − v)
+    #     = Σ_i a_i w_i  −  (Σ_i a_i) v
+    #     = einsum(a, w) −  s · v ,   s = Σ_i a_i  (= 1 for live rows, 0 cold-start)
+    # Same [B,C,n]·[B,n,d] contraction as the log-map, but no arccos / θ-over-sinθ:
+    # at the small angular scales wiki embeddings occupy, the chord and the geodesic
+    # log-map agree to second order — this tests whether the curvature correction was
+    # buying anything.
     # ----------------------------------------------------------------------
-    def _pooled_logmap(self, ev: torch.Tensor, ew: torch.Tensor,
-                       a: torch.Tensor) -> torch.Tensor:
-        """ev [B,C,d] (unit), ew [B,n,d] (unit), a [B,C,n] -> r [B,C,d] in T_v."""
-        cos = torch.einsum("bcd,bnd->bcn", ev, ew).clamp(-1 + self.eps, 1 - self.eps)
-        theta = torch.arccos(cos)                                   # [B,C,n]
-        sin = torch.sqrt(1.0 - cos * cos).clamp_min(self.eps)       # sinθ ≥ 0
-        g = theta / sin                                             # θ/sinθ → 1 as θ→0
-        beta = a * g                                                # [B,C,n]
-        alpha = (beta * cos).sum(dim=-1)                            # [B,C]
-        r = torch.einsum("bcn,bnd->bcd", beta, ew) - alpha.unsqueeze(-1) * ev
-        return r                                                    # ⊥ v, in T_v
+    def _pooled_residual(self, ev: torch.Tensor, ew: torch.Tensor,
+                         a: torch.Tensor) -> torch.Tensor:
+        """ev [B,C,d] (unit), ew [B,n,d] (unit), a [B,C,n] -> r [B,C,d] (ambient)."""
+        s = a.sum(dim=-1, keepdim=True)                            # [B,C,1]; 1 or 0
+        r = torch.einsum("bcn,bnd->bcd", a, ew) - s * ev          # [B,C,d]
+        return r
 
     # ----------------------------------------------------------------------
     def forward(self, tok_emb: torch.Tensor, tok_dt: torch.Tensor,
@@ -170,7 +165,7 @@ class SourceWalkAttnHead(nn.Module):
 
         # --- attention channel: is v like u's NEIGHBOURS -----------------------
         a = self._attention(ev, ew, tok_dt, tok_mask)              # [B, C, n]
-        r = self._pooled_logmap(ev, ew, a)                         # [B, C, d]
+        r = self._pooled_residual(ev, ew, a)                       # [B, C, d]
         logit = self.readout(r).squeeze(-1)                        # [B, C]
 
         # --- base channel: is v like u DIRECTLY (chord on the sphere) ----------
