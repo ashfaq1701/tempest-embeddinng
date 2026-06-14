@@ -553,3 +553,67 @@ feeding μ from an un-evicted per-node neighbour buffer — not switching heads.
 
 Logs: `logs/manifold/run_{point,gauss,attn}_*` (gitignored). Heads preserved at
 tags `geometric-point-head`, `geometric-gaussian-head`, `source-walk-attn-head`.
+
+---
+
+## Geometric-head improvement series — NO pair features, cross-dataset (2026-06-14)
+
+Goal: find the single best geometric link head (improved Point **or** improved
+Gaussian, carried forward unidirectionally) that generalizes across TGB — not
+wiki-only. Crucial reframe: this series runs **without pair/recurrence features**,
+so the geometry carries the prediction (with pair features on wiki the model
+down-weights the geometric channel to `coef_geo≈0.07` and every geometric change
+is masked). Selection oracle = **tgbl-review** (cold-start, surprise 0.987,
+~100% new-pair); **tgbl-wiki** (recurrence-heavy) is the non-regression guard.
+
+**Infra** (on `feature/point-improvements`): `scripts/strat_run.py` trains a head
+at best-config and runs a strict-causal **per-slice** stratified test eval
+(`Trainer._eval` + a recorder hook) — repeat/new-pair, source-degree, plus learned
+params and n_eff / ‖μ‖ distributions. Best-val-selected, single-seed (seed 42)
+unless noted. Config: d_emb 128, walks10/mwl20, 50ep/patience5, lr 1e-3. Review is
+subsampled to wiki size (110k recent train / 25k official val,test; **K_train=100**
+on review — the 352k-node embedding leaves no GPU headroom at K=300).
+
+### Result ledger (Δ test vs the plain Point baseline)
+
+| variant | which | wiki | review | verdict |
+|---|---|---|---|---|
+| Imp1 ablate angle −β·θ | Point | tie | — | drop θ (redundant with d via law of cosines; β learned ≈0) |
+| Imp2 global **ambient** diagonal metric | Point | **−** | — | 49× anisotropy but in a per-source-rotating frame → net loss |
+| N3 explicit radial channel −α₀‖ν‖ | Point | tie | **−0.010** | new-pair is chord-ceilinged; rescales geodesic vs recency → hurts cold-start. N5★ skipped |
+| N1 soft-min set-distance (κ) | Point | — | tie | multimodality dead; the unlearned core of the already-falsified attention head |
+| G1 per-source trace-whitening `d/√(s²+τ)` | Gauss smoke | — | **−0.002** | per-source 2nd moment unestimable; hurts cold-start → **Gaussian line dead** (G2/G3 skipped) |
+| **N2 intrinsic-frame anisotropy** | **Point** | **+0.0025** | **+0.0095 (2-seed)** | **WINNER — carried head** |
+
+### THE WINNER — N2 (committed `fa8e70d` on `feature/point-improvements`)
+
+The candidate distance is an **ellipse oriented along each source's own heading**
+`r = μ/‖μ‖`, not an isotropic circle:
+`d² = a‖δ∥‖² + b‖δ⊥‖²`, δ=ν−μ split into along-heading (δ∥) and sideways (δ⊥);
+a, b ≥ 0 are **two global scalars** (`logit = −α·d`). a=b recovers the plain Point
+head. The model learns that being off *along* the heading is ~free while being off
+*sideways* is costly — **direction matters more than exact distance**, the clean
+version of what the dropped angle term θ reached for.
+
+- **wiki:** learns a/b ≈ 1/100 (strong ellipse), **+0.0025 test** (0.7757→0.7782).
+- **review (cold-start):** **+0.0095 test, identical delta across seeds 42 & 1**
+  (N2 0.0828 vs Point 0.0733) — a real systematic gain, not noise.
+- **Adaptive**: ~isotropic where no direction signal exists → never hurts. 2 params,
+  cannot overfit. Cold-source safe (μ≈0 ⇒ r→0 ⇒ d→√b·‖ν‖ = geodesic-to-u).
+
+### Decision & why
+
+- **Best head = the N2 Point head.** It is the only lever that beat baseline, and
+  it wins **both** regime endpoints (wiki recurrence + review cold-start).
+- **The Gaussian line is dead.** Its distinctive per-source 2nd moment is *never a
+  net positive*: the full Gaussian shrinks the covariance away (τ→∞ ⇒ ties Point),
+  and the cheapest estimable fragment (G1's scalar trace), when *forced*, **hurts
+  cold-start** (60% deg-0 sources have noisy/zero spread; one global τ can't spare
+  them). So Point ≥ Gaussian in every regime, at lower cost.
+- The remaining gap to TPNet is **architectural** (recurrence/encoder/content
+  channels), not in the head — every geometric prototype (point, axis/ellipse, set)
+  and every per-source 2nd-order idea is now exhausted.
+
+Caveats: single-seed except N2-review (2 seeds); review is a wiki-sized chronological
+subsample at K=100 (relative-comparison harness, not the full-review leaderboard
+number). Per-slice ledger: `logs/manifold/SERIES_NOPAIR.md` + `strat_*.md` (gitignored).
