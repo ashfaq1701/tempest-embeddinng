@@ -1,10 +1,10 @@
-"""Geometric link head — point version (tangent-space recency-weighted mean + d/θ).
+"""Geometric link head — point version (recency-weighted mean + anisotropic ellipse).
 
-The cheap baseline of the family (the Gaussian head's τ→∞ limit, plus an explicit
-angle term). Same crafted idea: base point E[u]; u's temporal-walk neighbours
-log-mapped into the flat tangent space T_{E[u]}; a recency-weighted MEAN predicts
-"where v should belong"; the candidate is scored by how far it is from that
-predicted point — split into distance (wrong place) and angle (wrong heading).
+Base point E[u]; u's temporal-walk neighbours log-mapped into the flat tangent
+space T_{E[u]}; a recency-weighted MEAN μ predicts "where v should belong"; the
+candidate is scored by an anisotropic (ellipse) distance from that predicted point,
+oriented along the source's heading — so being off in the wrong DIRECTION costs
+more than being off in DISTANCE. The channels are mixed with learnable coefficients.
 
   base point   p = E[u]
   neighbours   g_i = Log_{E[u]}(E[node_i])          tangent vectors at E[u]
