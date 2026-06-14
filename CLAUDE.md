@@ -5,6 +5,12 @@ architecture below replaces the prior alignment+uniformity design
 (preserved on `backup/important-walk-embedding`) with a single
 InfoNCE contrastive loss + a separate BCE link head.
 
+> **`best_configs.sh` — the per-dataset best-config registry. KEEP IT UPDATED.**
+> It holds the single best-performing training command for each TGB dataset
+> (with the val/test it produced). Whenever you find a config that beats the
+> current best for a dataset, update that dataset's command in `best_configs.sh`
+> in the same change.
+
 ---
 
 ## Architecture
