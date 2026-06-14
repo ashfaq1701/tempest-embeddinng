@@ -11,18 +11,25 @@ predicted point — split into distance (wrong place) and angle (wrong heading).
   candidate    ν   = Log_{E[u]}(E[v])
   recency      w_i = softmax_i(−λ·age_i)            (λ ≥ 0 learnable; Σ w_i = 1)
   prediction   μ   = Σ_i w_i g_i                    the predicted position
-  distance     d   = ‖ν − μ‖                        how far off (place)
-  angle        θ   = ∠(ν, μ)                        direction mismatch (heading)
-  logit        = −α·d − β·θ
+  heading      r   = μ/‖μ‖ ;  δ = ν − μ = δ∥ (along r) + δ⊥ (⊥ r)
+  geo channel  d   = √( a·‖δ∥‖² + b·‖δ⊥‖² )         anisotropic ellipse, a,b ≥ 0
+  logit        = coef_geo·(−α·d) + coef_rec·rec(v) [+ coef_pair·pair(u,v)]
 
-d already fuses place + heading; exposing θ separately lets the model weight
-"wrong place" vs "wrong heading" independently. Three scalars (α, β, λ) — almost
-nothing to overfit.
+The geometric distance is an ELLIPSE oriented along each source's heading r (not an
+isotropic circle): the model learns a,b so being off ALONG the heading is weighted
+differently from being off SIDEWAYS — on tgbl-wiki it learns a/b ≈ 1/100 ("direction
+matters, distance-along-heading is ~free"). a=b recovers the plain circle ‖ν−μ‖.
+The channels (geometric / recency / pair) are mixed with learnable per-channel
+coefficients (init 1 = plain sum) so the model can rebalance them. Few scalars
+(α, λ, a, b, coef_*) — almost nothing to overfit; the anisotropy is adaptive
+(≈isotropic where no direction signal exists).
 
-Relation to the Gaussian head: that one replaces (d, θ) with a single Mahalanobis
-distance to a fitted ellipse N(μ, C); as its shrinkage τ→∞ it collapses to ‖ν−μ‖,
-i.e. this head's d term. Build this first; climb to the Gaussian only if the single
-point underfits (μ is one location, so it assumes u heads toward ONE region).
+Lineage: an explicit angle term −β·θ was tried and dropped (redundant with ‖ν−μ‖ by
+the law of cosines, needed a ‖μ‖-floor guard). The Gaussian head's per-source
+covariance was falsified — unestimable from a few recency-weighted neighbours, it
+either shrinks away → this head, or hurts on cold-start. A global AMBIENT metric also
+lost (49× anisotropy but in a frame that rotates per source); the per-source
+intrinsic frame above is the correct, estimable basis (2 global scalars).
 
 E stays the single sphere parameter (link-trained, no detach).
 """
@@ -51,19 +58,27 @@ class Time2Vec(nn.Module):
 
 
 class GeometricPointHead(nn.Module):
-    def __init__(self, d_emb: int, d_time: int = 16, mu_floor: float = 1e-3,
+    def __init__(self, d_emb: int, d_time: int = 16,
                  use_pair_features: bool = False):
         super().__init__()
         self.d_emb = d_emb
         self.eps = 1e-6
-        self.mu_floor = mu_floor      # below this ‖μ‖, the angle term is switched off
 
-        # --- geometric channel: three scalars ----------------------------------
+        # --- geometric channel -------------------------------------------------
         # u enters as the BASE POINT (everything relative to E[u]); no separate
         # u-vs-v term needed.
         self.log_lambda = nn.Parameter(torch.zeros(1))    # λ = softplus(·) ≥ 0  (recency)
         self.alpha = nn.Parameter(torch.tensor(10.0))     # distance weight
-        self.beta = nn.Parameter(torch.tensor(1.0))       # angle weight
+        # Intrinsic-frame anisotropy (a,b ≥ 0, global): the candidate distance is
+        # an ELLIPSE oriented along each source's heading r=μ/‖μ‖, not a circle —
+        # d² = a‖δ∥‖² + b‖δ⊥‖² (δ=ν−μ split into along-heading δ∥ and sideways δ⊥).
+        # The model learns that being off ALONG the heading is ~free while being
+        # off SIDEWAYS is costly: direction matters more than exact distance.
+        # a=b ⇒ the isotropic ‖ν−μ‖. +0.0025 test wiki / +0.0095 test review
+        # (2-seed) over the isotropic head. (The angle term −β·θ this replaces was
+        # redundant with ‖ν−μ‖ by the law of cosines; dropped.)
+        self.log_a = nn.Parameter(torch.zeros(1))         # radial (along-heading)
+        self.log_b = nn.Parameter(torch.zeros(1))         # tangential (off-heading)
 
         # --- proven additive terms (optional) ----------------------------------
         self.t2v_rec = Time2Vec(d_time)
@@ -72,6 +87,15 @@ class GeometricPointHead(nn.Module):
         if use_pair_features:
             self.t2v_pair = Time2Vec(d_time)
             self.pair_head = nn.Linear(d_time + 2, 1)
+
+        # --- learnable per-channel mix coefficients (init 1 = plain sum) --------
+        # One learnable gain per channel (on the raw channels) so the model can
+        # rebalance the geometric vs recency vs pair terms rather than a fixed
+        # sum. +0.005 val / +0.009 test on tgbl-wiki (with pair features on).
+        self.coef_geo = nn.Parameter(torch.ones(1))
+        self.coef_rec = nn.Parameter(torch.ones(1))
+        if use_pair_features:
+            self.coef_pair = nn.Parameter(torch.ones(1))
 
     def _logmap(self, p: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """Sphere log-map at base point p (closed form = geoopt.Sphere().logmap)."""
@@ -108,31 +132,25 @@ class GeometricPointHead(nn.Module):
         w = torch.nan_to_num(torch.softmax(wlog, dim=-1), nan=0.0)      # cold src -> all 0
         mu = (w.unsqueeze(-1) * g).sum(dim=1)                      # [B, d]
 
-        # --- distance (place) --------------------------------------------------
+        # --- distance: anisotropic ellipse in the per-source heading frame ------
         delta = nu - mu.unsqueeze(1)                              # [B, C, d]
-        d = delta.norm(dim=-1)                                    # [B, C] = ‖ν−μ‖
-        # cold/degenerate μ≈0 ⇒ d → ‖ν‖ = geodesic(E[u],E[v]) automatically.
+        r = mu / mu.norm(dim=-1, keepdim=True).clamp_min(self.eps)   # [B, d] heading
+        dpar2 = torch.einsum("bcd,bd->bc", delta, r).pow(2)         # [B, C] ‖δ∥‖²
+        dperp2 = ((delta * delta).sum(-1) - dpar2).clamp_min(0.0)   # [B, C] ‖δ⊥‖²
+        a = F.softplus(self.log_a)
+        b = F.softplus(self.log_b)
+        d = (a * dpar2 + b * dperp2).clamp_min(self.eps).sqrt()     # [B, C]
+        # cold/degenerate μ≈0 ⇒ r→0 ⇒ d → √b·‖ν‖ = geodesic(E[u],E[v]).
 
-        # --- angle (heading), guarded against ‖μ‖→0 cancellation ---------------
-        mu_norm = mu.norm(dim=-1)                                 # [B]
-        nu_norm = nu.norm(dim=-1).clamp_min(self.eps)            # [B, C]
-        dot = torch.einsum("bcd,bd->bc", nu, mu)                 # [B, C]
-        cos = (dot / (nu_norm * mu_norm.unsqueeze(1).clamp_min(self.eps))
-               ).clamp(-1 + self.eps, 1 - self.eps)
-        theta = torch.arccos(cos)                                # [B, C] ∈ [0, π]
-        # switch the angle off where μ is too small to define a direction.
-        theta = torch.where((mu_norm > self.mu_floor).unsqueeze(1),
-                            theta, torch.zeros_like(theta))
-
-        logit = (-self.alpha.clamp_min(1e-3) * d
-                 - self.beta.clamp_min(0.0) * theta)             # [B, C]
-
-        # --- proven additive terms (optional) ----------------------------------
-        logit = logit + self.rec_head(self.t2v_rec(rec_v_log)).squeeze(-1)
+        # --- channels combined with learnable per-channel coefficients ---------
+        geo = -self.alpha.clamp_min(1e-3) * d                      # [B, C]
+        rec = self.rec_head(self.t2v_rec(rec_v_log)).squeeze(-1)   # [B, C]
+        logit = self.coef_geo * geo + self.coef_rec * rec
         if self.use_pair_features:
             feat = torch.cat(
                 [self.t2v_pair(pair_rec_log),
                  pair_ever.unsqueeze(-1), pair_count_log.unsqueeze(-1)],
                 dim=-1)
-            logit = logit + self.pair_head(feat).squeeze(-1)
+            pair = self.pair_head(feat).squeeze(-1)                # [B, C]
+            logit = logit + self.coef_pair * pair
         return logit
