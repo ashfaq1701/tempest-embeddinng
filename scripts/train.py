@@ -81,6 +81,16 @@ def parse_args() -> argparse.Namespace:
              "confirmed +~0.02 test on tgbl-wiki.",
     )
 
+    # Chronological subsample (wiki-sized window on big datasets, e.g. review).
+    p.add_argument(
+        "--max-train-edges", default=0, type=int,
+        help="If >0, train on only the most-recent N train edges (fixed "
+             "chronological suffix) — a wiki-sized subsample of big datasets.")
+    p.add_argument(
+        "--max-eval-edges", default=0, type=int,
+        help="If >0, eval on only the first N official val/test edges (prefix; "
+             "keeps TGB pre-generated negatives valid).")
+
     # Walks (link head; BACKWARD only, graphs treated as undirected).
     p.add_argument(
         "--num-walks-per-node", default=5, type=int,
@@ -211,16 +221,34 @@ def main() -> Dict[str, Any]:
 
     # Derived dataset constants.
     num_nodes = loaded.max_node_count
-    dst_pool = np.unique(loaded.train.destinations).astype(np.int32)
+
+    # Optional chronological subsample: recent suffix of train (so the graph the
+    # walks see stays causal), official prefix of val/test (keeps TGB's
+    # pre-generated negatives valid). Used to run a wiki-sized window on big
+    # datasets (e.g. review) that otherwise OOM an 8 GB GPU at full size.
+    def _trunc(split, n, tail):
+        if n <= 0 or n >= int(split.sources.shape[0]):
+            return split
+        sl = slice(-n, None) if tail else slice(0, n)
+        ef = split.edge_feat[sl] if split.edge_feat is not None else None
+        return split._replace(
+            sources=split.sources[sl], destinations=split.destinations[sl],
+            timestamps=split.timestamps[sl], edge_feat=ef)
+
+    train_sp = _trunc(loaded.train, args.max_train_edges, tail=True)
+    val_sp = _trunc(loaded.val, args.max_eval_edges, tail=False)
+    test_sp = _trunc(loaded.test, args.max_eval_edges, tail=False)
+
+    dst_pool = np.unique(train_sp.destinations).astype(np.int32)
     # Full-dataset timestamps (train + val + test) feed compute_train_stats
     # so it can populate t_max_full / T_full — the v2 link-pred head's
     # time channel normaliser, bounded across train and eval splits.
     full_ts = np.concatenate([
-        loaded.train.timestamps,
-        loaded.val.timestamps,
-        loaded.test.timestamps,
+        train_sp.timestamps,
+        val_sp.timestamps,
+        test_sp.timestamps,
     ])
-    stats = compute_train_stats(loaded.train.timestamps, full_timestamps=full_ts)
+    stats = compute_train_stats(train_sp.timestamps, full_timestamps=full_ts)
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  dst_pool:      {len(dst_pool):,} unique destinations")
@@ -231,9 +259,9 @@ def main() -> Dict[str, Any]:
     print(f"  T_full:        {stats.T_full:.0f}")
     print(f"  median_inter_arrival: {stats.median_inter_arrival:.1f}")
     print(f"  mean_inter_arrival:   {stats.mean_inter_arrival:.1f}")
-    print(f"  train edges:   {len(loaded.train.sources):,}")
-    print(f"  val edges:     {len(loaded.val.sources):,}")
-    print(f"  test edges:    {len(loaded.test.sources):,}")
+    print(f"  train edges:   {len(train_sp.sources):,}")
+    print(f"  val edges:     {len(val_sp.sources):,}")
+    print(f"  test edges:    {len(test_sp.sources):,}")
 
     # ─── Build batch factories ─────────────────────────────────────
     # create_batches consumes a SplitData and yields Batches in
@@ -243,13 +271,13 @@ def main() -> Dict[str, Any]:
     # as eval_batch_size * (1 + K) for TGB's pregenerated negatives,
     # so it's a memory-fitting knob distinct from train.
     train_batches_factory = (
-        lambda: create_batches(loaded.train, args.batch_size)
+        lambda: create_batches(train_sp, args.batch_size)
     )
     val_batches_factory = (
-        lambda: create_batches(loaded.val, args.eval_batch_size)
+        lambda: create_batches(val_sp, args.eval_batch_size)
     )
     test_batches_factory = (
-        lambda: create_batches(loaded.test, args.eval_batch_size)
+        lambda: create_batches(test_sp, args.eval_batch_size)
     )
 
     # ─── Build evaluators ──────────────────────────────────────────
