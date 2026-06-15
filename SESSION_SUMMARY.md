@@ -696,3 +696,42 @@ The retired Point head is preserved in git history (master pre-`b77519b`) and on
 `feature/point-improvements`; not lost. Docstring de-framed (dropped the OPTION-2 /
 pooled-vs-mixture bake-off language) before promotion. `best_configs.sh` comment flags
 the pending ellipse-fix TODO.
+
+---
+
+# Edge-feature plumbing + weighting, 2026-06-15
+
+**Two pieces, different fates.**
+
+**1. Edge features plumbed into `WalkData` (KEPT on master, `b835c3f`).** TGB datasets
+carry per-edge features (tgbl-wiki: 172-dim) that were loaded → fed into Tempest →
+**dropped** on the way back out (`walks.py` discarded the sampler's 4th return as
+`_ef`). Now `WalkData.edge_feats` exposes them as `[NK, L, d_ef]` (`None` when absent),
+**index-aligned 1:1 with `nodes`/`timestamps`**: Tempest returns `[NK, L-1, d_ef]`
+(no seed-slot row) and we right-pad one zero column so the context mask
+(`positions < lens-1`) selects exactly the real edges. Pairing verified against the
+backward-walk contract — synthetic graph encoding `[src,tgt,ts,eid]` → **108/108**
+ts-match + endpoint-match, seed/padding exactly zero. Pinned in
+`tests/test_walk_edge_feats.py`. The model can read `wd.edge_feats` in `_score`
+whenever a head wants it; nothing consumed it before the experiment below.
+
+**2. Learnable edge-feature weighting on the velocity head (REVERTED; preserved at tag
+`edge-feature-integration`).** Re-weighted each step of the per-walk LS fit by
+`softmax(−λ·age + edge_proj(edge_feat))` — a **zero-init `Linear(172→1)`** added to the
+recency log-weight (exact no-op at init; grows only if it lowers the loss). Edge
+features entered ONLY the fit weights (no candidate channel — the `(u,v)` edge doesn't
+exist at query time). Always-on, no flags. Validated: byte-identical no-op at init,
+grads reach `E_u`/`E_v`/tokens/`edge_proj.weight`, masked steps stay `w=0`.
+
+**Outcome (wiki no-pf, vs the current master velocity head, same config/seed 42):** it
+**did not improve** — through the run it tracked the baseline within ±0.003, oscillating
+and trending **slightly negative** (ep6–11 Δval/Δtest ≈ −0.001; ep12 val +0.0014 /
+test −0.0003). Inside the wiki single-seed noise band ([[feedback_noise_threshold_wiki]]);
+the learned edge re-weighting buys nothing the recency weighting doesn't already get.
+Run stopped early (ep12) once the verdict was clear.
+
+**Disposition:** merged to master to land the commit in history, **tagged
+`edge-feature-integration`** (annotated, at `74d0726`), then **reverted on master**
+(`f000942`) so master's head stays edge-free. `git checkout edge-feature-integration`
+(or cherry-pick `74d0726`) restores the full feature. The `WalkData.edge_feats`
+plumbing stays on master as reusable infra. Branch `feature/edge-feature-weights` kept.
