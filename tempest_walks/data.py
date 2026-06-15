@@ -1,4 +1,4 @@
-"""TGB dataset bridge + timestamp-grouping batch iterator."""
+"""TGB dataset bridge + fixed-size (TGB-identical) batch iterator."""
 
 from typing import Iterator, NamedTuple, Optional
 
@@ -92,31 +92,31 @@ def load_tgb(name: str, root: str = "datasets") -> Loaded:
     )
 
 
-def create_batches(split: SplitData, target_batch_size: int) -> Iterator[Batch]:
-    """Timestamp-respecting chronological batches.
+def create_batches(split: SplitData, batch_size: int) -> Iterator[Batch]:
+    """TGB-identical fixed-size chronological batches (train AND eval).
 
-    All edges sharing a timestamp stay in the same batch (so the strict-
-    causal "ingest after scoring" rule still partitions cleanly across
-    batches). Batches grow until adding the next timestamp group would
-    exceed `target_batch_size`.
+    Consecutive fixed-size chunks of exactly `batch_size` events over the
+    already-time-sorted stream; timestamps are split freely across batch
+    boundaries — byte-for-byte the partition produced by
+    ``torch_geometric.TemporalDataLoader`` and by TPNet's
+    ``DataLoader(range(n), batch_size, shuffle=False, drop_last=False)``, which
+    every TGB leaderboard baseline uses, so our `batch_size` means exactly what
+    theirs does. The final partial batch is kept (drop_last=False) so every eval
+    positive is scored.
+
+    Strict-causality consequence (intentional — this is what the stateful TGB
+    baselines do): with timestamps now splittable, two edges sharing a timestamp
+    can land in different batches, so the later batch sees the earlier edge's
+    ingested graph / pair / last-seen state. Same-timestamp edges that land in
+    the SAME batch still don't inform each other (ingest is post-batch). Per-edge
+    quantities (t_query, the head's tok_age, pair_store/node_last queries) are
+    computed element-wise from `batch.ts` and are unaffected. Eval MRR is
+    identical regardless of batching — TGB negatives are keyed per positive edge,
+    not per batch — only causal-state freshness changes.
     """
     n = int(split.sources.shape[0])
-    if n == 0:
-        return
-
-    ts_change = np.where(np.diff(split.timestamps) != 0)[0] + 1
-    group_starts = np.concatenate([[0], ts_change])
-    group_ends = np.concatenate([ts_change, [n]])
-
-    batch_start_group = 0
-    for i in range(len(group_starts)):
-        edges_so_far = group_ends[i] - group_starts[batch_start_group]
-        if edges_so_far > target_batch_size and i > batch_start_group:
-            yield _slice(split, group_starts[batch_start_group], group_starts[i])
-            batch_start_group = i
-
-    if group_starts[batch_start_group] < n:
-        yield _slice(split, group_starts[batch_start_group], n)
+    for start in range(0, n, batch_size):
+        yield _slice(split, start, min(start + batch_size, n))
 
 
 def _slice(split: SplitData, start: int, end: int) -> Batch:
