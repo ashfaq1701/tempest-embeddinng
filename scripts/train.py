@@ -110,6 +110,19 @@ def parse_args() -> argparse.Namespace:
         help="Initial-edge bias for the backward walks.",
     )
 
+    # Candidate-side co-reachability (short len-2 backward walks per candidate).
+    p.add_argument(
+        "--num-walks-per-node-candidate-side", default=10, type=int,
+        help="M connectors sampled per UNIQUE candidate v (len-2 backward walks = "
+             "v's recent direct neighbours), feeding the head's soft-min cross "
+             "channel. Same Tempest graph + embedding table.",
+    )
+    p.add_argument(
+        "--start-bias-candidate-side", default="Linear", type=str,
+        help="Initial-edge bias for the candidate-side len-2 walks (the only bias "
+             "that matters for a 1-edge walk).",
+    )
+
     # The link head (LinkPredHead) has no architecture knobs beyond
     # max_walk_len, which is set from --link-pred-max-walk-len.
     p.add_argument(
@@ -307,6 +320,7 @@ def main() -> Dict[str, Any]:
     config = TrainerConfig(
         num_nodes=num_nodes,
         dst_pool=dst_pool,
+        t_train=float(stats.T_train),
 
         d_emb=args.d_emb,
 
@@ -333,6 +347,9 @@ def main() -> Dict[str, Any]:
         weight_decay=args.weight_decay,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
+
+        num_walks_per_node_candidate_side=args.num_walks_per_node_candidate_side,
+        start_bias_candidate_side=args.start_bias_candidate_side,
 
         seed=args.seed,
         use_gpu=args.use_gpu,

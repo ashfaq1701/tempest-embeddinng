@@ -1,4 +1,5 @@
-"""Geometric link head — point version (recency-weighted mean + anisotropic ellipse).
+"""Geometric link head — point version (recency-weighted mean + anisotropic ellipse)
++ co-reachability (cross) channel.
 
 Base point E[u]; u's temporal-walk neighbours log-mapped into the flat tangent
 space T_{E[u]}; a recency-weighted MEAN μ predicts "where v should belong"; the
@@ -14,15 +15,55 @@ more than being off in DISTANCE. The channels are mixed with learnable coefficie
   heading      r   = μ/‖μ‖ ;  δ = ν − μ = δ∥ (along r) + δ⊥ (⊥ r)
   geo channel  d   = √( a·‖δ∥‖² + b·‖δ⊥‖² )         anisotropic ellipse, a,b ≥ 0
   logit        = coef_geo·(−α·d) + coef_rec·rec(v) [+ coef_pair·pair(u,v)]
+                 + coef_cross·cross(u,v)
 
 The geometric distance is an ELLIPSE oriented along each source's heading r (not an
 isotropic circle): the model learns a,b so being off ALONG the heading is weighted
 differently from being off SIDEWAYS — on tgbl-wiki it learns a/b ≈ 1/100 ("direction
 matters, distance-along-heading is ~free"). a=b recovers the plain circle ‖ν−μ‖.
-The channels (geometric / recency / pair) are mixed with learnable per-channel
-coefficients (init 1 = plain sum) so the model can rebalance them. Few scalars
-(α, λ, a, b, coef_*) — almost nothing to overfit; the anisotropy is adaptive
-(≈isotropic where no direction signal exists).
+The channels (geometric / recency / pair / cross) are mixed with learnable per-channel
+coefficients (init 1 for the proven channels = plain sum) so the model can rebalance
+them. Few scalars (α, λ, a, b, coef_*) — almost nothing to overfit; the anisotropy is
+adaptive (≈isotropic where no direction signal exists).
+
+TIME UNITS — λ has units of 1/time, so λ·age must be dimensionless and O(1). Both the
+neighbour ages (tok_age) and the connector ages (conn_age) are therefore normalized by
+a single frozen constant t_train (the train-split time span) BEFORE entering λ, so age
+∈ ~[0,1] (≲1.5 on the eval splits, which extend past the train window). With normalized
+age, the default init log_lambda=0 ⇒ λ≈0.69 is already O(1) and correct from step 0.
+  - The source-side recency is a softmax, which is scale-invariant, so it tolerated raw
+    age regardless. The CROSS-side recency lives inside a logsumexp, which is NOT
+    scale-invariant: raw wiki ages (~1e6) make −λ·age ≈ −7e5, the cross logit swings
+    over ~1e6, and even an init-0 coef_cross diverges on the first step (its gradient is
+    scaled by that ~1e6 cross value). Normalizing fixes it at the source, in the units
+    where λ's init is right — not by hunting a dataset-specific decay constant.
+  - t_train MUST be the SAME frozen value at train AND eval (do not recompute per split,
+    or λ silently means different things in the two phases). It is a registered buffer.
+
+CO-REACHABILITY (cross) channel — for the new×both-seen cell, where the candidate v is
+seen but never linked from u, so the candidate term d(ν) is blind. Instead of asking
+"is v in u's region", it asks "is any recent CONNECTOR of v (a source that recently
+reached v) in u's region":
+
+  connectors   c_j = Log_{E[u]}(E[w_j])             v's recent direct neighbours, SAME tangent space
+  conn dist    d(c_j) = √( a·‖δ∥‖² + b·‖δ⊥‖² ),  δ = c_j − μ     SAME μ, r, a, b, α as candidates
+  cross        x(u,v) = logsumexp_j(−α·d(c_j) − λ·age_j)         soft-min: the single best
+                                                                  recent, in-character connector
+  logit       += coef_cross·x(u,v)                  init 0 = channel off, earns its weight
+
+Design choices that make this consistent rather than a bolted-on second model:
+  - Connectors are scored against the SAME μ and the SAME ellipse (a, b, heading r, α)
+    as the candidates — they are just another set of tangent vectors pushed through the
+    existing geometry. No second scale/temperature (that compounding broke earlier heads).
+  - Connector recency reuses the SAME λ as μ's neighbour recency, on the SAME normalized
+    age units — one shared decay in one unit system, not a coincidence that happens not
+    to crash. coef_cross init 0 keeps the channel off while it earns its weight.
+  - Soft-min (logsumexp) WITHIN connectors (existential: one in-character witness fires),
+    additive coef_cross BETWEEN channels. A sum over connectors would mean-pool and wash
+    out the single relevant witness.
+  - A candidate with no recent connectors contributes a neutral 0 (no −∞ leak).
+  - No degree gate yet (deferred): cross is a plain additive channel. The gate, if added
+    later, is a one-line g(deg_u)·cross in front of the cross term.
 
 Lineage: an explicit angle term −β·θ was tried and dropped (redundant with ‖ν−μ‖ by
 the law of cosines, needed a ‖μ‖-floor guard). The Gaussian head's per-source
@@ -59,14 +100,23 @@ class Time2Vec(nn.Module):
 
 class GeometricPointHead(nn.Module):
     def __init__(self, d_emb: int, d_time: int = 16,
-                 use_pair_features: bool = False):
+                 use_pair_features: bool = False, t_train: float = 1.0):
         super().__init__()
         self.d_emb = d_emb
         self.eps = 1e-6
 
+        # Frozen time-normalizer (the train-split span). λ·age is dimensionless and
+        # O(1) only if age is normalized by this; the trainer MUST pass the real
+        # train span, and the SAME value at eval. Registered as a buffer so it is
+        # device-correct and persists in the checkpoint.
+        self.register_buffer(
+            "t_train", torch.tensor(max(float(t_train), 1.0)), persistent=True)
+
         # --- geometric channel -------------------------------------------------
         # u enters as the BASE POINT (everything relative to E[u]); no separate
         # u-vs-v term needed.
+        # λ = softplus(log_lambda) ≥ 0. init log_lambda=0 ⇒ λ≈0.69 is O(1), which
+        # is correct for age NORMALIZED by t_train (age∈~[0,1]); see TIME UNITS.
         self.log_lambda = nn.Parameter(torch.zeros(1))    # λ = softplus(·) ≥ 0  (recency)
         self.alpha = nn.Parameter(torch.tensor(10.0))     # distance weight
         # Intrinsic-frame anisotropy (a,b ≥ 0, global): the candidate distance is
@@ -97,6 +147,13 @@ class GeometricPointHead(nn.Module):
         if use_pair_features:
             self.coef_pair = nn.Parameter(torch.ones(1))
 
+        # --- co-reachability (cross) channel -----------------------------------
+        # Reuses μ, the ellipse (a, b, heading r), λ and the t_train age-scale from
+        # the geometric channel; the ONLY new parameter is the channel gain. Init 0
+        # ⇒ the model starts as the proven baseline and the cross channel earns its
+        # weight.
+        self.coef_cross = nn.Parameter(torch.zeros(1))
+
     def _logmap(self, p: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """Sphere log-map at base point p (closed form = geoopt.Sphere().logmap)."""
         c = (p * x).sum(-1, keepdim=True).clamp(-1 + self.eps, 1 - self.eps)
@@ -104,23 +161,80 @@ class GeometricPointHead(nn.Module):
         orth = x - c * p
         return theta * orth / orth.norm(dim=-1, keepdim=True).clamp_min(self.eps)
 
+    def _ellipse_dist_sq(self, delta: torch.Tensor, r: torch.Tensor,
+                         a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Anisotropic ellipse distance² in the per-source heading frame.
+           delta [B, ..., d]  displacement ν−μ (or c−μ);  r [B, d] heading.
+           Broadcasts r over delta's leading axes after B.  -> [B, ...] (no d axis)."""
+        extra = delta.dim() - 2                      # axes between B and d
+        r_b = r.view(r.shape[0], *([1] * extra), r.shape[-1])
+        dpar2 = (delta * r_b).sum(-1).pow(2)         # [B, ...]
+        dperp2 = ((delta * delta).sum(-1) - dpar2).clamp_min(0.0)
+        return a * dpar2 + b * dperp2                # [B, ...]
+
+    def _cross(self, eu: torch.Tensor, mu: torch.Tensor, r: torch.Tensor,
+               a: torch.Tensor, b: torch.Tensor, alpha: torch.Tensor,
+               lam: torch.Tensor, conn_emb: torch.Tensor,
+               conn_age_n: torch.Tensor, conn_mask: torch.Tensor) -> torch.Tensor:
+        """Soft-min co-reachability logit per candidate.
+
+        Connectors are v's recent direct neighbours (sources that reached v), scored
+        against u's SAME μ / ellipse / λ as the candidates. The soft-min picks the
+        single best recent, in-character connector; candidates with no valid
+        connector contribute a neutral 0.
+
+           eu         [B, d]        unit source embedding (tangent base point)
+           mu, r      [B, d]        predicted position and heading (from neighbours)
+           conn_emb   [B, C, M, d]  connector embeddings (M per candidate; padded slots arbitrary)
+           conn_age_n [B, C, M]     connector age ALREADY normalized by t_train (≥0)
+           conn_mask  [B, C, M]     bool, True at a real connector
+           -> [B, C]
+        """
+        ec = F.normalize(conn_emb, dim=-1)                         # [B, C, M, d]
+        gc = self._logmap(eu[:, None, None, :], ec)               # [B, C, M, d] in T_{E[u]}
+        delta = gc - mu[:, None, None, :]                         # [B, C, M, d]
+        d_conn = self._ellipse_dist_sq(delta, r, a, b).clamp_min(self.eps).sqrt()  # [B, C, M]
+
+        # soft-min over connectors: best (in-character AND recent). Same λ, same
+        # normalized age units as μ's neighbour recency.
+        lw = (-alpha * d_conn - lam * conn_age_n)                # [B, C, M]
+        lw = lw.masked_fill(~conn_mask, -1e9)                    # padded slots -> −∞-ish
+        cross = torch.logsumexp(lw, dim=-1)                      # [B, C]
+
+        # candidate with no valid connector -> neutral 0 (also blocks gradient into
+        # padded connector slots for those rows).
+        has_conn = conn_mask.any(dim=-1)                         # [B, C]
+        return torch.where(has_conn, cross, torch.zeros_like(cross))
+
     def forward(self, tok_emb: torch.Tensor, tok_age: torch.Tensor,
                 tok_mask: torch.Tensor, E_u: torch.Tensor, E_v: torch.Tensor,
                 rec_v_log: torch.Tensor,
+                conn_emb: torch.Tensor, conn_age: torch.Tensor,
+                conn_mask: torch.Tensor,
                 pair_rec_log: torch.Tensor = None,
                 pair_ever: torch.Tensor = None,
                 pair_count_log: torch.Tensor = None) -> torch.Tensor:
         """tok_emb [B,n,d]  source walk-neighbour embeddings (context only).
-           tok_age [B,n]    age = t_query − t_node per token (≥0; 0 where masked).
+           tok_age [B,n]    age = t_query − t_node per token (≥0, RAW; normalized here).
            tok_mask[B,n]    bool, True at real neighbour positions.
            E_u     [B,d]    source embeddings (tangent-space BASE POINT).
            E_v     [B,C,d]  candidate embeddings.
            rec_v_log [B,C]  log1p(t_query − t_last[v]) candidate recency.
+           conn_emb [B,C,M,d]  v's recent direct-neighbour (connector) embeddings.
+           conn_age [B,C,M]    connector edge age = t_query − t_edge (≥0, RAW; normalized here).
+           conn_mask[B,C,M]    bool, True at a real connector.
            -> logits [B, C].
         """
         eu = F.normalize(E_u, dim=-1)                              # [B, d]
         ev = F.normalize(E_v, dim=-1)                              # [B, C, d]
         ew = F.normalize(tok_emb, dim=-1)                          # [B, n, d]
+
+        # --- normalize ages into λ's units (the fix; see TIME UNITS) -----------
+        # Both neighbour and connector ages share one frozen t_train so λ is one
+        # shared decay in one unit system. Source-side softmax is scale-invariant
+        # (this only rescales the learned λ); cross-side logsumexp REQUIRES it.
+        tok_age_n = tok_age / self.t_train                        # [B, n]   ~[0,1]
+        conn_age_n = conn_age / self.t_train                      # [B, C, M] ~[0,1.5]
 
         # --- map neighbours + candidates into T_{E[u]} -------------------------
         g = self._logmap(eu.unsqueeze(1), ew)                     # [B, n, d]
@@ -128,29 +242,34 @@ class GeometricPointHead(nn.Module):
 
         # --- recency-weighted predicted position μ ----------------------------
         lam = F.softplus(self.log_lambda)
-        wlog = (-lam * tok_age).masked_fill(~tok_mask, float("-inf"))   # [B, n]
-        w = torch.nan_to_num(torch.softmax(wlog, dim=-1), nan=0.0)      # cold src -> all 0
+        wlog = (-lam * tok_age_n).masked_fill(~tok_mask, float("-inf"))   # [B, n]
+        w = torch.nan_to_num(torch.softmax(wlog, dim=-1), nan=0.0)        # cold src -> all 0
         mu = (w.unsqueeze(-1) * g).sum(dim=1)                      # [B, d]
 
         # --- distance: anisotropic ellipse in the per-source heading frame ------
-        delta = nu - mu.unsqueeze(1)                              # [B, C, d]
         r = mu / mu.norm(dim=-1, keepdim=True).clamp_min(self.eps)   # [B, d] heading
-        dpar2 = torch.einsum("bcd,bd->bc", delta, r).pow(2)         # [B, C] ‖δ∥‖²
-        dperp2 = ((delta * delta).sum(-1) - dpar2).clamp_min(0.0)   # [B, C] ‖δ⊥‖²
         a = F.softplus(self.log_a)
         b = F.softplus(self.log_b)
-        d = (a * dpar2 + b * dperp2).clamp_min(self.eps).sqrt()     # [B, C]
+        alpha = self.alpha.clamp_min(1e-3)
+
+        delta = nu - mu.unsqueeze(1)                              # [B, C, d]
+        d = self._ellipse_dist_sq(delta, r, a, b).clamp_min(self.eps).sqrt()   # [B, C]
         # cold/degenerate μ≈0 ⇒ r→0 ⇒ d → √b·‖ν‖ = geodesic(E[u],E[v]).
 
         # --- channels combined with learnable per-channel coefficients ---------
-        geo = -self.alpha.clamp_min(1e-3) * d                      # [B, C]
-        rec = self.rec_head(self.t2v_rec(rec_v_log)).squeeze(-1)   # [B, C]
+        geo = -alpha * d                                          # [B, C]
+        rec = self.rec_head(self.t2v_rec(rec_v_log)).squeeze(-1)  # [B, C]
         logit = self.coef_geo * geo + self.coef_rec * rec
         if self.use_pair_features:
             feat = torch.cat(
                 [self.t2v_pair(pair_rec_log),
                  pair_ever.unsqueeze(-1), pair_count_log.unsqueeze(-1)],
                 dim=-1)
-            pair = self.pair_head(feat).squeeze(-1)                # [B, C]
+            pair = self.pair_head(feat).squeeze(-1)               # [B, C]
             logit = logit + self.coef_pair * pair
+
+        # --- co-reachability (cross) channel (same μ / ellipse / λ / age-scale) -
+        cross = self._cross(eu, mu, r, a, b, alpha, lam,
+                            conn_emb, conn_age_n, conn_mask)       # [B, C]
+        logit = logit + self.coef_cross * cross
         return logit

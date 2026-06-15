@@ -71,16 +71,26 @@ class WalkGenerator:
         """Ingest a batch of edges. STRICT-CAUSAL: call AFTER scoring."""
         self.trw.add_multiple_edges(src, tgt, ts, edge_features=edge_feat)
 
-    def walks_for_nodes(self, seeds: np.ndarray) -> WalkData:
+    def walks_for_nodes(self, seeds: np.ndarray, max_walk_len: Optional[int] = None,
+                        num_walks_per_node: Optional[int] = None,
+                        start_bias: Optional[str] = None) -> WalkData:
         """K BACKWARD walks per seed. ``nodes`` is [N*K, L] with rows
-        [i*K, (i+1)*K) = seed i's walks; seed at lens-1, padding = -1."""
+        [i*K, (i+1)*K) = seed i's walks; seed at lens-1, padding = -1.
+
+        Walk length / count / start-bias default to the instance values but accept
+        per-call overrides — the query is read-only over the SAME ingested graph, so
+        a caller wanting short (e.g. len-2 candidate-side) walks reuses this one
+        generator instead of a second Tempest instance."""
+        mwl = self.max_walk_len if max_walk_len is None else int(max_walk_len)
+        nw = self.num_walks_per_node if num_walks_per_node is None else int(num_walks_per_node)
+        sb = self.start_bias if start_bias is None else start_bias
         seed_arr = np.ascontiguousarray(seeds, dtype=np.int32)
         nodes, ts, lens, ef = self.trw.get_random_walks_and_times_for_nodes(
             seed_nodes=seed_arr,
-            max_walk_len=self.max_walk_len,
+            max_walk_len=mwl,
             walk_bias=self.walk_bias,
-            initial_edge_bias=self.start_bias,
-            num_walks_per_node=self.num_walks_per_node,
+            initial_edge_bias=sb,
+            num_walks_per_node=nw,
             walk_direction="Backward_In_Time",
         )
         nodes_t = torch.from_numpy(np.asarray(nodes).astype(np.int64))
@@ -109,6 +119,6 @@ class WalkGenerator:
             timestamps=torch.from_numpy(np.asarray(ts).astype(np.int64)),
             lens=torch.from_numpy(np.asarray(lens).astype(np.int64)),
             seeds=torch.from_numpy(seed_arr.astype(np.int64)),
-            K=self.num_walks_per_node,
+            K=nw,
             edge_feats=edge_feats,
         )
