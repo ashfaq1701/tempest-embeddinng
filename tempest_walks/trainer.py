@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
-from .link_pred_head import GeometricPointHead
+from .link_pred_head import GeometricVelocityPerWalkAvgHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
 from .pair_store import NodeLastSeenStore, PairRecencyStore
@@ -88,7 +88,7 @@ class Trainer:
         self.embedding_table = EmbeddingTable(
             num_nodes=config.num_nodes, d_emb=config.d_emb,
         ).to(self.device)
-        self.link_head = GeometricPointHead(
+        self.link_head = GeometricVelocityPerWalkAvgHead(
             d_emb=int(config.d_emb),
             use_pair_features=config.use_pair_features,
         ).to(self.device)
@@ -181,24 +181,21 @@ class Trainer:
         # attention pool. u's identity lives only in the base chord channel.
         is_ctx = torch.arange(L, device=device).view(1, 1, L) < (lens - 1).unsqueeze(-1)
 
-        # Flatten the (K, L) walk axes into one per-source token set [Ms, n]. The
-        # head sees a flat token set + mask; tok_mask = is_ctx keeps the seed and
-        # padding out (their embeddings are present but get zero recency weight).
-        n = K * L
-        tok_emb_all = self.embedding_table(nodes.clamp_min(0)).view(Ms, n, -1)  # [Ms,n,d]
-        tok_ts_all = ts.view(Ms, n)                             # [Ms, n] edge times
-        tok_mask_all = is_ctx.view(Ms, n)                       # [Ms, n] bool
+        # Keep the (K, L) walk structure — the velocity head fits each walk as its
+        # OWN trajectory, so the head consumes walk-structured tokens [B, K, L, d]
+        # (not a flat [B, n] set). tok_mask = is_ctx keeps the seed (= u) and padding
+        # out of every walk's fit (their embeddings are present but get zero weight).
+        tok_emb_all = self.embedding_table(nodes.clamp_min(0))  # [Ms, K, L, d]
 
-        tok_emb = tok_emb_all[u_pos]                            # [B, n, d]
-        tok_ts = tok_ts_all[u_pos]                              # [B, n]
-        tok_mask = tok_mask_all[u_pos]                          # [B, n]
+        tok_emb = tok_emb_all[u_pos]                            # [B, K, L, d]
+        tok_ts = ts[u_pos]                                     # [B, K, L]
+        tok_mask = is_ctx[u_pos]                               # [B, K, L]
 
-        # Per-token RAW query staleness age = t_query − t_token (t_token = ts[p], the
-        # token's own edge time), for the geometric recency weighting softmax(−λ·age).
+        # Per-token RAW query staleness age = t_query − t_token (the token's own edge
+        # time), for the recency weighting AND the per-walk velocity LS fit on age.
         # clamp_min(0) neutralises the seed's INT64_MAX sentinel (→ 0); the mask zeroes
-        # padding's bogus positive — finite everywhere, and masked entries are −∞'d in
-        # the head's softmax anyway.
-        tok_age = (t_query_t.unsqueeze(1).float() - tok_ts).clamp_min(0.0) * tok_mask.float()
+        # padding's bogus positive — finite everywhere, masked entries −∞'d in softmax.
+        tok_age = (t_query_t.view(-1, 1, 1).float() - tok_ts).clamp_min(0.0) * tok_mask.float()
 
         E_u = self.embedding_table(src_t)                       # [B, d]   base point E[u]
         E_v = self.embedding_table(cand_t)                      # [B, C, d]

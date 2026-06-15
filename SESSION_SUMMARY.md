@@ -679,3 +679,20 @@ Branches kept (not merged) for provenance: `feature/velocity-head` (a25db3c),
 `feature/velocity-perwalk-avg` (78628f6), `feature/velocity-mixture` (4d7c0da).
 Raw ledger: `logs/manifold/run12/RESULTS.tsv` (+ per-run `*.log`). Single-seed;
 mixture-review is OOM, not a number.
+
+### Promotion override (2026-06-15): velocity-perwalk-avg is now master's head
+
+Decision reversed by direction: **`GeometricVelocityPerWalkAvgHead` (per-walk averaged
+trajectory) is promoted to master** as the new base head, replacing the N2 Point head.
+Rationale: the Point head's wiki-no-pf win came from its **heading-frame** ellipse
+(oriented along the centroid heading r=μ/‖μ‖); the velocity head currently orients its
+ellipse along the **motion** V̂ — a different, not-yet-tuned frame. Rather than keep two
+heads, we take the trajectory head as the substrate and **port the heading-frame
+"ellipse point fix" onto it next** (expected to recover and likely exceed the −0.0006
+wiki-no-pf gap). Until that port lands, master is ~sub-noise below the retired Point
+head on wiki-no-pf and ties everywhere else (see table above).
+
+The retired Point head is preserved in git history (master pre-`b77519b`) and on
+`feature/point-improvements`; not lost. Docstring de-framed (dropped the OPTION-2 /
+pooled-vs-mixture bake-off language) before promotion. `best_configs.sh` comment flags
+the pending ellipse-fix TODO.
