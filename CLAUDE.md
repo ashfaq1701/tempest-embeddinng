@@ -140,6 +140,10 @@ Shapes:
   - `walks.nodes`        `[NK, L]`            int32   ; padding `-1`
   - `walks.timestamps`   `[NK, L]`            int64   ; sentinel `INT64_MAX` at `lens-1`; padding `-1`
   - `walks.edge_feats`   `[NK, L-1, d_ef]`    float32 ; **one column shorter than nodes**; tail rows are zero
+    - **Plumbed into `WalkData.edge_feats` right-padded to `[NK, L, d_ef]`** (one
+      zero column appended) so it indexes 1:1 with `nodes`/`timestamps`; the context
+      mask `positions < lens-1` then selects exactly the real edge rows. `None` when
+      the dataset has no edge features. Pairing pinned in `tests/test_walk_edge_feats.py`.
   - `walks.lens`         `[NK]`               int64
   - `walks.seeds`        `[N]`                int64
   - `walks.K` = walks per seed; `NK == N · K`

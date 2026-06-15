@@ -24,6 +24,18 @@ class WalkData(NamedTuple):
     lens: torch.Tensor         # [N*K] int64
     seeds: torch.Tensor        # [N] int64
     K: int                     # walks per seed
+    edge_feats: Optional[torch.Tensor] = None
+                               # [N*K, L, d_ef] float32, or None when the dataset
+                               # carries no edge features. INDEX-ALIGNED with nodes
+                               # / timestamps: edge_feats[p] is the feature of the
+                               # SAME edge (nodes[p], nodes[p+1]) whose time is
+                               # timestamps[p], for p in [0, lens-2]. The seed slot
+                               # (p = lens-1) and padding (p >= lens) are ZERO —
+                               # Tempest returns [N*K, L-1, d_ef] (no seed-slot
+                               # row); we right-pad one zero column so the context
+                               # mask (positions < lens-1) selects exactly the real
+                               # edge-feature rows. (Pairing verified against the
+                               # walk contract in tests/test_walk_edge_feats.py.)
 
 
 class WalkGenerator:
@@ -63,7 +75,7 @@ class WalkGenerator:
         """K BACKWARD walks per seed. ``nodes`` is [N*K, L] with rows
         [i*K, (i+1)*K) = seed i's walks; seed at lens-1, padding = -1."""
         seed_arr = np.ascontiguousarray(seeds, dtype=np.int32)
-        nodes, ts, lens, _ef = self.trw.get_random_walks_and_times_for_nodes(
+        nodes, ts, lens, ef = self.trw.get_random_walks_and_times_for_nodes(
             seed_nodes=seed_arr,
             max_walk_len=self.max_walk_len,
             walk_bias=self.walk_bias,
@@ -71,10 +83,32 @@ class WalkGenerator:
             num_walks_per_node=self.num_walks_per_node,
             walk_direction="Backward_In_Time",
         )
+        nodes_t = torch.from_numpy(np.asarray(nodes).astype(np.int64))
+
+        # Edge features (when the dataset has them). Tempest returns
+        # [N*K, L-1, d_ef], one column SHORTER than nodes, aligned so ef[p] is the
+        # feature of the edge (nodes[p], nodes[p+1]) — the same edge as
+        # timestamps[p] — for p in [0, lens-2]; it has no row for the seed slot and
+        # its tail/padding rows are zero. We right-pad the L-1 axis back up to L
+        # (one zero column) so edge_feats indexes 1:1 with nodes / timestamps and
+        # the existing context mask (positions < lens-1) selects exactly the real
+        # edges. When no edge features were ingested, Tempest hands back an empty
+        # object array (ndim 0) -> edge_feats stays None.
+        ef_arr = np.asarray(ef)
+        edge_feats = None
+        if ef_arr.ndim == 3 and ef_arr.size > 0:
+            ef_t = torch.from_numpy(np.ascontiguousarray(ef_arr, dtype=np.float32))
+            pad_cols = nodes_t.shape[1] - ef_t.shape[1]
+            if pad_cols > 0:
+                z = torch.zeros(ef_t.shape[0], pad_cols, ef_t.shape[2], dtype=ef_t.dtype)
+                ef_t = torch.cat([ef_t, z], dim=1)            # [N*K, L, d_ef]
+            edge_feats = ef_t
+
         return WalkData(
-            nodes=torch.from_numpy(np.asarray(nodes).astype(np.int64)),
+            nodes=nodes_t,
             timestamps=torch.from_numpy(np.asarray(ts).astype(np.int64)),
             lens=torch.from_numpy(np.asarray(lens).astype(np.int64)),
             seeds=torch.from_numpy(seed_arr.astype(np.int64)),
             K=self.num_walks_per_node,
+            edge_feats=edge_feats,
         )
