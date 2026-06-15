@@ -617,3 +617,65 @@ version of what the dropped angle term θ reached for.
 Caveats: single-seed except N2-review (2 seeds); review is a wiki-sized chronological
 subsample at K=100 (relative-comparison harness, not the full-review leaderboard
 number). Per-slice ledger: `logs/manifold/SERIES_NOPAIR.md` + `strat_*.md` (gitignored).
+
+---
+
+# Velocity / trajectory-extrapolation head bake-off, 2026-06-14/15
+
+**Hypothesis under test:** replace the static recency-weighted *centroid* μ (the N2
+Point head above) with a *trajectory*: fit the direction u's walk has been moving
+through tangent space over AGE by weighted least squares, project that line forward to
+query time, and score candidates by an ellipse oriented along the **motion** V̂. Three
+variants, each on its own branch off master (all carry the same intrinsic-frame
+anisotropy + 3 learnable channel-mix coefficients `coef_geo/coef_rec/coef_pair` as
+master, so the *only* change vs master is centroid → trajectory):
+
+| branch | head | how the K walks are used |
+|---|---|---|
+| `feature/velocity-head`        | `GeometricVelocityHead`           | **pooled** — one line over all K·L nodes (flat `[B,n,d]`) |
+| `feature/velocity-perwalk-avg` | `GeometricVelocityPerWalkAvgHead` | per-walk fit, **averaged** μ,V over K walks (`[B,K,L,d]`) |
+| `feature/velocity-mixture`     | `GeometricVelocityMixtureHead`    | per-walk fit, **soft-min** over K walk-lines (`[B,K,C,d]`) |
+
+The structured (`perwalk-avg`, `mixture`) heads needed a trainer `_score` adapter that
+keeps the (K,L) walk axes instead of flattening; `train.py` got `--max-train-edges/
+--max-eval-edges` chronological subsample (cherry-picked to all branches) for review.
+
+### Results — 12 runs (master + 3 branches × {wiki-nopf, wiki-pf, review-nopf}), seed 42
+
+| branch | wiki nopf (val/test) | wiki pf (val/test) | review nopf (val/test) |
+|---|---|---|---|
+| **master (N2 Point)**     | **0.8106 / 0.7789** | 0.8173 / 0.7934 | 0.0903 / 0.0935 |
+| velocity-head (pooled)    | 0.8053 / 0.7730     | 0.8173 / 0.7935 | 0.0904 / 0.0937 |
+| velocity-perwalk-avg      | 0.8067 / 0.7783     | 0.8163 / 0.7935 | **0.0905 / 0.0939** |
+| velocity-mixture          | 0.8067 / 0.7782     | 0.8165 / 0.7935 | OOM (1.53 GiB, 352k-node emb) |
+
+(Runtimes: wiki nopf ran long — 25–34 epochs, ~85–110 min; wiki pf converged fast —
+7–14 epochs, ~31–55 min; review ~4 min. Per-epoch cost rises across epochs because the
+Tempest graph accumulates edges.)
+
+### Verdict — the trajectory idea does NOT beat the static centroid. Keep master.
+
+- **Wiki no-pf (the pure head comparison): master WINS.** 0.7789 test vs the best
+  velocity head 0.7783 (perwalk-avg), +0.0039 val. All three velocity heads are
+  **≤ master**; the pooled head is clearly worst (−0.0059 test). Extrapolating "where
+  activity is heading" buys nothing over "where activity sits" — and costs accuracy.
+- **Wiki pf: everything ties** at test ≈ 0.7934–0.7935. As before, pair-feature
+  recurrence dominates and the geometric channel washes out (`coef_geo` shrinks) — the
+  centroid-vs-trajectory distinction is invisible here.
+- **Review cold-start: velocity heads a hair ahead** (perwalk-avg 0.0939 vs master
+  0.0935 test, +0.0004) but **deep inside the noise band** (bar = ≥0.015 or 3-seed;
+  see [[feedback_noise_threshold_wiki]]). Not shippable.
+- **Best velocity head, if one must be picked: `perwalk-avg`** — best-or-tied velocity
+  head on every cell, fastest of the structured pair, and **no OOM**. The `mixture`
+  head is the worst operational choice: its `[B,K,C,d]` per-walk×per-candidate tensor
+  OOMs review on 8 GB even at K=100, and it's the slowest. Pooled is worst on accuracy.
+
+**Decision: do not fold any velocity head into master.** The carried N2 anisotropic
+Point head stays the best head. This closes the trajectory-extrapolation line — it joins
+the Gaussian per-source 2nd-moment line as falsified. The remaining gap to TPNet
+(verified 0.827 test / 0.842 val) is architectural, not in the head geometry.
+
+Branches kept (not merged) for provenance: `feature/velocity-head` (a25db3c),
+`feature/velocity-perwalk-avg` (78628f6), `feature/velocity-mixture` (4d7c0da).
+Raw ledger: `logs/manifold/run12/RESULTS.tsv` (+ per-run `*.log`). Single-seed;
+mixture-review is OOM, not a number.
