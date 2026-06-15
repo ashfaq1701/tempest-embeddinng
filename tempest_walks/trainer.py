@@ -44,6 +44,7 @@ class TrainerConfig:
 
     # Model.
     d_emb: int = 128
+    edge_dim: int = 0           # per-edge feature width (0 = dataset has none)
 
     # Link loss / head.
     tau_link: float = 1.0       # softmax-CE temperature
@@ -88,9 +89,11 @@ class Trainer:
         self.embedding_table = EmbeddingTable(
             num_nodes=config.num_nodes, d_emb=config.d_emb,
         ).to(self.device)
+        self.edge_dim = int(config.edge_dim)
         self.link_head = GeometricVelocityPerWalkAvgHead(
             d_emb=int(config.d_emb),
             use_pair_features=config.use_pair_features,
+            edge_dim=self.edge_dim,
         ).to(self.device)
 
         # Streaming pairwise-interaction store feeding the pair features. Lifecycle
@@ -191,6 +194,15 @@ class Trainer:
         tok_ts = ts[u_pos]                                     # [B, K, L]
         tok_mask = is_ctx[u_pos]                               # [B, K, L]
 
+        # Per-step edge features, aligned 1:1 with the tokens (WalkData right-pads to
+        # L; seed slot + padding are zero). The head re-weights each walk's LS fit by
+        # them (zero-init ⇒ no-op at start). Zeros when the dataset has none.
+        if wd.edge_feats is not None:
+            edge_all = wd.edge_feats.to(device).view(Ms, K, L, -1)   # [Ms,K,L,edge_dim]
+            tok_edge_feat = edge_all[u_pos]                          # [B,K,L,edge_dim]
+        else:
+            tok_edge_feat = torch.zeros(B, K, L, self.edge_dim, device=device)
+
         # Per-token RAW query staleness age = t_query − t_token (the token's own edge
         # time), for the recency weighting AND the per-walk velocity LS fit on age.
         # clamp_min(0) neutralises the seed's INT64_MAX sentinel (→ 0); the mask zeroes
@@ -209,7 +221,7 @@ class Trainer:
                 src_t, cand_t, t_query_t)
 
         return self.link_head(
-            tok_emb, tok_age, tok_mask, E_u, E_v, rec_v_log,
+            tok_emb, tok_age, tok_mask, tok_edge_feat, E_u, E_v, rec_v_log,
             pair_rec_log=pair_rec_log, pair_ever=pair_ever,
             pair_count_log=pair_count_log)
 

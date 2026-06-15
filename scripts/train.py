@@ -293,11 +293,14 @@ def main() -> Dict[str, Any]:
     )
 
     # ─── Build TrainerConfig ───────────────────────────────────────
+    edge_dim = int(train_sp.edge_feat.shape[1]) if train_sp.edge_feat is not None else 0
+    print(f"  edge_dim:      {edge_dim}")
     config = TrainerConfig(
         num_nodes=num_nodes,
         dst_pool=dst_pool,
 
         d_emb=args.d_emb,
+        edge_dim=edge_dim,
 
         tau_link=args.tau_link,
         K_train=args.k_train,

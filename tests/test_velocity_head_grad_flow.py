@@ -22,8 +22,11 @@ import torch
 from tempest_walks.link_pred_head import GeometricVelocityPerWalkAvgHead
 
 
-def _head(d, pf=False, double=False):
-    h = GeometricVelocityPerWalkAvgHead(d_emb=d, use_pair_features=pf)
+EDGE_DIM = 4  # the head now consumes per-step edge features (zero-init = no-op)
+
+
+def _head(d, pf=False, double=False, edge_dim=EDGE_DIM):
+    h = GeometricVelocityPerWalkAvgHead(d_emb=d, use_pair_features=pf, edge_dim=edge_dim)
     return h.double() if double else h
 
 
@@ -46,7 +49,8 @@ def test_shared_table_gradient_per_role():
     mask = torch.ones(B, K, L, dtype=torch.bool)            # all neighbours valid
     rec = torch.rand(B, C)
 
-    out = _head(d)(tok, age, mask, E_u, E_v, rec)
+    tef = torch.randn(B, K, L, EDGE_DIM)
+    out = _head(d)(tok, age, mask, tef, E_u, E_v, rec)
     assert out.shape == (B, C)
     assert torch.isfinite(out).all()
     out.sum().backward()
@@ -78,7 +82,8 @@ def test_per_token_masking():
     age = torch.rand(B, K, L) * 3 + 0.1
     rec = torch.rand(B, C)
 
-    out = _head(d)(tok, age, mask, E_u, E_v, rec)
+    tef = torch.randn(B, K, L, EDGE_DIM)
+    out = _head(d)(tok, age, mask, tef, E_u, E_v, rec)
     out.sum().backward()
 
     gper = tok.grad.abs().sum(-1)                            # [B,K,L]
@@ -102,9 +107,10 @@ def test_gradcheck_logmap_and_fit():
     age = (torch.rand(B, K, L, dtype=torch.double) * 3 + 0.1)   # fixed, distinct
     mask = torch.ones(B, K, L, dtype=torch.bool)               # all valid (differentiable)
     rec = torch.rand(B, C, dtype=torch.double)
+    tef = torch.randn(B, K, L, EDGE_DIM, dtype=torch.double)
 
     def f(eu, ev, t):
-        return head(t, age, mask, eu, ev, rec)
+        return head(t, age, mask, tef, eu, ev, rec)
 
     ok = torch.autograd.gradcheck(f, (E_u, E_v, tok), eps=1e-6, atol=1e-4, rtol=1e-3)
     print(f"\n[check3] gradcheck passed = {ok}")

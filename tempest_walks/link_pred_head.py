@@ -10,7 +10,9 @@ Input is walk-structured [B, K, L, d] (K walks × L steps), kept separate per wa
 
   base point   p = E[u]                            (everything in the tangent space at u)
   per walk k:  g_i = Log_{E[u]}(E[node_i])         walk-k nodes as tangent vectors
-               fit g(age) ≈ ḡ_k + V_k·(age−ā_k)    recency-weighted LS over walk k's L steps
+               fit g(age) ≈ ḡ_k + V_k·(age−ā_k)    LS over walk k's L steps, weighted by
+                                                   softmax(−λ·age + edge_proj(edge_feat))
+                                                   — recency × learned edge-type weight
                μ_k = ḡ_k − V_k                      walk-k prediction at query time (age=0)
   aggregate :  μ = mean_k μ_k ,  V = mean_k V_k     over VALID walks (≥1 real token)
   candidate :  ν = Log_{E[u]}(E[v]) ;  δ = ν − μ ;  V̂ = V/‖V‖
@@ -50,7 +52,8 @@ class Time2Vec(nn.Module):
 
 
 class GeometricVelocityPerWalkAvgHead(nn.Module):
-    def __init__(self, d_emb: int, d_time: int = 16, use_pair_features: bool = False):
+    def __init__(self, d_emb: int, d_time: int = 16, use_pair_features: bool = False,
+                 edge_dim: int = 0):
         super().__init__()
         self.d_emb = d_emb
         self.eps = 1e-6
@@ -58,6 +61,15 @@ class GeometricVelocityPerWalkAvgHead(nn.Module):
         self.alpha = nn.Parameter(torch.tensor(10.0))
         self.log_a = nn.Parameter(torch.zeros(1))
         self.log_b = nn.Parameter(torch.zeros(1))
+        # Edge-feature re-weighting of the per-walk LS fit: a learnable scalar per
+        # walk STEP, added to that step's recency log-weight (which steps matter).
+        # ZERO-INIT ⇒ e≡0 ⇒ exact recency-only fit at start; the projection grows
+        # only if edge-type re-weighting lowers the loss (its magnitude = the learned
+        # amount). Single Linear, no MLP; only enters the fit weights (no candidate
+        # channel — the (u,v) edge does not exist at query time).
+        self.edge_proj = nn.Linear(edge_dim, 1)
+        nn.init.zeros_(self.edge_proj.weight)
+        nn.init.zeros_(self.edge_proj.bias)
         self.t2v_rec = Time2Vec(d_time)
         self.rec_head = nn.Linear(d_time, 1)
         self.use_pair_features = use_pair_features
@@ -75,11 +87,14 @@ class GeometricVelocityPerWalkAvgHead(nn.Module):
         orth = x - c * p
         return theta * orth / orth.norm(dim=-1, keepdim=True).clamp_min(self.eps)
 
-    def _per_walk_fit(self, g, age, mask):
-        """g [B,K,L,d], age [B,K,L], mask [B,K,L] (bool)
+    def _per_walk_fit(self, g, age, mask, edge_feat):
+        """g [B,K,L,d], age [B,K,L], mask [B,K,L] (bool),
+        edge_feat [B,K,L,edge_dim]
         -> mu_k [B,K,d], V_k [B,K,d], walk_valid [B,K]."""
         lam = F.softplus(self.log_lambda)
-        wlog = (-lam * age).masked_fill(~mask, float("-inf"))      # over L, per walk
+        e = self.edge_proj(edge_feat).squeeze(-1)                  # [B,K,L]  0 at init
+        # e added BEFORE the masked_fill so padded steps stay −inf ⇒ w=0.
+        wlog = (-lam * age + e).masked_fill(~mask, float("-inf"))  # over L, per walk
         w = torch.nan_to_num(torch.softmax(wlog, dim=-1), nan=0.0)  # [B,K,L]
         gbar = (w.unsqueeze(-1) * g).sum(dim=2)                    # [B,K,d]
         abar = (w * age).sum(dim=2)                               # [B,K]
@@ -92,10 +107,11 @@ class GeometricVelocityPerWalkAvgHead(nn.Module):
         mu = gbar - V                                            # [B,K,d]
         return mu, V, mask.any(dim=2)                            # walk_valid [B,K]
 
-    def forward(self, tok_emb, tok_age, tok_mask, E_u, E_v, rec_v_log,
+    def forward(self, tok_emb, tok_age, tok_mask, tok_edge_feat, E_u, E_v, rec_v_log,
                 pair_rec_log=None, pair_ever=None, pair_count_log=None):
         """tok_emb [B,K,L,d], tok_age [B,K,L], tok_mask [B,K,L],
-           E_u [B,d], E_v [B,C,d], rec_v_log [B,C] -> logits [B,C]."""
+           tok_edge_feat [B,K,L,edge_dim] (per-step edge features, aligned with
+           tok_age/tok_mask), E_u [B,d], E_v [B,C,d], rec_v_log [B,C] -> logits [B,C]."""
         eu = F.normalize(E_u, dim=-1)                             # [B,d]
         ev = F.normalize(E_v, dim=-1)                             # [B,C,d]
         ew = F.normalize(tok_emb, dim=-1)                         # [B,K,L,d]
@@ -103,7 +119,7 @@ class GeometricVelocityPerWalkAvgHead(nn.Module):
         g = self._logmap(eu.unsqueeze(1).unsqueeze(1), ew)        # [B,K,L,d]
         nu = self._logmap(eu.unsqueeze(1), ev)                   # [B,C,d]
 
-        mu_k, V_k, walk_valid = self._per_walk_fit(g, tok_age, tok_mask)
+        mu_k, V_k, walk_valid = self._per_walk_fit(g, tok_age, tok_mask, tok_edge_feat)
         wv = walk_valid.float().unsqueeze(-1)                     # [B,K,1]
         denom = wv.sum(dim=1).clamp_min(self.eps)                # [B,1]
         mu = (wv * mu_k).sum(dim=1) / denom                      # [B,d]  averaged prediction
