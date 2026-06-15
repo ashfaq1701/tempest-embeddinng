@@ -735,3 +735,55 @@ Run stopped early (ep12) once the verdict was clear.
 (`f000942`) so master's head stays edge-free. `git checkout edge-feature-integration`
 (or cherry-pick `74d0726`) restores the full feature. The `WalkData.edge_feats`
 plumbing stays on master as reusable infra. Branch `feature/edge-feature-weights` kept.
+
+---
+
+# With-pair-features test stratification on current master, 2026-06-15
+
+Re-ran `scripts/stratify_test_errors.py` on the **current master head**
+(`GeometricVelocityPerWalkAvgHead` + `--use-pair-features`) to re-localize the gap to
+TPNet after the velocity-head promotion. wiki, seed 42, d_emb 128, walks10, K_train=100,
+TPNet protocol (train bs 200 / eval bs 20), 25 ep / patience 5. Peaked **ep4 (val 0.8145
+/ test 0.7921)**; stratified test MRR **0.7922** over 23,621 positives (sanity OK,
+partitions reconstruct ±1e-4). **TPNet ref 0.827 test → gap +0.0348.** (The output file's
+title still says `SourceWalkAttnHead` — stale script header; the trained head is the
+current velocity head.) Two script-side bit-rot fixes were needed to run against master:
+re-added the optional `recorder` hook to `Trainer._eval` (stripped in `cdc99c0`) and
+dropped stale `neigh_store` / `use_struct_features` references in the script.
+
+### Pair recurrence (the whole story in two rows)
+
+| slice | frac | mean_rr | hits@1 | hits@10 | contrib |
+|---|---|---|---|---|---|
+| **repeat-pair** | 87.4% | **0.9030** | 0.850 | 0.985 | 0.7888 |
+| **new-pair**    | 12.6% | **0.0268** | 0.003 | 0.056 | 0.0034 |
+
+### Cross-tab: pair-recurrence × transductivity (decisive)
+
+| slice | frac | mean_rr | verdict |
+|---|---|---|---|
+| repeat × both-seen | 87.4% | 0.9030 | solved — not a decoder-capacity gap |
+| **new × both-seen** | **8.0%** | **0.0207** | the co-reachability cell (both endpoints known, never linked) |
+| new × u-only-inductive | 4.5% | 0.0383 | cold-start / bootstrap source |
+| new × v/both-inductive | 0.1% | ~0.004 | negligible mass |
+
+### Source-degree (orthogonal view — same cold-start story)
+
+deg=0 sources (4.5%) sit at mean_rr **0.0381**; the curve climbs monotonically to
+0.87 (deg 21-100) / 0.84 (deg >100). Low-degree/cold sources are exactly the new-pair
+mass; warm sources are solved.
+
+### Where the gap is
+
+**Unchanged from §12's pre-velocity-head finding: the entire +0.0348 test gap to TPNet
+is the 12.6% new-pair slice (mean_rr 0.027); the 87% repeat majority is already at
+0.903.** Headroom sizing: lifting `new × both-seen` (8.0%, 0.0207) to even 0.30 is
++0.0223 overall — alone more than half the TPNet gap; to the both-seen level (0.829) it
+is +0.0646. The decisive cell is again **new × both-seen** (both endpoints seen, never
+linked) plus the cold-start `new × u-only-inductive` cell. Per §13 this headroom is
+**triply-confirmed not recoverable from graph/walk structure** (exact co-reach ceiling
+`A^3`=0.041, aggregate co-reach redundant, cross-attention finds nothing on the slice) —
+it is content / node-feature / cold-start signal. The velocity head did **not** change
+the shape of the gap: it remains architectural (content channels), not in the head
+geometry or pair features. Output: `logs/stratify/wiki_test_strata_attn.{md,json}`
+(single-seed).

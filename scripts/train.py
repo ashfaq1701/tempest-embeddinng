@@ -17,6 +17,7 @@ Hyperparameters exposed at CLI (and their grouping):
                   --batch-size, --eval-batch-size, --num-epochs,
                   --early-stop-patience
   System:         --seed, --use-gpu, --use-gpu-tempest
+  Analysis:       --stratify (post-train per-slice test-MRR stratification)
 
 Derived from the dataset (not exposed): num_nodes, dst_pool, and
 mean_inter_arrival (TrainStats) for the Tempest sliding-window cap.
@@ -180,6 +181,16 @@ def parse_args() -> argparse.Namespace:
              "Tempest GPU mode allocates a multi-GB arena that may "
              "collide with PyTorch's allocator on small GPUs; default "
              "off, enable only if you have headroom.",
+    )
+    p.add_argument(
+        "--stratify",
+        action="store_true",
+        help="After training, re-run the strict-causal TEST eval on the best-val "
+             "model and stratify per-positive MRR by pair-recurrence, "
+             "transductivity (endpoint-seen), and source-degree — localizing where "
+             "MRR is lost. Writes logs/stratify/<dataset>_seed<seed>_strata.{md,json}. "
+             "Re-seeds the trainer's causal stores over train+val first; training is "
+             "untouched. Off by default.",
     )
     p.add_argument(
         "--export-best-embedding-table",
@@ -362,6 +373,21 @@ def main() -> Dict[str, Any]:
     print(f"  stopped_at_epoch:  {result['stopped_at_epoch']}")
     print(f"  best_val_mrr:      {result['best_val_mrr']:.4f}")
     print(f"  best_test_mrr:     {result['best_test_mrr']:.4f}")
+
+    # Optional: stratify the best-val model's test MRR to localize the gap.
+    if args.stratify:
+        from tempest_walks.stratify import run_stratification
+        meta = {
+            "dataset": args.dataset, "seed": args.seed, "d_emb": args.d_emb,
+            "batch_size": args.batch_size, "eval_batch_size": args.eval_batch_size,
+            "head": type(trainer.link_head).__name__
+            + (" + pair features" if args.use_pair_features else ""),
+            "best_epoch": result["stopped_at_epoch"],
+            "best_val": result["best_val_mrr"], "best_test": result["best_test_mrr"],
+        }
+        run_stratification(
+            trainer, train_batches_factory, val_batches_factory,
+            test_eval, test_batches_factory, num_nodes, meta)
 
     # Optional: dump best-val-restored embedding table for downstream
     # analysis. Raw [num_nodes, d_emb] float32 array; node ids follow

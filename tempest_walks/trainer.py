@@ -255,14 +255,19 @@ class Trainer:
     # Eval — strict-causal, no_grad
     # ──────────────────────────────────────────────────────────────────
 
-    def _eval(self, evaluator: Evaluator, batches: Iterable[Batch]) -> float:
+    def _eval(self, evaluator: Evaluator, batches: Iterable[Batch],
+              recorder: Any = None) -> float:
         self.embedding_table.eval()
         self.link_head.eval()
         total, n = 0.0, 0
         with torch.no_grad():
             for batch in batches:
                 B = len(batch.src)
+                if recorder is not None:
+                    recorder.before_batch(batch)
                 if B == 0:
+                    if recorder is not None:
+                        recorder.after_batch(batch)
                     self.walk_gen.add_edges(
                         batch.src, batch.tgt, batch.ts, batch.edge_feat)
                     if self.pair_store is not None:
@@ -288,10 +293,15 @@ class Trainer:
                 logits = self._score(src_t, cand_t, t_query_t).cpu().numpy()
 
                 for i in range(B):
-                    total += evaluator.score_to_metric(
+                    rr = evaluator.score_to_metric(
                         float(logits[i, 0]), logits[i, 1:1 + counts[i]])
+                    total += rr
+                    if recorder is not None:
+                        recorder.on_positive(batch, i, rr)
                 n += B
 
+                if recorder is not None:
+                    recorder.after_batch(batch)
                 self.walk_gen.add_edges(
                     batch.src, batch.tgt, batch.ts, batch.edge_feat)
                 if self.pair_store is not None:
