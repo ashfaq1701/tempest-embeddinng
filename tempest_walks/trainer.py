@@ -41,7 +41,7 @@ class TrainerConfig:
     # Dataset-derived.
     num_nodes: int
     dst_pool: np.ndarray
-    t_train: float              # train-split time span; frozen λ age-normalizer (REQUIRED)
+    t_train: float              # train-split span; sets the cross λ_cross init scale (REQUIRED)
 
     # Model.
     d_emb: int = 128
