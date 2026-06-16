@@ -109,9 +109,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-walk-len-candidate-side", default=2, type=int,
                    help="L for the candidate-side walks. 2 = v's direct neighbours "
                         "only; >2 reaches indirect (co-reachability) neighbours.")
-    p.add_argument("--walk-bias-candidate-side", default="ExponentialIndex", type=str,
+    p.add_argument("--walk-bias-candidate-side", default="ExponentialWeight", type=str,
                    help="Per-hop edge bias for the candidate-side walks.")
-    p.add_argument("--start-bias-candidate-side", default="ExponentialIndex", type=str,
+    p.add_argument("--start-bias-candidate-side", default="ExponentialWeight", type=str,
                    help="Initial-edge bias for the candidate-side walks.")
 
     # The link head (LinkPredHead) has no architecture knobs beyond
