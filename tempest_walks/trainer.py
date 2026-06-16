@@ -54,6 +54,12 @@ class TrainerConfig:
     # one logit term. Off by default => baseline byte-identical.
     use_pair_features: bool = False
 
+    # Hop-distance (K) weighting in the head: down-weight walk-neighbours by their
+    # hop distance from the seed (K=1 direct = highest priority; deeper hops fade),
+    # on BOTH the query-side μ pool and the candidate-side cross channel. Off by
+    # default => baseline byte-identical.
+    use_hop_weight: bool = False
+
     # Walks (BACKWARD only, undirected). Decoupled QUERY-side (source u → μ) and
     # CANDIDATE-side (v → connectors for the cross channel), both sampled from the
     # SAME Tempest graph via per-call overrides (no second store, no extra ingest).
@@ -102,6 +108,7 @@ class Trainer:
             d_emb=int(config.d_emb),
             use_pair_features=config.use_pair_features,
             t_train=float(config.t_train),
+            use_hop_weight=config.use_hop_weight,
         ).to(self.device)
 
         # Streaming pairwise-interaction store feeding the pair features. Lifecycle
@@ -226,11 +233,12 @@ class Trainer:
 
         # Candidate-side connectors (co-reachability): v's walk-neighbourhood as IDS
         # (the head gathers embeddings per chunk from the table to bound memory).
-        conn_ids, conn_age, conn_mask = self._candidate_connectors(cand_t, t_query_t)
+        conn_ids, conn_age, conn_hop, conn_mask = self._candidate_connectors(
+            cand_t, t_query_t)
 
         return self.link_head(
             tok_emb, tok_age, tok_mask, E_u, E_v, rec_v_log,
-            conn_ids, conn_age, conn_mask, self.embedding_table.E.weight,
+            conn_ids, conn_age, conn_hop, conn_mask, self.embedding_table.E.weight,
             pair_rec_log=pair_rec_log, pair_ever=pair_ever,
             pair_count_log=pair_count_log)
 
@@ -247,6 +255,7 @@ class Trainer:
 
         -> conn_ids [B,C,M] (node ids, −1 at padding; head gathers embeddings),
            conn_age [B,C,M] (raw, same units as tok_age),
+           conn_hop [B,C,M] (hop distance K of the connector from v; 1 = direct),
            conn_mask [B,C,M] (True at a real connector). M = K_cand · L_cand."""
         device = self.device
         B, C = cand_t.shape
@@ -266,15 +275,23 @@ class Trainer:
         # its own edge recency (direct neighbours recent, deeper hops older).
         is_ctx = torch.arange(L, device=device).view(1, 1, L) < (lens - 1).unsqueeze(-1)
         n = K * L
+        # Connector hop distance from v (seed at lens-1): position p is K=(lens-1)−p
+        # hops from v (p=lens-2 → K=1, direct neighbour). clamp_min(0) keeps padding
+        # finite (masked anyway). On the cross logsumexp a constant K (len-2 → all
+        # hop 1) cancels in the per-query CE; γ_cross only bites at len ≥ 3.
+        pos = torch.arange(L, device=device).view(1, 1, L)
+        hop = ((lens - 1).unsqueeze(-1) - pos).clamp_min(0).float()  # [Mv, K, L]
         id_all = nodes.view(Mv, n)                             # [Mv, n] node ids (−1 pad)
         ts_all = ts.view(Mv, n)
         mask_all = is_ctx.view(Mv, n)
+        hop_all = hop.view(Mv, n)
         conn_ids = id_all[v_inv].view(B, C, n)                # [B, C, n] long
         conn_ts = ts_all[v_inv].view(B, C, n)
         conn_mask = mask_all[v_inv].view(B, C, n)
+        conn_hop = hop_all[v_inv].view(B, C, n)
         conn_age = ((t_query_t.view(B, 1, 1).float() - conn_ts).clamp_min(0.0)
                     * conn_mask.float())                      # raw; 0 at masked slots
-        return conn_ids, conn_age, conn_mask
+        return conn_ids, conn_age, conn_hop, conn_mask
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step

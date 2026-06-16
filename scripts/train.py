@@ -81,6 +81,14 @@ def parse_args() -> argparse.Namespace:
              "ever-interacted bit ‖ decayed log interaction-count. Multi-seed "
              "confirmed +~0.02 test on tgbl-wiki.",
     )
+    p.add_argument(
+        "--use-hop-weight", action="store_true",
+        help="CONNECTOR-side hop weighting in the cross channel: penalise a connector "
+             "by its hop distance from v, −κ·(hop−1) inside the logsumexp (1-hop pays "
+             "0, deeper hops fade with proportionally smaller gradients). Learnable κ "
+             "(init 0.69) — a soft continuous length sweep on the connector set. "
+             "Off => baseline. (No query-side term; it was inert on wiki.)",
+    )
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
     p.add_argument(
@@ -319,6 +327,7 @@ def main() -> Dict[str, Any]:
         K_train=args.k_train,
 
         use_pair_features=args.use_pair_features,
+        use_hop_weight=args.use_hop_weight,
 
         num_walks_per_node_query_side=args.num_walks_per_node_query_side,
         max_walk_len_query_side=args.max_walk_len_query_side,
