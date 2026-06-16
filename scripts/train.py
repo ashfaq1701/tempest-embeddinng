@@ -9,9 +9,9 @@ Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root
   Model:          --d-emb
   Link/head:      --tau-link, --k-train
-  Walks:          --num-walks-per-node, --max-walk-len, --walk-bias,
-                  --start-bias, --tempest-batch-window-multiplier
-                  (backward-only; graphs are treated as undirected)
+  Walks:          --{num-walks-per-node,max-walk-len,walk-bias,start-bias}-
+                  {query,candidate}-side, --tempest-batch-window-multiplier
+                  (backward-only, undirected; query=source→μ, candidate=v→connectors)
   Optimisation:   --lr, --lr-min, --warmup-fraction,
                   --warmup-steps-cap, --decay-horizon-epochs, --weight-decay,
                   --batch-size, --eval-batch-size, --num-epochs,
@@ -92,36 +92,27 @@ def parse_args() -> argparse.Namespace:
         help="If >0, eval on only the first N official val/test edges (prefix; "
              "keeps TGB pre-generated negatives valid).")
 
-    # Walks (link head; BACKWARD only, graphs treated as undirected).
-    p.add_argument(
-        "--num-walks-per-node", default=5, type=int,
-        help="K walks per node sampled for the head (sources + candidates).",
-    )
-    p.add_argument(
-        "--max-walk-len", default=20, type=int,
-        help="L, max walk length.",
-    )
-    p.add_argument(
-        "--walk-bias", default="ExponentialWeight", type=str,
-        help="Per-hop edge bias for the backward walks.",
-    )
-    p.add_argument(
-        "--start-bias", default="ExponentialWeight", type=str,
-        help="Initial-edge bias for the backward walks.",
-    )
+    # Walks (BACKWARD only, undirected). Decoupled QUERY-side (source u → μ) and
+    # CANDIDATE-side (v → connectors for the cross channel); same Tempest graph.
+    p.add_argument("--num-walks-per-node-query-side", default=5, type=int,
+                   help="K walks per source u (build μ).")
+    p.add_argument("--max-walk-len-query-side", default=20, type=int,
+                   help="L, max walk length for the query-side walks.")
+    p.add_argument("--walk-bias-query-side", default="ExponentialWeight", type=str,
+                   help="Per-hop edge bias for the query-side backward walks.")
+    p.add_argument("--start-bias-query-side", default="ExponentialWeight", type=str,
+                   help="Initial-edge bias for the query-side backward walks.")
 
-    # Candidate-side co-reachability (short len-2 backward walks per candidate).
-    p.add_argument(
-        "--num-walks-per-node-candidate-side", default=10, type=int,
-        help="M connectors sampled per UNIQUE candidate v (len-2 backward walks = "
-             "v's recent direct neighbours), feeding the head's soft-min cross "
-             "channel. Same Tempest graph + embedding table.",
-    )
-    p.add_argument(
-        "--start-bias-candidate-side", default="Linear", type=str,
-        help="Initial-edge bias for the candidate-side len-2 walks (the only bias "
-             "that matters for a 1-edge walk).",
-    )
+    p.add_argument("--num-walks-per-node-candidate-side", default=10, type=int,
+                   help="K walks per candidate v; their context nodes are the cross "
+                        "channel's connectors (FREE LENGTH — direct + indirect).")
+    p.add_argument("--max-walk-len-candidate-side", default=2, type=int,
+                   help="L for the candidate-side walks. 2 = v's direct neighbours "
+                        "only; >2 reaches indirect (co-reachability) neighbours.")
+    p.add_argument("--walk-bias-candidate-side", default="ExponentialIndex", type=str,
+                   help="Per-hop edge bias for the candidate-side walks.")
+    p.add_argument("--start-bias-candidate-side", default="ExponentialIndex", type=str,
+                   help="Initial-edge bias for the candidate-side walks.")
 
     # The link head (LinkPredHead) has no architecture knobs beyond
     # max_walk_len, which is set from --link-pred-max-walk-len.
@@ -329,10 +320,14 @@ def main() -> Dict[str, Any]:
 
         use_pair_features=args.use_pair_features,
 
-        num_walks_per_node=args.num_walks_per_node,
-        max_walk_len=args.max_walk_len,
-        walk_bias=args.walk_bias,
-        start_bias=args.start_bias,
+        num_walks_per_node_query_side=args.num_walks_per_node_query_side,
+        max_walk_len_query_side=args.max_walk_len_query_side,
+        walk_bias_query_side=args.walk_bias_query_side,
+        start_bias_query_side=args.start_bias_query_side,
+        num_walks_per_node_candidate_side=args.num_walks_per_node_candidate_side,
+        max_walk_len_candidate_side=args.max_walk_len_candidate_side,
+        walk_bias_candidate_side=args.walk_bias_candidate_side,
+        start_bias_candidate_side=args.start_bias_candidate_side,
         max_time_capacity=compute_max_time_capacity(
             args.tempest_batch_window_multiplier,
             args.batch_size,
@@ -347,9 +342,6 @@ def main() -> Dict[str, Any]:
         weight_decay=args.weight_decay,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
-
-        num_walks_per_node_candidate_side=args.num_walks_per_node_candidate_side,
-        start_bias_candidate_side=args.start_bias_candidate_side,
 
         seed=args.seed,
         use_gpu=args.use_gpu,

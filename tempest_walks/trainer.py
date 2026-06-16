@@ -54,19 +54,21 @@ class TrainerConfig:
     # one logit term. Off by default => baseline byte-identical.
     use_pair_features: bool = False
 
-    # Walks (link head; BACKWARD only, undirected).
-    num_walks_per_node: int = 5
-    max_walk_len: int = 20
-    walk_bias: str = "ExponentialWeight"
-    start_bias: str = "ExponentialWeight"
-    max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
-
-    # Candidate-side co-reachability: short (len-2) BACKWARD walks per unique
-    # candidate v give v's recent direct neighbours (connectors) + edge times,
-    # sampled from the SAME walk graph (no second store, no extra ingest). The head
-    # reuses λ + raw age, so no extra time-scale knob.
+    # Walks (BACKWARD only, undirected). Decoupled QUERY-side (source u → μ) and
+    # CANDIDATE-side (v → connectors for the cross channel), both sampled from the
+    # SAME Tempest graph via per-call overrides (no second store, no extra ingest).
+    # Candidate-side is a FREE-LENGTH walk-neighbourhood (all context nodes of v's
+    # walks become connectors, parallel to the query side), not just direct
+    # neighbours — max_walk_len_candidate_side controls the reach (2 = direct only).
+    num_walks_per_node_query_side: int = 5
+    max_walk_len_query_side: int = 20
+    walk_bias_query_side: str = "ExponentialWeight"
+    start_bias_query_side: str = "ExponentialWeight"
     num_walks_per_node_candidate_side: int = 10
-    start_bias_candidate_side: str = "Linear"
+    max_walk_len_candidate_side: int = 2
+    walk_bias_candidate_side: str = "ExponentialIndex"
+    start_bias_candidate_side: str = "ExponentialIndex"
+    max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
     # Optimisation. Single RiemannianAdam over {E, GRU, scale}: E (the lone
     # ManifoldParameter) gets the sphere update, GRU/scale the Euclidean one.
@@ -114,12 +116,14 @@ class Trainer:
         # sampling candidate walks (source-side-only head). Always on.
         self.node_last = NodeLastSeenStore()
 
+        # One generator, configured QUERY-side; candidate-side walks reuse it via
+        # per-call overrides (different length / count / biases, same graph).
         self.walk_gen = WalkGenerator(
             use_gpu=config.use_gpu_tempest,
-            walk_bias=config.walk_bias,
-            start_bias=config.start_bias,
-            num_walks_per_node=config.num_walks_per_node,
-            max_walk_len=config.max_walk_len,
+            walk_bias=config.walk_bias_query_side,
+            start_bias=config.start_bias_query_side,
+            num_walks_per_node=config.num_walks_per_node_query_side,
+            max_walk_len=config.max_walk_len_query_side,
             max_time_capacity=config.max_time_capacity,
         )
         self.neg_sampler_train = UniformNegativeSampler(
@@ -230,33 +234,44 @@ class Trainer:
             pair_count_log=pair_count_log)
 
     def _candidate_connectors(self, cand_t: torch.Tensor, t_query_t: torch.Tensor):
-        """v's recent direct neighbours for the co-reachability channel.
+        """v's walk-neighbourhood for the co-reachability channel (FREE LENGTH).
 
-        For every UNIQUE candidate v, sample short len-2 BACKWARD walks on the SAME
-        Tempest graph (per-call override — no second store) → v's recent direct
-        neighbours + edge times, embedded by the SAME table. Indexed CSR-style by
-        unique-v. Strict-causal: same pre-ingest graph as the source-side walks.
+        For every UNIQUE candidate v, sample CANDIDATE-side BACKWARD walks on the SAME
+        Tempest graph (per-call overrides — no second store). ALL context nodes of
+        those walks (seed v and padding excluded) become connectors — direct AND
+        indirect neighbours, each with its own edge time — exactly parallel to how the
+        query side exposes u's walk-neighbours. max_walk_len_candidate_side=2 reduces
+        to v's direct neighbours. Indexed CSR-style by unique-v; embedded by the SAME
+        table. Strict-causal: same pre-ingest graph as the query-side walks.
 
         -> conn_emb [B,C,M,d], conn_age [B,C,M] (raw, same units as tok_age),
-           conn_mask [B,C,M] (True at a real connector)."""
+           conn_mask [B,C,M] (True at a real connector). M = K_cand · L_cand."""
         device = self.device
         B, C = cand_t.shape
         uniq_v, v_inv = torch.unique(cand_t.reshape(-1), return_inverse=True)  # [Mv],[B*C]
         wc = self.walk_gen.walks_for_nodes(
-            uniq_v.cpu().numpy(), max_walk_len=2,
+            uniq_v.cpu().numpy(),
+            max_walk_len=self.config.max_walk_len_candidate_side,
             num_walks_per_node=self.config.num_walks_per_node_candidate_side,
-            start_bias=self.config.start_bias_candidate_side)
-        Mv, M = uniq_v.shape[0], wc.K
-        cn = wc.nodes.to(device).view(Mv, M, 2)
-        cts = wc.timestamps.to(device).view(Mv, M, 2).float()
-        clen = wc.lens.to(device).view(Mv, M)
-        # position 0 = the connector (seed v sits at lens-1); valid iff lens == 2.
-        conn_id = cn[:, :, 0][v_inv].view(B, C, M)               # [B, C, M]
-        conn_ts = cts[:, :, 0][v_inv].view(B, C, M)
-        conn_mask = (clen == 2)[v_inv].view(B, C, M)
-        conn_emb = self.embedding_table(conn_id.clamp_min(0))    # [B, C, M, d]
+            start_bias=self.config.start_bias_candidate_side,
+            walk_bias=self.config.walk_bias_candidate_side)
+        Mv, K, L = uniq_v.shape[0], wc.K, wc.nodes.shape[1]
+        nodes = wc.nodes.to(device).view(Mv, K, L)              # [Mv, K, L]
+        ts = wc.timestamps.to(device).view(Mv, K, L).float()
+        lens = wc.lens.to(device).view(Mv, K)
+        # Context = real walk-neighbours: exclude the seed v (slot lens-1) and padding.
+        # ts[p] is the time of edge (nodes[p], nodes[p+1]), so each connector carries
+        # its own edge recency (direct neighbours recent, deeper hops older).
+        is_ctx = torch.arange(L, device=device).view(1, 1, L) < (lens - 1).unsqueeze(-1)
+        n = K * L
+        emb_all = self.embedding_table(nodes.clamp_min(0)).view(Mv, n, -1)  # [Mv, n, d]
+        ts_all = ts.view(Mv, n)
+        mask_all = is_ctx.view(Mv, n)
+        conn_emb = emb_all[v_inv].view(B, C, n, -1)            # [B, C, n, d]
+        conn_ts = ts_all[v_inv].view(B, C, n)
+        conn_mask = mask_all[v_inv].view(B, C, n)
         conn_age = ((t_query_t.view(B, 1, 1).float() - conn_ts).clamp_min(0.0)
-                    * conn_mask.float())                         # raw; 0 at padded slots
+                    * conn_mask.float())                       # raw; 0 at masked slots
         return conn_emb, conn_age, conn_mask
 
     # ──────────────────────────────────────────────────────────────────
