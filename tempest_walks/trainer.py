@@ -224,12 +224,13 @@ class Trainer:
             pair_rec_log, pair_ever, pair_count_log = self.pair_store.query(
                 src_t, cand_t, t_query_t)
 
-        # Candidate-side connectors (co-reachability): v's recent direct neighbours.
-        conn_emb, conn_age, conn_mask = self._candidate_connectors(cand_t, t_query_t)
+        # Candidate-side connectors (co-reachability): v's walk-neighbourhood as IDS
+        # (the head gathers embeddings per chunk from the table to bound memory).
+        conn_ids, conn_age, conn_mask = self._candidate_connectors(cand_t, t_query_t)
 
         return self.link_head(
             tok_emb, tok_age, tok_mask, E_u, E_v, rec_v_log,
-            conn_emb, conn_age, conn_mask,
+            conn_ids, conn_age, conn_mask, self.embedding_table.E.weight,
             pair_rec_log=pair_rec_log, pair_ever=pair_ever,
             pair_count_log=pair_count_log)
 
@@ -244,7 +245,8 @@ class Trainer:
         to v's direct neighbours. Indexed CSR-style by unique-v; embedded by the SAME
         table. Strict-causal: same pre-ingest graph as the query-side walks.
 
-        -> conn_emb [B,C,M,d], conn_age [B,C,M] (raw, same units as tok_age),
+        -> conn_ids [B,C,M] (node ids, −1 at padding; head gathers embeddings),
+           conn_age [B,C,M] (raw, same units as tok_age),
            conn_mask [B,C,M] (True at a real connector). M = K_cand · L_cand."""
         device = self.device
         B, C = cand_t.shape
@@ -264,15 +266,15 @@ class Trainer:
         # its own edge recency (direct neighbours recent, deeper hops older).
         is_ctx = torch.arange(L, device=device).view(1, 1, L) < (lens - 1).unsqueeze(-1)
         n = K * L
-        emb_all = self.embedding_table(nodes.clamp_min(0)).view(Mv, n, -1)  # [Mv, n, d]
+        id_all = nodes.view(Mv, n)                             # [Mv, n] node ids (−1 pad)
         ts_all = ts.view(Mv, n)
         mask_all = is_ctx.view(Mv, n)
-        conn_emb = emb_all[v_inv].view(B, C, n, -1)            # [B, C, n, d]
+        conn_ids = id_all[v_inv].view(B, C, n)                # [B, C, n] long
         conn_ts = ts_all[v_inv].view(B, C, n)
         conn_mask = mask_all[v_inv].view(B, C, n)
         conn_age = ((t_query_t.view(B, 1, 1).float() - conn_ts).clamp_min(0.0)
-                    * conn_mask.float())                       # raw; 0 at masked slots
-        return conn_emb, conn_age, conn_mask
+                    * conn_mask.float())                      # raw; 0 at masked slots
+        return conn_ids, conn_age, conn_mask
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step

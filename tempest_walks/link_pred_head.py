@@ -76,6 +76,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class Time2Vec(nn.Module):
@@ -170,11 +171,11 @@ class GeometricPointHead(nn.Module):
 
     def _cross(self, eu: torch.Tensor, mu: torch.Tensor, r: torch.Tensor,
                a: torch.Tensor, b: torch.Tensor, alpha: torch.Tensor,
-               conn_emb: torch.Tensor, conn_age: torch.Tensor,
-               conn_mask: torch.Tensor) -> torch.Tensor:
+               conn_ids: torch.Tensor, conn_age: torch.Tensor,
+               conn_mask: torch.Tensor, e_weight: torch.Tensor) -> torch.Tensor:
         """Soft-min co-reachability logit per candidate.
 
-        Connectors are v's recent direct neighbours (sources that reached v), scored
+        Connectors are v's recent walk-neighbours (sources that reached v), scored
         against u's SAME μ / ellipse as the candidates, with a SEPARATE recency decay
         λ_cross (on RAW age; init dataset-derived low, then learned). The soft-min
         picks the single best recent, in-character connector; candidates with no
@@ -182,33 +183,50 @@ class GeometricPointHead(nn.Module):
 
            eu        [B, d]        unit source embedding (tangent base point)
            mu, r     [B, d]        predicted position and heading (from neighbours)
-           conn_emb  [B, C, M, d]  connector embeddings (M per candidate; padded slots arbitrary)
+           conn_ids  [B, C, M]     connector NODE IDS (M per candidate; −1 at padded slots)
            conn_age  [B, C, M]     connector age = t_query − t_edge ≥ 0 (RAW units)
            conn_mask [B, C, M]     bool, True at a real connector
+           e_weight  [N, d]        embedding matrix (connectors are gathered per chunk)
            -> [B, C]
-        """
-        ec = F.normalize(conn_emb, dim=-1)                         # [B, C, M, d]
-        gc = self._logmap(eu[:, None, None, :], ec)               # [B, C, M, d] in T_{E[u]}
-        delta = gc - mu[:, None, None, :]                         # [B, C, M, d]
-        d_conn = self._ellipse_dist_sq(delta, r, a, b).clamp_min(self.eps).sqrt()  # [B, C, M]
 
-        # soft-min over connectors: best (in-character AND recent), with the cross's
-        # OWN λ_cross on raw age (separate from μ's neighbour λ).
+        Chunked over candidates C and gradient-checkpointed in training: connector
+        embeddings are gathered from e_weight PER CHUNK (the full [B,C,M,d] is never
+        materialized — only [B,M] int ids), and the log-map intermediates are
+        recomputed in backward instead of stored. Numerically identical to a single
+        pass (the soft-min is per-candidate independent); bounds peak memory so
+        FREE-LENGTH walks (M = K_cand·L_cand) fit on a small GPU."""
         lam_cross = F.softplus(self.log_lambda_cross)
-        lw = (-alpha * d_conn - lam_cross * conn_age)            # [B, C, M]
-        lw = lw.masked_fill(~conn_mask, -1e9)                    # padded slots -> −∞-ish
-        cross = torch.logsumexp(lw, dim=-1)                      # [B, C]
+        C, M = conn_ids.shape[1], conn_ids.shape[2]
+        chunk = max(1, 2048 // max(M, 1))     # bound B·chunk·M·d across walk lengths
+        outs = []
+        for c0 in range(0, C, chunk):
+            sl = slice(c0, min(c0 + chunk, C))
+            args = (eu, mu, r, a, b, alpha, lam_cross,
+                    conn_ids[:, sl], conn_age[:, sl], conn_mask[:, sl], e_weight)
+            if self.training and torch.is_grad_enabled():
+                outs.append(checkpoint(self._cross_chunk, *args, use_reentrant=False))
+            else:
+                outs.append(self._cross_chunk(*args))
+        return torch.cat(outs, dim=1)                            # [B, C]
 
-        # candidate with no valid connector -> neutral 0 (also blocks gradient into
-        # padded connector slots for those rows).
-        has_conn = conn_mask.any(dim=-1)                         # [B, C]
-        return torch.where(has_conn, cross, torch.zeros_like(cross))
+    def _cross_chunk(self, eu, mu, r, a, b, alpha, lam_cross,
+                     conn_ids, conn_age, conn_mask, e_weight):
+        """One candidate-chunk of the soft-min (see _cross). Gathers connector
+        embeddings from e_weight here so the full [B,C,M,d] is never stored.
+        -> [B, chunk]."""
+        ec = F.normalize(F.embedding(conn_ids.clamp_min(0), e_weight), dim=-1)  # [B,c,M,d]
+        gc = self._logmap(eu[:, None, None, :], ec)               # [B, c, M, d]
+        delta = gc - mu[:, None, None, :]
+        d_conn = self._ellipse_dist_sq(delta, r, a, b).clamp_min(self.eps).sqrt()
+        lw = (-alpha * d_conn - lam_cross * conn_age).masked_fill(~conn_mask, -1e9)
+        cross = torch.logsumexp(lw, dim=-1)                       # [B, c]
+        return torch.where(conn_mask.any(dim=-1), cross, torch.zeros_like(cross))
 
     def forward(self, tok_emb: torch.Tensor, tok_age: torch.Tensor,
                 tok_mask: torch.Tensor, E_u: torch.Tensor, E_v: torch.Tensor,
                 rec_v_log: torch.Tensor,
-                conn_emb: torch.Tensor, conn_age: torch.Tensor,
-                conn_mask: torch.Tensor,
+                conn_ids: torch.Tensor, conn_age: torch.Tensor,
+                conn_mask: torch.Tensor, e_weight: torch.Tensor,
                 pair_rec_log: torch.Tensor = None,
                 pair_ever: torch.Tensor = None,
                 pair_count_log: torch.Tensor = None) -> torch.Tensor:
@@ -218,9 +236,10 @@ class GeometricPointHead(nn.Module):
            E_u     [B,d]    source embeddings (tangent-space BASE POINT).
            E_v     [B,C,d]  candidate embeddings.
            rec_v_log [B,C]  log1p(t_query − t_last[v]) candidate recency.
-           conn_emb [B,C,M,d]  v's recent direct-neighbour (connector) embeddings.
+           conn_ids [B,C,M]    v's connector NODE IDS (gathered from e_weight per chunk).
            conn_age [B,C,M]    connector edge age = t_query − t_edge (≥0, RAW units).
            conn_mask[B,C,M]    bool, True at a real connector.
+           e_weight [N,d]      embedding matrix (for the per-chunk connector gather).
            -> logits [B, C].
         """
         eu = F.normalize(E_u, dim=-1)                              # [B, d]
@@ -262,6 +281,6 @@ class GeometricPointHead(nn.Module):
 
         # --- co-reachability (cross) channel (same μ / ellipse; own λ_cross, raw age) -
         cross = self._cross(eu, mu, r, a, b, alpha,
-                            conn_emb, conn_age, conn_mask)         # [B, C]
+                            conn_ids, conn_age, conn_mask, e_weight)  # [B, C]
         logit = logit + self.coef_cross * cross
         return logit
