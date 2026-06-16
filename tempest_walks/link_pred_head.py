@@ -185,38 +185,21 @@ class GeometricPointHead(nn.Module):
            conn_ids  [B, C, M]     connector NODE IDS (M per candidate; −1 at padded slots)
            conn_age  [B, C, M]     connector age = t_query − t_edge ≥ 0 (RAW units)
            conn_mask [B, C, M]     bool, True at a real connector
-           e_weight  [N, d]        embedding matrix (connectors are gathered per chunk)
+           e_weight  [N, d]        embedding matrix (connectors gathered from it)
            -> [B, C]
 
-        Chunked over candidates C: connector embeddings are gathered from e_weight
-        PER CHUNK (the full [B,C,M,d] is never materialized — only [B,C,M] int ids),
-        which bounds the transient (and, at eval/no-grad, the peak) memory. Numerically
-        identical to a single pass (the soft-min is per-candidate independent)."""
-        lam_cross = F.softplus(self.log_lambda_cross)
-        B, C, M = conn_ids.shape
-        # Largest chunk whose [B, chunk, M, d] activation stays under a budget, so
-        # lengths that fit run in a SINGLE chunk (no loop overhead) and only oversized
-        # ones split. Budget on B·chunk·M keeps it train/eval-aware (B differs).
-        chunk = max(1, 2_000_000 // max(B * M, 1))
-        outs = []
-        for c0 in range(0, C, chunk):
-            sl = slice(c0, min(c0 + chunk, C))
-            outs.append(self._cross_chunk(
-                eu, mu, r, a, b, alpha, lam_cross,
-                conn_ids[:, sl], conn_age[:, sl], conn_mask[:, sl], e_weight))
-        return torch.cat(outs, dim=1)                            # [B, C]
-
-    def _cross_chunk(self, eu, mu, r, a, b, alpha, lam_cross,
-                     conn_ids, conn_age, conn_mask, e_weight):
-        """One candidate-chunk of the soft-min (see _cross). Gathers connector
-        embeddings from e_weight here so the full [B,C,M,d] is never stored.
-        -> [B, chunk]."""
-        ec = F.normalize(F.embedding(conn_ids.clamp_min(0), e_weight), dim=-1)  # [B,c,M,d]
-        gc = self._logmap(eu[:, None, None, :], ec)               # [B, c, M, d]
+        SINGLE PASS — no chunking, no checkpointing: the full [B,C,M,d] connector
+        activation is built in one shot, so peak memory scales with B·C·M·d and never
+        the speed. This is deliberately MEMORY-DEPENDENT: a larger GPU supports longer
+        candidate walks (larger M); a smaller GPU OOMs at high lengths. To go longer,
+        use a bigger GPU or fewer/shorter candidate walks (K_cand·L_cand)."""
+        ec = F.normalize(F.embedding(conn_ids.clamp_min(0), e_weight), dim=-1)  # [B,C,M,d]
+        gc = self._logmap(eu[:, None, None, :], ec)               # [B, C, M, d]
         delta = gc - mu[:, None, None, :]
-        d_conn = self._ellipse_dist_sq(delta, r, a, b).clamp_min(self.eps).sqrt()
+        d_conn = self._ellipse_dist_sq(delta, r, a, b).clamp_min(self.eps).sqrt()  # [B,C,M]
+        lam_cross = F.softplus(self.log_lambda_cross)
         lw = (-alpha * d_conn - lam_cross * conn_age).masked_fill(~conn_mask, -1e9)
-        cross = torch.logsumexp(lw, dim=-1)                       # [B, c]
+        cross = torch.logsumexp(lw, dim=-1)                       # [B, C]
         return torch.where(conn_mask.any(dim=-1), cross, torch.zeros_like(cross))
 
     def forward(self, tok_emb: torch.Tensor, tok_age: torch.Tensor,
