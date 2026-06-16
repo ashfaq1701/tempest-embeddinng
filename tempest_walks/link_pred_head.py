@@ -216,10 +216,10 @@ class GeometricPointHead(nn.Module):
            E_u     [B,d]    source embeddings (tangent-space BASE POINT).
            E_v     [B,C,d]  candidate embeddings.
            rec_v_log [B,C]  log1p(t_query − t_last[v]) candidate recency.
-           conn_ids [B,C,M]    v's connector NODE IDS (gathered from e_weight per chunk).
+           conn_ids [B,C,M]    v's connector NODE IDS (gathered from e_weight).
            conn_age [B,C,M]    connector edge age = t_query − t_edge (≥0, RAW units).
            conn_mask[B,C,M]    bool, True at a real connector.
-           e_weight [N,d]      embedding matrix (for the per-chunk connector gather).
+           e_weight [N,d]      embedding matrix (for the connector gather).
            -> logits [B, C].
         """
         eu = F.normalize(E_u, dim=-1)                              # [B, d]
