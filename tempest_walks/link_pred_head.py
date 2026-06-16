@@ -193,8 +193,11 @@ class GeometricPointHead(nn.Module):
         which bounds the transient (and, at eval/no-grad, the peak) memory. Numerically
         identical to a single pass (the soft-min is per-candidate independent)."""
         lam_cross = F.softplus(self.log_lambda_cross)
-        C, M = conn_ids.shape[1], conn_ids.shape[2]
-        chunk = max(1, 2048 // max(M, 1))     # bound B·chunk·M·d across walk lengths
+        B, C, M = conn_ids.shape
+        # Largest chunk whose [B, chunk, M, d] activation stays under a budget, so
+        # lengths that fit run in a SINGLE chunk (no loop overhead) and only oversized
+        # ones split. Budget on B·chunk·M keeps it train/eval-aware (B differs).
+        chunk = max(1, 2_000_000 // max(B * M, 1))
         outs = []
         for c0 in range(0, C, chunk):
             sl = slice(c0, min(c0 + chunk, C))
