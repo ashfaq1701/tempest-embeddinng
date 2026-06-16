@@ -76,7 +76,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 
 class Time2Vec(nn.Module):
@@ -189,24 +188,19 @@ class GeometricPointHead(nn.Module):
            e_weight  [N, d]        embedding matrix (connectors are gathered per chunk)
            -> [B, C]
 
-        Chunked over candidates C and gradient-checkpointed in training: connector
-        embeddings are gathered from e_weight PER CHUNK (the full [B,C,M,d] is never
-        materialized — only [B,M] int ids), and the log-map intermediates are
-        recomputed in backward instead of stored. Numerically identical to a single
-        pass (the soft-min is per-candidate independent); bounds peak memory so
-        FREE-LENGTH walks (M = K_cand·L_cand) fit on a small GPU."""
+        Chunked over candidates C: connector embeddings are gathered from e_weight
+        PER CHUNK (the full [B,C,M,d] is never materialized — only [B,C,M] int ids),
+        which bounds the transient (and, at eval/no-grad, the peak) memory. Numerically
+        identical to a single pass (the soft-min is per-candidate independent)."""
         lam_cross = F.softplus(self.log_lambda_cross)
         C, M = conn_ids.shape[1], conn_ids.shape[2]
         chunk = max(1, 2048 // max(M, 1))     # bound B·chunk·M·d across walk lengths
         outs = []
         for c0 in range(0, C, chunk):
             sl = slice(c0, min(c0 + chunk, C))
-            args = (eu, mu, r, a, b, alpha, lam_cross,
-                    conn_ids[:, sl], conn_age[:, sl], conn_mask[:, sl], e_weight)
-            if self.training and torch.is_grad_enabled():
-                outs.append(checkpoint(self._cross_chunk, *args, use_reentrant=False))
-            else:
-                outs.append(self._cross_chunk(*args))
+            outs.append(self._cross_chunk(
+                eu, mu, r, a, b, alpha, lam_cross,
+                conn_ids[:, sl], conn_age[:, sl], conn_mask[:, sl], e_weight))
         return torch.cat(outs, dim=1)                            # [B, C]
 
     def _cross_chunk(self, eu, mu, r, a, b, alpha, lam_cross,
