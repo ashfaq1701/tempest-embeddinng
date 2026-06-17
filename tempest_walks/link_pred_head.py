@@ -59,8 +59,14 @@ Design choices that make this consistent rather than a bolted-on second model:
     additive coef_cross BETWEEN channels. A sum over connectors would mean-pool and wash
     out the single relevant witness.
   - A candidate with no recent connectors contributes a neutral 0 (no −∞ leak).
-  - No degree gate yet (deferred): cross is a plain additive channel. The gate, if added
-    later, is a one-line g(deg_u)·cross in front of the cross term.
+  - Cross is a plain additive channel. Two conditioning mechanisms were tried and
+    REJECTED on tgbl-wiki (2×2 {gate}×{hop} grid, all cells within ~0.002 test of
+    baseline = inside the 0.015 noise band): a learnable source-DEGREE gate
+    g(deg_u)·cross (to silence cross on warm/repeat sources) and a connector
+    HOP-distance penalty −κ·(hop−1) in the logsumexp (a soft candidate-walk-length
+    sweep; longer reach was net-neutral-to-negative). The gate can't move wiki — its
+    target cold/new-pair slice is only ~13% of the data — so both are deferred to a
+    cold-start workload (review), where the cross channel is designed to matter.
 
 Lineage: an explicit angle term −β·θ was tried and dropped (redundant with ‖ν−μ‖ by
 the law of cosines, needed a ‖μ‖-floor guard). The Gaussian head's per-source
