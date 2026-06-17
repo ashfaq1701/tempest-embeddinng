@@ -109,9 +109,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-walk-len-candidate-side", default=2, type=int,
                    help="L for the candidate-side walks. 2 = v's direct neighbours "
                         "only; >2 reaches indirect (co-reachability) neighbours.")
-    p.add_argument("--walk-bias-candidate-side", default="Linear", type=str,
+    p.add_argument("--walk-bias-candidate-side", default="Uniform", type=str,
                    help="Per-hop edge bias for the candidate-side walks.")
-    p.add_argument("--start-bias-candidate-side", default="Linear", type=str,
+    p.add_argument("--start-bias-candidate-side", default="Uniform", type=str,
                    help="Initial-edge bias for the candidate-side walks.")
 
     # The link head (LinkPredHead) has no architecture knobs beyond
@@ -153,14 +153,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--weight-decay", default=1e-4, type=float)
     p.add_argument(
-        "--batch-size", default=500, type=int,
+        "--batch-size", default=200, type=int,
         help="Train batch size. Under the per-query ranking link "
              "loss each batch does B*(1+K_train) link_head forwards. "
              "Default 500 keeps the per-step compute envelope "
              "comparable to historical baselines.",
     )
     p.add_argument(
-        "--eval-batch-size", default=200, type=int,
+        "--eval-batch-size", default=20, type=int,
         help="Batch size for val/test eval batches. The link head "
              "materialises tensors of shape [eval_batch_size, 1+K_eval, "
              "d_emb] where K_eval is TGB's per-positive negative count "
@@ -311,7 +311,6 @@ def main() -> Dict[str, Any]:
     config = TrainerConfig(
         num_nodes=num_nodes,
         dst_pool=dst_pool,
-        t_train=float(stats.T_train),
 
         d_emb=args.d_emb,
 

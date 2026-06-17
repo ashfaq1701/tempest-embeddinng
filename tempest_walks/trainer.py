@@ -41,7 +41,6 @@ class TrainerConfig:
     # Dataset-derived.
     num_nodes: int
     dst_pool: np.ndarray
-    t_train: float              # train-split span; sets the cross λ_cross init scale (REQUIRED)
 
     # Model.
     d_emb: int = 128
@@ -101,7 +100,6 @@ class Trainer:
         self.link_head = GeometricPointHead(
             d_emb=int(config.d_emb),
             use_pair_features=config.use_pair_features,
-            t_train=float(config.t_train),
         ).to(self.device)
 
         # Streaming pairwise-interaction store feeding the pair features. Lifecycle
