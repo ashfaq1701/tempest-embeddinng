@@ -19,6 +19,13 @@ tangent spaces (T_{E[u]} vs T_{E[v]}), so Exp-mapping each to the sphere first i
 the geodesic well-defined. A cold node with no walk-neighbours has μ ≈ 0 ⇒ P = E[node], so
 geo degrades gracefully to −α·geodesic(E[u], E[v]) (the plain embedding distance).
 
+μ_v is computed ONCE PER UNIQUE candidate node and scattered to the [B,C] grid via v_inv —
+P_v depends only on v's walks + E[v] (the recency softmax is shift-invariant, so the query's
+t_query cancels), so per-cell recomputation is pure redundancy. This keeps the candidate
+activation at [Mv,M,d] instead of [B,C,M,d] (Mv = #unique candidates) — ~8-20× less memory
+and compute, exactly equal to the per-cell form (verified bit-identical). rec/pair stay
+per-[B,C] (they depend on t_query outside any softmax).
+
 Additive non-geometric channels (carried over from the proven point head, each with its own
 learnable per-channel coefficient so the model can rebalance):
   - rec  : candidate v's own staleness, ExpDecayBasis recency of Δt_v = t_query − t_last[v].
@@ -136,29 +143,36 @@ class DualMuHead(nn.Module):
     # ──────────────────────────────────────────────────────────────────
 
     def forward(self, tok_emb: torch.Tensor, tok_age: torch.Tensor,
-                tok_mask: torch.Tensor, E_u: torch.Tensor, E_v: torch.Tensor,
+                tok_mask: torch.Tensor, E_u: torch.Tensor,
                 rec_v_dt: torch.Tensor,
+                uniq_v_ids: torch.Tensor, v_inv: torch.Tensor,
                 cand_ids: torch.Tensor, cand_age: torch.Tensor,
                 cand_mask: torch.Tensor, e_weight: torch.Tensor,
                 pair_dt: torch.Tensor = None,
                 pair_count_log: torch.Tensor = None) -> torch.Tensor:
         """Source side (μ_u): tok_emb [B,n,d], tok_age [B,n], tok_mask [B,n], E_u [B,d].
-           Candidate side (μ_v): cand_ids/cand_age/cand_mask [B,C,M] (v's walk-neighbour
-           node ids gathered from e_weight [N,d]), E_v [B,C,d].
-           rec_v_dt [B,C] RAW Δt_v candidate staleness (→ basis_rec).
-           pair_dt [B,C] RAW Δt_uv, pair_count_log [B,C] log1p(count) — when pair on.
-           -> logits [B, C]."""
+           Candidate side (μ_v) — PER UNIQUE NODE (dedup): uniq_v_ids [Mv] the unique
+           candidate node ids, v_inv [B*C] scatters P_v back to the [B,C] grid, and
+           cand_ids/cand_age/cand_mask [Mv,M] are v's walk-neighbour node ids / per-batch-
+           reference ages / mask. P_v is computed once per unique v then indexed — the
+           [B,C,M,d] tensor never materialises (only [Mv,M,d]). Exact: μ_v is query-
+           independent (see _candidate_walk_tokens), so the dedup changes nothing.
+           rec_v_dt [B,C] RAW Δt_v candidate staleness (→ basis_rec); pair_dt/pair_count_log
+           [B,C] when pair on. -> logits [B, C]."""
+        B, C = rec_v_dt.shape
         eu = F.normalize(E_u, dim=-1)                                  # [B, d]
-        ev = F.normalize(E_v, dim=-1)                                  # [B, C, d]
 
         # --- geometric channel: P_u (u's walks) vs P_v (v's walks) ----------------
         ew_u = F.normalize(tok_emb, dim=-1)                            # [B, n, d]
         mu_u = self._mu(eu, ew_u, tok_age, tok_mask)                   # [B, d]
         P_u = self._expmap(eu, mu_u)                                   # [B, d]
 
-        ew_v = F.normalize(F.embedding(cand_ids.clamp_min(0), e_weight), dim=-1)  # [B,C,M,d]
-        mu_v = self._mu(ev, ew_v, cand_age, cand_mask)                 # [B, C, d]
-        P_v = self._expmap(ev, mu_v)                                   # [B, C, d]
+        # μ_v once per UNIQUE candidate node, then scatter via v_inv (no [B,C,M,d] blow-up).
+        ev_u = F.normalize(F.embedding(uniq_v_ids, e_weight), dim=-1)             # [Mv, d]
+        ew_v = F.normalize(F.embedding(cand_ids.clamp_min(0), e_weight), dim=-1)  # [Mv, M, d]
+        mu_v = self._mu(ev_u, ew_v, cand_age, cand_mask)              # [Mv, d]
+        P_v_u = self._expmap(ev_u, mu_v)                             # [Mv, d]
+        P_v = P_v_u[v_inv].view(B, C, -1)                           # [B, C, d] cheap index
 
         cos = (P_u.unsqueeze(1) * P_v).sum(-1).clamp(-1 + self.eps, 1 - self.eps)  # [B,C]
         geo = -self.alpha.clamp_min(1e-3) * torch.arccos(cos)         # [B, C] = −α·geodesic
