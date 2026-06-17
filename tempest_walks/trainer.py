@@ -224,9 +224,10 @@ class Trainer:
         # channel is on, the (u,v) last-interaction Δt — both RAW, both fed to the head's
         # ExpDecayBasis. Never-seen (u,v) → Δt=∞ ⇒ φ=0 (handled in PairRecencyStore).
         rec_v_dt = self.node_last.query(cand_t, t_query_t)       # [B, C] raw Δt
-        pair_dt = None
+        pair_dt = pair_count_log = None
         if self.pair_store is not None:
-            pair_dt = self.pair_store.query(src_t, cand_t, t_query_t)   # [B, C] raw Δt_uv
+            pair_dt, pair_count_log = self.pair_store.query(     # [B, C] raw Δt_uv, log1p(count)
+                src_t, cand_t, t_query_t)
 
         # Candidate-side connectors (co-reachability): v's walk-neighbourhood as IDS
         # (the head gathers embeddings per chunk from the table to bound memory).
@@ -235,7 +236,7 @@ class Trainer:
         return self.link_head(
             tok_emb, tok_age, tok_mask, E_u, E_v, rec_v_dt,
             conn_ids, conn_age, conn_mask, self.embedding_table.E.weight,
-            pair_dt=pair_dt)
+            pair_dt=pair_dt, pair_count_log=pair_count_log)
 
     def _candidate_connectors(self, cand_t: torch.Tensor, t_query_t: torch.Tensor):
         """v's walk-neighbourhood for the co-reachability channel (FREE LENGTH).

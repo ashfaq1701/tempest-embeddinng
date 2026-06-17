@@ -49,10 +49,11 @@ class PairRecencyStore:
 
     @torch.no_grad()
     def query(self, src: torch.Tensor, cand: torch.Tensor, t_query: torch.Tensor):
-        """src [B] long, cand [B, C] long, t_query [B] long -> pair_dt [B, C] RAW Δt_uv
-        on cand.device (fed to the head's ExpDecayBasis). Real pairs: Δt = t_query −
-        t_last[(u,v)] (clamped ≥0). NEVER-seen pairs (count==0): Δt = +inf (1e18) ⇒
-        φ → 0, a clean baseline distinct from any real pair — no ever-bit/count/sentinel."""
+        """src [B] long, cand [B, C] long, t_query [B] long ->
+        (pair_dt [B, C], pair_count_log [B, C]) on cand.device.
+          pair_dt        : RAW Δt_uv = t_query − t_last[(u,v)] (clamped ≥0; → ExpDecayBasis).
+                           NEVER-seen (count==0) ⇒ Δt = +inf (1e18) ⇒ φ → 0 (clean baseline).
+          pair_count_log : log1p(#(u,v) interactions) (0 for never-seen → no count term)."""
         device = cand.device
         B, C = cand.shape
         s = src.detach().to("cpu", torch.int64).numpy()
@@ -65,7 +66,9 @@ class PairRecencyStore:
         cnt = out["count"].reshape(B, C)
         rec = np.clip(tq[:, None] - last, 0, None).astype(np.float32)
         rec[cnt == 0] = 1e18                                       # never-seen ⇒ Δt=∞ ⇒ φ=0
-        return torch.from_numpy(rec).to(device)
+        count_log = np.log1p(cnt.astype(np.float32))               # 0 for never-seen
+        return (torch.from_numpy(rec).to(device),
+                torch.from_numpy(count_log).to(device))
 
 
 class NodeLastSeenStore:

@@ -163,6 +163,10 @@ class GeometricPointHead(nn.Module):
         self.coef_rec = nn.Parameter(torch.ones(1))
         if use_pair_features:
             self.coef_pair = nn.Parameter(torch.ones(1))
+            # (u,v) interaction-COUNT term: coef_pair_count · log1p(count). A separate
+            # learnable scalar gain (init 0 ⇒ off, earns its weight). Never-seen pair →
+            # count=0 → log1p=0 → no contribution (same clean baseline as the recency).
+            self.coef_pair_count = nn.Parameter(torch.zeros(1))
 
         # --- co-reachability (cross) channel -----------------------------------
         # Reuses μ and the ellipse (a, b, heading r, α) from the geometric channel.
@@ -234,7 +238,8 @@ class GeometricPointHead(nn.Module):
                 rec_v_dt: torch.Tensor,
                 conn_ids: torch.Tensor, conn_age: torch.Tensor,
                 conn_mask: torch.Tensor, e_weight: torch.Tensor,
-                pair_dt: torch.Tensor = None) -> torch.Tensor:
+                pair_dt: torch.Tensor = None,
+                pair_count_log: torch.Tensor = None) -> torch.Tensor:
         """tok_emb [B,n,d]  source walk-neighbour embeddings (context only).
            tok_age [B,n]    age = t_query − t_node per token (≥0, RAW units).
            tok_mask[B,n]    bool, True at real neighbour positions.
@@ -278,7 +283,8 @@ class GeometricPointHead(nn.Module):
         logit = self.coef_geo * geo + self.coef_rec * rec
         if self.use_pair_features:
             pair = self.pair_head(self.basis_pair(pair_dt)).squeeze(-1)  # [B, C]
-            logit = logit + self.coef_pair * pair
+            logit = (logit + self.coef_pair * pair
+                     + self.coef_pair_count * pair_count_log)
 
         # --- co-reachability (cross) channel (same μ / ellipse; own ρ_cross, raw age) -
         cross = self._cross(eu, mu, r, a, b, alpha,
