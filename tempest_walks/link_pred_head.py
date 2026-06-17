@@ -27,10 +27,13 @@ learnable per-channel coefficient so the model can rebalance):
            (init 0 ⇒ off, earns its weight). The proven recurrence win; a no-grad-to-E
            additive logit bias that sharpens scores without touching the sphere geometry.
 
-TIME UNITS — ages are RAW (t_query − t_edge), never normalized at runtime. μ is a softmax
-(scale-invariant) so raw age is exact (λ self-scales). The rec/pair ExpDecayBasis is scale-
-free on raw Δt by construction (log-spaced rates from 1/t_train to 1; a never-seen event
-Δt→∞ maps to φ=0 for free). t_train sets the basis init only — never a per-step scaler.
+TIME UNITS — ages are RAW (t_query − t_edge), never normalized at runtime. The μ softmax
+is scale-invariant in the LIMIT, but its INIT temperature is not: λ is initialised ≈ 1/t_train
+so λ·(typical raw age) ~ O(1) and λ actually trains — at the naive λ≈O(1) init the softmax
+saturates to a hard argmax and ∂loss/∂λ → 0 (λ pinned, μ frozen as "the single most-recent
+neighbour"). The rec/pair ExpDecayBasis is scale-free on raw Δt by construction (log-spaced
+rates from 1/t_train to 1; a never-seen event Δt→∞ maps to φ=0 for free). t_train sets these
+inits only — never a per-step scaler.
 
 E stays the single sphere parameter (link-trained, no detach).
 """
@@ -72,8 +75,14 @@ class DualMuHead(nn.Module):
 
         # --- geometric channel: μ_u ↔ μ_v geodesic --------------------------------
         # λ = softplus(log_lambda) ≥ 0, shared by both μ's (source/candidate symmetric),
-        # on RAW age inside the μ softmax (scale-invariant, so λ self-scales).
-        self.log_lambda = nn.Parameter(torch.zeros(1))    # λ = softplus(·) ≥ 0  (recency)
+        # on RAW age inside the μ softmax. The softmax is scale-invariant in the LIMIT,
+        # but its INIT temperature is NOT: with λ·age ≫ 1 the softmax saturates to a hard
+        # argmax and ∂softmax/∂λ → 0, so λ stays pinned and never trains. Init λ ≈ 1/t_train
+        # so λ·(typical raw age) ~ O(1) — unsaturated, so λ actually adapts. (raw age kept
+        # everywhere; this only fixes the init temperature.) softplus⁻¹(x)=log(expm1(x)).
+        lam0 = 1.0 / max(float(t_train), 1.0)
+        self.log_lambda = nn.Parameter(
+            torch.tensor([math.log(math.expm1(lam0))], dtype=torch.float32))
         self.alpha = nn.Parameter(torch.tensor(10.0))     # geodesic → logit scale
 
         # --- rec channel: candidate v's own staleness -----------------------------
