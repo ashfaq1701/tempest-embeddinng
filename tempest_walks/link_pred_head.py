@@ -168,6 +168,19 @@ class GeometricPointHead(nn.Module):
         if use_hop_weight:
             self.log_kappa = nn.Parameter(torch.zeros(1))
 
+        # --- source-degree gate on the cross channel (optional) ----------------
+        # Cross helps the cold/new-pair slice but pollutes the warm/repeat slice
+        # (the soft-min finds SOME in-character editor on any popular page). A single
+        # coef_cross can't separate them; this gate scales cross by (1−g) where
+        # g = sigmoid(w_gate·log1p(deg_u) + b_gate) keyed on the SOURCE degree:
+        # cross loud on cold (low-degree) u, silenced on warm (high-degree) u once
+        # w_gate learns positive. b_gate=2.0 ⇒ gate starts mostly closed (cross earns
+        # its way in; with coef_cross=0 init, cross is off at init). log1p(deg) (not
+        # raw) so the train→eval degree inflation is a gentle monotone extrapolation.
+        # Applied per-source, broadcast over candidates; off ⇒ deg_u=None ⇒ skipped.
+        self.w_gate = nn.Parameter(torch.zeros(1))
+        self.b_gate = nn.Parameter(torch.full((1,), 2.0))
+
     def _logmap(self, p: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """Sphere log-map at base point p (closed form = geoopt.Sphere().logmap)."""
         c = (p * x).sum(-1, keepdim=True).clamp(-1 + self.eps, 1 - self.eps)
@@ -235,7 +248,8 @@ class GeometricPointHead(nn.Module):
                 e_weight: torch.Tensor,
                 pair_rec_log: torch.Tensor = None,
                 pair_ever: torch.Tensor = None,
-                pair_count_log: torch.Tensor = None) -> torch.Tensor:
+                pair_count_log: torch.Tensor = None,
+                deg_u: torch.Tensor = None) -> torch.Tensor:
         """tok_emb [B,n,d]  source walk-neighbour embeddings (context only).
            tok_age [B,n]    age = t_query − t_node per token (≥0, RAW units).
            tok_mask[B,n]    bool, True at real neighbour positions.
@@ -290,5 +304,9 @@ class GeometricPointHead(nn.Module):
         # --- co-reachability (cross) channel (same μ / ellipse; own λ_cross, raw age) -
         cross = self._cross(eu, mu, r, a, b, alpha,
                             conn_ids, conn_age, conn_hop, conn_mask, e_weight)  # [B, C]
+        if deg_u is not None:
+            # source-degree gate: open on cold u, closed on warm u (w_gate learns +)
+            g = torch.sigmoid(self.w_gate * torch.log1p(deg_u) + self.b_gate)  # [B]
+            cross = (1.0 - g).unsqueeze(-1) * cross                            # [B, C]
         logit = logit + self.coef_cross * cross
         return logit

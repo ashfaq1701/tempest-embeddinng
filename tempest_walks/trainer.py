@@ -60,6 +60,11 @@ class TrainerConfig:
     # default => baseline byte-identical.
     use_hop_weight: bool = False
 
+    # Source-degree gate on the cross channel: scale cross by (1−sigmoid(w·log1p(deg_u)
+    # +b)) keyed on the source's current degree — cross loud on cold u, silenced on
+    # warm u. Off by default => deg_u=None => gate skipped => baseline byte-identical.
+    use_degree_gate: bool = False
+
     # Walks (BACKWARD only, undirected). Decoupled QUERY-side (source u → μ) and
     # CANDIDATE-side (v → connectors for the cross channel), both sampled from the
     # SAME Tempest graph via per-call overrides (no second store, no extra ingest).
@@ -236,11 +241,18 @@ class Trainer:
         conn_ids, conn_age, conn_hop, conn_mask = self._candidate_connectors(
             cand_t, t_query_t)
 
+        # Source-degree gate key (per-source, pre-ingest ⇒ strict-causal). None when
+        # the gate is off ⇒ the head's None-check skips it (byte-identical baseline).
+        deg_u = None
+        if self.config.use_degree_gate:
+            deg_u = torch.from_numpy(
+                self.walk_gen.node_degrees(src_t.cpu().numpy())).to(device).float()  # [B]
+
         return self.link_head(
             tok_emb, tok_age, tok_mask, E_u, E_v, rec_v_log,
             conn_ids, conn_age, conn_hop, conn_mask, self.embedding_table.E.weight,
             pair_rec_log=pair_rec_log, pair_ever=pair_ever,
-            pair_count_log=pair_count_log)
+            pair_count_log=pair_count_log, deg_u=deg_u)
 
     def _candidate_connectors(self, cand_t: torch.Tensor, t_query_t: torch.Tensor):
         """v's walk-neighbourhood for the co-reachability channel (FREE LENGTH).

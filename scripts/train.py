@@ -89,6 +89,13 @@ def parse_args() -> argparse.Namespace:
              "(init 0.69) — a soft continuous length sweep on the connector set. "
              "Off => baseline. (No query-side term; it was inert on wiki.)",
     )
+    p.add_argument(
+        "--use-degree-gate", action="store_true",
+        help="Source-degree gate on the cross channel: scale cross by "
+             "(1−sigmoid(w·log1p(deg_u)+b)) keyed on the source's degree — cross loud "
+             "on cold/new-pair sources, silenced on warm/repeat sources. Learnable "
+             "w,b (b init 2.0 => starts mostly closed). Off => baseline.",
+    )
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
     p.add_argument(
@@ -328,6 +335,7 @@ def main() -> Dict[str, Any]:
 
         use_pair_features=args.use_pair_features,
         use_hop_weight=args.use_hop_weight,
+        use_degree_gate=args.use_degree_gate,
 
         num_walks_per_node_query_side=args.num_walks_per_node_query_side,
         max_walk_len_query_side=args.max_walk_len_query_side,

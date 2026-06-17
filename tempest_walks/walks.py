@@ -66,6 +66,12 @@ class WalkGenerator:
         """Drop all ingested edges. Call at the start of each epoch."""
         self.trw.clear()
 
+    def node_degrees(self, nodes: np.ndarray) -> np.ndarray:
+        """Total degree (undirected ⇒ u's edit count) of each node in the CURRENT
+        pre-ingest graph. Strict-causal: query before add_edges, same as the walks."""
+        return self.trw.get_node_degrees(
+            np.ascontiguousarray(nodes, dtype=np.int32), "Backward_In_Time")
+
     def add_edges(self, src: np.ndarray, tgt: np.ndarray, ts: np.ndarray,
                   edge_feat: Optional[np.ndarray] = None) -> None:
         """Ingest a batch of edges. STRICT-CAUSAL: call AFTER scoring."""
