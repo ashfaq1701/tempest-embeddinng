@@ -102,6 +102,23 @@ class Time2Vec(nn.Module):
         return torch.cat([lin, per], dim=-1)
 
 
+class ExpDecayBasis(nn.Module):
+    """Multi-rate exponential-decay staleness encoder: φ(Δt) = [exp(−ρ_k·Δt)]_{k=1..K}.
+    ρ_k = exp(log_rates_k) > 0 learnable, log-spaced init from 1/t_train (train-span
+    scale) to 1 (most-recent scale). The Hawkes/TPP recency feature — scale-free on RAW
+    Δt, bounded [0,1], monotone, multi-timescale — replacing Time2Vec(log1p(t)). A
+    never-seen event (Δt → +inf, encoded as a huge value) maps to φ = 0 for free."""
+
+    def __init__(self, dim: int, t_train: float):
+        super().__init__()
+        r_lo = -math.log(max(float(t_train), 1.0))    # ρ ≈ 1/t_train
+        r_hi = 0.0                                    # ρ ≈ 1
+        self.log_rates = nn.Parameter(torch.linspace(r_lo, r_hi, dim))   # [K]
+
+    def forward(self, dt: torch.Tensor) -> torch.Tensor:   # dt [...]  raw Δt ≥ 0
+        return torch.exp(-torch.exp(self.log_rates) * dt.unsqueeze(-1))  # [..., K]
+
+
 class GeometricPointHead(nn.Module):
     def __init__(self, d_emb: int, d_time: int = 16,
                  use_pair_features: bool = False, t_train: float = 1.0):
@@ -128,12 +145,15 @@ class GeometricPointHead(nn.Module):
         self.log_b = nn.Parameter(torch.zeros(1))         # tangential (off-heading)
 
         # --- proven additive terms (optional) ----------------------------------
-        self.t2v_rec = Time2Vec(d_time)
+        # rec channel: candidate v's own recency, exp-decay basis on RAW Δt_v.
+        self.basis_rec = ExpDecayBasis(d_time, t_train)
         self.rec_head = nn.Linear(d_time, 1)
         self.use_pair_features = use_pair_features
         if use_pair_features:
-            self.t2v_pair = Time2Vec(d_time)
-            self.pair_head = nn.Linear(d_time + 2, 1)
+            # pair channel (FLAGGED): (u,v) last-interaction recency, exp-decay basis on
+            # RAW Δt_uv. Never-seen pair → Δt huge → basis 0 (no ever-bit/count needed).
+            self.basis_pair = ExpDecayBasis(d_time, t_train)
+            self.pair_head = nn.Linear(d_time, 1)
 
         # --- learnable per-channel mix coefficients (init 1 = plain sum) --------
         # One learnable gain per channel (on the raw channels) so the model can
@@ -211,18 +231,16 @@ class GeometricPointHead(nn.Module):
 
     def forward(self, tok_emb: torch.Tensor, tok_age: torch.Tensor,
                 tok_mask: torch.Tensor, E_u: torch.Tensor, E_v: torch.Tensor,
-                rec_v_log: torch.Tensor,
+                rec_v_dt: torch.Tensor,
                 conn_ids: torch.Tensor, conn_age: torch.Tensor,
                 conn_mask: torch.Tensor, e_weight: torch.Tensor,
-                pair_rec_log: torch.Tensor = None,
-                pair_ever: torch.Tensor = None,
-                pair_count_log: torch.Tensor = None) -> torch.Tensor:
+                pair_dt: torch.Tensor = None) -> torch.Tensor:
         """tok_emb [B,n,d]  source walk-neighbour embeddings (context only).
            tok_age [B,n]    age = t_query − t_node per token (≥0, RAW units).
            tok_mask[B,n]    bool, True at real neighbour positions.
            E_u     [B,d]    source embeddings (tangent-space BASE POINT).
            E_v     [B,C,d]  candidate embeddings.
-           rec_v_log [B,C]  log1p(t_query − t_last[v]) candidate recency.
+           rec_v_dt [B,C]   RAW Δt = t_query − t_last[v] candidate recency (→ basis_rec).
            conn_ids [B,C,M]    v's connector NODE IDS (gathered from e_weight).
            conn_age [B,C,M]    connector edge age = t_query − t_edge (≥0, RAW units).
            conn_mask[B,C,M]    bool, True at a real connector.
@@ -256,14 +274,10 @@ class GeometricPointHead(nn.Module):
 
         # --- channels combined with learnable per-channel coefficients ---------
         geo = -alpha * d                                          # [B, C]
-        rec = self.rec_head(self.t2v_rec(rec_v_log)).squeeze(-1)  # [B, C]
+        rec = self.rec_head(self.basis_rec(rec_v_dt)).squeeze(-1)  # [B, C]
         logit = self.coef_geo * geo + self.coef_rec * rec
         if self.use_pair_features:
-            feat = torch.cat(
-                [self.t2v_pair(pair_rec_log),
-                 pair_ever.unsqueeze(-1), pair_count_log.unsqueeze(-1)],
-                dim=-1)
-            pair = self.pair_head(feat).squeeze(-1)               # [B, C]
+            pair = self.pair_head(self.basis_pair(pair_dt)).squeeze(-1)  # [B, C]
             logit = logit + self.coef_pair * pair
 
         # --- co-reachability (cross) channel (same μ / ellipse; own ρ_cross, raw age) -

@@ -112,7 +112,7 @@ class Trainer:
         # mirrors walk_gen: reset() per epoch, update() after scoring, query() at
         # scoring time.
         self.pair_store = (
-            PairRecencyStore(num_nodes=config.num_nodes, t_train=config.t_train)
+            PairRecencyStore(num_nodes=config.num_nodes)
             if config.use_pair_features else None
         )
 
@@ -220,23 +220,22 @@ class Trainer:
         E_u = self.embedding_table(src_t)                       # [B, d]   base point E[u]
         E_v = self.embedding_table(cand_t)                      # [B, C, d]
 
-        # Candidate recency from the per-node last-seen store; pair features from the
-        # pairwise store. Both are optional additive logit terms in the head.
-        rec_v_log = self.node_last.query(cand_t, t_query_t)      # [B, C]
-        pair_rec_log = pair_ever = pair_count_log = None
+        # Candidate v's own recency Δt (per-node last-seen store) and, when the pair
+        # channel is on, the (u,v) last-interaction Δt — both RAW, both fed to the head's
+        # ExpDecayBasis. Never-seen (u,v) → Δt=∞ ⇒ φ=0 (handled in PairRecencyStore).
+        rec_v_dt = self.node_last.query(cand_t, t_query_t)       # [B, C] raw Δt
+        pair_dt = None
         if self.pair_store is not None:
-            pair_rec_log, pair_ever, pair_count_log = self.pair_store.query(
-                src_t, cand_t, t_query_t)
+            pair_dt = self.pair_store.query(src_t, cand_t, t_query_t)   # [B, C] raw Δt_uv
 
         # Candidate-side connectors (co-reachability): v's walk-neighbourhood as IDS
         # (the head gathers embeddings per chunk from the table to bound memory).
         conn_ids, conn_age, conn_mask = self._candidate_connectors(cand_t, t_query_t)
 
         return self.link_head(
-            tok_emb, tok_age, tok_mask, E_u, E_v, rec_v_log,
+            tok_emb, tok_age, tok_mask, E_u, E_v, rec_v_dt,
             conn_ids, conn_age, conn_mask, self.embedding_table.E.weight,
-            pair_rec_log=pair_rec_log, pair_ever=pair_ever,
-            pair_count_log=pair_count_log)
+            pair_dt=pair_dt)
 
     def _candidate_connectors(self, cand_t: torch.Tensor, t_query_t: torch.Tensor):
         """v's walk-neighbourhood for the co-reachability channel (FREE LENGTH).
