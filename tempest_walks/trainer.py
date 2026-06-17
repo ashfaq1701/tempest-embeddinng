@@ -66,8 +66,8 @@ class TrainerConfig:
     start_bias_query_side: str = "ExponentialWeight"
     num_walks_per_node_candidate_side: int = 10
     max_walk_len_candidate_side: int = 2
-    walk_bias_candidate_side: str = "ExponentialWeight"
-    start_bias_candidate_side: str = "ExponentialWeight"
+    walk_bias_candidate_side: str = "Linear"
+    start_bias_candidate_side: str = "Linear"
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
     # Optimisation. Single RiemannianAdam over {E, GRU, scale}: E (the lone
