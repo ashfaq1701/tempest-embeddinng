@@ -109,9 +109,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-walk-len-candidate-side", default=2, type=int,
                    help="L for the candidate-side walks. 2 = v's direct neighbours "
                         "only; >2 reaches indirect (co-reachability) neighbours.")
-    p.add_argument("--walk-bias-candidate-side", default="Uniform", type=str,
+    p.add_argument("--walk-bias-candidate-side", default="Linear", type=str,
                    help="Per-hop edge bias for the candidate-side walks.")
-    p.add_argument("--start-bias-candidate-side", default="Uniform", type=str,
+    p.add_argument("--start-bias-candidate-side", default="Linear", type=str,
                    help="Initial-edge bias for the candidate-side walks.")
 
     # The link head (LinkPredHead) has no architecture knobs beyond
@@ -155,9 +155,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--batch-size", default=200, type=int,
         help="Train batch size. Under the per-query ranking link "
-             "loss each batch does B*(1+K_train) link_head forwards. "
-             "Default 500 keeps the per-step compute envelope "
-             "comparable to historical baselines.",
+             "loss each batch does B*(1+K_train) link_head forwards.",
     )
     p.add_argument(
         "--eval-batch-size", default=20, type=int,

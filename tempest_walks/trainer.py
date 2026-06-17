@@ -42,8 +42,9 @@ class TrainerConfig:
     num_nodes: int
     dst_pool: np.ndarray
 
-    # Frozen train-split span — used ONLY by the pair-feature recency cap (never-seen
-    # sentinel in PairRecencyStore); ignored when use_pair_features is off.
+    # Frozen train-split span. Two uses: the head's cross-channel decay λ_cross init
+    # (≈0.1/t_train, so the raw-age logsumexp stays O(0.1) at init) and the pair-feature
+    # recency cap (never-seen sentinel in PairRecencyStore).
     t_train: float = 1.0
 
     # Model.
@@ -104,6 +105,7 @@ class Trainer:
         self.link_head = GeometricPointHead(
             d_emb=int(config.d_emb),
             use_pair_features=config.use_pair_features,
+            t_train=float(config.t_train),
         ).to(self.device)
 
         # Streaming pairwise-interaction store feeding the pair features. Lifecycle
