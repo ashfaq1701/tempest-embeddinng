@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
-from .link_pred_head import GeometricPointHead
+from .link_pred_head import DualMuHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
 from .pair_store import NodeLastSeenStore, PairRecencyStore
@@ -59,20 +59,20 @@ class TrainerConfig:
     # one logit term. Off by default => baseline byte-identical.
     use_pair_features: bool = False
 
-    # Walks (BACKWARD only, undirected). Decoupled QUERY-side (source u → μ) and
-    # CANDIDATE-side (v → connectors for the cross channel), both sampled from the
-    # SAME Tempest graph via per-call overrides (no second store, no extra ingest).
-    # Candidate-side is a FREE-LENGTH walk-neighbourhood (all context nodes of v's
-    # walks become connectors, parallel to the query side), not just direct
-    # neighbours — max_walk_len_candidate_side controls the reach (2 = direct only).
+    # Walks (BACKWARD only, undirected). The QUERY side feeds μ_u (source u's
+    # walk-neighbours) and the CANDIDATE side feeds μ_v (candidate v's walk-neighbours)
+    # — SYMMETRIC: each μ is a recency-weighted mean over its node's walk-neighbours
+    # (all context nodes, seed + padding excluded). Both sampled from the SAME Tempest
+    # graph via per-call overrides (no second store, no extra ingest). For the dual-μ
+    # head the candidate side should MIRROR the query side (default to matching args).
     num_walks_per_node_query_side: int = 5
     max_walk_len_query_side: int = 20
     walk_bias_query_side: str = "ExponentialWeight"
     start_bias_query_side: str = "ExponentialWeight"
-    num_walks_per_node_candidate_side: int = 10
-    max_walk_len_candidate_side: int = 2
-    walk_bias_candidate_side: str = "Linear"
-    start_bias_candidate_side: str = "Linear"
+    num_walks_per_node_candidate_side: int = 5
+    max_walk_len_candidate_side: int = 20
+    walk_bias_candidate_side: str = "ExponentialWeight"
+    start_bias_candidate_side: str = "ExponentialWeight"
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
     # Optimisation. Single RiemannianAdam over {E, GRU, scale}: E (the lone
@@ -103,7 +103,7 @@ class Trainer:
         self.embedding_table = EmbeddingTable(
             num_nodes=config.num_nodes, d_emb=config.d_emb,
         ).to(self.device)
-        self.link_head = GeometricPointHead(
+        self.link_head = DualMuHead(
             d_emb=int(config.d_emb),
             use_pair_features=config.use_pair_features,
             t_train=float(config.t_train),
@@ -230,29 +230,30 @@ class Trainer:
             pair_dt, pair_count_log = self.pair_store.query(     # [B, C] raw Δt_uv, log1p(count)
                 src_t, cand_t, t_query_t)
 
-        # Candidate-side connectors (co-reachability): v's walk-neighbourhood as IDS
-        # (the head gathers embeddings per chunk from the table to bound memory).
-        conn_ids, conn_age, conn_mask = self._candidate_connectors(cand_t, t_query_t)
+        # Candidate-side walk-neighbours for μ_v: v's walk-neighbourhood as IDS
+        # (the head gathers embeddings from the table to build μ_v), symmetric to the
+        # source tokens that build μ_u.
+        cand_ids, cand_age, cand_mask = self._candidate_walk_tokens(cand_t, t_query_t)
 
         return self.link_head(
             tok_emb, tok_age, tok_mask, E_u, E_v, rec_v_dt,
-            conn_ids, conn_age, conn_mask, self.embedding_table.E.weight,
+            cand_ids, cand_age, cand_mask, self.embedding_table.E.weight,
             pair_dt=pair_dt, pair_count_log=pair_count_log)
 
-    def _candidate_connectors(self, cand_t: torch.Tensor, t_query_t: torch.Tensor):
-        """v's walk-neighbourhood for the co-reachability channel (FREE LENGTH).
+    def _candidate_walk_tokens(self, cand_t: torch.Tensor, t_query_t: torch.Tensor):
+        """v's walk-neighbour token set for μ_v — symmetric to the source side.
 
         For every UNIQUE candidate v, sample CANDIDATE-side BACKWARD walks on the SAME
         Tempest graph (per-call overrides — no second store). ALL context nodes of
-        those walks (seed v and padding excluded) become connectors — direct AND
-        indirect neighbours, each with its own edge time — exactly parallel to how the
-        query side exposes u's walk-neighbours. max_walk_len_candidate_side=2 reduces
-        to v's direct neighbours. Indexed CSR-style by unique-v; embedded by the SAME
-        table. Strict-causal: same pre-ingest graph as the query-side walks.
+        those walks (seed v and padding excluded) become v's walk-neighbour tokens —
+        exactly parallel to how the query side exposes u's walk-neighbours for μ_u. The
+        head builds μ_v = recency-weighted mean of Log_{E[v]}(E[token]) from these.
+        Indexed CSR-style by unique-v; embedded by the SAME table. Strict-causal: same
+        pre-ingest graph as the query-side walks.
 
-        -> conn_ids [B,C,M] (node ids, −1 at padding; head gathers embeddings),
-           conn_age [B,C,M] (raw, same units as tok_age),
-           conn_mask [B,C,M] (True at a real connector). M = K_cand · L_cand."""
+        -> cand_ids [B,C,M] (node ids, −1 at padding; head gathers embeddings),
+           cand_age [B,C,M] (raw, same units as tok_age),
+           cand_mask [B,C,M] (True at a real walk-neighbour). M = K_cand · L_cand."""
         device = self.device
         B, C = cand_t.shape
         uniq_v, v_inv = torch.unique(cand_t.reshape(-1), return_inverse=True)  # [Mv],[B*C]
@@ -267,19 +268,19 @@ class Trainer:
         ts = wc.timestamps.to(device).view(Mv, K, L).float()
         lens = wc.lens.to(device).view(Mv, K)
         # Context = real walk-neighbours: exclude the seed v (slot lens-1) and padding.
-        # ts[p] is the time of edge (nodes[p], nodes[p+1]), so each connector carries
+        # ts[p] is the time of edge (nodes[p], nodes[p+1]), so each neighbour carries
         # its own edge recency (direct neighbours recent, deeper hops older).
         is_ctx = torch.arange(L, device=device).view(1, 1, L) < (lens - 1).unsqueeze(-1)
         n = K * L
         id_all = nodes.view(Mv, n)                             # [Mv, n] node ids (−1 pad)
         ts_all = ts.view(Mv, n)
         mask_all = is_ctx.view(Mv, n)
-        conn_ids = id_all[v_inv].view(B, C, n)                # [B, C, n] long
-        conn_ts = ts_all[v_inv].view(B, C, n)
-        conn_mask = mask_all[v_inv].view(B, C, n)
-        conn_age = ((t_query_t.view(B, 1, 1).float() - conn_ts).clamp_min(0.0)
-                    * conn_mask.float())                      # raw; 0 at masked slots
-        return conn_ids, conn_age, conn_mask
+        cand_ids = id_all[v_inv].view(B, C, n)                # [B, C, n] long
+        cand_ts = ts_all[v_inv].view(B, C, n)
+        cand_mask = mask_all[v_inv].view(B, C, n)
+        cand_age = ((t_query_t.view(B, 1, 1).float() - cand_ts).clamp_min(0.0)
+                    * cand_mask.float())                      # raw; 0 at masked slots
+        return cand_ids, cand_age, cand_mask
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step

@@ -102,15 +102,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start-bias-query-side", default="ExponentialWeight", type=str,
                    help="Initial-edge bias for the query-side backward walks.")
 
-    p.add_argument("--num-walks-per-node-candidate-side", default=10, type=int,
-                   help="K walks per candidate v; their context nodes are the cross "
-                        "channel's connectors (FREE LENGTH — direct + indirect).")
-    p.add_argument("--max-walk-len-candidate-side", default=2, type=int,
-                   help="L for the candidate-side walks. 2 = v's direct neighbours "
-                        "only; >2 reaches indirect (co-reachability) neighbours.")
-    p.add_argument("--walk-bias-candidate-side", default="Linear", type=str,
+    p.add_argument("--num-walks-per-node-candidate-side", default=5, type=int,
+                   help="K walks per candidate v; their context nodes build μ_v "
+                        "(symmetric to the query side's μ_u). Mirror the query side.")
+    p.add_argument("--max-walk-len-candidate-side", default=20, type=int,
+                   help="L for the candidate-side walks that feed μ_v. Mirror the "
+                        "query side (--max-walk-len-query-side) for a symmetric head.")
+    p.add_argument("--walk-bias-candidate-side", default="ExponentialWeight", type=str,
                    help="Per-hop edge bias for the candidate-side walks.")
-    p.add_argument("--start-bias-candidate-side", default="Linear", type=str,
+    p.add_argument("--start-bias-candidate-side", default="ExponentialWeight", type=str,
                    help="Initial-edge bias for the candidate-side walks.")
 
     # The link head (LinkPredHead) has no architecture knobs beyond
