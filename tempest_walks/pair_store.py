@@ -14,6 +14,8 @@ scoring a batch, ``query()`` at scoring time (pre-ingest state). Timestamps are
 monotone non-decreasing across chronological batches, so ``last_ts`` = amax is the
 last interaction time.
 """
+import math
+
 import numpy as np
 import torch
 
@@ -23,8 +25,11 @@ from .sparse_store import SparseStreamStore
 class PairRecencyStore:
     """Exact last-interaction-time + count per undirected node pair, streamed."""
 
-    def __init__(self, num_nodes: int):
+    def __init__(self, num_nodes: int, t_train: float):
         self.N = int(num_nodes)
+        # Frozen train-split span — sets the recency CAP so a never-seen pair can be
+        # placed strictly beyond any real gap (see query()).
+        self.t_train = float(t_train)
         self._store = SparseStreamStore(
             {"last_ts": ("max", 0), "count": ("add", 0)})
 
@@ -50,8 +55,12 @@ class PairRecencyStore:
         """src [B] long, cand [B, C] long, t_query [B] long ->
         (pair_rec_log [B, C], ever_bit [B, C], count_log [B, C]) on cand.device.
 
-        Cold pairs get last_ts = 0 (recency = t_query, large); the ever-bit flags
-        real history."""
+        pair_rec_log is self-contained: real pairs land in [0, CAP] (CAP = log1p of the
+        frozen train span = the max plausible real gap), and a never-seen pair sits at
+        NEVER = CAP + 1 — strictly above any real value, at the stalest end of the axis.
+        So recency alone distinguishes never-seen from old-but-real, without leaning on
+        the ever-bit. (Previously a cold pair's last_ts=0 made rec=t_query, colliding
+        with a genuinely old real pair.)"""
         device = cand.device
         B, C = cand.shape
         s = src.detach().to("cpu", torch.int64).numpy()
@@ -64,8 +73,11 @@ class PairRecencyStore:
         cnt = out["count"].reshape(B, C)
         rec = np.clip(tq[:, None] - last, 0, None)
 
-        pair_rec_log = torch.log1p(torch.from_numpy(rec.astype(np.float32)))
         ever = torch.from_numpy((cnt > 0).astype(np.float32))
+        cap = math.log1p(self.t_train)                             # max plausible real gap
+        real = torch.log1p(torch.from_numpy(rec.astype(np.float32))).clamp(max=cap)
+        never = cap + 1.0                                          # strictly past any real
+        pair_rec_log = torch.where(ever.bool(), real, torch.full_like(real, never))
         count_log = torch.log1p(torch.from_numpy(cnt.astype(np.float32)))
         return (pair_rec_log.to(device), ever.to(device), count_log.to(device))
 

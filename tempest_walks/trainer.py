@@ -42,6 +42,10 @@ class TrainerConfig:
     num_nodes: int
     dst_pool: np.ndarray
 
+    # Frozen train-split span — used ONLY by the pair-feature recency cap (never-seen
+    # sentinel in PairRecencyStore); ignored when use_pair_features is off.
+    t_train: float = 1.0
+
     # Model.
     d_emb: int = 128
 
@@ -106,7 +110,7 @@ class Trainer:
         # mirrors walk_gen: reset() per epoch, update() after scoring, query() at
         # scoring time.
         self.pair_store = (
-            PairRecencyStore(num_nodes=config.num_nodes)
+            PairRecencyStore(num_nodes=config.num_nodes, t_train=config.t_train)
             if config.use_pair_features else None
         )
 

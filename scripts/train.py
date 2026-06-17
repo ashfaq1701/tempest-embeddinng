@@ -311,6 +311,7 @@ def main() -> Dict[str, Any]:
     config = TrainerConfig(
         num_nodes=num_nodes,
         dst_pool=dst_pool,
+        t_train=float(stats.T_train),
 
         d_emb=args.d_emb,
 
