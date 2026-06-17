@@ -85,28 +85,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class Time2Vec(nn.Module):
-    """Time2Vec (Kazemi et al. 2019): scalar τ -> [linear, sin(ω₁τ+φ₁), …]."""
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.w0 = nn.Parameter(torch.zeros(1))
-        self.b0 = nn.Parameter(torch.zeros(1))
-        self.w = nn.Parameter(torch.randn(dim - 1))
-        self.b = nn.Parameter(torch.rand(dim - 1) * 2 * math.pi)
-
-    def forward(self, tau: torch.Tensor) -> torch.Tensor:
-        tau = tau.unsqueeze(-1)
-        lin = self.w0 * tau + self.b0
-        per = torch.sin(tau * self.w + self.b)
-        return torch.cat([lin, per], dim=-1)
-
-
 class ExpDecayBasis(nn.Module):
     """Multi-rate exponential-decay staleness encoder: φ(Δt) = [exp(−ρ_k·Δt)]_{k=1..K}.
     ρ_k = exp(log_rates_k) > 0 learnable, log-spaced init from 1/t_train (train-span
     scale) to 1 (most-recent scale). The Hawkes/TPP recency feature — scale-free on RAW
-    Δt, bounded [0,1], monotone, multi-timescale — replacing Time2Vec(log1p(t)). A
+    Δt, bounded [0,1], monotone, multi-timescale — feeding the rec/pair channels. A
     never-seen event (Δt → +inf, encoded as a huge value) maps to φ = 0 for free."""
 
     def __init__(self, dim: int, t_train: float):

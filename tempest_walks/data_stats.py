@@ -10,8 +10,6 @@ Today's fields:
     t_min                       — min training timestamp
     t_max                       — max training timestamp
     T_train                     — span (t_max - t_min), > 0
-    t_max_full                  — max timestamp across train + val + test
-    T_full                      — span (t_max_full - t_min), > 0
     median_inter_arrival        — median Δt between consecutive events
     mean_inter_arrival          — mean   Δt between consecutive events
 
@@ -41,24 +39,15 @@ class TrainStats:
     t_min: int
     t_max: int
     T_train: float
-    t_max_full: int
-    T_full: float
     median_inter_arrival: float
     mean_inter_arrival: float
 
 
 def compute_train_stats(
     timestamps: np.ndarray,
-    full_timestamps: np.ndarray = None,
 ) -> TrainStats:
     """Compute every derived constant from the training-split timestamp
     array (`loaded.train.timestamps`). Called once at data load.
-
-    `full_timestamps`, when supplied (typically `concat(train, val,
-    test)`), drives the `t_max_full` / `T_full` fields the v2 link-
-    pred head uses to bound its per-position gap normaliser at both
-    train and eval. When omitted, `t_max_full = t_max` and
-    `T_full = T_train` — the train-only fallback.
 
     Inter-arrival statistics: Δt between sorted consecutive events,
     excluding zero gaps (multiple events sharing a timestamp are
@@ -73,14 +62,6 @@ def compute_train_stats(
     T_train = float(t_max - t_min)
     if T_train <= 0:
         raise ValueError(f"Non-positive T_train: {T_train}")
-
-    if full_timestamps is not None and len(full_timestamps) > 0:
-        t_max_full = int(np.asarray(full_timestamps).astype(np.int64).max())
-    else:
-        t_max_full = t_max
-    if t_max_full < t_max:
-        t_max_full = t_max
-    T_full = float(t_max_full - t_min)
 
     gaps = np.diff(np.sort(ts))
     gaps = gaps[gaps > 0]
@@ -97,8 +78,6 @@ def compute_train_stats(
         t_min=t_min,
         t_max=t_max,
         T_train=T_train,
-        t_max_full=t_max_full,
-        T_full=T_full,
         median_inter_arrival=median_ia,
         mean_inter_arrival=mean_ia,
     )

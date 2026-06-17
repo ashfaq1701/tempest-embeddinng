@@ -42,9 +42,10 @@ class TrainerConfig:
     num_nodes: int
     dst_pool: np.ndarray
 
-    # Frozen train-split span. Two uses: the head's cross-channel decay λ_cross init
-    # (≈0.1/t_train, so the raw-age logsumexp stays O(0.1) at init) and the pair-feature
-    # recency cap (never-seen sentinel in PairRecencyStore).
+    # Frozen train-split span. Sets the log-spaced init of the head's exp-decay rates:
+    # the cross-channel decay ρ_cross = exp(log_rate_cross), init −log(t_train) (so the
+    # raw-age logsumexp stays O(1) at init), and the ExpDecayBasis rates (1/t_train … 1)
+    # for the rec / pair channels. Init only — never a per-step scaler.
     t_train: float = 1.0
 
     # Model.
