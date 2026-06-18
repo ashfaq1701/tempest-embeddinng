@@ -205,27 +205,25 @@ class Trainer:
         # attention pool. u's identity lives only in the base chord channel.
         is_ctx = torch.arange(L, device=device).view(1, 1, L) < (lens - 1).unsqueeze(-1)
 
-        # Flatten the (K, L) walk axes into one per-source token set [Ms, n]. The
-        # Point head consumes a FLAT token set + mask (μ = recency-weighted mean over
-        # all of u's walk-neighbours); tok_mask = is_ctx keeps the seed (= u) and
-        # padding out (their embeddings present but get zero recency weight).
+        # CUMULATIVE PATH age per token: a token at hop-distance k from the seed carries
+        # Σ_{i=1..k}(batch_t_max − t_edge_i) = the reverse-cumsum of edge ages toward the seed,
+        # so the recency weight e^{−λ·age} = ∏ edge decays (TPNet's walk score) and deeper
+        # tokens decay by their whole path — not just their connecting edge. edge_age = 0 at the
+        # seed slot (INT64_MAX sentinel) and padding; where() discards them (no int64 underflow).
+        edge_age = torch.where(is_ctx, batch_t_max - ts, torch.zeros_like(ts))     # [Ms,K,L]
+        cum_age = torch.flip(torch.cumsum(torch.flip(edge_age, dims=[2]), dim=2), dims=[2])
+
+        # Flatten the (K, L) walk axes into one per-source token set [Ms, n]. The head consumes
+        # a FLAT token set + mask (μ = recency-weighted mean over all of u's walk-neighbours);
+        # tok_mask = is_ctx keeps the seed (= u) and padding out (zero recency weight).
         n = K * L
         tok_emb_all = self.embedding_table(nodes.clamp_min(0)).view(Ms, n, -1)  # [Ms,n,d]
-        tok_ts_all = ts.view(Ms, n)                             # [Ms, n] edge times
+        tok_age_all = cum_age.view(Ms, n)                      # [Ms, n] cumulative path age int64
         tok_mask_all = is_ctx.view(Ms, n)                      # [Ms, n] bool
 
         tok_emb = tok_emb_all[u_pos]                           # [B, n, d]
-        tok_ts = tok_ts_all[u_pos]                             # [B, n]
+        tok_age = tok_age_all[u_pos].clamp_min(0).float()     # [B, n] cumulative path age
         tok_mask = tok_mask_all[u_pos]                         # [B, n]
-
-        # Per-token RAW staleness age = batch_t_max − t_token (the token's own edge time),
-        # for the recency-weighted mean softmax(−λ·age). INT64 subtract before the float cast
-        # (float32-exact on large timestamps). where(tok_mask, …, 0) keeps the seed's
-        # INT64_MAX sentinel and padding OUT of the subtraction (no int64 underflow); masked
-        # entries are −∞'d in the head softmax anyway. clamp_min(0) is defensive.
-        tok_age = torch.where(
-            tok_mask, batch_t_max - tok_ts, torch.zeros_like(tok_ts)
-        ).clamp_min(0).float()
 
         E_u = self.embedding_table(src_t)                       # [B, d]   base point E[u]
 
@@ -290,19 +288,17 @@ class Trainer:
         ts_i = wc.timestamps.to(device).to(torch.int64).view(Mv, K, L)   # raw edge times (int64)
         lens = wc.lens.to(device).view(Mv, K)
         # Context = real walk-neighbours: exclude the seed v (slot lens-1) and padding.
-        # ts[p] is the time of edge (nodes[p], nodes[p+1]), so each neighbour carries
-        # its own edge recency (direct neighbours recent, deeper hops older).
         is_ctx = torch.arange(L, device=device).view(1, 1, L) < (lens - 1).unsqueeze(-1)
+        # CUMULATIVE PATH age (matches the source side): each hop-k neighbour carries
+        # Σ_{i=1..k}(batch_t_max − t_edge_i) = reverse-cumsum of edge ages toward the seed, so
+        # e^{−λ·age} = ∏ edge decays (TPNet's walk score). edge_age = 0 at seed/padding; the
+        # shared per-batch batch_t_max keeps μ_v query-independent (per-node dedup intact).
+        edge_age = torch.where(is_ctx, batch_t_max - ts_i, torch.zeros_like(ts_i))   # [Mv,K,L]
+        cum_age = torch.flip(torch.cumsum(torch.flip(edge_age, dims=[2]), dim=2), dims=[2])
         n = K * L
         cand_ids = nodes.view(Mv, n)                           # [Mv, n] node ids (−1 pad)
         cand_mask = is_ctx.view(Mv, n)                         # [Mv, n] bool
-        ts_i = ts_i.view(Mv, n)                                # [Mv, n] int64 (sentinel in masked)
-        # Per-BATCH reference age (query-independent): subtract the SHARED batch_t_max in
-        # INT64 (exact) before the float cast, so magnitudes stay float32-exact. The same
-        # reference feeds the source μ_u — one consistent batch recency origin for both
-        # sides. Masked slots → 0 (neutral; the head −∞-masks them anyway).
-        cand_age = torch.where(
-            cand_mask, batch_t_max - ts_i, torch.zeros_like(ts_i)).clamp_min(0).float()
+        cand_age = cum_age.view(Mv, n).clamp_min(0).float()   # [Mv, n] cumulative path age
         return uniq_v, v_inv, cand_ids, cand_age, cand_mask
 
     # ──────────────────────────────────────────────────────────────────
