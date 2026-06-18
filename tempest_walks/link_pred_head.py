@@ -153,28 +153,16 @@ class DualMuHead(nn.Module):
 
     def _mu(self, base: torch.Tensor, ew: torch.Tensor,
             age: torch.Tensor, mask: torch.Tensor,
-            log_lambda: torch.Tensor, T: int = 3) -> torch.Tensor:
-        """Variant A — IRLS CONSENSUS CENTER (outlier-robust recency mean of Log_base(nbr)).
-           Starts from the plain recency mean, then T fixed unrolled IRLS steps down-weight
-           neighbours far from the EMERGING center μ (rejection is emergent, no k). c is the
-           recency-weighted RMS residual = emergent scale; ψ = (r²+c²)^−½ the robust weight.
-           c and μ are .detach()'d inside the weights (IRLS quasi-constants); the final
-           μ = Σ ω·g keeps gradient through g → E. base/ew/age/mask as before; uses the SPLIT
-           log_lambda arg (λ_u for source, λ_v for candidate). Masked / cold ⇒ μ = 0."""
+            log_lambda: torch.Tensor) -> torch.Tensor:
+        """Recency-weighted mean of Log_base(neighbour), in the tangent space at base.
+           base [..., d] unit ; ew [..., M, d] unit ; age [..., M] ; mask [..., M] bool ;
+           log_lambda the per-side recency rate param (λ_u for source, λ_v for candidate).
+           -> μ [..., d] (tangent at base). Masked / cold ⇒ μ = 0."""
         g = self._logmap(base.unsqueeze(-2), ew)                       # [..., M, d]
         lam = F.softplus(log_lambda)
         wlog = (-lam * age).masked_fill(~mask, float("-inf"))          # [..., M]
-        w = torch.nan_to_num(torch.softmax(wlog, dim=-1), nan=0.0)     # [..., M] recency (cold ⇒ 0)
-        mu = (w.unsqueeze(-1) * g).sum(dim=-2)                         # [..., d] recency mean (init)
-        for _ in range(T):                                            # fixed-T unrolled IRLS
-            r = (g - mu.detach().unsqueeze(-2)).norm(dim=-1)          # [..., M] residual to center
-            c = torch.sqrt((w * r * r).sum(-1) / w.sum(-1).clamp_min(self.eps)
-                           ).detach().unsqueeze(-1)                    # [..., 1] emergent scale (wtd RMS)
-            psi = torch.rsqrt(r * r + c * c + self.eps)               # [..., M] robust weight
-            omega = (w * psi).masked_fill(~mask, 0.0)                 # recency × robustness
-            omega = omega / omega.sum(-1, keepdim=True).clamp_min(self.eps)
-            mu = (omega.unsqueeze(-1) * g).sum(dim=-2)                # [..., d] reweighted center
-        return mu
+        w = torch.nan_to_num(torch.softmax(wlog, dim=-1), nan=0.0)     # cold ⇒ all 0
+        return (w.unsqueeze(-1) * g).sum(dim=-2)                       # [..., d]
 
     # ──────────────────────────────────────────────────────────────────
     # Forward
