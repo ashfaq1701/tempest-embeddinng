@@ -93,19 +93,19 @@ def parse_args() -> argparse.Namespace:
 
     # Walks (BACKWARD only, undirected). Decoupled QUERY-side (source u → μ) and
     # CANDIDATE-side (v → connectors for the cross channel); same Tempest graph.
-    p.add_argument("--num-walks-per-node-query-side", default=5, type=int,
+    p.add_argument("--num-walks-per-node-query-side", default=10, type=int,
                    help="K walks per source u (build μ).")
-    p.add_argument("--max-walk-len-query-side", default=20, type=int,
+    p.add_argument("--max-walk-len-query-side", default=10, type=int,
                    help="L, max walk length for the query-side walks.")
     p.add_argument("--walk-bias-query-side", default="ExponentialWeight", type=str,
                    help="Per-hop edge bias for the query-side backward walks.")
     p.add_argument("--start-bias-query-side", default="ExponentialWeight", type=str,
                    help="Initial-edge bias for the query-side backward walks.")
 
-    p.add_argument("--num-walks-per-node-candidate-side", default=5, type=int,
+    p.add_argument("--num-walks-per-node-candidate-side", default=10, type=int,
                    help="K walks per candidate v; their context nodes build μ_v "
                         "(symmetric to the query side's μ_u). Mirror the query side.")
-    p.add_argument("--max-walk-len-candidate-side", default=20, type=int,
+    p.add_argument("--max-walk-len-candidate-side", default=10, type=int,
                    help="L for the candidate-side walks that feed μ_v. Mirror the "
                         "query side (--max-walk-len-query-side) for a symmetric head.")
     p.add_argument("--walk-bias-candidate-side", default="ExponentialWeight", type=str,
