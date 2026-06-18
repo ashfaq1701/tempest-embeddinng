@@ -108,6 +108,11 @@ class DualMuHead(nn.Module):
         log_lam0 = math.log(math.expm1(lam0))
         self.log_lambda_u = nn.Parameter(torch.tensor([log_lam0], dtype=torch.float32))
         self.log_lambda_v = nn.Parameter(torch.tensor([log_lam0], dtype=torch.float32))
+        # Variant B proximity-to-seed sharpness β = softplus(log_beta), split per side. Init
+        # β≈1 (softplus⁻¹(1)); β→0 ⇒ plain recency mean, β large ⇒ μ pulled toward the seed.
+        log_beta0 = math.log(math.expm1(1.0))
+        self.log_beta_u = nn.Parameter(torch.tensor([log_beta0], dtype=torch.float32))
+        self.log_beta_v = nn.Parameter(torch.tensor([log_beta0], dtype=torch.float32))
         self.alpha = nn.Parameter(torch.tensor(10.0))     # cosine → logit scale
         # Identity gate g = σ(gate_logit): P = normalize((1−g)·E[node] + g·Exp_E[node](μ)).
         # Blends the node's own embedding (IDENTITY) with its walk-predicted point. g=1 ⇒ pure
@@ -153,28 +158,25 @@ class DualMuHead(nn.Module):
 
     def _mu(self, base: torch.Tensor, ew: torch.Tensor,
             age: torch.Tensor, mask: torch.Tensor,
-            log_lambda: torch.Tensor, T: int = 3) -> torch.Tensor:
-        """Variant A — IRLS CONSENSUS CENTER (outlier-robust recency mean of Log_base(nbr)).
-           Starts from the plain recency mean, then T fixed unrolled IRLS steps down-weight
-           neighbours far from the EMERGING center μ (rejection is emergent, no k). c is the
-           recency-weighted RMS residual = emergent scale; ψ = (r²+c²)^−½ the robust weight.
-           c and μ are .detach()'d inside the weights (IRLS quasi-constants); the final
-           μ = Σ ω·g keeps gradient through g → E. base/ew/age/mask as before; uses the SPLIT
-           log_lambda arg (λ_u for source, λ_v for candidate). Masked / cold ⇒ μ = 0."""
+            log_lambda: torch.Tensor, log_beta: torch.Tensor) -> torch.Tensor:
+        """Variant B — CLOSEST-TO-SEED proximity (homophily exploit). Weights neighbours by
+           BOTH recency (softmax −λ·age) and proximity to the fixed seed E[base]: prox =
+           softmax(−β·‖g‖), where ‖g‖ is the geodesic distance to the seed (already in g). No
+           iteration; center fixed at the seed. base/ew/age/mask as before; SPLIT log_lambda
+           (λ_u/λ_v) and SPLIT log_beta (β_u/β_v) per side. Masked / cold ⇒ μ = 0.
+           NB: β→0 ⇒ collapses to the plain recency mean (proximity inert); β large ⇒ μ pulled
+           toward the seed (P→E[node]), which can regress geo toward plain ⟨E[u],E[v]⟩."""
         g = self._logmap(base.unsqueeze(-2), ew)                       # [..., M, d]
         lam = F.softplus(log_lambda)
         wlog = (-lam * age).masked_fill(~mask, float("-inf"))          # [..., M]
         w = torch.nan_to_num(torch.softmax(wlog, dim=-1), nan=0.0)     # [..., M] recency (cold ⇒ 0)
-        mu = (w.unsqueeze(-1) * g).sum(dim=-2)                         # [..., d] recency mean (init)
-        for _ in range(T):                                            # fixed-T unrolled IRLS
-            r = (g - mu.detach().unsqueeze(-2)).norm(dim=-1)          # [..., M] residual to center
-            c = torch.sqrt((w * r * r).sum(-1) / w.sum(-1).clamp_min(self.eps)
-                           ).detach().unsqueeze(-1)                    # [..., 1] emergent scale (wtd RMS)
-            psi = torch.rsqrt(r * r + c * c + self.eps)               # [..., M] robust weight
-            omega = (w * psi).masked_fill(~mask, 0.0)                 # recency × robustness
-            omega = omega / omega.sum(-1, keepdim=True).clamp_min(self.eps)
-            mu = (omega.unsqueeze(-1) * g).sum(dim=-2)                # [..., d] reweighted center
-        return mu
+        d = g.norm(dim=-1)                                            # [..., M] geodesic dist to seed
+        beta = F.softplus(log_beta)
+        plog = (-beta * d).masked_fill(~mask, float("-inf"))          # [..., M]
+        prox = torch.nan_to_num(torch.softmax(plog, dim=-1), nan=0.0) # [..., M] closeness-to-seed
+        omega = (w * prox).masked_fill(~mask, 0.0)                    # recency × proximity
+        omega = omega / omega.sum(-1, keepdim=True).clamp_min(self.eps)
+        return (omega.unsqueeze(-1) * g).sum(dim=-2)                  # [..., d]
 
     # ──────────────────────────────────────────────────────────────────
     # Forward
@@ -205,13 +207,13 @@ class DualMuHead(nn.Module):
         # P = normalize((1−g)·E[node] + g·Exp_E[node](μ)): gated blend of identity and the
         # walk-predicted point. Cold μ≈0 ⇒ Exp=E[node] ⇒ P=E[node] for any g.
         ew_u = F.normalize(tok_emb, dim=-1)                            # [B, n, d]
-        mu_u = self._mu(eu, ew_u, tok_age, tok_mask, self.log_lambda_u)   # [B, d]
+        mu_u = self._mu(eu, ew_u, tok_age, tok_mask, self.log_lambda_u, self.log_beta_u)   # [B, d]
         P_u = F.normalize((1.0 - g) * eu + g * self._expmap(eu, mu_u), dim=-1)    # [B, d]
 
         # μ_v once per UNIQUE candidate node, then scatter via v_inv (no [B,C,M,d] blow-up).
         ev_u = F.normalize(F.embedding(uniq_v_ids, e_weight), dim=-1)             # [Mv, d]
         ew_v = F.normalize(F.embedding(cand_ids.clamp_min(0), e_weight), dim=-1)  # [Mv, M, d]
-        mu_v = self._mu(ev_u, ew_v, cand_age, cand_mask, self.log_lambda_v)  # [Mv, d]
+        mu_v = self._mu(ev_u, ew_v, cand_age, cand_mask, self.log_lambda_v, self.log_beta_v)  # [Mv, d]
         P_v_u = F.normalize((1.0 - g) * ev_u + g * self._expmap(ev_u, mu_v), dim=-1)  # [Mv, d]
         P_v = P_v_u[v_inv].view(B, C, -1)                           # [B, C, d] cheap index
 
