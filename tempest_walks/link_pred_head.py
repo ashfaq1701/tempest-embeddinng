@@ -112,9 +112,15 @@ class GeometricPointHead(nn.Module):
         # --- geometric channel -------------------------------------------------
         # u enters as the BASE POINT (everything relative to E[u]); no separate
         # u-vs-v term needed.
-        # λ = softplus(log_lambda) ≥ 0, on RAW age inside the μ softmax (scale-
-        # invariant, so λ self-scales — exactly the proven baseline; see TIME UNITS).
-        self.log_lambda = nn.Parameter(torch.zeros(1))    # λ = softplus(·) ≥ 0  (recency)
+        # λ = softplus(log_lambda) ≥ 0, on RAW age inside the μ softmax. Init λ ≈ C/t_train
+        # (C=10) — NOT log_lambda=0: at zero-init λ = softplus(0) = 0.693 on raw ages makes
+        # λ·age enormous, so the softmax saturates to a hard argmax and ∂loss/∂λ → 0 (λ pinned,
+        # μ frozen as the single most-recent neighbour). Scaling the init by 1/t_train puts
+        # λ·age ~ O(1) so λ actually TRAINS. (Same fix already baked into log_rate_cross below,
+        # which inits at −log(t_train) ⇒ ρ≈1/t_train ⇒ ρ·age O(1); only log_lambda was unscaled.)
+        lam0 = 10.0 / max(float(t_train), 1.0)
+        self.log_lambda = nn.Parameter(
+            torch.tensor([math.log(math.expm1(lam0))], dtype=torch.float32))
         self.alpha = nn.Parameter(torch.tensor(10.0))     # distance weight
         # Intrinsic-frame anisotropy (a,b ≥ 0, global): the candidate distance is
         # an ELLIPSE oriented along each source's heading r=μ/‖μ‖, not a circle —
