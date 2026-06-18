@@ -185,13 +185,19 @@ class Trainer:
         walks). Strict-causal: walks + store reflect the pre-ingest state."""
         device = self.device
         B, C = cand_t.shape
+        # ONE per-batch recency reference (int64) shared by BOTH the source μ_u and the
+        # candidate μ_v token ages: the latest query time in the batch. Walks are causal
+        # (edge times ≤ their query time ≤ this max), so ref − t_edge ≥ 0. The μ softmax is
+        # shift-invariant, so a per-batch-shared ref gives bit-identical μ to per-query
+        # t_query — while letting us subtract in INT64 before the float cast (float32-exact).
+        batch_t_max = t_query_t.max()                            # int64 scalar
 
         # Walks for the unique SOURCES only.
         uniq_s, u_pos = torch.unique(src_t, return_inverse=True)  # uniq_s [Ms], u_pos [B]
         wd = self.walk_gen.walks_for_nodes(uniq_s.cpu().numpy())
         Ms, K, L = uniq_s.shape[0], wd.K, wd.nodes.shape[1]
         nodes = wd.nodes.to(device).view(Ms, K, L)               # [Ms, K, L]
-        ts = wd.timestamps.to(device).view(Ms, K, L).float()     # [Ms, K, L]
+        ts = wd.timestamps.to(device).to(torch.int64).view(Ms, K, L)   # [Ms,K,L] raw edge times int64
         lens = wd.lens.to(device).view(Ms, K)                    # [Ms, K]
         # Context positions hold real edge times (the seed slot lens-1 is the
         # INT64_MAX sentinel; padding is -1). is_ctx is BOTH the time-stat mask AND
@@ -212,11 +218,14 @@ class Trainer:
         tok_ts = tok_ts_all[u_pos]                             # [B, n]
         tok_mask = tok_mask_all[u_pos]                         # [B, n]
 
-        # Per-token RAW query staleness age = t_query − t_token (the token's own edge
-        # time), for the recency-weighted mean softmax(−λ·age). clamp_min(0)
-        # neutralises the seed's INT64_MAX sentinel (→ 0); the mask zeroes padding's
-        # bogus positive — finite everywhere, masked entries −∞'d in the head softmax.
-        tok_age = (t_query_t.unsqueeze(1).float() - tok_ts).clamp_min(0.0) * tok_mask.float()
+        # Per-token RAW staleness age = batch_t_max − t_token (the token's own edge time),
+        # for the recency-weighted mean softmax(−λ·age). INT64 subtract before the float cast
+        # (float32-exact on large timestamps). where(tok_mask, …, 0) keeps the seed's
+        # INT64_MAX sentinel and padding OUT of the subtraction (no int64 underflow); masked
+        # entries are −∞'d in the head softmax anyway. clamp_min(0) is defensive.
+        tok_age = torch.where(
+            tok_mask, batch_t_max - tok_ts, torch.zeros_like(tok_ts)
+        ).clamp_min(0).float()
 
         E_u = self.embedding_table(src_t)                       # [B, d]   base point E[u]
 
@@ -232,7 +241,8 @@ class Trainer:
 
         # Candidate-side walk-neighbours for μ_v, PER UNIQUE candidate node (no [B,C,M,d]
         # blow-up): the head computes P_v once per unique v and indexes via v_inv.
-        uniq_v, v_inv, cand_ids, cand_age, cand_mask = self._candidate_walk_tokens(cand_t)
+        uniq_v, v_inv, cand_ids, cand_age, cand_mask = self._candidate_walk_tokens(
+            cand_t, batch_t_max)
 
         return self.link_head(
             tok_emb, tok_age, tok_mask, E_u, rec_v_dt,
@@ -240,7 +250,7 @@ class Trainer:
             self.embedding_table.E.weight,
             pair_dt=pair_dt, pair_count_log=pair_count_log)
 
-    def _candidate_walk_tokens(self, cand_t: torch.Tensor):
+    def _candidate_walk_tokens(self, cand_t: torch.Tensor, batch_t_max: torch.Tensor):
         """v's walk-neighbour tokens for μ_v — returned PER UNIQUE candidate node.
 
         For every UNIQUE candidate v, sample CANDIDATE-side BACKWARD walks on the SAME
@@ -255,11 +265,12 @@ class Trainer:
         candidate, so the head computes P_v once per unique v and indexes via v_inv.
 
         The recency weight is shift-invariant: softmax(−λ·(t_query−t_edge)) is unchanged by
-        any per-token-shared offset, so a PER-BATCH reference (here the latest real edge
-        time) replaces the per-query t_query. We subtract it in INT64 before the float cast
-        so the resulting age stays small and float32-exact even on large-timestamp datasets,
-        then weight by −λ·age — bit-identical to the per-query form and query-independent (so
-        μ_v stays per-node). If eval ever ingests intra-batch, revisit.
+        any per-token-shared offset, so the PER-BATCH reference `batch_t_max` (the latest
+        query time in the batch, passed in by the caller and shared with the source μ_u)
+        replaces the per-query t_query. We subtract it in INT64 before the float cast so the
+        resulting age stays small and float32-exact even on large-timestamp datasets, then
+        weight by −λ·age — bit-identical to the per-query form and query-independent (so μ_v
+        stays per-node). If eval ever ingests intra-batch, revisit.
 
         -> uniq_v   [Mv]      unique candidate node ids,
            v_inv    [B*C]     scatter index back to the [B, C] candidate grid,
@@ -286,12 +297,12 @@ class Trainer:
         cand_ids = nodes.view(Mv, n)                           # [Mv, n] node ids (−1 pad)
         cand_mask = is_ctx.view(Mv, n)                         # [Mv, n] bool
         ts_i = ts_i.view(Mv, n)                                # [Mv, n] int64 (sentinel in masked)
-        # Per-BATCH reference age (query-independent): subtract the latest real edge time in
-        # INT64 (exact) before the float cast, so magnitudes stay float32-exact. Masked slots
-        # → 0 (neutral; the head −∞-masks them anyway).
-        real = ts_i[cand_mask]
-        ref = real.max() if real.numel() > 0 else torch.zeros((), dtype=torch.int64, device=device)
-        cand_age = torch.where(cand_mask, ref - ts_i, torch.zeros_like(ts_i)).clamp_min(0).float()
+        # Per-BATCH reference age (query-independent): subtract the SHARED batch_t_max in
+        # INT64 (exact) before the float cast, so magnitudes stay float32-exact. The same
+        # reference feeds the source μ_u — one consistent batch recency origin for both
+        # sides. Masked slots → 0 (neutral; the head −∞-masks them anyway).
+        cand_age = torch.where(
+            cand_mask, batch_t_max - ts_i, torch.zeros_like(ts_i)).clamp_min(0).float()
         return uniq_v, v_inv, cand_ids, cand_age, cand_mask
 
     # ──────────────────────────────────────────────────────────────────
