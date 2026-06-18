@@ -1,14 +1,15 @@
-"""Link head — DualMu version (symmetric walk-mean, geodesic on the hypersphere).
+"""Link head — DualMu version (symmetric walk-mean, predicted-point cosine on the hypersphere).
 
 Both endpoints build a recency-weighted PREDICTED NEIGHBOUR POSITION from their own
-temporal walks, then the geometric channel scores the link by the geodesic between the
+temporal walks, then the geometric channel scores the link by the cosine between the
 two predicted points:
 
   μ_u = Σ softmax(−λ·age)·Log_{E[u]}(E[w])   over u's walk-neighbours w   (tangent at E[u])
   P_u = Exp_{E[u]}(μ_u)                        a point on the sphere
   μ_v = Σ softmax(−λ·age)·Log_{E[v]}(E[w])   over v's walk-neighbours w   (tangent at E[v])
   P_v = Exp_{E[v]}(μ_v)
-  geo = −α · arccos(⟨P_u, P_v⟩)               geodesic on the hypersphere
+  geo = α · ⟨P_u, P_v⟩                         cosine (≡ neg-sq-Euclidean on the sphere;
+                                               avoids the arccos gradient singularity)
 
   logit = coef_geo·geo + coef_rec·rec(v) [+ coef_pair·pair(u,v) + coef_pair_count·log1p(count)]
 
@@ -16,8 +17,8 @@ The geometry is just TWO scalars (one shared recency rate λ for both μ's — t
 candidate sides are symmetric — and one distance scale α): no ellipse, no heading frame,
 no co-reachability channel. μ_u and μ_v ARE the geometric model. μ_u, μ_v live in DIFFERENT
 tangent spaces (T_{E[u]} vs T_{E[v]}), so Exp-mapping each to the sphere first is what makes
-the geodesic well-defined. A cold node with no walk-neighbours has μ ≈ 0 ⇒ P = E[node], so
-geo degrades gracefully to −α·geodesic(E[u], E[v]) (the plain embedding distance).
+the cosine well-defined. A cold node with no walk-neighbours has μ ≈ 0 ⇒ P = E[node], so
+geo degrades gracefully to α·⟨E[u], E[v]⟩ (the plain embedding similarity).
 
 μ_v is computed ONCE PER UNIQUE candidate node and scattered to the [B,C] grid via v_inv —
 P_v depends only on v's walks + E[v] (the recency softmax is shift-invariant, so the query's
@@ -80,17 +81,23 @@ class DualMuHead(nn.Module):
         self.d_emb = d_emb
         self.eps = 1e-6
 
-        # --- geometric channel: μ_u ↔ μ_v geodesic --------------------------------
-        # λ = softplus(log_lambda) ≥ 0, shared by both μ's (source/candidate symmetric),
-        # on RAW age inside the μ softmax. The softmax is scale-invariant in the LIMIT,
-        # but its INIT temperature is NOT: with λ·age ≫ 1 the softmax saturates to a hard
-        # argmax and ∂softmax/∂λ → 0, so λ stays pinned and never trains. Init λ ≈ 1/t_train
-        # so λ·(typical raw age) ~ O(1) — unsaturated, so λ actually adapts. (raw age kept
-        # everywhere; this only fixes the init temperature.) softplus⁻¹(x)=log(expm1(x)).
-        lam0 = 1.0 / max(float(t_train), 1.0)
+        # --- geometric channel: ⟨P_u, P_v⟩ (predicted-point similarity) ------------
+        # Each side builds a recency-weighted predicted point P = Exp_E[node](μ); the score
+        # is their cosine ⟨P_u, P_v⟩ (≡ neg-squared-Euclidean on the unit sphere; cosine
+        # avoids the arccos gradient singularity at coincidence). Ablations showed the two
+        # identity↔prediction cross signals and the anisotropic ellipse add nothing over this
+        # symmetric pred↔pred cosine on wiki — so the head keeps only the P↔P term.
+        #
+        # λ = softplus(log_lambda) on RAW age in the μ softmax. Init λ ≈ C/t_train so μ is a
+        # FOCUSED recency mean over the most-recent ~N/C neighbours: C=10 (~24 eff of ~80) is
+        # the symmetric-head sweet spot. NOT argmax (point-head's log_lambda=0): for the
+        # SYMMETRIC head both μ_u and μ_v are one-hot under argmax → sparse gradients on BOTH
+        # sides → collapse (the point head survives argmax only because its candidate is the
+        # dense stable E[v]). NOT 1/t_train either (near-flat → diffuse weak μ). softplus⁻¹(x).
+        lam0 = 10.0 / max(float(t_train), 1.0)
         self.log_lambda = nn.Parameter(
             torch.tensor([math.log(math.expm1(lam0))], dtype=torch.float32))
-        self.alpha = nn.Parameter(torch.tensor(10.0))     # geodesic → logit scale
+        self.alpha = nn.Parameter(torch.tensor(10.0))     # cosine → logit scale
 
         # --- rec channel: candidate v's own staleness -----------------------------
         self.basis_rec = ExpDecayBasis(d_time, t_train)
@@ -174,8 +181,10 @@ class DualMuHead(nn.Module):
         P_v_u = self._expmap(ev_u, mu_v)                             # [Mv, d]
         P_v = P_v_u[v_inv].view(B, C, -1)                           # [B, C, d] cheap index
 
-        cos = (P_u.unsqueeze(1) * P_v).sum(-1).clamp(-1 + self.eps, 1 - self.eps)  # [B,C]
-        geo = -self.alpha.clamp_min(1e-3) * torch.arccos(cos)         # [B, C] = −α·geodesic
+        # --- predicted-point similarity: α·⟨P_u, P_v⟩ -----------------------------
+        # Both endpoints are unit-sphere points, so cosine ≡ neg-squared-Euclidean for
+        # ranking; α scales it into a logit. Cold node ⇒ μ=0 ⇒ P=E[node] (graceful).
+        geo = self.alpha.clamp_min(1e-3) * (P_u.unsqueeze(1) * P_v).sum(-1)  # [B, C]
 
         # --- channels combined with learnable per-channel coefficients ------------
         rec = self.rec_head(self.basis_rec(rec_v_dt)).squeeze(-1)     # [B, C]
