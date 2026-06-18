@@ -5,16 +5,19 @@ temporal walks, then the geometric channel scores the link by the cosine between
 two predicted points:
 
   μ_u = Σ softmax(−λ·age)·Log_{E[u]}(E[w])   over u's walk-neighbours w   (tangent at E[u])
-  P_u = Exp_{E[u]}(μ_u)                        a point on the sphere
+  P_u = normalize((1−g)·E[u] + g·Exp_{E[u]}(μ_u))   gated identity↔prediction blend
   μ_v = Σ softmax(−λ·age)·Log_{E[v]}(E[w])   over v's walk-neighbours w   (tangent at E[v])
-  P_v = Exp_{E[v]}(μ_v)
+  P_v = normalize((1−g)·E[v] + g·Exp_{E[v]}(μ_v))
   geo = α · ⟨P_u, P_v⟩                         cosine (≡ neg-sq-Euclidean on the sphere;
                                                avoids the arccos gradient singularity)
 
+  g = σ(gate_logit) shared by both sides: g=1 ⇒ pure walk-prediction (plain DualMu);
+  g→0 ⇒ pure identity E[node] (re-injects the candidate identity the point head relies on).
+
   logit = coef_geo·geo + coef_rec·rec(v) [+ coef_pair·pair(u,v) + coef_pair_count·log1p(count)]
 
-The geometry is just TWO scalars (one shared recency rate λ for both μ's — the source and
-candidate sides are symmetric — and one distance scale α): no ellipse, no heading frame,
+The geometry is a few scalars (decoupled recency rates λ_u, λ_v — one per side, since u and v
+play asymmetric roles — one distance scale α, and the identity gate g): no ellipse, no heading frame,
 no co-reachability channel. μ_u and μ_v ARE the geometric model. μ_u, μ_v live in DIFFERENT
 tangent spaces (T_{E[u]} vs T_{E[v]}), so Exp-mapping each to the sphere first is what makes
 the cosine well-defined. A cold node with no walk-neighbours has μ ≈ 0 ⇒ P = E[node], so
@@ -89,15 +92,29 @@ class DualMuHead(nn.Module):
         # symmetric pred↔pred cosine on wiki — so the head keeps only the P↔P term.
         #
         # λ = softplus(log_lambda) on RAW age in the μ softmax. Init λ ≈ C/t_train so μ is a
-        # FOCUSED recency mean over the most-recent ~N/C neighbours: C=10 (~24 eff of ~80) is
-        # the symmetric-head sweet spot. NOT argmax (point-head's log_lambda=0): for the
-        # SYMMETRIC head both μ_u and μ_v are one-hot under argmax → sparse gradients on BOTH
-        # sides → collapse (the point head survives argmax only because its candidate is the
-        # dense stable E[v]). NOT 1/t_train either (near-flat → diffuse weak μ). softplus⁻¹(x).
+        # FOCUSED recency mean over the most-recent ~N/C neighbours: C=30 (~8 eff of ~80) — a
+        # sharp μ leaning toward the most-recent neighbours, with the identity gate giving the
+        # model a stable fallback (g→0 ⇒ rely on E[node]) that lets it tolerate sharper λ than
+        # the pure head could. NOT full argmax (point-head's log_lambda=0): for the SYMMETRIC
+        # head both μ_u and μ_v near-one-hot → sparse gradients on BOTH sides → collapse risk
+        # (the point head survives argmax only because its candidate is the dense stable E[v]).
+        # NOT 1/t_train either (near-flat → diffuse weak μ). softplus⁻¹(x).
+        #
+        # DECOUPLED per side: λ_u (source/query μ_u) and λ_v (candidate μ_v) are SEPARATE
+        # learnable params — u and v play asymmetric roles (e.g. bipartite users vs pages have
+        # different neighbour-time distributions), so each side can pick its own sharpness.
+        # Both init C=10; if decoupling helps they diverge from there.
         lam0 = 10.0 / max(float(t_train), 1.0)
-        self.log_lambda = nn.Parameter(
-            torch.tensor([math.log(math.expm1(lam0))], dtype=torch.float32))
+        log_lam0 = math.log(math.expm1(lam0))
+        self.log_lambda_u = nn.Parameter(torch.tensor([log_lam0], dtype=torch.float32))
+        self.log_lambda_v = nn.Parameter(torch.tensor([log_lam0], dtype=torch.float32))
         self.alpha = nn.Parameter(torch.tensor(10.0))     # cosine → logit scale
+        # Identity gate g = σ(gate_logit): P = normalize((1−g)·E[node] + g·Exp_E[node](μ)).
+        # Blends the node's own embedding (IDENTITY) with its walk-predicted point. g=1 ⇒ pure
+        # prediction (the plain DualMu head); g→0 ⇒ pure identity E[node] — re-injecting the
+        # candidate identity that the point head leans on. Shared by both u and v (symmetric).
+        # Init logit 0 (g=0.5). A cold node (μ≈0 ⇒ Exp=E[node]) gives P=E[node] for any g.
+        self.gate_logit = nn.Parameter(torch.zeros(1))
 
         # --- rec channel: candidate v's own staleness -----------------------------
         self.basis_rec = ExpDecayBasis(d_time, t_train)
@@ -135,12 +152,14 @@ class DualMuHead(nn.Module):
         return torch.cos(vn) * p + torch.sin(vn) * (v / vn)
 
     def _mu(self, base: torch.Tensor, ew: torch.Tensor,
-            age: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+            age: torch.Tensor, mask: torch.Tensor,
+            log_lambda: torch.Tensor) -> torch.Tensor:
         """Recency-weighted mean of Log_base(neighbour), in the tangent space at base.
-           base [..., d] unit ; ew [..., M, d] unit ; age [..., M] ; mask [..., M] bool
+           base [..., d] unit ; ew [..., M, d] unit ; age [..., M] ; mask [..., M] bool ;
+           log_lambda the per-side recency rate param (λ_u for source, λ_v for candidate).
            -> μ [..., d] (tangent at base). Masked / cold ⇒ μ = 0."""
         g = self._logmap(base.unsqueeze(-2), ew)                       # [..., M, d]
-        lam = F.softplus(self.log_lambda)
+        lam = F.softplus(log_lambda)
         wlog = (-lam * age).masked_fill(~mask, float("-inf"))          # [..., M]
         w = torch.nan_to_num(torch.softmax(wlog, dim=-1), nan=0.0)     # cold ⇒ all 0
         return (w.unsqueeze(-1) * g).sum(dim=-2)                       # [..., d]
@@ -168,17 +187,20 @@ class DualMuHead(nn.Module):
            [B,C] when pair on. -> logits [B, C]."""
         B, C = rec_v_dt.shape
         eu = F.normalize(E_u, dim=-1)                                  # [B, d]
+        g = torch.sigmoid(self.gate_logit)                            # identity↔prediction gate
 
         # --- geometric channel: P_u (u's walks) vs P_v (v's walks) ----------------
+        # P = normalize((1−g)·E[node] + g·Exp_E[node](μ)): gated blend of identity and the
+        # walk-predicted point. Cold μ≈0 ⇒ Exp=E[node] ⇒ P=E[node] for any g.
         ew_u = F.normalize(tok_emb, dim=-1)                            # [B, n, d]
-        mu_u = self._mu(eu, ew_u, tok_age, tok_mask)                   # [B, d]
-        P_u = self._expmap(eu, mu_u)                                   # [B, d]
+        mu_u = self._mu(eu, ew_u, tok_age, tok_mask, self.log_lambda_u)   # [B, d]
+        P_u = F.normalize((1.0 - g) * eu + g * self._expmap(eu, mu_u), dim=-1)    # [B, d]
 
         # μ_v once per UNIQUE candidate node, then scatter via v_inv (no [B,C,M,d] blow-up).
         ev_u = F.normalize(F.embedding(uniq_v_ids, e_weight), dim=-1)             # [Mv, d]
         ew_v = F.normalize(F.embedding(cand_ids.clamp_min(0), e_weight), dim=-1)  # [Mv, M, d]
-        mu_v = self._mu(ev_u, ew_v, cand_age, cand_mask)              # [Mv, d]
-        P_v_u = self._expmap(ev_u, mu_v)                             # [Mv, d]
+        mu_v = self._mu(ev_u, ew_v, cand_age, cand_mask, self.log_lambda_v)  # [Mv, d]
+        P_v_u = F.normalize((1.0 - g) * ev_u + g * self._expmap(ev_u, mu_v), dim=-1)  # [Mv, d]
         P_v = P_v_u[v_inv].view(B, C, -1)                           # [B, C, d] cheap index
 
         # --- predicted-point similarity: α·⟨P_u, P_v⟩ -----------------------------
