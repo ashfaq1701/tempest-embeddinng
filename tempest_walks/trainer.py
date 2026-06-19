@@ -221,10 +221,10 @@ class Trainer:
         E_u = self.embedding_table(src_t)                       # [B, d]   base point E[u]
         E_v = self.embedding_table(cand_t)                      # [B, C, d]
 
-        # Candidate v's own recency Δt (per-node last-seen store) and, when the pair
+        # Candidate v's own staleness Δt (per-node last-seen store) and, when the pair
         # channel is on, the (u,v) last-interaction Δt — both RAW, both fed to the head's
         # ExpDecayBasis. Never-seen (u,v) → Δt=∞ ⇒ φ=0 (handled in PairRecencyStore).
-        rec_v_dt = self.node_last.query(cand_t, t_query_t)       # [B, C] raw Δt
+        staleness_dt = self.node_last.query(cand_t, t_query_t)   # [B, C] raw Δt_v
         pair_dt = pair_count_log = None
         if self.pair_store is not None:
             pair_dt, pair_count_log = self.pair_store.query(     # [B, C] raw Δt_uv, log1p(count)
@@ -235,7 +235,7 @@ class Trainer:
         conn_ids, conn_age, conn_mask = self._candidate_connectors(cand_t, t_query_t)
 
         return self.link_head(
-            tok_emb, tok_age, tok_mask, E_u, E_v, rec_v_dt,
+            tok_emb, tok_age, tok_mask, E_u, E_v, staleness_dt,
             conn_ids, conn_age, conn_mask, self.embedding_table.E.weight,
             pair_dt=pair_dt, pair_count_log=pair_count_log)
 

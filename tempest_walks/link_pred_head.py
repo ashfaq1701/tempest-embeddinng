@@ -13,18 +13,21 @@ more than being off in DISTANCE. The channels are mixed with learnable coefficie
   recency      w_i = softmax_i(−λ·age_i)            (λ ≥ 0 learnable; Σ w_i = 1)
   prediction   μ   = Σ_i w_i g_i                    the predicted position
   heading      r   = μ/‖μ‖ ;  δ = ν − μ = δ∥ (along r) + δ⊥ (⊥ r)
-  geo channel  d   = √( a·‖δ∥‖² + b·‖δ⊥‖² )         anisotropic ellipse, a,b ≥ 0
-  logit        = coef_geo·(−α·d) + coef_rec·rec(v) [+ coef_pair·pair(u,v)]
-                 + coef_coreach·coreach(u,v)
+  ellipse dist d   = √( a·‖δ∥‖² + b·‖δ⊥‖² )         anisotropic ellipse, a,b ≥ 0
+  identity     = −α·d                               1st-order: candidate v's own fit to μ
+  geo          = coef_identity·identity + coef_coreach·coreach(u,v)   TOTAL geometric
+  logit        = geo + coef_staleness·staleness(v) [+ coef_pair·pair(u,v)]
 
 The geometric distance is an ELLIPSE oriented along each source's heading r (not an
 isotropic circle): the model learns a,b so being off ALONG the heading is weighted
 differently from being off SIDEWAYS — on tgbl-wiki it learns a/b ≈ 1/100 ("direction
 matters, distance-along-heading is ~free"). a=b recovers the plain circle ‖ν−μ‖.
-The channels (geometric / recency / pair / co-reachability) are mixed with learnable per-channel
-coefficients (init 1 for the proven channels = plain sum) so the model can rebalance
-them. Few scalars (α, λ, a, b, coef_*) — almost nothing to overfit; the anisotropy is
-adaptive (≈isotropic where no direction signal exists).
+Channel structure: GEOMETRIC = {identity (1st-order, candidate's own fit) + co-reachability
+(2nd-order, ∃-witness over v's connectors)}, then candidate STALENESS, then PAIR (flagged).
+All mixed with learnable per-channel coefficients (identity/staleness init 1 = plain sum;
+co-reach/pair-count init 0 = off, earn their weight) so the model can rebalance them. Few
+scalars (α, λ, a, b, coef_*) — almost nothing to overfit; the anisotropy is adaptive
+(≈isotropic where no direction signal exists).
 
 TIME UNITS — ages are RAW (t_query − t_edge), never normalized at runtime.
   - The source-side recency μ = Σ softmax(−λ·age)·g is a SOFTMAX, which is
@@ -92,7 +95,7 @@ class ExpDecayBasis(nn.Module):
     """Multi-rate exponential-decay staleness encoder: φ(Δt) = [exp(−ρ_k·Δt)]_{k=1..K}.
     ρ_k = exp(log_rates_k) > 0 learnable, log-spaced init from 1/t_train (train-span
     scale) to 1 (most-recent scale). The Hawkes/TPP recency feature — scale-free on RAW
-    Δt, bounded [0,1], monotone, multi-timescale — feeding the rec/pair channels. A
+    Δt, bounded [0,1], monotone, multi-timescale — feeding the staleness/pair channels. A
     never-seen event (Δt → +inf, encoded as a huge value) maps to φ = 0 for free."""
 
     def __init__(self, dim: int, t_train: float):
@@ -137,9 +140,10 @@ class GeometricPointHead(nn.Module):
         self.log_b = nn.Parameter(torch.zeros(1))         # tangential (off-heading)
 
         # --- proven additive terms (optional) ----------------------------------
-        # rec channel: candidate v's own recency, exp-decay basis on RAW Δt_v.
-        self.basis_rec = ExpDecayBasis(d_time, t_train)
-        self.rec_head = nn.Linear(d_time, 1)
+        # staleness channel: candidate v's own recency Δt_v = t_query − t_last[v],
+        # exp-decay basis on RAW Δt_v ("how stale is v").
+        self.basis_staleness = ExpDecayBasis(d_time, t_train)
+        self.staleness_head = nn.Linear(d_time, 1)
         self.use_pair_features = use_pair_features
         if use_pair_features:
             # pair channel (FLAGGED): (u,v) last-interaction recency, exp-decay basis on
@@ -148,11 +152,12 @@ class GeometricPointHead(nn.Module):
             self.pair_head = nn.Linear(d_time, 1)
 
         # --- learnable per-channel mix coefficients (init 1 = plain sum) --------
-        # One learnable gain per channel (on the raw channels) so the model can
-        # rebalance the geometric vs recency vs pair terms rather than a fixed
-        # sum. +0.005 val / +0.009 test on tgbl-wiki (with pair features on).
-        self.coef_geo = nn.Parameter(torch.ones(1))
-        self.coef_rec = nn.Parameter(torch.ones(1))
+        # One learnable gain per channel so the model can rebalance the channels
+        # rather than a fixed sum. +0.005 val / +0.009 test on tgbl-wiki (pair on).
+        # GEOMETRIC channel = coef_identity·identity + coef_coreach·coreach (the two
+        # geometric sub-terms: 1st-order candidate fit + 2nd-order co-reachability).
+        self.coef_identity = nn.Parameter(torch.ones(1))     # 1st-order: candidate v's own fit
+        self.coef_staleness = nn.Parameter(torch.ones(1))    # candidate staleness channel
         if use_pair_features:
             self.coef_pair = nn.Parameter(torch.ones(1))
             # (u,v) interaction-COUNT term: coef_pair_count · log1p(count). A separate
@@ -230,7 +235,7 @@ class GeometricPointHead(nn.Module):
 
     def forward(self, tok_emb: torch.Tensor, tok_age: torch.Tensor,
                 tok_mask: torch.Tensor, E_u: torch.Tensor, E_v: torch.Tensor,
-                rec_v_dt: torch.Tensor,
+                staleness_dt: torch.Tensor,
                 conn_ids: torch.Tensor, conn_age: torch.Tensor,
                 conn_mask: torch.Tensor, e_weight: torch.Tensor,
                 pair_dt: torch.Tensor = None,
@@ -240,7 +245,7 @@ class GeometricPointHead(nn.Module):
            tok_mask[B,n]    bool, True at real neighbour positions.
            E_u     [B,d]    source embeddings (tangent-space BASE POINT).
            E_v     [B,C,d]  candidate embeddings.
-           rec_v_dt [B,C]   RAW Δt = t_query − t_last[v] candidate recency (→ basis_rec).
+           staleness_dt [B,C] RAW Δt = t_query − t_last[v] candidate staleness (→ basis_staleness).
            conn_ids [B,C,M]    v's connector NODE IDS (gathered from e_weight).
            conn_age [B,C,M]    connector edge age = t_query − t_edge (≥0, RAW units).
            conn_mask[B,C,M]    bool, True at a real connector.
@@ -272,16 +277,20 @@ class GeometricPointHead(nn.Module):
         d = self._ellipse_dist_sq(delta, r, a, b).clamp_min(self.eps).sqrt()   # [B, C]
         # cold/degenerate μ≈0 ⇒ r→0 ⇒ d → √b·‖ν‖ = geodesic(E[u],E[v]).
 
-        # --- channels combined with learnable per-channel coefficients ---------
-        geo = -alpha * d                                          # [B, C]
-        rec = self.rec_head(self.basis_rec(rec_v_dt)).squeeze(-1)  # [B, C]
-        logit = self.coef_geo * geo + self.coef_rec * rec
-
-        # --- co-reachability (∃-witness) channel (same μ / ellipse; own ρ, raw age) ---
+        # ===== GEOMETRIC channel = identity + co-reachability ==================
+        # 1st-order: the candidate v's OWN fit to u's prediction (−α·distance).
+        identity = -alpha * d                                     # [B, C]
+        # 2nd-order: ∃-witness over v's connectors (same μ / ellipse; own ρ, raw age).
         coreach = self._coreach(eu, mu, r, a, b, alpha,
                                 conn_ids, conn_age, conn_mask, e_weight)  # [B, C]
-        logit = logit + self.coef_coreach * coreach
+        geo = self.coef_identity * identity + self.coef_coreach * coreach  # total geometric
 
+        # ===== candidate STALENESS channel =====================================
+        staleness = self.staleness_head(self.basis_staleness(staleness_dt)).squeeze(-1)  # [B, C]
+
+        logit = geo + self.coef_staleness * staleness
+
+        # ===== PAIR channel (flagged), applied last ============================
         if self.use_pair_features:
             pair = self.pair_head(self.basis_pair(pair_dt)).squeeze(-1)  # [B, C]
             logit = (logit + self.coef_pair * pair

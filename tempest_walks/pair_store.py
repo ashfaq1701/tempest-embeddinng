@@ -93,7 +93,7 @@ class NodeLastSeenStore:
 
     @torch.no_grad()
     def query(self, cand: torch.Tensor, t_query: torch.Tensor) -> torch.Tensor:
-        """cand [B, C] long, t_query [B] long -> rec_v_dt [B, C] RAW Δt on cand.device
+        """cand [B, C] long, t_query [B] long -> staleness_dt [B, C] RAW Δt on cand.device
         (t_query − t_last[v], clamped ≥0; fed to the head's ExpDecayBasis). Cold nodes
         get last_ts=0 ⇒ Δt = t_query (very stale)."""
         device = cand.device
