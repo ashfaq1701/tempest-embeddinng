@@ -1,34 +1,44 @@
-"""Symmetric point head — recency-weighted predictions on both sides, four grad-paths.
+"""Unified symmetric witness head — symmetric predictions + soft-MAX witness terms.
 
-Four geometric grad-paths, each a clean inner product of unit/ambient vectors:
+The single-model "best of both": symmetric predictions on BOTH sides, with the
+candidate/source token comparisons done as recency-weighted soft-MAX WITNESS terms
+(logsumexp) rather than a diluting sum — so the discriminative "v has one exact
+connector matching u's prediction" signal is representable, while a learnable sharpness
+β lets the witness soften back toward the average when that is better.
 
-  μ_u = recency-weighted tangent mean of u's walk tokens, in T_{E[u]};  P_u = Exp_{E[u]}(μ_u)
-  μ_v = recency-weighted tangent mean of v's walk tokens, in T_{E[v]};  P_v = Exp_{E[v]}(μ_v)
-  S_u = recency-weighted EXTRINSIC sum of u's token embeddings  (ambient, Σ w_i·E[w_i])
-  S_v = recency-weighted EXTRINSIC sum of v's token embeddings  (ambient, Σ w_j·E[w_j])
+  μ_u = Σ_i softmax(+λ·edge_t_i^u)·Log_{E[u]}(E[w_i^u]) ;  P_u = Exp_{E[u]}(μ_u)
+  μ_v = Σ_j softmax(+λ·edge_t_j^v)·Log_{E[v]}(E[w_j^v]) ;  P_v = Exp_{E[v]}(μ_v)
 
-  T1 = ⟨P_u, E_v⟩                 grad → E[v] identity      (+ u's tokens via P_u)
-  T2 = ⟨P_v, E_u⟩                 grad → E[u] identity      (+ v's tokens via P_v)
-  T3 = ⟨P_u, S_v⟩                 grad → v's tokens, INDIVIDUALLY, age-weighted (w_j·P_u)
-  T4 = ⟨P_v, S_u⟩                 grad → u's tokens, INDIVIDUALLY, age-weighted (w_i·P_v)
-  geo = α·(coef_t1·T1 + coef_t2·T2 + coef_t3·T3 + coef_t4·T4)
+  T1 = ⟨P_u, E_v⟩                                         identity  (cheap, [B,C])
+  T2 = ⟨P_v, E_u⟩                                         identity  (cheap, [B,C])
+  T3 = logsumexp_j ( β·⟨P_u, E[w_j^v]⟩ − ρ·age_j^v )     candidate witness  ([B,C,M])
+  T4 = logsumexp_i ( β·⟨P_v, E[w_i^u]⟩ − ρ·age_i^u )     source witness     ([B,C,M])
+  geo   = α·(c1·T1 + c2·T2 + c3·T3 + c4·T4)
   logit = coef_geo·geo + coef_rec·rec(v) [+ coef_pair·pair(u,v) + coef_pair_count·log1p(count)]
 
-KEY IDENTITY (why this is cheap AND exact): sum-pooling commutes through the inner
-product — Σ_j w_j⟨P_u, E[w_j]⟩ = ⟨P_u, Σ_j w_j E[w_j]⟩ = ⟨P_u, S_v⟩. So "compare the
-prediction against every one of the other side's tokens, individually, age-weighted"
-equals "compare against the weighted token SUM" — one per-node vector, no [B,C,M,d]
-walk axis, no chunking. Per-token gradient is preserved exactly: ∂T3/∂E[w_j] = w_j·P_u.
-(Holds ONLY for linear/sum pooling; logsumexp/max would NOT commute and would force the
-walk axis. S_* is the RAW weighted sum — do not normalize it, or the equality breaks.)
+WHY WITNESS (logsumexp), NOT SUM: on recurrence-heavy wiki the discriminative question is
+"does v have ONE token landing on u's prediction" — a max/argmax signal. A linear sum
+(Σ w·⟨P_u,E[w]⟩ = ⟨P_u, Σ w·E[w]⟩) dilutes that single witness among many tokens and
+structurally cannot represent it. logsumexp surfaces it. The price is that logsumexp does
+NOT commute through the inner product, so the per-token [B,C,M,d] axis is real and there
+is NO candidate-side dedup (deliberate — dropped to buy back the witness). Single pass, no
+chunking; peak memory ~ B·C·M·d, bounded by walk length M (run M≈50 where it fits).
 
-DEDUP: μ_v, P_v, S_v are per-node (v's frame, v's tokens only). The recency weights use
-the SHIFT-INVARIANT edge-time form so they are query-independent (t_query cancels);
-combined with one pre-ingest snapshot per batch, they are computed ONCE per unique
-candidate and scattered via v_inv. No [B,C,M,d] tensor is ever materialized.
+β — THE SUM↔MIN DIAL: large β → hard witness (single best connector); small β → softens
+toward the average. One learnable β (shared T3/T4) subsumes both prior heads. Init ~1.
 
-COLD NODE: no tokens ⇒ μ=0 ⇒ P=E[node]; S=0. geo degrades to the identity terms
-(T1,T2 → ⟨E_u,E_v⟩) with the token terms (T3,T4) contributing 0. Graceful.
+TWO RECENCY-RATE ROLES (cannot merge):
+  • μ-λ  = softplus(log_lambda)  — SOFTMAX (scale-invariant). softmax(+λ·edge_t):
+    t_query cancels, query-independent. ONE shared λ for μ_u, μ_v.
+  • witness-ρ = exp(log_rate)    — LOGSUMEXP (NOT scale-invariant). raw AGE, init
+    −log(t_train) ⇒ ρ·age~O(1). ONE shared ρ for T3, T4.
+  μ uses edge_t (shift-inv); witness uses age (bounded ρ). The trainer supplies both.
+
+COEFS: c1,c2 init 1 ; c3,c4 init 0 (witness terms earn weight; baseline = symmetric
+identity-cosine head). Plain cosine identity (no ellipse to start).
+
+COLD NODE: no tokens ⇒ μ=0 ⇒ P=E[node]; an all-masked witness returns NEUTRAL 0
+(mask −inf before logsumexp, then where(any_valid, ·, 0)). geo degrades to identity terms.
 
 E is the single sphere parameter (geoopt ManifoldParameter, link-trained, no detach).
 """
@@ -40,11 +50,10 @@ import torch.nn.functional as F
 
 
 class ExpDecayBasis(nn.Module):
-    """Multi-rate exponential-decay staleness encoder: φ(Δt) = [exp(−ρ_k·Δt)]_{k=1..K}.
-    ρ_k = exp(log_rates_k) > 0 learnable, log-spaced init from 1/t_train to 1. Scale-free
-    on RAW Δt, bounded [0,1], monotone, multi-timescale. Never-seen event (Δt→+inf) ⇒ 0."""
+    """φ(Δt) = [exp(−ρ_k·Δt)]_{k=1..K}, ρ_k = exp(log_rates_k) log-spaced 1/t_train→1.
+       Scale-free on RAW Δt, bounded [0,1], monotone; Δt→∞ ⇒ 0."""
 
-    def __init__(self, dim: int, t_train: float):
+    def __init__(self, dim: int, t_train: float) -> None:
         super().__init__()
         r_lo = -math.log(max(float(t_train), 1.0))
         r_hi = 0.0
@@ -54,7 +63,7 @@ class ExpDecayBasis(nn.Module):
         return torch.exp(-torch.exp(self.log_rates) * dt.unsqueeze(-1))
 
 
-class SymmetricPointHead(nn.Module):
+class UnifiedSymmetricWitnessHead(nn.Module):
 
     # ──────────────────────────────────────────────────────────────────
     # Construction
@@ -62,24 +71,30 @@ class SymmetricPointHead(nn.Module):
 
     def __init__(self, d_emb: int, d_time: int = 16,
                  use_pair_features: bool = False, t_train: float = 1.0,
-                 token_terms_start_off: bool = True) -> None:
+                 witness_terms_start_off: bool = True) -> None:
         super().__init__()
         self.d_emb = d_emb
         self.eps = 1e-6
 
-        # shared recency rate λ = softplus(log_lambda); init ≈ C/t_train (C=10) so
-        # λ·age ~ O(1) → softmax unsaturated → λ trains (zero-init would argmax-pin it).
+        # μ-recency λ (softmax, shift-invariant): init ≈ C/t_train so λ·age~O(1) → λ trains
         lam0 = 10.0 / max(float(t_train), 1.0)
         self.log_lambda = nn.Parameter(
             torch.tensor([math.log(math.expm1(lam0))], dtype=torch.float32))
-        self.alpha = nn.Parameter(torch.tensor(10.0))          # geo → logit scale
+        # witness-recency ρ (logsumexp, bounded): init −log(t_train) ⇒ ρ·age~O(1)
+        self.log_rate = nn.Parameter(
+            torch.tensor([-math.log(max(float(t_train), 1.0))], dtype=torch.float32))
+        # witness sharpness β (sum↔min dial): init moderate β≈1 ; softplus⁻¹(1)
+        self.log_beta = nn.Parameter(
+            torch.tensor([math.log(math.expm1(1.0))], dtype=torch.float32))
 
-        # per-term mix gains: identity terms on (init 1), token terms off (init 0)
-        self.coef_t1 = nn.Parameter(torch.ones(1))             # ⟨P_u, E_v⟩
-        self.coef_t2 = nn.Parameter(torch.ones(1))             # ⟨P_v, E_u⟩
-        t_init = 0.0 if token_terms_start_off else 1.0
-        self.coef_t3 = nn.Parameter(torch.full((1,), t_init))  # ⟨P_u, S_v⟩
-        self.coef_t4 = nn.Parameter(torch.full((1,), t_init))  # ⟨P_v, S_u⟩
+        self.alpha = nn.Parameter(torch.tensor(10.0))            # geo → logit scale
+
+        # per-term mix: identity on, witness off (earn weight)
+        self.coef_t1 = nn.Parameter(torch.ones(1))               # ⟨P_u, E_v⟩
+        self.coef_t2 = nn.Parameter(torch.ones(1))               # ⟨P_v, E_u⟩
+        c0 = 0.0 if witness_terms_start_off else 1.0
+        self.coef_t3 = nn.Parameter(torch.full((1,), c0))        # candidate witness
+        self.coef_t4 = nn.Parameter(torch.full((1,), c0))        # source witness
 
         # additive channels
         self.basis_rec = ExpDecayBasis(d_time, t_train)
@@ -110,50 +125,58 @@ class SymmetricPointHead(nn.Module):
         return torch.cos(vn) * base + torch.sin(vn) * (v / vn)
 
     # ──────────────────────────────────────────────────────────────────
-    # Per-node aggregates
+    # Prediction
     # ──────────────────────────────────────────────────────────────────
 
-    def _recency_weights(self, edge_t: torch.Tensor,
-                         mask: torch.Tensor) -> torch.Tensor:
-        """w = softmax(+λ·edge_t) over the token axis, query-independent (shift-invariant).
-           Mask to −inf BEFORE softmax so the internal max is over valid tokens only;
-           a node with no valid tokens → all-0 (cold)."""
+    def _mu_recency_weights(self, edge_t: torch.Tensor,
+                            mask: torch.Tensor) -> torch.Tensor:
+        """softmax(+λ·edge_t) over the last (token) axis; shift-invariant.
+           Mask to −inf BEFORE the softmax max-subtraction; no tokens ⇒ all-0."""
         lam = F.softplus(self.log_lambda)
-        wlog = (lam * edge_t).masked_fill(~mask, float("-inf"))      # [..., M]
+        wlog = (lam * edge_t).masked_fill(~mask, float("-inf"))
         return torch.nan_to_num(torch.softmax(wlog, dim=-1), nan=0.0)
 
-    def _node_aggregates(self, base_emb: torch.Tensor, tok_emb: torch.Tensor,
-                         tok_edge_t: torch.Tensor, tok_mask: torch.Tensor):
-        """P = Exp_base(Σ w·Log_base(tok))  [G,d] unit ;  S = Σ w·tok  [G,d] ambient (raw).
-           Same w drives both. Cold ⇒ μ=0 ⇒ P=base, S=0."""
-        base = F.normalize(base_emb, dim=-1)                         # [G, d]
-        tok = F.normalize(tok_emb, dim=-1)                          # [G, M, d]
-        w = self._recency_weights(tok_edge_t, tok_mask)            # [G, M]
-        # P: tangent mean → sphere
-        g = self._logmap(base.unsqueeze(-2), tok)                  # [G, M, d]
-        mu = (w.unsqueeze(-1) * g).sum(dim=-2)                     # [G, d]
-        P = self._expmap(base, mu)                                 # [G, d]
-        # S: raw ambient weighted sum (NOT normalized)
-        S = (w.unsqueeze(-1) * tok).sum(dim=-2)                    # [G, d]
-        return P, S
+    def _predict(self, base_emb: torch.Tensor, tok_emb: torch.Tensor,
+                 tok_edge_t: torch.Tensor, tok_mask: torch.Tensor) -> torch.Tensor:
+        """P = Exp_base(Σ w·Log_base(tok)). Shape-agnostic over leading axes:
+           base_emb [..., d] ; tok_emb [..., M, d] ; tok_edge_t/tok_mask [..., M]."""
+        base = F.normalize(base_emb, dim=-1)
+        tok = F.normalize(tok_emb, dim=-1)
+        w = self._mu_recency_weights(tok_edge_t, tok_mask)        # [..., M]
+        g = self._logmap(base.unsqueeze(-2), tok)                # [..., M, d]
+        mu = (w.unsqueeze(-1) * g).sum(dim=-2)                   # [..., d]
+        return self._expmap(base, mu)                            # [..., d]
+
+    # ──────────────────────────────────────────────────────────────────
+    # Witness
+    # ──────────────────────────────────────────────────────────────────
+
+    def _witness(self, P: torch.Tensor, tok_emb: torch.Tensor,
+                 tok_age: torch.Tensor, tok_mask: torch.Tensor) -> torch.Tensor:
+        """logsumexp_m( β·⟨P, tok_m⟩ − ρ·age_m ) over the token axis; neutral 0 if empty.
+           P [B,C,d] ; tok_emb [B,C,M,d] (unit) ; tok_age/tok_mask [B,C,M]  -> [B,C]."""
+        tok = F.normalize(tok_emb, dim=-1)                       # [B,C,M,d]
+        sim = (P.unsqueeze(-2) * tok).sum(-1)                    # [B,C,M]  ⟨P, tok_m⟩
+        beta = F.softplus(self.log_beta)
+        rho = torch.exp(self.log_rate)
+        lw = (beta * sim - rho * tok_age).masked_fill(~tok_mask, float("-inf"))  # [B,C,M]
+        wit = torch.logsumexp(lw, dim=-1)                        # [B,C]
+        return torch.where(tok_mask.any(dim=-1), wit, torch.zeros_like(wit))
 
     # ──────────────────────────────────────────────────────────────────
     # Geometric score
     # ──────────────────────────────────────────────────────────────────
 
-    def _geo(self, P_u, S_u, E_u, P_v, S_v, E_v) -> torch.Tensor:
-        """α·(c1·⟨P_u,E_v⟩ + c2·⟨P_v,E_u⟩ + c3·⟨P_u,S_v⟩ + c4·⟨P_v,S_u⟩)."""
-        eu = F.normalize(E_u, dim=-1).unsqueeze(1)                  # [B,1,d]
-        ev = F.normalize(E_v, dim=-1)                              # [B,C,d]
-        Pu = P_u.unsqueeze(1)                                      # [B,1,d]
-        Su = S_u.unsqueeze(1)                                      # [B,1,d]
-        t1 = (Pu * ev).sum(-1)                                     # ⟨P_u, E_v⟩
-        t2 = (P_v * eu).sum(-1)                                    # ⟨P_v, E_u⟩
-        t3 = (Pu * S_v).sum(-1)                                    # ⟨P_u, S_v⟩
-        t4 = (P_v * Su).sum(-1)                                    # ⟨P_v, S_u⟩
+    def _geo(self, P_u: torch.Tensor, E_u: torch.Tensor,
+             P_v: torch.Tensor, E_v: torch.Tensor,
+             wit_cand: torch.Tensor, wit_src: torch.Tensor) -> torch.Tensor:
+        eu = F.normalize(E_u, dim=-1).unsqueeze(1)               # [B,1,d]
+        ev = F.normalize(E_v, dim=-1)                           # [B,C,d]
+        t1 = (P_u.unsqueeze(1) * ev).sum(-1)                    # ⟨P_u, E_v⟩   [B,C]
+        t2 = (P_v * eu).sum(-1)                                 # ⟨P_v, E_u⟩   [B,C]
         alpha = self.alpha.clamp_min(1e-3)
         return alpha * (self.coef_t1 * t1 + self.coef_t2 * t2
-                        + self.coef_t3 * t3 + self.coef_t4 * t4)   # [B,C]
+                        + self.coef_t3 * wit_cand + self.coef_t4 * wit_src)
 
     # ──────────────────────────────────────────────────────────────────
     # Additive channels
@@ -171,29 +194,53 @@ class SymmetricPointHead(nn.Module):
     # ──────────────────────────────────────────────────────────────────
 
     def forward(self,
-                E_u: torch.Tensor,
-                tok_u_emb: torch.Tensor, tok_u_edge_t: torch.Tensor,
-                tok_u_mask: torch.Tensor,
-                uniq_v_ids: torch.Tensor, v_inv: torch.Tensor,
-                tok_v_ids: torch.Tensor, tok_v_edge_t: torch.Tensor,
-                tok_v_mask: torch.Tensor, e_weight: torch.Tensor,
-                rec_v_dt: torch.Tensor,
-                pair_dt: torch.Tensor = None,
-                pair_count_log: torch.Tensor = None) -> torch.Tensor:
+                # ── source side (per query) ──
+                E_u: torch.Tensor,             # [B, d]
+                tok_u_emb: torch.Tensor,       # [B, n, d]
+                tok_u_edge_t: torch.Tensor,    # [B, n]   → μ_u softmax (shift-invariant)
+                tok_u_age: torch.Tensor,       # [B, n]   → T4 witness (bounded ρ)
+                tok_u_mask: torch.Tensor,      # [B, n]
+                # ── candidate side (per UNIQUE node + scatter) ──
+                uniq_v_ids: torch.Tensor,      # [Mv, d]  unique candidate embeddings → E_v / P_v base
+                v_inv: torch.Tensor,           # [B*C]    scatter index (unique → [B,C] grid)
+                tok_v_emb_u: torch.Tensor,     # [Mv, M, d]  unique candidate tokens (_predict runs here)
+                tok_v_edge_t_u: torch.Tensor,  # [Mv, M]     → μ_v softmax (shift-invariant, dedupable)
+                tok_v_mask_u: torch.Tensor,    # [Mv, M]
+                tok_v_age: torch.Tensor,       # [B, C, M]   → T3 witness; query-dependent, GENUINELY grid
+                # ── additive channels ──
+                rec_v_dt: torch.Tensor,        # [B, C]
+                pair_dt: torch.Tensor = None,         # [B, C]
+                pair_count_log: torch.Tensor = None   # [B, C]
+                ) -> torch.Tensor:
         B, C = rec_v_dt.shape
+        M = tok_v_emb_u.shape[1]
+        d = self.d_emb
 
-        # source side (per query)
-        P_u, S_u = self._node_aggregates(E_u, tok_u_emb, tok_u_edge_t, tok_u_mask)  # [B,d]×2
+        # source prediction (per query)
+        P_u = self._predict(E_u, tok_u_emb, tok_u_edge_t, tok_u_mask)          # [B,d]
 
-        # candidate side (per UNIQUE node, then scatter)
-        ev_u = F.embedding(uniq_v_ids, e_weight)                              # [Mv,d]
-        tok_v_emb = F.embedding(tok_v_ids.clamp_min(0), e_weight)             # [Mv,M,d]
-        P_v_u, S_v_u = self._node_aggregates(ev_u, tok_v_emb, tok_v_edge_t, tok_v_mask)
-        E_v = F.normalize(ev_u, dim=-1)[v_inv].view(B, C, -1)                # [B,C,d]
-        P_v = P_v_u[v_inv].view(B, C, -1)                                    # [B,C,d]
-        S_v = S_v_u[v_inv].view(B, C, -1)                                    # [B,C,d]
+        # candidate prediction PER UNIQUE v (v's own frame/tokens; shift-invariant +λ·edge_t
+        # weights → query-independent), then scatter. Bit-exact to the full-grid P_v in both
+        # forward and backward (scatter-add adjoint), at [Mv,M,d] instead of [B,C,M,d].
+        P_v_u = self._predict(uniq_v_ids, tok_v_emb_u, tok_v_edge_t_u, tok_v_mask_u)  # [Mv,d]
+        P_v = P_v_u[v_inv].view(B, C, d)                                       # [B,C,d]
+        E_v = F.normalize(uniq_v_ids, dim=-1)[v_inv].view(B, C, d)            # [B,C,d]
 
-        geo = self._geo(P_u, S_u, E_u, P_v, S_v, E_v)                        # [B,C]
+        # T3 candidate witness: P_u (broadcast over C) vs v's tokens. The ONLY candidate-side
+        # [B,C,M,d] block — scatter the unique tokens/mask to the grid here (witness can't dedup).
+        tok_v_emb = tok_v_emb_u[v_inv].view(B, C, M, d)                       # [B,C,M,d]
+        tok_v_mask = tok_v_mask_u[v_inv].view(B, C, M)                        # [B,C,M]
+        P_u_bc = P_u.unsqueeze(1).expand(B, C, d)                             # [B,C,d]
+        wit_cand = self._witness(P_u_bc, tok_v_emb, tok_v_age, tok_v_mask)     # [B,C]
+
+        # T4 source witness: P_v vs u's tokens, broadcast u's [B,n,*] over C → [B,C,n,*]
+        n = tok_u_emb.shape[1]
+        tok_u_emb_bc = tok_u_emb.unsqueeze(1).expand(B, C, n, d)               # [B,C,n,d]
+        tok_u_age_bc = tok_u_age.unsqueeze(1).expand(B, C, n)                  # [B,C,n]
+        tok_u_mask_bc = tok_u_mask.unsqueeze(1).expand(B, C, n)               # [B,C,n]
+        wit_src = self._witness(P_v, tok_u_emb_bc, tok_u_age_bc, tok_u_mask_bc)  # [B,C]
+
+        geo = self._geo(P_u, E_u, P_v, E_v, wit_cand, wit_src)                 # [B,C]
         logit = self.coef_geo * geo + self.coef_rec * self._rec(rec_v_dt)
         if self.use_pair_features:
             logit = logit + self._pair(pair_dt, pair_count_log)

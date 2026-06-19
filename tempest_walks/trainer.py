@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
-from .link_pred_head import SymmetricPointHead
+from .link_pred_head import UnifiedSymmetricWitnessHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
 from .pair_store import NodeLastSeenStore, PairRecencyStore
@@ -103,7 +103,7 @@ class Trainer:
         self.embedding_table = EmbeddingTable(
             num_nodes=config.num_nodes, d_emb=config.d_emb,
         ).to(self.device)
-        self.link_head = SymmetricPointHead(
+        self.link_head = UnifiedSymmetricWitnessHead(
             d_emb=int(config.d_emb),
             use_pair_features=config.use_pair_features,
             t_train=float(config.t_train),
@@ -214,12 +214,14 @@ class Trainer:
         tok_ts = tok_ts_all[u_pos]                             # [B, n]
         tok_mask = tok_mask_all[u_pos]                         # [B, n]
 
-        # Per-token RAW edge time, fed to the head's shift-invariant softmax(+λ·edge_t)
-        # (query-independent → keeps the candidate side dedupable). Masked slots (seed
-        # INT64_MAX sentinel, −1 padding) are zeroed here and −∞-masked in the head, so
-        # their value is irrelevant; only real walk-neighbour edge times carry weight.
+        # Two recency channels per source token (masked slots → 0; −∞/neutral-masked in head):
+        #   edge_t : RAW edge time → μ_u softmax(+λ·edge_t)   (shift-invariant)
+        #   age    : RAW t_query − t_edge ≥ 0 → T4 witness     (bounded ρ; query-dependent)
         tok_u_edge_t = torch.where(
-            tok_mask, tok_ts, torch.zeros_like(tok_ts)).float()  # [B, n]
+            tok_mask, tok_ts, torch.zeros_like(tok_ts)).float()      # [B, n]
+        tok_u_age = torch.where(
+            tok_mask, t_query_t.unsqueeze(1) - tok_ts, torch.zeros_like(tok_ts)
+        ).clamp_min(0).float()                                       # [B, n]
 
         E_u = self.embedding_table(src_t)                       # [B, d]   base point E[u]
 
@@ -233,45 +235,47 @@ class Trainer:
             pair_dt, pair_count_log = self.pair_store.query(     # [B, C] raw Δt_uv, log1p(count)
                 src_t, cand_t, t_query_t)
 
-        # Candidate-side walk-neighbours for μ_v/S_v, PER UNIQUE candidate node (no
-        # [B,C,M,d] blow-up): the head computes the v-aggregates once per unique v and
-        # indexes via v_inv.
-        uniq_v, v_inv, tok_v_ids, tok_v_edge_t, tok_v_mask = self._candidate_walk_tokens(
-            cand_t)
+        # Candidate-side walk-neighbour tokens, PER UNIQUE candidate (the prediction P_v is
+        # per-node → computed on [Mv,M,d] and scattered; only the witness needs the full grid,
+        # which the head materialises internally). The witness age is the one genuinely
+        # grid-shaped tensor (query-dependent t_query − t_edge).
+        (uniq_v_emb, v_inv, tok_v_emb_u, tok_v_edge_t_u, tok_v_mask_u,
+         tok_v_age) = self._candidate_walk_tokens(cand_t, t_query_t)
 
         return self.link_head(
-            E_u, tok_emb, tok_u_edge_t, tok_mask,
-            uniq_v, v_inv, tok_v_ids, tok_v_edge_t, tok_v_mask,
-            self.embedding_table.E.weight,
+            E_u, tok_emb, tok_u_edge_t, tok_u_age, tok_mask,
+            uniq_v_emb, v_inv, tok_v_emb_u, tok_v_edge_t_u, tok_v_mask_u, tok_v_age,
             rec_v_dt,
             pair_dt=pair_dt, pair_count_log=pair_count_log)
 
-    def _candidate_walk_tokens(self, cand_t: torch.Tensor):
-        """v's walk-neighbour tokens for μ_v/S_v — returned PER UNIQUE candidate node.
+    def _candidate_walk_tokens(self, cand_t: torch.Tensor, t_query_t: torch.Tensor):
+        """v's walk-neighbour tokens, scattered to the full [B, C, M] candidate grid.
 
         For every UNIQUE candidate v, sample CANDIDATE-side BACKWARD walks on the SAME
         Tempest graph (per-call overrides — no second store). ALL context nodes of those
         walks (seed v and padding excluded) become v's walk-neighbour tokens — symmetric
         to how the query side exposes u's walk-neighbours for μ_u.
 
-        The v-aggregates are PER-NODE quantities: they depend only on v's walks + E[v], not
-        on the query. EXACT iff the whole batch is scored against ONE pre-ingest snapshot (no
-        intra-batch graph update) — true here: both _train_step and _eval call add_edges
-        AFTER scoring the full batch. Then v's walks are identical across all queries having v
-        as a candidate, so the head computes its aggregates once per unique v and indexes via
-        v_inv.
+        SAMPLING is per UNIQUE candidate (v's walks depend only on v + the pre-ingest
+        snapshot, not the query — EXACT because add_edges runs only after the whole batch is
+        scored, so v's tokens are identical across every cell naming v). The PREDICTION P_v is
+        per-node, so it is computed by the head on the [Mv,M,d] unique tokens and scattered via
+        v_inv (bit-exact). Only the witness needs the full [B,C,M,d] grid, which the head
+        materialises internally; the one tensor that is genuinely grid-shaped here is the
+        witness AGE (query-dependent), returned at [B,C,M].
 
-        Token recency is the RAW edge time, fed to the head's shift-invariant
-        softmax(+λ·edge_t): query-independent (t_query cancels by softmax shift-invariance),
-        so the v-aggregates stay per-node. Masked slots are zeroed (the head −∞-masks them).
-        If eval ever ingests intra-batch, revisit.
+        Two recency channels (masked slots → 0):
+          edge_t (unique, dedupable) : RAW edge time → μ_v softmax(+λ·edge_t), shift-invariant;
+          age    (grid, query-dep)   : RAW t_query − t_edge ≥ 0 → witness (bounded ρ).
 
-        -> uniq_v       [Mv]      unique candidate node ids,
-           v_inv        [B*C]     scatter index back to the [B, C] candidate grid,
-           tok_v_ids    [Mv, M]   walk-neighbour node ids (−1 at padding; head gathers E),
-           tok_v_edge_t [Mv, M]   raw edge time (0 at masked slots; → +λ·edge_t),
-           tok_v_mask   [Mv, M]   True at a real walk-neighbour. M = K_cand · L_cand."""
+        -> uniq_v_emb     [Mv, d]      unique candidate embeddings (→ E_v / P_v base),
+           v_inv          [B*C]        scatter index (unique → [B,C] grid),
+           tok_v_emb_u    [Mv, M, d]   unique walk-neighbour embeddings (padding → E[0], masked),
+           tok_v_edge_t_u [Mv, M]      raw edge time (0 at masked slots),
+           tok_v_mask_u   [Mv, M]      True at a real walk-neighbour,
+           tok_v_age      [B, C, M]    raw age ≥ 0 (0 at masked). M = K_cand · L_cand."""
         device = self.device
+        B, C = cand_t.shape
         uniq_v, v_inv = torch.unique(cand_t.reshape(-1), return_inverse=True)  # [Mv],[B*C]
         wc = self.walk_gen.walks_for_nodes(
             uniq_v.cpu().numpy(),
@@ -284,19 +288,26 @@ class Trainer:
         ts_i = wc.timestamps.to(device).to(torch.int64).view(Mv, K, L)   # raw edge times (int64)
         lens = wc.lens.to(device).view(Mv, K)
         # Context = real walk-neighbours: exclude the seed v (slot lens-1) and padding.
-        # ts[p] is the time of edge (nodes[p], nodes[p+1]), so each neighbour carries
-        # its own edge recency (direct neighbours recent, deeper hops older).
         is_ctx = torch.arange(L, device=device).view(1, 1, L) < (lens - 1).unsqueeze(-1)
-        n = K * L
-        tok_v_ids = nodes.view(Mv, n)                          # [Mv, n] node ids (−1 pad)
-        tok_v_mask = is_ctx.view(Mv, n)                        # [Mv, n] bool
-        ts_i = ts_i.view(Mv, n)                                # [Mv, n] int64 (sentinel in masked)
-        # RAW edge time → head's shift-invariant softmax(+λ·edge_t) (query-independent, so
-        # the v-aggregates stay per-node and dedupable). Masked slots → 0 (the head −∞-masks
-        # them anyway, so their value never enters a weight).
-        tok_v_edge_t = torch.where(
-            tok_v_mask, ts_i, torch.zeros_like(ts_i)).float()
-        return uniq_v, v_inv, tok_v_ids, tok_v_edge_t, tok_v_mask
+        M = K * L
+        ids_u = nodes.view(Mv, M)                              # [Mv, M] node ids (−1 pad)
+        tok_v_mask_u = is_ctx.view(Mv, M)                      # [Mv, M] bool
+        ts_u = ts_i.view(Mv, M)                                # [Mv, M] int64 (sentinel masked)
+
+        # Per-unique (dedupable): embeddings, raw edge time, mask.
+        uniq_v_emb = self.embedding_table(uniq_v)                              # [Mv, d]
+        tok_v_emb_u = self.embedding_table(ids_u.clamp_min(0))                 # [Mv, M, d]
+        tok_v_edge_t_u = torch.where(
+            tok_v_mask_u, ts_u, torch.zeros_like(ts_u)).float()               # [Mv, M]
+
+        # Grid (query-dependent): witness age = t_query − t_edge ≥ 0, on the scattered times.
+        ts_grid = ts_u[v_inv].view(B, C, M)                                   # [B, C, M] int64
+        mask_grid = tok_v_mask_u[v_inv].view(B, C, M)                         # [B, C, M]
+        tok_v_age = torch.where(
+            mask_grid, t_query_t.view(B, 1, 1) - ts_grid, torch.zeros_like(ts_grid)
+        ).clamp_min(0).float()                                                # [B, C, M]
+        return (uniq_v_emb, v_inv, tok_v_emb_u, tok_v_edge_t_u, tok_v_mask_u,
+                tok_v_age)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
