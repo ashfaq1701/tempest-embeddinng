@@ -276,13 +276,15 @@ class GeometricPointHead(nn.Module):
         geo = -alpha * d                                          # [B, C]
         rec = self.rec_head(self.basis_rec(rec_v_dt)).squeeze(-1)  # [B, C]
         logit = self.coef_geo * geo + self.coef_rec * rec
-        if self.use_pair_features:
-            pair = self.pair_head(self.basis_pair(pair_dt)).squeeze(-1)  # [B, C]
-            logit = (logit + self.coef_pair * pair
-                     + self.coef_pair_count * pair_count_log)
 
         # --- co-reachability (∃-witness) channel (same μ / ellipse; own ρ, raw age) ---
         coreach = self._coreach(eu, mu, r, a, b, alpha,
                                 conn_ids, conn_age, conn_mask, e_weight)  # [B, C]
         logit = logit + self.coef_coreach * coreach
+
+        if self.use_pair_features:
+            pair = self.pair_head(self.basis_pair(pair_dt)).squeeze(-1)  # [B, C]
+            logit = (logit + self.coef_pair * pair
+                     + self.coef_pair_count * pair_count_log)
+
         return logit
