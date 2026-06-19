@@ -1,5 +1,5 @@
 """Geometric link head — point version (recency-weighted mean + anisotropic ellipse)
-+ co-reachability (cross) channel.
++ co-reachability (∃-witness) channel.
 
 Base point E[u]; u's temporal-walk neighbours log-mapped into the flat tangent
 space T_{E[u]}; a recency-weighted MEAN μ predicts "where v should belong"; the
@@ -15,13 +15,13 @@ more than being off in DISTANCE. The channels are mixed with learnable coefficie
   heading      r   = μ/‖μ‖ ;  δ = ν − μ = δ∥ (along r) + δ⊥ (⊥ r)
   geo channel  d   = √( a·‖δ∥‖² + b·‖δ⊥‖² )         anisotropic ellipse, a,b ≥ 0
   logit        = coef_geo·(−α·d) + coef_rec·rec(v) [+ coef_pair·pair(u,v)]
-                 + coef_cross·cross(u,v)
+                 + coef_coreach·coreach(u,v)
 
 The geometric distance is an ELLIPSE oriented along each source's heading r (not an
 isotropic circle): the model learns a,b so being off ALONG the heading is weighted
 differently from being off SIDEWAYS — on tgbl-wiki it learns a/b ≈ 1/100 ("direction
 matters, distance-along-heading is ~free"). a=b recovers the plain circle ‖ν−μ‖.
-The channels (geometric / recency / pair / cross) are mixed with learnable per-channel
+The channels (geometric / recency / pair / co-reachability) are mixed with learnable per-channel
 coefficients (init 1 for the proven channels = plain sum) so the model can rebalance
 them. Few scalars (α, λ, a, b, coef_*) — almost nothing to overfit; the anisotropy is
 adaptive (≈isotropic where no direction signal exists).
@@ -29,45 +29,48 @@ adaptive (≈isotropic where no direction signal exists).
 TIME UNITS — ages are RAW (t_query − t_edge), never normalized at runtime.
   - The source-side recency μ = Σ softmax(−λ·age)·g is a SOFTMAX, which is
     scale-invariant, so raw age is exactly the proven baseline (λ self-scales).
-  - The CROSS-side recency lives inside a LOGSUMEXP, which is NOT scale-invariant:
-    with a normal rate on raw wiki ages (~1e6), −rate·age ≈ −7e5, the cross logit
-    swings over ~1e6 and even an init-0 coef_cross diverges on step 1. So the cross
-    gets its OWN decay ρ_cross = exp(log_rate_cross) on RAW age, init log_rate_cross =
-    −log(t_train) ⇒ ρ_cross ≈ 1/t_train ⇒ ρ_cross·age ~ O(1) at init (bounded). The
+  - The CO-REACH-side recency lives inside a LOGSUMEXP, which is NOT scale-invariant:
+    with a normal rate on raw wiki ages (~1e6), −rate·age ≈ −7e5, the co-reach logit
+    swings over ~1e6 and even an init-0 coef_coreach diverges on step 1. So co-reach
+    gets its OWN decay ρ = exp(log_rate_coreach) on RAW age, init log_rate_coreach =
+    −log(t_train) ⇒ ρ ≈ 1/t_train ⇒ ρ·age ~ O(1) at init (bounded). The
     exp-log-rate parameterization is scale-free & well-conditioned (∂z/∂log_rate = z);
     t_train sets the init, it is NOT a per-step scaler. (μ keeps softplus(log_lambda)
     on raw age — the proven argmax-init baseline.)
 
-CO-REACHABILITY (cross) channel — for the new×both-seen cell, where the candidate v is
-seen but never linked from u, so the candidate term d(ν) is blind. Instead of asking
-"is v in u's region", it asks "is any recent CONNECTOR of v (a source that recently
-reached v) in u's region":
+CO-REACHABILITY (∃-witness) channel — a soft, temporal, geometric COMMON-NEIGHBOUR
+signal. For the new×both-seen cell, where the candidate v is seen but never linked from
+u, the candidate term d(ν) is blind. Instead of asking "is v in u's region", it asks "is
+any recent CONNECTOR of v (a source that recently reached v) in u's region":
 
   connectors   c_j = Log_{E[u]}(E[w_j])             v's recent direct neighbours, SAME tangent space
   conn dist    d(c_j) = √( a·‖δ∥‖² + b·‖δ⊥‖² ),  δ = c_j − μ     SAME μ, r, a, b, α as candidates
-  cross        x(u,v) = logsumexp_j(−α·d(c_j) − ρ_cross·age_j)   soft-min: the single best
-                                                                  recent, in-character connector
-  logit       += coef_cross·x(u,v)                  init 0 = channel off, earns its weight
+  coreach      x(u,v) = logsumexp_j(−α·d(c_j) − ρ·age_j)         ∃-witness (soft-min): the single
+                                                                  best recent, in-region connector
+  logit       += coef_coreach·x(u,v)                init 0 = channel off, earns its weight
 
-Design choices that make this consistent rather than a bolted-on second model:
+This is the classic common-neighbour heuristic SOFTENED into geometry: proximity-in-
+prediction-space instead of an exact shared-node count, and an EXISTENTIAL soft-min (one
+witness suffices) instead of a sum/count. Design choices that make it consistent rather
+than a bolted-on second model:
   - Connectors are scored against the SAME μ and the SAME ellipse (a, b, heading r, α)
     as the candidates — they are just another set of tangent vectors pushed through the
     existing geometry. No second scale/temperature (that compounding broke earlier heads).
-  - Connector recency uses its OWN ρ_cross = exp(log_rate_cross) (separate from μ's λ),
-    on RAW age, init −log(t_train) (see TIME UNITS). coef_cross init 0 keeps the channel
+  - Connector recency uses its OWN ρ = exp(log_rate_coreach) (separate from μ's λ),
+    on RAW age, init −log(t_train) (see TIME UNITS). coef_coreach init 0 keeps the channel
     off while it earns its weight.
-  - Soft-min (logsumexp) WITHIN connectors (existential: one in-character witness fires),
-    additive coef_cross BETWEEN channels. A sum over connectors would mean-pool and wash
+  - Soft-min (logsumexp) WITHIN connectors (existential: one in-region witness fires),
+    additive coef_coreach BETWEEN channels. A sum over connectors would mean-pool and wash
     out the single relevant witness.
   - A candidate with no recent connectors contributes a neutral 0 (no −∞ leak).
-  - Cross is a plain additive channel. Two conditioning mechanisms were tried and
+  - Co-reach is a plain additive channel. Two conditioning mechanisms were tried and
     REJECTED on tgbl-wiki (2×2 {gate}×{hop} grid, all cells within ~0.002 test of
     baseline = inside the 0.015 noise band): a learnable source-DEGREE gate
-    g(deg_u)·cross (to silence cross on warm/repeat sources) and a connector
+    g(deg_u)·coreach (to silence co-reach on warm/repeat sources) and a connector
     HOP-distance penalty −κ·(hop−1) in the logsumexp (a soft candidate-walk-length
     sweep; longer reach was net-neutral-to-negative). The gate can't move wiki — its
     target cold/new-pair slice is only ~13% of the data — so both are deferred to a
-    cold-start workload (review), where the cross channel is designed to matter.
+    cold-start workload (review), where the co-reach channel is designed to matter.
 
 Lineage: an explicit angle term −β·θ was tried and dropped (redundant with ‖ν−μ‖ by
 the law of cosines, needed a ‖μ‖-floor guard). The Gaussian head's per-source
@@ -116,7 +119,7 @@ class GeometricPointHead(nn.Module):
         # (C=10) — NOT log_lambda=0: at zero-init λ = softplus(0) = 0.693 on raw ages makes
         # λ·age enormous, so the softmax saturates to a hard argmax and ∂loss/∂λ → 0 (λ pinned,
         # μ frozen as the single most-recent neighbour). Scaling the init by 1/t_train puts
-        # λ·age ~ O(1) so λ actually TRAINS. (Same fix already baked into log_rate_cross below,
+        # λ·age ~ O(1) so λ actually TRAINS. (Same fix already baked into log_rate_coreach below,
         # which inits at −log(t_train) ⇒ ρ≈1/t_train ⇒ ρ·age O(1); only log_lambda was unscaled.)
         lam0 = 10.0 / max(float(t_train), 1.0)
         self.log_lambda = nn.Parameter(
@@ -157,17 +160,17 @@ class GeometricPointHead(nn.Module):
             # count=0 → log1p=0 → no contribution (same clean baseline as the recency).
             self.coef_pair_count = nn.Parameter(torch.zeros(1))
 
-        # --- co-reachability (cross) channel -----------------------------------
+        # --- co-reachability (∃-witness) channel -------------------------------
         # Reuses μ and the ellipse (a, b, heading r, α) from the geometric channel.
         # Two new params:
-        #   coef_cross : channel gain, init 0 ⇒ starts as the proven baseline.
-        #   log_rate_cross : SEPARATE connector-recency decay ρ_cross = exp(log_rate)
-        #     on RAW age. init −log(t_train) ⇒ ρ_cross ≈ 1/t_train ⇒ ρ_cross·age ~ O(1)
-        #     at init, so the (non-scale-invariant) cross logsumexp stays bounded — same
+        #   coef_coreach : channel gain, init 0 ⇒ starts as the proven baseline.
+        #   log_rate_coreach : SEPARATE connector-recency decay ρ = exp(log_rate)
+        #     on RAW age. init −log(t_train) ⇒ ρ ≈ 1/t_train ⇒ ρ·age ~ O(1) at init,
+        #     so the (non-scale-invariant) co-reach logsumexp stays bounded — same
         #     exp-log-rate idiom as ExpDecayBasis, replacing the softplus(λ)+0.1/t_train
         #     hack. Same recency family, just a cleaner well-conditioned parameterization.
-        self.coef_cross = nn.Parameter(torch.zeros(1))
-        self.log_rate_cross = nn.Parameter(
+        self.coef_coreach = nn.Parameter(torch.zeros(1))
+        self.log_rate_coreach = nn.Parameter(
             torch.tensor([-math.log(max(float(t_train), 1.0))], dtype=torch.float32))
 
     def _logmap(self, p: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -188,17 +191,20 @@ class GeometricPointHead(nn.Module):
         dperp2 = ((delta * delta).sum(-1) - dpar2).clamp_min(0.0)
         return a * dpar2 + b * dperp2                # [B, ...]
 
-    def _cross(self, eu: torch.Tensor, mu: torch.Tensor, r: torch.Tensor,
-               a: torch.Tensor, b: torch.Tensor, alpha: torch.Tensor,
-               conn_ids: torch.Tensor, conn_age: torch.Tensor,
-               conn_mask: torch.Tensor, e_weight: torch.Tensor) -> torch.Tensor:
-        """Soft-min co-reachability logit per candidate.
+    def _coreach(self, eu: torch.Tensor, mu: torch.Tensor, r: torch.Tensor,
+                 a: torch.Tensor, b: torch.Tensor, alpha: torch.Tensor,
+                 conn_ids: torch.Tensor, conn_age: torch.Tensor,
+                 conn_mask: torch.Tensor, e_weight: torch.Tensor) -> torch.Tensor:
+        """Co-reachability (∃-witness) logit per candidate — a soft, temporal, geometric
+        common-neighbour signal: does v have ONE recent connector that falls in u's
+        predicted region?
 
         Connectors are v's recent walk-neighbours (sources that reached v), scored
         against u's SAME μ / ellipse as the candidates, with a SEPARATE recency decay
-        ρ_cross = exp(log_rate_cross) (on RAW age; init −log(t_train)). The soft-min
-        picks the single best recent, in-character connector; candidates with no
-        valid connector contribute a neutral 0.
+        ρ = exp(log_rate_coreach) (on RAW age; init −log(t_train)). The soft-min
+        (logsumexp) is EXISTENTIAL — it returns the single best recent, in-region
+        connector (the "witness"), not an average; candidates with no valid connector
+        contribute a neutral 0.
 
            eu        [B, d]        unit source embedding (tangent base point)
            mu, r     [B, d]        predicted position and heading (from neighbours)
@@ -217,10 +223,10 @@ class GeometricPointHead(nn.Module):
         gc = self._logmap(eu[:, None, None, :], ec)               # [B, C, M, d]
         delta = gc - mu[:, None, None, :]
         d_conn = self._ellipse_dist_sq(delta, r, a, b).clamp_min(self.eps).sqrt()  # [B,C,M]
-        rho_cross = torch.exp(self.log_rate_cross)
-        lw = (-alpha * d_conn - rho_cross * conn_age).masked_fill(~conn_mask, -1e9)
-        cross = torch.logsumexp(lw, dim=-1)                       # [B, C]
-        return torch.where(conn_mask.any(dim=-1), cross, torch.zeros_like(cross))
+        rho = torch.exp(self.log_rate_coreach)
+        lw = (-alpha * d_conn - rho * conn_age).masked_fill(~conn_mask, -1e9)
+        coreach = torch.logsumexp(lw, dim=-1)                     # [B, C]
+        return torch.where(conn_mask.any(dim=-1), coreach, torch.zeros_like(coreach))
 
     def forward(self, tok_emb: torch.Tensor, tok_age: torch.Tensor,
                 tok_mask: torch.Tensor, E_u: torch.Tensor, E_v: torch.Tensor,
@@ -275,8 +281,8 @@ class GeometricPointHead(nn.Module):
             logit = (logit + self.coef_pair * pair
                      + self.coef_pair_count * pair_count_log)
 
-        # --- co-reachability (cross) channel (same μ / ellipse; own ρ_cross, raw age) -
-        cross = self._cross(eu, mu, r, a, b, alpha,
-                            conn_ids, conn_age, conn_mask, e_weight)  # [B, C]
-        logit = logit + self.coef_cross * cross
+        # --- co-reachability (∃-witness) channel (same μ / ellipse; own ρ, raw age) ---
+        coreach = self._coreach(eu, mu, r, a, b, alpha,
+                                conn_ids, conn_age, conn_mask, e_weight)  # [B, C]
+        logit = logit + self.coef_coreach * coreach
         return logit

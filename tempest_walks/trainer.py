@@ -43,7 +43,7 @@ class TrainerConfig:
     dst_pool: np.ndarray
 
     # Frozen train-split span. Sets the log-spaced init of the head's exp-decay rates:
-    # the cross-channel decay ρ_cross = exp(log_rate_cross), init −log(t_train) (so the
+    # the co-reachability decay ρ = exp(log_rate_coreach), init −log(t_train) (so the
     # raw-age logsumexp stays O(1) at init), and the ExpDecayBasis rates (1/t_train … 1)
     # for the rec / pair channels. Init only — never a per-step scaler.
     t_train: float = 1.0
@@ -60,7 +60,7 @@ class TrainerConfig:
     use_pair_features: bool = False
 
     # Walks (BACKWARD only, undirected). Decoupled QUERY-side (source u → μ) and
-    # CANDIDATE-side (v → connectors for the cross channel), both sampled from the
+    # CANDIDATE-side (v → connectors for the co-reachability channel), both sampled from the
     # SAME Tempest graph via per-call overrides (no second store, no extra ingest).
     # Candidate-side is a FREE-LENGTH walk-neighbourhood (all context nodes of v's
     # walks become connectors, parallel to the query side), not just direct
