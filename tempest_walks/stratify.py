@@ -50,8 +50,9 @@ class TestStratRecorder:
         src = np.asarray(batch.src, np.int64)
         tgt = np.asarray(batch.tgt, np.int64)
         ts = np.asarray(batch.ts, np.int64)
-        _, ever, count_log = self.pair.query(
+        _, count_log = self.pair.query(
             torch.from_numpy(src), torch.from_numpy(tgt)[:, None], torch.from_numpy(ts))
+        ever = count_log > 0   # ever-seen ⟺ count>0 ⟺ log1p(count)>0 (PairRecencyStore dropped the ever bit)
         self._m = {
             "u_deg": self.deg[src].copy(),
             "v_deg": self.deg[tgt].copy(),
