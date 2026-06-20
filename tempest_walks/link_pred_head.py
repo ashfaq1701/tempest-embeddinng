@@ -103,12 +103,15 @@ class SymmetricGeometricHead(nn.Module):
         # asymmetric head — free, unconstrained. The two CANDIDATE-side terms (the genuinely
         # new μ_v terms) are FLOORED at ≥0 via softplus(raw): the geometry is oriented
         # higher=better, so a NEGATIVE coef would invert it — never wanted. Flooring lets each
-        # candidate term only HELP or TURN OFF, never invert. softplus (not hard clamp) keeps a
-        # live gradient at the floor so a term can recover. raw init −4 ⇒ softplus≈0.018 (≈off).
+        # candidate term only stay positive or TURN OFF, never invert; softplus (not hard
+        # clamp) keeps a live gradient so it can move freely. raw init = softplus⁻¹(1) ⇒ the
+        # candidate terms start fully ON (effective coef 1), and the model can drive them down
+        # toward OFF (→0) if they don't help.
+        on_raw = math.log(math.expm1(1.0))                 # softplus⁻¹(1) ⇒ effective coef 1
         self.coef_query_identity = nn.Parameter(torch.ones(1))
-        self.coef_candidate_identity_raw = nn.Parameter(torch.full((1,), -4.0))
+        self.coef_candidate_identity_raw = nn.Parameter(torch.full((1,), on_raw))
         self.coef_query_coreach = nn.Parameter(torch.zeros(1))
-        self.coef_candidate_coreach_raw = nn.Parameter(torch.full((1,), -4.0))
+        self.coef_candidate_coreach_raw = nn.Parameter(torch.full((1,), on_raw))
         self.coef_staleness = nn.Parameter(torch.ones(1))
         if use_pair_features:
             self.coef_pair = nn.Parameter(torch.ones(1))
