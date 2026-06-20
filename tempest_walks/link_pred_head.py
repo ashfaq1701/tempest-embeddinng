@@ -99,12 +99,16 @@ class SymmetricGeometricHead(nn.Module):
             self.pair_head = nn.Linear(d_time, 1)
 
         # --- four geometric mix coefficients -----------------------------------
-        # query_identity is the proven baseline (init 1); the three mirror/witness terms
-        # earn their weight from 0 ⇒ at init the head == the asymmetric identity term.
+        # query_identity (proven baseline, init 1) and query_coreach (init 0) match master's
+        # asymmetric head — free, unconstrained. The two CANDIDATE-side terms (the genuinely
+        # new μ_v terms) are FLOORED at ≥0 via softplus(raw): the geometry is oriented
+        # higher=better, so a NEGATIVE coef would invert it — never wanted. Flooring lets each
+        # candidate term only HELP or TURN OFF, never invert. softplus (not hard clamp) keeps a
+        # live gradient at the floor so a term can recover. raw init −4 ⇒ softplus≈0.018 (≈off).
         self.coef_query_identity = nn.Parameter(torch.ones(1))
-        self.coef_candidate_identity = nn.Parameter(torch.zeros(1))
+        self.coef_candidate_identity_raw = nn.Parameter(torch.full((1,), -4.0))
         self.coef_query_coreach = nn.Parameter(torch.zeros(1))
-        self.coef_candidate_coreach = nn.Parameter(torch.zeros(1))
+        self.coef_candidate_coreach_raw = nn.Parameter(torch.full((1,), -4.0))
         self.coef_staleness = nn.Parameter(torch.ones(1))
         if use_pair_features:
             self.coef_pair = nn.Parameter(torch.ones(1))
@@ -255,10 +259,11 @@ class SymmetricGeometricHead(nn.Module):
                                   su_ids, su_nmask, su_ages, su_amask,
                                   e_weight, a, b, alpha)           # [B,C]
 
+        # query terms free; the two candidate-side terms floored ≥0 via softplus(raw).
         geo = (self.coef_query_identity * q_ident
-               + self.coef_candidate_identity * c_ident
+               + F.softplus(self.coef_candidate_identity_raw) * c_ident
                + self.coef_query_coreach * q_coreach
-               + self.coef_candidate_coreach * c_coreach)
+               + F.softplus(self.coef_candidate_coreach_raw) * c_coreach)
 
         # --- candidate STALENESS channel ---
         staleness = self.staleness_head(self.basis_staleness(staleness_dt)).squeeze(-1)  # [B,C]
