@@ -1,24 +1,33 @@
-"""Strict-causal training + eval loop — link-supervised source-side walk-encoder.
+"""Strict-causal training + eval loop — link-supervised symmetric walk-encoder.
 
 Per-batch ordering (training):
   1. neg = neg_sampler.sample(batch)                 — [B, K_train] uniform negs
   2. candidates = [pos | negs]                       — [B, 1+K_train]
-  3. logits = score(src, candidates)                 — sample K walks for the SOURCES
-       only, GRU-encode to h[u], score by the chord  -scale*‖ĥ[u] - E[v]‖
+  3. logits = score(src, candidates)                 — SYMMETRIC: sample walks for the
+       unique sources AND the unique candidates, dedup each to a per-node CSR, score.
   4. L = cross_entropy(logits / tau_link, target=0)  — Bruch 2019, upper-bounds 1-MRR
   5. one backward + single optimizer step
   6. walk_gen.add_edges(batch)                        — post-scoring, LAST
 
-E (on the unit sphere) and the GRU are trained together by L (no alignment, no
-detach) by a single RiemannianAdam: E gets the manifold update, the Euclidean
-GRU/scale get the ordinary update.
+E (on the unit sphere) and the head are trained together by L (no alignment, no detach)
+by a single RiemannianAdam.
 
-Eval (no_grad): TGB per-positive negatives, score each [pos | ~999 negs] via the
-same path, official Evaluator MRR; advance Tempest with the full batch after.
+SYMMETRIC CSR TOKEN PREP — the source side (u → μ) and the candidate side (v → connectors)
+go through ONE shared routine `_walk_csr`: walk for the unique seeds, flatten the (K,L) walk
+axes, and DEDUPLICATE per seed into a compact CSR
+    (node_ids [G,U], node_mask [G,U], ages [G,U,kmax], age_mask [G,U,kmax])
+— distinct neighbour nodes per seed, each carrying its OCCURRENCE AGES (all of them, so the
+recency mean stays exact) and, implicitly, its COUNT = age_mask.sum(-1). Both sides emit the
+SAME layout; they differ only in which seeds (sources vs candidates) and which walk params.
+The source CSR is computed per unique source [Ms,…] and gathered to [B,…]; the candidate CSR
+is computed per unique candidate [Mv,…] and scattered to [B,C,…] via v_inv (the dedup is
+exact — the per-node CSR is query-independent given a single pre-ingest snapshot and the
+shift-invariant recency weighting). IDs are passed to the head, which gathers embeddings from
+the shared table for both sides. Strict-causal: walks + stores reflect the pre-ingest state.
 """
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import geoopt
 import numpy as np
@@ -43,9 +52,8 @@ class TrainerConfig:
     dst_pool: np.ndarray
 
     # Frozen train-split span. Sets the log-spaced init of the head's exp-decay rates:
-    # the co-reachability decay ρ = exp(log_rate_coreach), init −log(t_train) (so the
-    # raw-age logsumexp stays O(1) at init), and the ExpDecayBasis rates (1/t_train … 1)
-    # for the rec / pair channels. Init only — never a per-step scaler.
+    # the co-reachability decay ρ = exp(log_rate_coreach), init −log(t_train), and the
+    # ExpDecayBasis rates (1/t_train … 1). Init only — never a per-step scaler.
     t_train: float = 1.0
 
     # Model.
@@ -55,18 +63,13 @@ class TrainerConfig:
     tau_link: float = 1.0       # softmax-CE temperature
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
 
-    # Exact pairwise (u,v) recurrence + history from the streaming store, added as
-    # one logit term. Off by default => baseline byte-identical.
+    # Exact pairwise (u,v) recurrence channel, added as one logit term. Flagged; the
+    # in-geometry count term aims to make it droppable.
     use_pair_features: bool = False
 
     # Walks (BACKWARD only, undirected). Decoupled QUERY-side (source u → μ) and
-    # CANDIDATE-side (v → connectors for the co-reachability channel), both sampled from the
-    # SAME Tempest graph via per-call overrides (no second store, no extra ingest).
-    # Candidate-side is a FREE-LENGTH walk-neighbourhood (all context nodes of v's
-    # walks become connectors, parallel to the query side), not just direct
-    # neighbours — max_walk_len_candidate_side controls the reach (2 = direct only).
-    # Walk-len defaults set by the wiki sweep: query-len 5 (shorter is better,
-    # monotone +0.006 test vs 20, more stable); candidate-len 5 (≥3 adds ~0.003).
+    # CANDIDATE-side (v → connectors), both sampled from the SAME Tempest graph via
+    # per-call overrides. Both sides now go through the SAME CSR dedup phase.
     num_walks_per_node_query_side: int = 5
     max_walk_len_query_side: int = 5
     walk_bias_query_side: str = "ExponentialWeight"
@@ -77,23 +80,30 @@ class TrainerConfig:
     start_bias_candidate_side: str = "Linear"
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
-    # Optimisation. Single RiemannianAdam over {E, GRU, scale}: E (the lone
-    # ManifoldParameter) gets the sphere update, GRU/scale the Euclidean one.
-    lr: float = 1e-3            # peak LR
-    lr_min: float = 1e-5        # cosine floor
-    weight_decay: float = 1e-4  # applies to GRU/scale; a no-op on the sphere E
+    # Optimisation.
+    lr: float = 1e-3
+    lr_min: float = 1e-5
+    weight_decay: float = 1e-4
     warmup_fraction: float = 0.05
     warmup_steps_cap: int = 500
     decay_horizon_epochs: int = 50
 
     # Run control.
     num_epochs: int = 50
-    early_stop_patience: int = 0   # 0 = no early stopping
+    early_stop_patience: int = 0
 
     # System.
     seed: int = 42
     use_gpu: bool = False
     use_gpu_tempest: bool = False
+
+
+# CSR bundle — the symmetric per-seed deduplicated walk-neighbourhood.
+#   node_ids  [G, U]        distinct neighbour node ids per seed (−1 at padded node slots)
+#   node_mask [G, U]        True at a real distinct node
+#   ages      [G, U, kmax]  each distinct node's OCCURRENCE ages (raw; 0 at padded slots)
+#   age_mask  [G, U, kmax]  True at a real occurrence (count_node = age_mask.sum(-1))
+WalkCSR = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
 
 class Trainer:
@@ -111,16 +121,10 @@ class Trainer:
             t_train=float(config.t_train),
         ).to(self.device)
 
-        # Streaming pairwise-interaction store feeding the pair features. Lifecycle
-        # mirrors walk_gen: reset() per epoch, update() after scoring, query() at
-        # scoring time.
         self.pair_store = (
             PairRecencyStore(num_nodes=config.num_nodes)
             if config.use_pair_features else None
         )
-
-        # Per-node last-seen store: supplies the candidate recency term without
-        # sampling candidate walks (source-side-only head). Always on.
         self.node_last = NodeLastSeenStore()
 
         # One generator, configured QUERY-side; candidate-side walks reuse it via
@@ -137,9 +141,6 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # Single RiemannianAdam over every trainable parameter. E is a
-        # ManifoldParameter (sphere update); the GRU/scale are Euclidean
-        # (ordinary update). stabilize=10 periodically re-projects E.
         params = list(self.embedding_table.parameters()) + list(self.link_head.parameters())
         self.opt = geoopt.optim.RiemannianAdam(
             params, lr=config.lr, weight_decay=config.weight_decay, stabilize=10)
@@ -171,6 +172,125 @@ class Trainer:
         )
 
     # ──────────────────────────────────────────────────────────────────
+    # Symmetric CSR token preparation — ONE routine for both sides
+    # ──────────────────────────────────────────────────────────────────
+
+    def _walk_csr(self, seeds_unique: torch.Tensor, t_query_per_seed: torch.Tensor,
+                  *, max_walk_len: Optional[int] = None,
+                  num_walks_per_node: Optional[int] = None,
+                  start_bias: Optional[str] = None,
+                  walk_bias: Optional[str] = None) -> WalkCSR:
+        """Walk for `seeds_unique`, then DEDUPLICATE each seed's walk-neighbours into a
+        compact per-node CSR. Symmetric: the source and candidate sides call this with the
+        same contract, differing only in seeds + walk params.
+
+           seeds_unique      [G] long      unique seed node ids (sources OR candidates)
+           t_query_per_seed  [G] long      the query time to age each seed's tokens against
+                                           (sources: per-source t_query; candidates: see note)
+           -> WalkCSR (node_ids [G,U], node_mask [G,U], ages [G,U,kmax], age_mask [G,U,kmax])
+
+        Dedup is per seed-row: occurrences of the same neighbour node collapse to ONE node
+        slot carrying ALL its occurrence ages (recency mean stays exact) and its count
+        (= #occurrences = age_mask.sum(-1)). U = max distinct neighbours over rows, kmax =
+        max occurrences of any one node in a row; both padded. Seed (= the node itself) and
+        walk padding are excluded before dedup. Strict-causal: pre-ingest graph snapshot."""
+        device = self.device
+        G = int(seeds_unique.shape[0])
+        wd = self.walk_gen.walks_for_nodes(
+            seeds_unique.cpu().numpy(),
+            max_walk_len=max_walk_len,
+            num_walks_per_node=num_walks_per_node,
+            start_bias=start_bias,
+            walk_bias=walk_bias)
+        K, L = wd.K, wd.nodes.shape[1]
+        nodes = wd.nodes.to(device).view(G, K, L)               # [G, K, L]
+        ts = wd.timestamps.to(device).view(G, K, L)             # [G, K, L] int64 edge times
+        lens = wd.lens.to(device).view(G, K)                    # [G, K]
+        # Context = real walk-neighbours: exclude the seed slot (lens-1) and padding.
+        is_ctx = torch.arange(L, device=device).view(1, 1, L) < (lens - 1).unsqueeze(-1)
+
+        n = K * L
+        flat_ids = nodes.reshape(G, n)                          # [G, n] node ids (−1 pad)
+        flat_ts = ts.reshape(G, n)                              # [G, n] raw edge times
+        flat_mask = is_ctx.reshape(G, n)                        # [G, n] True at real token
+        # Per-token RAW age = t_query − t_edge (≥0), masked. clamp_min neutralises the seed
+        # sentinel; the mask zeroes padding's bogus value — finite everywhere.
+        flat_age = ((t_query_per_seed.view(G, 1).to(torch.int64) - flat_ts).clamp_min(0)
+                    .to(torch.float32)) * flat_mask.to(torch.float32)       # [G, n]
+
+        return self._dedup_to_csr(flat_ids, flat_age, flat_mask)
+
+    @staticmethod
+    def _dedup_to_csr(flat_ids: torch.Tensor, flat_age: torch.Tensor,
+                      flat_mask: torch.Tensor) -> WalkCSR:
+        """Collapse a flat per-seed token set [G, n] (with repeated nodes) into the compact
+        CSR (node_ids [G,U], node_mask [G,U], ages [G,U,kmax], age_mask [G,U,kmax]) by
+        grouping occurrences of the same node id within each row. Vectorised, dense-padded.
+
+        U = max distinct nodes over rows; kmax = max occurrences of any one node in a row.
+        All occurrence ages are kept (recency stays exact); count = age_mask.sum(-1)."""
+        device = flat_ids.device
+        G, n = flat_ids.shape
+
+        # Sort each row by node id so equal ids are contiguous; invalids (mask False) pushed
+        # to the end via a large sentinel key. Stable so occurrence order within a node holds.
+        BIG = torch.iinfo(torch.int64).max
+        sort_key = torch.where(flat_mask, flat_ids, torch.full_like(flat_ids, BIG))
+        order = torch.argsort(sort_key, dim=1, stable=True)              # [G, n]
+        ids_s = torch.gather(flat_ids, 1, order)                        # [G, n] sorted ids
+        age_s = torch.gather(flat_age, 1, order)                        # [G, n]
+        msk_s = torch.gather(flat_mask, 1, order)                       # [G, n]
+
+        # "new distinct node" boundary within a row: first valid slot, or id changes.
+        prev_id = torch.cat([torch.full((G, 1), -2, device=device, dtype=ids_s.dtype),
+                             ids_s[:, :-1]], dim=1)
+        prev_msk = torch.cat([torch.zeros((G, 1), device=device, dtype=torch.bool),
+                              msk_s[:, :-1]], dim=1)
+        is_new = msk_s & (~prev_msk | (ids_s != prev_id))               # [G, n] start of a node-run
+        # distinct-node index per valid slot (cumsum of run-starts − 1); invalids → −1.
+        node_idx = torch.cumsum(is_new.to(torch.int64), dim=1) - 1      # [G, n]
+        node_idx = torch.where(msk_s, node_idx, torch.full_like(node_idx, -1))
+        U = int(node_idx.max().item()) + 1 if msk_s.any() else 1
+
+        # occurrence index WITHIN each distinct node: position minus the run-start position.
+        ar = torch.arange(n, device=device).view(1, n).expand(G, n)     # [G, n] col positions
+        run_start_pos = torch.where(is_new, ar, torch.zeros_like(ar))
+        # cummax of run_start_pos gives, at each slot, the start position of its current run.
+        run_start = torch.cummax(run_start_pos, dim=1).values            # [G, n]
+        occ_idx = torch.where(msk_s, ar - run_start, torch.zeros_like(ar))   # [G, n]
+        kmax = int(occ_idx[msk_s].max().item()) + 1 if msk_s.any() else 1
+
+        # Scatter sorted (id, age) into [G, U, kmax] by (node_idx, occ_idx).
+        node_ids = torch.full((G, U), -1, device=device, dtype=flat_ids.dtype)
+        node_mask = torch.zeros((G, U), device=device, dtype=torch.bool)
+        ages = torch.zeros((G, U, kmax), device=device, dtype=flat_age.dtype)
+        age_mask = torch.zeros((G, U, kmax), device=device, dtype=torch.bool)
+
+        valid = msk_s
+        rows = torch.arange(G, device=device).view(G, 1).expand(G, n)[valid]
+        u_at = node_idx[valid]
+        k_at = occ_idx[valid]
+        node_ids[rows, u_at] = ids_s[valid]
+        node_mask[rows, u_at] = True
+        ages[rows, u_at, k_at] = age_s[valid]
+        age_mask[rows, u_at, k_at] = True
+        return node_ids, node_mask, ages, age_mask
+
+    @staticmethod
+    def _gather_csr(csr: WalkCSR, index: torch.Tensor, out_shape) -> WalkCSR:
+        """Index a per-unique-seed CSR [G,…] onto the batch grid via `index` (long [P]),
+        reshaping the leading axis to `out_shape` (e.g. [B] for sources, [B,C] for
+        candidates). The dedup is exact: each seed's CSR is query-independent, so gathering
+        replicates it to every cell naming that seed (scatter-add adjoint on backward)."""
+        node_ids, node_mask, ages, age_mask = csr
+        U = node_ids.shape[-1]; kmax = ages.shape[-1]
+        ni = node_ids[index].view(*out_shape, U)
+        nm = node_mask[index].view(*out_shape, U)
+        ag = ages[index].view(*out_shape, U, kmax)
+        am = age_mask[index].view(*out_shape, U, kmax)
+        return ni, nm, ag, am
+
+    # ──────────────────────────────────────────────────────────────────
     # Scoring — shared by train + eval
     # ──────────────────────────────────────────────────────────────────
 
@@ -178,110 +298,58 @@ class Trainer:
                t_query_t: torch.Tensor) -> torch.Tensor:
         """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> logits [B, C].
 
-        SOURCE-SIDE ONLY: sample K walks for the unique SOURCES only and expose each
-        source's CONTEXT walk-neighbours as a flat token set {w_i} (seed + padding
-        excluded). Each candidate v attends over those tokens and pulls a
-        candidate-specific sphere log-map residual (the attention channel), while
-        E[u] enters once as a direct chord(E[u], E[v]) base channel. Candidate recency
-        (t_query - t_last[v]) comes from the per-node last-seen store (no candidate
-        walks). Strict-causal: walks + store reflect the pre-ingest state."""
+        SYMMETRIC: build a per-node CSR for the unique sources (→ μ tokens) and a per-node
+        CSR for the unique candidates (→ connectors), via the SAME `_walk_csr`. Gather the
+        source CSR to [B,…] and scatter the candidate CSR to [B,C,…]. IDs go to the head;
+        the head gathers embeddings from the shared table for both sides."""
         device = self.device
         B, C = cand_t.shape
 
-        # Walks for the unique SOURCES only.
-        uniq_s, u_pos = torch.unique(src_t, return_inverse=True)  # uniq_s [Ms], u_pos [B]
-        wd = self.walk_gen.walks_for_nodes(uniq_s.cpu().numpy())
-        Ms, K, L = uniq_s.shape[0], wd.K, wd.nodes.shape[1]
-        nodes = wd.nodes.to(device).view(Ms, K, L)               # [Ms, K, L]
-        ts = wd.timestamps.to(device).view(Ms, K, L).float()     # [Ms, K, L]
-        lens = wd.lens.to(device).view(Ms, K)                    # [Ms, K]
-        # Context positions hold real edge times (the seed slot lens-1 is the
-        # INT64_MAX sentinel; padding is -1). is_ctx is BOTH the time-stat mask AND
-        # the token mask — it excludes the seed (= u itself), so u never enters the
-        # attention pool. u's identity lives only in the base chord channel.
-        is_ctx = torch.arange(L, device=device).view(1, 1, L) < (lens - 1).unsqueeze(-1)
+        # --- SOURCE side: unique sources → CSR → gather to [B] ---
+        uniq_s, u_pos = torch.unique(src_t, return_inverse=True)        # [Ms], [B]
+        first_src = torch.argmax(
+            (src_t.view(-1, 1) == uniq_s.view(1, -1)).to(torch.int64), dim=0)
+        csr_s = self._walk_csr(
+            uniq_s, t_query_t[first_src],
+            max_walk_len=self.config.max_walk_len_query_side,
+            num_walks_per_node=self.config.num_walks_per_node_query_side,
+            start_bias=self.config.start_bias_query_side,
+            walk_bias=self.config.walk_bias_query_side)
+        src_ids, src_nmask, src_ages, src_amask = self._gather_csr(csr_s, u_pos, (B,))
 
-        # Flatten the (K, L) walk axes into one per-source token set [Ms, n]. The
-        # Point head consumes a FLAT token set + mask (μ = recency-weighted mean over
-        # all of u's walk-neighbours); tok_mask = is_ctx keeps the seed (= u) and
-        # padding out (their embeddings present but get zero recency weight).
-        n = K * L
-        tok_emb_all = self.embedding_table(nodes.clamp_min(0)).view(Ms, n, -1)  # [Ms,n,d]
-        tok_ts_all = ts.view(Ms, n)                             # [Ms, n] edge times
-        tok_mask_all = is_ctx.view(Ms, n)                      # [Ms, n] bool
-
-        tok_emb = tok_emb_all[u_pos]                           # [B, n, d]
-        tok_ts = tok_ts_all[u_pos]                             # [B, n]
-        tok_mask = tok_mask_all[u_pos]                         # [B, n]
-
-        # Per-token RAW query staleness age = t_query − t_token (the token's own edge
-        # time), for the recency-weighted mean softmax(−λ·age). clamp_min(0)
-        # neutralises the seed's INT64_MAX sentinel (→ 0); the mask zeroes padding's
-        # bogus positive — finite everywhere, masked entries −∞'d in the head softmax.
-        tok_age = (t_query_t.unsqueeze(1).float() - tok_ts).clamp_min(0.0) * tok_mask.float()
-
-        E_u = self.embedding_table(src_t)                       # [B, d]   base point E[u]
-        E_v = self.embedding_table(cand_t)                      # [B, C, d]
-
-        # Candidate v's own staleness Δt (per-node last-seen store) and, when the pair
-        # channel is on, the (u,v) last-interaction Δt — both RAW, both fed to the head's
-        # ExpDecayBasis. Never-seen (u,v) → Δt=∞ ⇒ φ=0 (handled in PairRecencyStore).
-        staleness_dt = self.node_last.query(cand_t, t_query_t)   # [B, C] raw Δt_v
-        pair_dt = pair_count_log = None
-        if self.pair_store is not None:
-            pair_dt, pair_count_log = self.pair_store.query(     # [B, C] raw Δt_uv, log1p(count)
-                src_t, cand_t, t_query_t)
-
-        # Candidate-side connectors (co-reachability): v's walk-neighbourhood as IDS
-        # (the head gathers embeddings per chunk from the table to bound memory).
-        conn_ids, conn_age, conn_mask = self._candidate_connectors(cand_t, t_query_t)
-
-        return self.link_head(
-            tok_emb, tok_age, tok_mask, E_u, E_v, staleness_dt,
-            conn_ids, conn_age, conn_mask, self.embedding_table.E.weight,
-            pair_dt=pair_dt, pair_count_log=pair_count_log)
-
-    def _candidate_connectors(self, cand_t: torch.Tensor, t_query_t: torch.Tensor):
-        """v's walk-neighbourhood for the co-reachability channel (FREE LENGTH).
-
-        For every UNIQUE candidate v, sample CANDIDATE-side BACKWARD walks on the SAME
-        Tempest graph (per-call overrides — no second store). ALL context nodes of
-        those walks (seed v and padding excluded) become connectors — direct AND
-        indirect neighbours, each with its own edge time — exactly parallel to how the
-        query side exposes u's walk-neighbours. max_walk_len_candidate_side=2 reduces
-        to v's direct neighbours. Indexed CSR-style by unique-v; embedded by the SAME
-        table. Strict-causal: same pre-ingest graph as the query-side walks.
-
-        -> conn_ids [B,C,M] (node ids, −1 at padding; head gathers embeddings),
-           conn_age [B,C,M] (raw, same units as tok_age),
-           conn_mask [B,C,M] (True at a real connector). M = K_cand · L_cand."""
-        device = self.device
-        B, C = cand_t.shape
-        uniq_v, v_inv = torch.unique(cand_t.reshape(-1), return_inverse=True)  # [Mv],[B*C]
-        wc = self.walk_gen.walks_for_nodes(
-            uniq_v.cpu().numpy(),
+        # --- CANDIDATE side: unique candidates → CSR → scatter to [B,C] ---
+        uniq_v, v_inv = torch.unique(cand_t.reshape(-1), return_inverse=True)  # [Mv], [B*C]
+        # Each unique candidate is aged against the query time of (one of) the rows that
+        # names it; ages enter only the (recency) reductions and the per-seed snapshot is
+        # shared, so any naming row's t_query is consistent for the dedup.
+        first_row = torch.argmax(
+            (cand_t.reshape(-1).view(-1, 1) == uniq_v.view(1, -1)).to(torch.int64), dim=0)
+        tq_per_v = t_query_t.view(B, 1).expand(B, C).reshape(-1)[first_row]    # [Mv]
+        csr_v = self._walk_csr(
+            uniq_v, tq_per_v,
             max_walk_len=self.config.max_walk_len_candidate_side,
             num_walks_per_node=self.config.num_walks_per_node_candidate_side,
             start_bias=self.config.start_bias_candidate_side,
             walk_bias=self.config.walk_bias_candidate_side)
-        Mv, K, L = uniq_v.shape[0], wc.K, wc.nodes.shape[1]
-        nodes = wc.nodes.to(device).view(Mv, K, L)              # [Mv, K, L]
-        ts = wc.timestamps.to(device).view(Mv, K, L).float()
-        lens = wc.lens.to(device).view(Mv, K)
-        # Context = real walk-neighbours: exclude the seed v (slot lens-1) and padding.
-        # ts[p] is the time of edge (nodes[p], nodes[p+1]), so each connector carries
-        # its own edge recency (direct neighbours recent, deeper hops older).
-        is_ctx = torch.arange(L, device=device).view(1, 1, L) < (lens - 1).unsqueeze(-1)
-        n = K * L
-        id_all = nodes.view(Mv, n)                             # [Mv, n] node ids (−1 pad)
-        ts_all = ts.view(Mv, n)
-        mask_all = is_ctx.view(Mv, n)
-        conn_ids = id_all[v_inv].view(B, C, n)                # [B, C, n] long
-        conn_ts = ts_all[v_inv].view(B, C, n)
-        conn_mask = mask_all[v_inv].view(B, C, n)
-        conn_age = ((t_query_t.view(B, 1, 1).float() - conn_ts).clamp_min(0.0)
-                    * conn_mask.float())                      # raw; 0 at masked slots
-        return conn_ids, conn_age, conn_mask
+        cand_ids, cand_nmask, cand_ages, cand_amask = self._gather_csr(csr_v, v_inv, (B, C))
+
+        E_u = self.embedding_table(src_t)                              # [B, d]
+        E_v = self.embedding_table(cand_t)                             # [B, C, d]
+
+        # Candidate staleness + (flagged) pair channel — unchanged stores.
+        staleness_dt = self.node_last.query(cand_t, t_query_t)         # [B, C]
+        pair_dt = pair_count_log = None
+        if self.pair_store is not None:
+            pair_dt, pair_count_log = self.pair_store.query(src_t, cand_t, t_query_t)
+
+        return self.link_head(
+            # source CSR (μ side)
+            E_u, src_ids, src_nmask, src_ages, src_amask,
+            # candidate CSR (identity + connectors side)
+            E_v, cand_ids, cand_nmask, cand_ages, cand_amask,
+            # shared table + additive channels
+            self.embedding_table.E.weight, t_query_t, staleness_dt,
+            pair_dt=pair_dt, pair_count_log=pair_count_log)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
@@ -291,7 +359,7 @@ class Trainer:
         device = self.device
         B = len(batch.src)
 
-        _, neg_tgt = self.neg_sampler_train.sample(batch)        # [B, K_train]
+        _, neg_tgt = self.neg_sampler_train.sample(batch)              # [B, K_train]
         src_t = torch.from_numpy(batch.src.astype(np.int64)).to(device)
         cand_np = np.concatenate(
             [batch.tgt.astype(np.int64)[:, None],
@@ -299,7 +367,7 @@ class Trainer:
         cand_t = torch.from_numpy(cand_np).to(device)
         t_query_t = torch.from_numpy(batch.ts.astype(np.int64)).to(device)
 
-        logits = self._score(src_t, cand_t, t_query_t)           # [B, 1+K]
+        logits = self._score(src_t, cand_t, t_query_t)                 # [B, 1+K]
         target = torch.zeros(B, dtype=torch.long, device=device)
         loss = F.cross_entropy(logits / self.config.tau_link, target)
 
@@ -349,8 +417,6 @@ class Trainer:
                 counts = [int(arr.shape[0]) for arr in neg_tgt_list]
                 max_K = max(counts) if counts else 0
 
-                # candidates_v [B, 1+max_K]; col 0 = positive, padded cols repeat
-                # the positive (never read — per-row slice uses K_i).
                 pos_v_np = batch.tgt.astype(np.int64)
                 cand_v_np = np.tile(pos_v_np[:, None], (1, 1 + max_K))
                 for i in range(B):
