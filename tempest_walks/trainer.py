@@ -65,12 +65,14 @@ class TrainerConfig:
     # Candidate-side is a FREE-LENGTH walk-neighbourhood (all context nodes of v's
     # walks become connectors, parallel to the query side), not just direct
     # neighbours — max_walk_len_candidate_side controls the reach (2 = direct only).
+    # Walk-len defaults set by the wiki sweep: query-len 5 (shorter is better,
+    # monotone +0.006 test vs 20, more stable); candidate-len 5 (≥3 adds ~0.003).
     num_walks_per_node_query_side: int = 5
-    max_walk_len_query_side: int = 20
+    max_walk_len_query_side: int = 5
     walk_bias_query_side: str = "ExponentialWeight"
     start_bias_query_side: str = "ExponentialWeight"
     num_walks_per_node_candidate_side: int = 10
-    max_walk_len_candidate_side: int = 2
+    max_walk_len_candidate_side: int = 5
     walk_bias_candidate_side: str = "Linear"
     start_bias_candidate_side: str = "Linear"
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded

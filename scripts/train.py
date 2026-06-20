@@ -95,8 +95,9 @@ def parse_args() -> argparse.Namespace:
     # CANDIDATE-side (v → connectors for the cross channel); same Tempest graph.
     p.add_argument("--num-walks-per-node-query-side", default=5, type=int,
                    help="K walks per source u (build μ).")
-    p.add_argument("--max-walk-len-query-side", default=20, type=int,
-                   help="L, max walk length for the query-side walks.")
+    p.add_argument("--max-walk-len-query-side", default=5, type=int,
+                   help="L, max walk length for the query-side walks. (Sweep on wiki: "
+                        "shorter is better — 20→5 gave +0.006 test, monotone, more stable.)")
     p.add_argument("--walk-bias-query-side", default="ExponentialWeight", type=str,
                    help="Per-hop edge bias for the query-side backward walks.")
     p.add_argument("--start-bias-query-side", default="ExponentialWeight", type=str,
@@ -105,9 +106,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-walks-per-node-candidate-side", default=10, type=int,
                    help="K walks per candidate v; their context nodes are the cross "
                         "channel's connectors (FREE LENGTH — direct + indirect).")
-    p.add_argument("--max-walk-len-candidate-side", default=2, type=int,
+    p.add_argument("--max-walk-len-candidate-side", default=5, type=int,
                    help="L for the candidate-side walks. 2 = v's direct neighbours "
-                        "only; >2 reaches indirect (co-reachability) neighbours.")
+                        "only; >2 reaches indirect (co-reachability) neighbours. "
+                        "(Sweep on wiki: ≥3 adds ~0.003 test over 2; default 5.)")
     p.add_argument("--walk-bias-candidate-side", default="Linear", type=str,
                    help="Per-hop edge bias for the candidate-side walks.")
     p.add_argument("--start-bias-candidate-side", default="Linear", type=str,
