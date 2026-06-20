@@ -1,30 +1,53 @@
-"""Geometric link head — ASYMMETRIC CSR version (μ_u + query co-reach only).
+"""Geometric link head — SYMMETRIC CSR version (μ + co-reach on BOTH sides).
 
-This is the SYMMETRIC head (SymmetricGeometricHead) restricted to the QUERY side: it builds
-a prediction μ_u for the source only and scores the candidate against it. It is written to
-MIRROR the symmetric head exactly — same helpers (_logmap, _ellipse_dist_sq, _heading,
-_mu_from_csr, _identity, _coreach), same shared parameters and NAMES, same forward signature
-— so the transition to the full symmetric head is a clean superset: add μ_v, the two
-candidate-side terms, and their two coefficients; nothing else changes. An asymmetric
-checkpoint loads into the symmetric head directly (the candidate coefs init 0 ⇒ symmetric
-starts identical to asymmetric).
+The asymmetric point head builds a prediction μ_u only for the source and scores the
+candidate against it. This symmetric version builds a prediction on BOTH sides — μ_u from
+the source CSR (u's neighbours, in E[u]'s frame) and μ_v from the candidate CSR (v's
+neighbours, in E[v]'s frame) — and forms FOUR geometric terms:
+
+  NAMING: a "query_*" term anchors on the QUERY's region (μ_u, frame E[u]); a "candidate_*"
+  term anchors on the CANDIDATE's region (μ_v, frame E[v]). Within each, *_identity probes
+  the OTHER endpoint's bare embedding; *_coreach probes the OTHER endpoint's connector CSR.
 
   μ_u = Σ_w softmax(logsumexp_occ(−λ·age)+γμ·log(1+k))·Log_{E[u]}(E[w∈u-CSR]) ; r_u = ĝate(μ_u)
+  μ_v = Σ_w softmax(...)·Log_{E[v]}(E[w∈v-CSR])                                ; r_v = ĝate(μ_v)
 
-  query_identity = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )         is v in u's region?   [B,C]
-  query_coreach  = logsumexp_w(−α·ellipse(Log_{E[u]}(E[v-conn_w])−μ_u; r_u)
-                               + γc·log(1+k_w) + logsumexp_occ(−ρ·age))                     [B,C]
-                   does v have ONE connector in u's region?  (candidate CSR in u's frame)
-  geo   = coef_query_identity·query_identity + coef_query_coreach·query_coreach
+  query_identity     = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )    is v in u's region?      [B,C]
+  candidate_identity = −α·ellipse( Log_{E[v]}(E_u) − μ_v ; r_v )    is u in v's region?      [B,C]
+  query_coreach      = logsumexp_w(−α·ellipse(Log_{E[u]}(E[v-conn_w])−μ_u; r_u)
+                                   + γc·log(1+k_w) + logsumexp_occ(−ρ·age))                   [B,C]
+                       does v have ONE connector in u's region?  (v-CSR witnessed in u's frame)
+  candidate_coreach  = logsumexp_w(−α·ellipse(Log_{E[v]}(E[u-conn_w])−μ_v; r_v)
+                                   + γc·log(1+k_w) + logsumexp_occ(−ρ·age))                   [B,C]
+                       does u have ONE connector in v's region?  (u-CSR witnessed in v's frame)
+
+  geo   = c_qi·query_identity + c_ci·candidate_identity + c_qc·query_coreach + c_cc·candidate_coreach
   logit = geo + coef_staleness·staleness(v) [+ coef_pair·pair + coef_pair_count·log1p(cnt)]
 
-The candidate CSR is used ONLY as the connector witnesses for query_coreach (it is NOT used
-to build a μ_v here — that is the symmetric head's addition). Baseline at init: coef_query_
-identity=1, coef_query_coreach=0 ⇒ the proven identity term and nothing else.
+SYMMETRY OF USE — each CSR is used TWICE: the source CSR builds μ_u AND supplies the
+connector witnesses for candidate_coreach; the candidate CSR builds μ_v AND supplies the
+witnesses for query_coreach. One shared parameter set (λ, α, a, b, ρ, γμ, γc) drives both
+sides — the two sides are mirror images, not independent heads.
 
-μ AS A COUNT CENTER OF MASS, COUNT IN TWO ROLES, TIME UNITS, COLD-NODE GATING — all identical
-to the symmetric head; see SymmetricGeometricHead for the full discussion. γμ=0 recovers the
-proven recency μ exactly; γc=0 recovers the proven co-reach. E is the single sphere parameter.
+BASELINE AT INIT — c_qi=1, the three mirror/witness terms c_ci=c_qc=c_cc=0. So at init the
+head IS the proven asymmetric identity term (query_identity) and NOTHING else; each new term
+earns its weight from zero. (μ_v and both co-reaches are computed but contribute 0 until
+their coefs leave 0.)
+
+COUNT, TWO ROLES (unchanged): γμ·log(1+k) inside each μ softmax = RELATIVE count (prediction
+direction); γc·log(1+k) inside each co-reach logsumexp = ABSOLUTE count (connection strength,
+once per node via the logsumexp-shift identity). Together with recency (−ρ·age) and existence,
+the self-witness reproduces the pair channel geometrically — now on BOTH sides.
+
+MEMORY — symmetric co-reach materialises TWO [B,C,U,d] witness grids (v's connectors in u's
+frame; u's connectors broadcast into each v's frame) plus μ_v's [B,C,Uv,d] log-map: ~3× the
+asymmetric head's single grid. Non-dedupable on the witness side (the Log into the other
+endpoint's frame is pair-dependent). μ_v is per-unique-v and COULD be deduped/scattered
+(query-independent) — left full-grid here for interface simplicity; that's the first lever
+if it OOMs (compute μ_v on [Mv,…] in the trainer, pass it in).
+
+TIME UNITS — raw ages; μ softmax scale-invariant (λ self-scales), co-reach logsumexp bounded
+by ρ init −log(t_train). E stays the single sphere parameter (link-trained, no detach).
 """
 import math
 
@@ -47,7 +70,7 @@ class ExpDecayBasis(nn.Module):
         return torch.exp(-torch.exp(self.log_rates) * dt.unsqueeze(-1))
 
 
-class GeometricPointHead(nn.Module):
+class SymmetricGeometricHead(nn.Module):
     def __init__(self, d_emb: int, d_time: int = 16,
                  use_pair_features: bool = False, t_train: float = 1.0):
         super().__init__()
@@ -59,10 +82,10 @@ class GeometricPointHead(nn.Module):
         self.log_lambda = nn.Parameter(
             torch.tensor([math.log(math.expm1(lam0))], dtype=torch.float32))
         self.alpha = nn.Parameter(torch.tensor(10.0))     # shared distance weight
-        # Shared anisotropic ellipse (a,b ≥ 0).
+        # Shared anisotropic ellipse (a,b ≥ 0), used in BOTH frames (symmetric).
         self.log_a = nn.Parameter(torch.zeros(1))
         self.log_b = nn.Parameter(torch.zeros(1))
-        # Shared μ count emphasis (relative), init 0 ⇒ recovers recency μ.
+        # Shared μ count emphasis (relative), init 0 ⇒ recovers recency μ on both sides.
         self.gamma_mu = nn.Parameter(torch.zeros(1))
 
         # --- candidate staleness channel ---------------------------------------
@@ -75,11 +98,13 @@ class GeometricPointHead(nn.Module):
             self.basis_pair = ExpDecayBasis(d_time, t_train)
             self.pair_head = nn.Linear(d_time, 1)
 
-        # --- geometric mix coefficients (QUERY side only) ----------------------
-        # Names mirror the symmetric head; the candidate-side coefs are simply absent here.
-        # query_identity is the proven baseline (init 1); query_coreach earns weight (init 0).
+        # --- four geometric mix coefficients -----------------------------------
+        # query_identity is the proven baseline (init 1); the three mirror/witness terms
+        # earn their weight from 0 ⇒ at init the head == the asymmetric identity term.
         self.coef_query_identity = nn.Parameter(torch.ones(1))
+        self.coef_candidate_identity = nn.Parameter(torch.zeros(1))
         self.coef_query_coreach = nn.Parameter(torch.zeros(1))
+        self.coef_candidate_coreach = nn.Parameter(torch.zeros(1))
         self.coef_staleness = nn.Parameter(torch.ones(1))
         if use_pair_features:
             self.coef_pair = nn.Parameter(torch.ones(1))
@@ -91,7 +116,7 @@ class GeometricPointHead(nn.Module):
         self.gamma_coreach = nn.Parameter(torch.zeros(1))
 
     # ──────────────────────────────────────────────────────────────────
-    # Geometry primitives (IDENTICAL to SymmetricGeometricHead)
+    # Geometry primitives (shape-agnostic over leading axes)
     # ──────────────────────────────────────────────────────────────────
 
     def _logmap(self, p: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -102,8 +127,8 @@ class GeometricPointHead(nn.Module):
 
     def _ellipse_dist_sq(self, delta: torch.Tensor, r: torch.Tensor,
                          a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """Ellipse distance² a‖δ∥‖²+b‖δ⊥‖² in heading frame r. delta [...,d]; r broadcastable
-           to delta (caller unsqueezes the U axis where needed) -> [...]."""
+        """Ellipse distance² a‖δ∥‖²+b‖δ⊥‖² in the heading frame r. delta [...,d];
+           r broadcastable to delta (caller unsqueezes the U axis where needed) -> [...]."""
         dpar2 = (delta * r).sum(-1).pow(2)
         dperp2 = ((delta * delta).sum(-1) - dpar2).clamp_min(0.0)
         return a * dpar2 + b * dperp2
@@ -116,7 +141,7 @@ class GeometricPointHead(nn.Module):
         return gate * mu / mu_norm.clamp_min(self.eps)
 
     # ──────────────────────────────────────────────────────────────────
-    # μ — count center of mass over a CSR (IDENTICAL to SymmetricGeometricHead)
+    # μ — count center of mass over a CSR (one side); shape-agnostic
     # ──────────────────────────────────────────────────────────────────
 
     def _mu_from_csr(self, base_emb: torch.Tensor, ids: torch.Tensor, nmask: torch.Tensor,
@@ -136,19 +161,19 @@ class GeometricPointHead(nn.Module):
         return (w.unsqueeze(-1) * g).sum(dim=-2)                          # [...,d]
 
     # ──────────────────────────────────────────────────────────────────
-    # identity — probe an embedding against a prediction (IDENTICAL)
+    # identity — probe an embedding against a prediction (one side)
     # ──────────────────────────────────────────────────────────────────
 
     def _identity(self, frame: torch.Tensor, probe: torch.Tensor, mu: torch.Tensor,
                   r: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
                   alpha: torch.Tensor) -> torch.Tensor:
         """−α·ellipse( Log_frame(probe) − μ ; r ). All [...,d] (caller broadcasts) -> [...]."""
-        nu = self._logmap(frame, probe)
+        nu = self._logmap(frame, probe)                                  # [...,d]
         dist = self._ellipse_dist_sq(nu - mu, r, a, b).clamp_min(self.eps).sqrt()
         return -alpha * dist
 
     # ──────────────────────────────────────────────────────────────────
-    # co-reach — count-aware ∃-witness of a CSR against a prediction (IDENTICAL)
+    # co-reach — count-aware ∃-witness of a CSR against a prediction (one side)
     # ──────────────────────────────────────────────────────────────────
 
     def _coreach(self, frame: torch.Tensor, mu: torch.Tensor, r: torch.Tensor,
@@ -169,7 +194,7 @@ class GeometricPointHead(nn.Module):
         return torch.where(nmask.any(dim=-1), wit, torch.zeros_like(wit))
 
     # ──────────────────────────────────────────────────────────────────
-    # Forward — QUERY side only (mirror of the symmetric forward, candidate terms dropped)
+    # Forward
     # ──────────────────────────────────────────────────────────────────
 
     def forward(self,
@@ -179,7 +204,7 @@ class GeometricPointHead(nn.Module):
                 src_nmask: torch.Tensor,       # [B, Us]
                 src_ages: torch.Tensor,        # [B, Us, ks]
                 src_amask: torch.Tensor,       # [B, Us, ks]
-                # ── candidate CSR (v side) — used here ONLY as query_coreach connectors ──
+                # ── candidate CSR (v side) ──
                 E_v: torch.Tensor,             # [B, C, d]
                 cand_ids: torch.Tensor,        # [B, C, Uv]
                 cand_nmask: torch.Tensor,      # [B, C, Uv]
@@ -200,24 +225,40 @@ class GeometricPointHead(nn.Module):
         b = F.softplus(self.log_b)
         alpha = self.alpha.clamp_min(1e-3)
 
-        # --- prediction on the QUERY side only ---
-        mu_u = self._mu_from_csr(eu, src_ids, src_nmask, src_ages, src_amask, e_weight)  # [B,d]
+        # --- predictions on BOTH sides ---
+        mu_u = self._mu_from_csr(eu, src_ids, src_nmask, src_ages, src_amask, e_weight)   # [B,d]
+        mu_v = self._mu_from_csr(ev, cand_ids, cand_nmask, cand_ages, cand_amask, e_weight)  # [B,C,d]
         r_u = self._heading(mu_u)                                 # [B,d]
+        r_v = self._heading(mu_v)                                 # [B,C,d]
 
+        # broadcast u-side quantities to the [B,C] grid
         eu_bc = eu.unsqueeze(1).expand(B, C, d)                   # [B,C,d]
         mu_u_bc = mu_u.unsqueeze(1).expand(B, C, d)
         r_u_bc = r_u.unsqueeze(1).expand(B, C, d)
 
-        # --- query_identity: is v in u's region? ---
-        q_ident = self._identity(eu_bc, ev, mu_u_bc, r_u_bc, a, b, alpha)   # [B,C]
+        # --- IDENTITIES (anchor on each side's own region) ---
+        q_ident = self._identity(eu_bc, ev, mu_u_bc, r_u_bc, a, b, alpha)   # v in u's region [B,C]
+        c_ident = self._identity(ev, eu_bc, mu_v, r_v, a, b, alpha)         # u in v's region [B,C]
 
-        # --- query_coreach: does v have a connector in u's region? (candidate CSR in u's frame) ---
+        # --- CO-REACHES (witness the OTHER side's connectors in this side's region) ---
+        # query_coreach: v's connectors (candidate CSR) in u's frame vs μ_u
         q_coreach = self._coreach(eu_bc, mu_u_bc, r_u_bc,
                                   cand_ids, cand_nmask, cand_ages, cand_amask,
                                   e_weight, a, b, alpha)           # [B,C]
+        # candidate_coreach: u's connectors (source CSR) broadcast into each v's frame vs μ_v
+        Us, ks = src_ids.shape[1], src_ages.shape[2]
+        su_ids = src_ids.unsqueeze(1).expand(B, C, Us)
+        su_nmask = src_nmask.unsqueeze(1).expand(B, C, Us)
+        su_ages = src_ages.unsqueeze(1).expand(B, C, Us, ks)
+        su_amask = src_amask.unsqueeze(1).expand(B, C, Us, ks)
+        c_coreach = self._coreach(ev, mu_v, r_v,
+                                  su_ids, su_nmask, su_ages, su_amask,
+                                  e_weight, a, b, alpha)           # [B,C]
 
         geo = (self.coef_query_identity * q_ident
-               + self.coef_query_coreach * q_coreach)
+               + self.coef_candidate_identity * c_ident
+               + self.coef_query_coreach * q_coreach
+               + self.coef_candidate_coreach * c_coreach)
 
         # --- candidate STALENESS channel ---
         staleness = self.staleness_head(self.basis_staleness(staleness_dt)).squeeze(-1)  # [B,C]
