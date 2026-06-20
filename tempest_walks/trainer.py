@@ -75,7 +75,7 @@ class TrainerConfig:
     max_walk_len_query_side: int = 5
     walk_bias_query_side: str = "ExponentialWeight"
     start_bias_query_side: str = "ExponentialWeight"
-    num_walks_per_node_candidate_side: int = 10
+    num_walks_per_node_candidate_side: int = 5
     max_walk_len_candidate_side: int = 5
     walk_bias_candidate_side: str = "Linear"
     start_bias_candidate_side: str = "Linear"

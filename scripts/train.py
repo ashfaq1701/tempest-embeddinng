@@ -103,7 +103,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start-bias-query-side", default="ExponentialWeight", type=str,
                    help="Initial-edge bias for the query-side backward walks.")
 
-    p.add_argument("--num-walks-per-node-candidate-side", default=10, type=int,
+    p.add_argument("--num-walks-per-node-candidate-side", default=5, type=int,
                    help="K walks per candidate v; their context nodes are the cross "
                         "channel's connectors (FREE LENGTH — direct + indirect).")
     p.add_argument("--max-walk-len-candidate-side", default=5, type=int,
