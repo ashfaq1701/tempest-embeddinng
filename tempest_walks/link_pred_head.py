@@ -1,57 +1,39 @@
-"""Geometric link head — SYMMETRIC CSR version (μ + co-reach on BOTH sides).
+"""Geometric link head — ASYMMETRIC (μ_u + query co-reach), COUNT-FREE.
 
-The asymmetric point head builds a prediction μ_u only for the source and scores the
-candidate against it. This symmetric version builds a prediction on BOTH sides — μ_u from
-the source CSR (u's neighbours, in E[u]'s frame) and μ_v from the candidate CSR (v's
-neighbours, in E[v]'s frame) — and forms FOUR geometric terms:
+Builds a prediction μ_u for the source from its walk tokens and scores each candidate against
+it with two query-anchored terms:
 
-  NAMING: a "query_*" term anchors on the QUERY's region (μ_u, frame E[u]); a "candidate_*"
-  term anchors on the CANDIDATE's region (μ_v, frame E[v]). Within each, *_identity probes
-  the OTHER endpoint's bare embedding; *_coreach probes the OTHER endpoint's connector CSR.
-
-  TOKEN BASIS — each seed carries a COUNT-FREE bag of walk-reached positions p (one token
-  per reached position; a node recurring k times is k tokens). μ / co-reach sum/logsumexp
-  over those tokens directly — multiplicity is implicit in token repetition, so no explicit
-  count term remains. age_p = t_query − t_edge(p).
+  TOKEN BASIS — each seed carries a COUNT-FREE bag of walk-reached positions p (one token per
+  reached position; a node recurring k times is k tokens). μ / co-reach sum/logsumexp over those
+  tokens directly — multiplicity is implicit in token repetition, no explicit count. age_p =
+  t_query − t_edge(p).
 
   μ_u = Σ_p softmax_p(−λ·age_p)·Log_{E[u]}(E[node_p ∈ u-tokens]) ; r_u = ĝate(μ_u)
-  μ_v = Σ_p softmax_p(−λ·age_p)·Log_{E[v]}(E[node_p ∈ v-tokens]) ; r_v = ĝate(μ_v)
 
-  query_identity     = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )    is v in u's region?      [B,C]
-  candidate_identity = −α·ellipse( Log_{E[v]}(E_u) − μ_v ; r_v )    is u in v's region?      [B,C]
-  query_coreach      = logsumexp_p(−α·ellipse(Log_{E[u]}(E[v-conn_p])−μ_u; r_u) − ρ·age_p)   [B,C]
-                       does v have ONE connector token in u's region?  (v-tokens in u's frame)
-  candidate_coreach  = logsumexp_p(−α·ellipse(Log_{E[v]}(E[u-conn_p])−μ_v; r_v) − ρ·age_p)   [B,C]
-                       does u have ONE connector token in v's region?  (u-tokens in v's frame)
-
-  geo   = c_qi·query_identity + c_ci·candidate_identity + c_qc·query_coreach + c_cc·candidate_coreach
+  query_identity = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )         is v in u's region?   [B,C]
+  query_coreach  = logsumexp_p(−α·ellipse(Log_{E[u]}(E[v-conn_p])−μ_u; r_u) − ρ·age_p)     [B,C]
+                   does v have ONE connector token in u's region?  (candidate tokens in u's frame)
+  geo   = coef_query_identity·query_identity + coef_query_coreach·query_coreach
   logit = geo + coef_staleness·staleness(v) [+ coef_pair·pair + coef_pair_count·log1p(cnt)]
 
-SYMMETRY OF USE — each side's tokens are used TWICE: the source tokens build μ_u AND supply
-the connector witnesses for candidate_coreach; the candidate tokens build μ_v AND supply the
-witnesses for query_coreach. One shared parameter set (λ, α, a, b, ρ) drives both sides —
-the two sides are mirror images, not independent heads.
+Candidate walk tokens are used ONLY as the query_coreach connector witnesses (candidate tokens
+in u's frame); there is no candidate-side prediction μ_v here.
 
-BASELINE AT INIT — c_qi=1, the three mirror/witness terms c_ci=c_qc=c_cc=0. So at init the
-head IS the proven asymmetric identity term (query_identity) and NOTHING else; each new term
-earns its weight from zero. (μ_v and both co-reaches are computed but contribute 0 until
-their coefs leave 0.)
+SYMMETRY-READY — the three reductions (_mu_from_csr, _identity, _coreach) and the shared params
+(λ, α, a, b, ρ) are side-agnostic: each takes an arbitrary frame + token bag. Restoring the full
+symmetric head is therefore purely additive — build μ_v from the candidate tokens and add the
+two candidate-anchored terms (candidate_identity, candidate_coreach) with their own coefs; the
+token prep, helpers, and existing terms are unchanged.
 
-COUNT-FREE — the token basis carries no explicit count. A node reached k times appears as k
-tokens, so its μ softmax-mass is summed across them automatically and the co-reach soft-OR
-rises with each token; the old γμ·log(1+k) / γc·log(1+k) emphases (both learned ≈ −0.4,
-i.e. suppressed) are gone. The pair channel — when enabled — still carries its own recency +
-count; the in-geometry terms aim to make it droppable.
+BASELINE AT INIT — coef_query_identity=1, coef_query_coreach=0 ⇒ at init the head IS the proven
+identity term and nothing else; query_coreach earns its weight from zero.
 
-MEMORY — symmetric co-reach materialises TWO [B,C,U,d] witness grids (v's connectors in u's
-frame; u's connectors broadcast into each v's frame) plus μ_v's [B,C,Uv,d] log-map: ~3× the
-asymmetric head's single grid. Non-dedupable on the witness side (the Log into the other
-endpoint's frame is pair-dependent). μ_v is per-unique-v and COULD be deduped/scattered
-(query-independent) — left full-grid here for interface simplicity; that's the first lever
-if it OOMs (compute μ_v on [Mv,…] in the trainer, pass it in).
+COUNT-FREE — a node reached k times appears as k tokens, so its μ softmax-mass is summed across
+them and the co-reach soft-OR rises with each token; the old γμ·log(1+k) / γc·log(1+k) emphases
+(both learned ≈ −0.4, suppressed) are gone. The pair channel still carries its own recency+count.
 
-TIME UNITS — raw ages; μ softmax scale-invariant (λ self-scales), co-reach logsumexp bounded
-by ρ init −log(t_train). E stays the single sphere parameter (link-trained, no detach).
+TIME UNITS — raw ages; μ softmax scale-invariant (λ self-scales), co-reach logsumexp bounded by
+ρ init −log(t_train). E stays the single sphere parameter (link-trained, no detach).
 """
 import math
 
@@ -74,7 +56,7 @@ class ExpDecayBasis(nn.Module):
         return torch.exp(-torch.exp(self.log_rates) * dt.unsqueeze(-1))
 
 
-class SymmetricGeometricHead(nn.Module):
+class GeometricPointHead(nn.Module):
     def __init__(self, d_emb: int, d_time: int = 16,
                  use_pair_features: bool = False, t_train: float = 1.0):
         super().__init__()
@@ -86,8 +68,7 @@ class SymmetricGeometricHead(nn.Module):
         self.log_lambda = nn.Parameter(
             torch.tensor([math.log(math.expm1(lam0))], dtype=torch.float32))
         self.alpha = nn.Parameter(torch.tensor(10.0))     # shared distance weight
-        # Shared anisotropic ellipse (a,b ≥ 0), used in BOTH frames (symmetric).
-        self.log_a = nn.Parameter(torch.zeros(1))
+        self.log_a = nn.Parameter(torch.zeros(1))         # anisotropic ellipse (a,b ≥ 0)
         self.log_b = nn.Parameter(torch.zeros(1))
 
         # --- candidate staleness channel ---------------------------------------
@@ -100,20 +81,10 @@ class SymmetricGeometricHead(nn.Module):
             self.basis_pair = ExpDecayBasis(d_time, t_train)
             self.pair_head = nn.Linear(d_time, 1)
 
-        # --- four geometric mix coefficients -----------------------------------
-        # query_identity (proven baseline, init 1) and query_coreach (init 0) match master's
-        # asymmetric head — free, unconstrained. The two CANDIDATE-side terms (the genuinely
-        # new μ_v terms) are FLOORED at ≥0 via softplus(raw): the geometry is oriented
-        # higher=better, so a NEGATIVE coef would invert it — never wanted. Flooring lets each
-        # candidate term only stay positive or TURN OFF, never invert; softplus (not hard
-        # clamp) keeps a live gradient so it can move freely. raw init = softplus⁻¹(1) ⇒ the
-        # candidate terms start fully ON (effective coef 1), and the model can drive them down
-        # toward OFF (→0) if they don't help.
-        on_raw = math.log(math.expm1(1.0))                 # softplus⁻¹(1) ⇒ effective coef 1
+        # --- geometric mix coefficients ----------------------------------------
+        # query_identity is the proven baseline (init 1); query_coreach earns weight (init 0).
         self.coef_query_identity = nn.Parameter(torch.ones(1))
-        self.coef_candidate_identity_raw = nn.Parameter(torch.full((1,), on_raw))
         self.coef_query_coreach = nn.Parameter(torch.zeros(1))
-        self.coef_candidate_coreach_raw = nn.Parameter(torch.full((1,), on_raw))
         self.coef_staleness = nn.Parameter(torch.ones(1))
         if use_pair_features:
             self.coef_pair = nn.Parameter(torch.ones(1))
@@ -149,7 +120,7 @@ class SymmetricGeometricHead(nn.Module):
         return gate * mu / mu_norm.clamp_min(self.eps)
 
     # ──────────────────────────────────────────────────────────────────
-    # μ — count center of mass over a CSR (one side); shape-agnostic
+    # μ — recency center of mass over a token bag (frame-agnostic)
     # ──────────────────────────────────────────────────────────────────
 
     def _mu_from_csr(self, base_emb: torch.Tensor, ids: torch.Tensor, nmask: torch.Tensor,
@@ -166,7 +137,7 @@ class SymmetricGeometricHead(nn.Module):
         return (w.unsqueeze(-1) * g).sum(dim=-2)                          # [...,d]
 
     # ──────────────────────────────────────────────────────────────────
-    # identity — probe an embedding against a prediction (one side)
+    # identity — probe an embedding against a prediction (frame-agnostic)
     # ──────────────────────────────────────────────────────────────────
 
     def _identity(self, frame: torch.Tensor, probe: torch.Tensor, mu: torch.Tensor,
@@ -178,7 +149,7 @@ class SymmetricGeometricHead(nn.Module):
         return -alpha * dist
 
     # ──────────────────────────────────────────────────────────────────
-    # co-reach — count-aware ∃-witness of a CSR against a prediction (one side)
+    # co-reach — ∃-witness of a token bag against a prediction (frame-agnostic)
     # ──────────────────────────────────────────────────────────────────
 
     def _coreach(self, frame: torch.Tensor, mu: torch.Tensor, r: torch.Tensor,
@@ -207,7 +178,7 @@ class SymmetricGeometricHead(nn.Module):
                 src_ids: torch.Tensor,         # [B, Us]
                 src_nmask: torch.Tensor,       # [B, Us]
                 src_ages: torch.Tensor,        # [B, Us]
-                # ── candidate tokens (v side) ──
+                # ── candidate tokens (v side) — query_coreach connectors ──
                 E_v: torch.Tensor,             # [B, C, d]
                 cand_ids: torch.Tensor,        # [B, C, Uv]
                 cand_nmask: torch.Tensor,      # [B, C, Uv]
@@ -226,40 +197,23 @@ class SymmetricGeometricHead(nn.Module):
         b = F.softplus(self.log_b)
         alpha = self.alpha.clamp_min(1e-3)
 
-        # --- predictions on BOTH sides ---
-        mu_u = self._mu_from_csr(eu, src_ids, src_nmask, src_ages, e_weight)        # [B,d]
-        mu_v = self._mu_from_csr(ev, cand_ids, cand_nmask, cand_ages, e_weight)     # [B,C,d]
+        # --- prediction μ_u, broadcast to the [B,C] grid ---
+        mu_u = self._mu_from_csr(eu, src_ids, src_nmask, src_ages, e_weight)   # [B,d]
         r_u = self._heading(mu_u)                                 # [B,d]
-        r_v = self._heading(mu_v)                                 # [B,C,d]
-
-        # broadcast u-side quantities to the [B,C] grid
         eu_bc = eu.unsqueeze(1).expand(B, C, d)                   # [B,C,d]
         mu_u_bc = mu_u.unsqueeze(1).expand(B, C, d)
         r_u_bc = r_u.unsqueeze(1).expand(B, C, d)
 
-        # --- IDENTITIES (anchor on each side's own region) ---
-        q_ident = self._identity(eu_bc, ev, mu_u_bc, r_u_bc, a, b, alpha)   # v in u's region [B,C]
-        c_ident = self._identity(ev, eu_bc, mu_v, r_v, a, b, alpha)         # u in v's region [B,C]
+        # --- query_identity: is v in u's region? ---
+        q_ident = self._identity(eu_bc, ev, mu_u_bc, r_u_bc, a, b, alpha)   # [B,C]
 
-        # --- CO-REACHES (witness the OTHER side's connector tokens in this side's region) ---
-        # query_coreach: v's connector tokens (candidate side) in u's frame vs μ_u
+        # --- query_coreach: does v have a connector token in u's region? ---
         q_coreach = self._coreach(eu_bc, mu_u_bc, r_u_bc,
                                   cand_ids, cand_nmask, cand_ages,
                                   e_weight, a, b, alpha)           # [B,C]
-        # candidate_coreach: u's connector tokens (source side) broadcast into each v's frame
-        Us = src_ids.shape[1]
-        su_ids = src_ids.unsqueeze(1).expand(B, C, Us)
-        su_nmask = src_nmask.unsqueeze(1).expand(B, C, Us)
-        su_ages = src_ages.unsqueeze(1).expand(B, C, Us)
-        c_coreach = self._coreach(ev, mu_v, r_v,
-                                  su_ids, su_nmask, su_ages,
-                                  e_weight, a, b, alpha)           # [B,C]
 
-        # query terms free; the two candidate-side terms floored ≥0 via softplus(raw).
         geo = (self.coef_query_identity * q_ident
-               + F.softplus(self.coef_candidate_identity_raw) * c_ident
-               + self.coef_query_coreach * q_coreach
-               + F.softplus(self.coef_candidate_coreach_raw) * c_coreach)
+               + self.coef_query_coreach * q_coreach)
 
         # --- candidate STALENESS channel ---
         staleness = self.staleness_head(self.basis_staleness(staleness_dt)).squeeze(-1)  # [B,C]

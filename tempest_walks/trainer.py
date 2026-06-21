@@ -1,10 +1,11 @@
-"""Strict-causal training + eval loop — link-supervised symmetric walk-encoder.
+"""Strict-causal training + eval loop — link-supervised geometric walk head (ASYMMETRIC).
 
 Per-batch ordering (training):
   1. neg = neg_sampler.sample(batch)                 — [B, K_train] uniform negs
   2. candidates = [pos | negs]                       — [B, 1+K_train]
-  3. logits = score(src, candidates)                 — SYMMETRIC: sample walks for the
-       unique sources AND the unique candidates, dedup each to a per-node CSR, score.
+  3. logits = score(src, candidates)                 — sample walks for the unique sources
+       (→ μ_u) AND the unique candidates (→ query_coreach connectors), pack each to tokens,
+       score with GeometricPointHead (query_identity + query_coreach).
   4. L = cross_entropy(logits / tau_link, target=0)  — Bruch 2019, upper-bounds 1-MRR
   5. one backward + single optimizer step
   6. walk_gen.add_edges(batch)                        — post-scoring, LAST
@@ -12,16 +13,18 @@ Per-batch ordering (training):
 E (on the unit sphere) and the head are trained together by L (no alignment, no detach)
 by a single RiemannianAdam.
 
-SYMMETRIC TOKEN PREP — the source side (u → μ) and the candidate side (v → connectors) go
-through the shared `walk_token_csr` module: `build_walk_batch` walks the unique seeds and packs
-the real context tokens into a two-level CSR WalkBatch (seed → walk → position), COUNT-FREE —
-every reached position is its own (node, t_edge) token, with the seed slot, padding, and the
-walk's own origin node-id excluded. `walk_batch_to_dense` collapses the walk level to a per-seed
-dense token bag (node_ids [G,U], node_mask [G,U], pos_ts [G,U]); the source bag is gathered to
-[B,…] and the candidate bag scattered to [B,C,…] via v_inv (each seed's tokens are query-
-independent given a single pre-ingest snapshot). Ages = t_query − t_edge are formed at grid
-level here (each row's own query time), then IDs + ages go to the head, which gathers embeddings
-from the shared table for both sides. Strict-causal: walks + stores reflect the pre-ingest state.
+TOKEN PREP — the source side (u → μ_u) and the candidate side (v → connectors) go through the
+shared `walk_token_csr` module: `build_walk_batch` walks the unique seeds and packs the real
+context tokens into a two-level CSR WalkBatch (seed → walk → position), COUNT-FREE — every
+reached position is its own (node, t_edge) token, with the seed slot, padding, and the walk's
+own origin node-id excluded. `walk_batch_to_dense` collapses the walk level to a per-seed dense
+token bag (node_ids [G,U], node_mask [G,U], pos_ts [G,U]); the source bag is gathered to [B,…]
+and the candidate bag scattered to [B,C,…] via v_inv (each seed's tokens are query-independent
+given a single pre-ingest snapshot). Ages = t_query − t_edge are formed at grid level here (each
+row's own query time), then IDs + ages go to the head. The candidate tokens are used ONLY as
+query_coreach connectors here (no μ_v) — they are still sampled; restoring symmetry adds μ_v +
+the two candidate-anchored terms in the head, no change to this prep. Strict-causal: walks +
+stores reflect the pre-ingest state.
 """
 import time
 from dataclasses import dataclass
@@ -35,7 +38,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
-from .link_pred_head import SymmetricGeometricHead
+from .link_pred_head import GeometricPointHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
 from .pair_store import NodeLastSeenStore, PairRecencyStore
@@ -106,7 +109,7 @@ class Trainer:
         self.embedding_table = EmbeddingTable(
             num_nodes=config.num_nodes, d_emb=config.d_emb,
         ).to(self.device)
-        self.link_head = SymmetricGeometricHead(
+        self.link_head = GeometricPointHead(
             d_emb=int(config.d_emb),
             use_pair_features=config.use_pair_features,
             t_train=float(config.t_train),
@@ -170,13 +173,14 @@ class Trainer:
                t_query_t: torch.Tensor) -> torch.Tensor:
         """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> logits [B, C].
 
-        SYMMETRIC: build a two-level packed WalkBatch for the unique sources (→ μ tokens)
-        and one for the unique candidates (→ connector tokens), via the SAME
+        Build a two-level packed WalkBatch for the unique sources (→ μ_u tokens) and one for
+        the unique candidates (→ query_coreach connector tokens), via the SAME
         `build_walk_batch`. Collapse each to its per-seed dense token view, gather the source
         view to [B,…] and scatter the candidate view to [B,C,…]. Ages = t_query − t_edge are
         formed HERE at grid level (each row's own query time; the packed walk-edge times are
         query-independent), then IDs + ages go to the head, which gathers embeddings from the
-        shared table for both sides."""
+        shared table. The candidate tokens feed query_coreach only (no μ_v in the asymmetric
+        head)."""
         device = self.device
         B, C = cand_t.shape
 
