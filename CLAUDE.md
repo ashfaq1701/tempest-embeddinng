@@ -956,3 +956,128 @@ is approximately E0_bwd in the table above — val 0.7682 / test
   bias is expected to matter more than on wiki, but that hasn't
   been re-validated under the cleaned-up head and remains an open
   follow-up.
+
+---
+
+## Co-reachability gap — diagnosis + neighbour-set-interaction redesign
+
+This is the live research thread on the geometric `GeometricPointHead`
+(μ_u + query_identity + query_coreach, count-free, on the two-level
+`WalkBatch` CSR). The gap to TPNet (test ≈ 0.827; we sit ≈ 0.773
+no-pair-features) is localised — by repeated stratification — to the
+**new-pair / cold-source / inductive** slice (~13% of test at ~0.03–0.04
+MRR). Repeats are saturated (~0.88); the whole gap is the new-pair slice,
+and within it the part co-reachability is supposed to own.
+
+### The gap: the head has both neighbour-sets but never intersects them
+
+Co-reachability between (u, v) is structurally a **set-overlap**:
+`|N(u) ∩ N(v)|` (common neighbours), or its multi-hop generalisation
+`⟨A_u, A_v⟩` (path count) — the quantity every classic heuristic (CN,
+Adamic-Adar, Katz) and TPNet compute. What the head actually does:
+
+- source tokens `{w_i^u}` → **collapsed to a centroid** μ_u; the
+  individual neighbour identities are gone after the mean.
+- `query_coreach` checks "is some candidate connector `E[w_j^v]`
+  geometrically near μ_u?" — i.e. it compares v's connectors to u's
+  **centroid**, never to u's **set**.
+
+So the head **never computes the intersection of the two token sets it is
+holding**. The strongest co-reach signal — "is one of v's connectors
+*literally* one of u's neighbours?" (exact common neighbour, id-match) —
+is **structurally absent**; it can only fire if the embedding happens to
+place a shared neighbour near μ_u, and E is ~87% repeat-trained.
+
+**Why the centroid is the wrong object (information-theoretic):** μ_u is a
+lossy summary — two different neighbour sets can share a mean. It is a
+sufficient statistic for "where does u point on average" (right for
+`query_identity`, which is why repeats hit 0.88) but **not** for
+set-overlap: you cannot recover N(u) from μ_u, so you cannot intersect it
+with N(v). The architecture picked the right object for prediction and the
+wrong object for co-reachability, then tried to recover co-reachability
+from the wrong object (centroid proximity) — which is why every refinement
+(ellipse, count, ∃-witness, slice-weighting) moved it only by noise.
+
+### Evidence — W=4 new-pair slice-weighting (mechanism, not signal)
+
+Up-weighting new-pairs 4× in the training CE, vs the origin-fix baseline,
+single-seed wiki, by stratum:
+
+| stratum | frac | baseline | W=4 | Δ |
+|---|---|---|---|---|
+| repeat-pair | 87.4% | 0.8789 | 0.8762 | −0.0027 (the cost) |
+| new-pair (all) | 12.6% | 0.0387 | 0.0428 | +0.0041 |
+| **new × both-seen** (co-reach's target) | 8.0% | 0.0409 | 0.0429 | **+0.0020** |
+| new × u-only-inductive | 4.5% | 0.0353 | 0.0434 | +0.0081 |
+| deg=0 (cold source) | 4.5% | 0.0350 | 0.0431 | +0.0081 |
+| overall test | | 0.7727 | 0.7709 | −0.0018 |
+
+The decisive read: the gains are on **cold/inductive** slices (deg=0,
+u-only-inductive: +0.008) where the source has no walk history and
+co-reach is structurally blind — those moved via the **staleness** channel
+("is v recently active"), not reachability. Co-reach's actual target
+(new×both-seen) barely moved (+0.002, within noise) **even though co-reach
+got 37% of the gradient** (up from 13%) and is alive (learned coef ≈ 0.32).
+Conclusion: a 1-witness soft-min over connectors cannot encode the
+set-intersection — **the mechanism is the bottleneck, not the training
+signal.** Slice-weighting is committed as a knob, default off.
+
+### The redesign: score the pair by neighbour-set INTERACTION
+
+Keep μ_u/`query_identity` for repeats (it works). **Add** a co-reach
+channel that operates on the two token sets directly — a learned
+cross-interaction between the source and candidate dense token bags:
+
+```
+coreach(u, v) = Σ_{i ∈ tokens(u)} Σ_{j ∈ tokens(v)}
+                  k(w_i, w_j) · rec_u(w_i) · rec_v(w_j)
+```
+
+- `k(w_i, w_j) = [w_i == w_j]` → **exact weighted common-neighbour count**,
+  id-level, **independent of the embedding geometry** (works despite E
+  being repeat-trained). This is the signal currently missing.
+- `k(w_i, w_j) = ⟨E[w_i], E[w_j]⟩` (or RBF) → **soft** common-neighbour:
+  counts *similar* connectors too, a strict generalisation, fully
+  geometric/learned.
+- The Σ (sum) is the path-**density** ∃-witness throws away (what TPNet
+  wins on). Init coef 0 ⇒ repeats untouched.
+- `rec_u/rec_v` come from token multiplicity + age (the CSR is count-free;
+  multiplicity *is* the count).
+
+This is the mechanism the gap points at (`⟨A_u, A_v⟩`), computed from the
+head's **own** walk CSRs and **own** E — **no pair store**. It makes the
+pair channel a degenerate hand-crafted special case (`A^(1)_{uv}`) of a
+learned multi-hop set-interaction, i.e. the path to **removing** the patchy
+pair features, not adding more.
+
+**Cost:** an `[B, C, U_u, U_v]` set-product (U ≈ 15–30 each) — same memory
+class as the witness grid; the `k=id-match` term is cheap (no embedding
+gather). `walk_csr` (walk identity, preserved by the new CSR) additionally
+enables the stronger *path*-count variant later (distinct temporal walks
+from v landing in u's region), not just node-overlap.
+
+### Substrate state (what's already in place on master)
+
+- Two-level **count-free `WalkBatch` CSR** is landed: hands over the raw
+  token sets (and walk identity) the interaction needs; `walk_batch_to_dense`
+  gives per-seed dense `node_ids[G,U]` bags.
+- Source and candidate are **two separate bundles** (`wb_s` from `uniq_s`,
+  `wb_v` from `uniq_v`), so u∩v is a **cross-bundle join** on the dense
+  views, not a shared-pool segment-intersect.
+- Head is asymmetric (μ_u + query_identity + query_coreach); the
+  set-interaction is the **new co-reach channel** (init coef 0).
+- **Counts are recoverable** — the CSR is count-free (token multiplicity
+  already encodes count), but if an explicit per-node count term is wanted
+  later it can ride alongside as a side-channel:
+  `unique_batch_nodes [U]` (the batch's unique-node vocabulary) +
+  `counts [B*U]` (per-(seed, unique-node) occurrence count, dense over that
+  vocabulary). Not built now; this is the re-introduction shape.
+
+### Open fork (next step)
+
+1. **CN-predictiveness analysis first** (recommended, cheap, decisive):
+   for new×both-seen, compute exact `CN = |dense_s ∩ dense_v|`; check it
+   separates pos vs neg; check the current `query_coreach` is *uncorrelated*
+   with it. If CN predicts but coreach ignores it → gap proven, prize
+   bounded.
+2. Go straight to **building** the set-interaction channel.
