@@ -64,6 +64,16 @@ def walk_csr(walk_gen, device: torch.device,
     flat_ids = nodes.reshape(G, n)                          # [G, n] node ids (−1 pad)
     flat_ts = ts.reshape(G, n)                              # [G, n] raw edge times
     flat_mask = is_ctx.reshape(G, n)                        # [G, n] True at real token
+    # DROP THE WALK'S OWN ORIGIN node-id (not just its seed SLOT): a backward walk that
+    # revisits its origin re-enters the seed as a "neighbour" at a context position. Since
+    # the seed is the most-revisited node, the logsumexp-over-occurrences hands it dominant
+    # softmax mass in μ — but Log_base(E[base]) = 0, so μ is pulled toward a ZERO vector
+    # (≈27% of μ's mass on wiki, ≈50% on cold/low-degree sources), diluting the genuine
+    # neighbours; on the candidate side it also makes the connector v witness ITSELF in
+    # co-reach (the witness collapses to the identity distance). Each side passes its OWN
+    # seeds, so this removes u from the source CSR and v from the candidate CSR while keeping
+    # u-among-v's-connectors (u is not the candidate walk's origin) — the real pair signal.
+    flat_mask = flat_mask & (flat_ids != seeds_unique.view(G, 1).to(flat_ids.dtype))
     # Per-token RAW age = t_query − t_edge (≥0), masked. clamp_min neutralises the seed
     # sentinel; the mask zeroes padding's bogus value — finite everywhere.
     flat_age = ((t_query_per_seed.view(G, 1).to(torch.int64) - flat_ts).clamp_min(0)

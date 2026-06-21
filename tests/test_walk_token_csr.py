@@ -90,21 +90,25 @@ def test_dedup_to_csr_cold_and_padding_rows():
 # ──────────────────────────────────────────────────────────────────────────
 # 2. walk_csr END-TO-END vs an independent reconstruction of the SAME walks
 # ──────────────────────────────────────────────────────────────────────────
-def _expected_csr_from_walkdata(wd, t_query_per_seed):
+def _expected_csr_from_walkdata(wd, seeds, t_query_per_seed):
     """Reconstruct {node: sorted ages} per seed from a captured WalkData, under the
-    documented contract: context = positions [0, lens-2]; age = clamp(t_query − t_edge, 0)."""
+    contract: context = positions [0, lens-2]; age = clamp(t_query − t_edge, 0); and the
+    walk's OWN ORIGIN node-id is DROPPED (not just its seed slot)."""
     G = int(t_query_per_seed.shape[0])
     K, L = wd.K, wd.nodes.shape[1]
     nodes = wd.nodes.view(G, K, L).cpu().numpy()
     ts = wd.timestamps.view(G, K, L).to(torch.int64).cpu().numpy()
     lens = wd.lens.view(G, K).cpu().numpy()
     tq = t_query_per_seed.cpu().numpy().astype(np.int64)
+    sd = seeds.cpu().numpy().astype(np.int64)
     ref = []
     for g in range(G):
         row = defaultdict(list)
         for k in range(K):
             for p in range(0, int(lens[g, k]) - 1):       # context only (excl. seed slot + pad)
                 node = int(nodes[g, k, p])
+                if node == int(sd[g]):                     # drop the walk's own origin
+                    continue
                 age = float(max(0, int(tq[g]) - int(ts[g, k, p])))
                 row[node].append(age)
         ref.append({n: sorted(a) for n, a in row.items()})
@@ -139,10 +143,13 @@ def test_walk_csr_matches_tempest_backward_walks():
     node_ids, node_mask, ages, age_mask = csr
 
     got = _csr_to_dict(node_ids, node_mask, ages, age_mask)
-    exp = _expected_csr_from_walkdata(captured["wd"], tq)
+    exp = _expected_csr_from_walkdata(captured["wd"], seeds, tq)
 
     # sanity: at least some seed actually has walk-neighbours (graph dense enough)
     assert any(len(r) > 0 for r in exp), "no context tokens sampled — graph too sparse"
+    # the fix: each seed's OWN origin node-id must NOT appear in its CSR.
+    for g, s in enumerate(seeds.tolist()):
+        assert s not in got[g], f"seed {s} (its own origin) leaked into its CSR: {sorted(got[g])}"
 
     for g in range(len(seeds)):
         assert set(got[g].keys()) == set(exp[g].keys()), \
@@ -182,14 +189,18 @@ def test_walk_csr_includes_exactly_the_context_positions():
     wg.walks_for_nodes = orig
 
     wd = captured["wd"]
-    G, K = len(seeds), wd.K
+    G, K, L = len(seeds), wd.K, wd.nodes.shape[1]
+    nodes = wd.nodes.view(G, K, L).cpu().numpy()
     lens = wd.lens.view(G, K).cpu().numpy()
+    sd = seeds.cpu().numpy()
     for g in range(G):
-        n_ctx = int(sum(int(lens[g, k]) - 1 for k in range(K)))   # context positions [0,lens-2]
+        # context positions [0, lens-2] whose node-id is NOT the origin (the fix)
+        n_ctx = int(sum(1 for k in range(K) for p in range(int(lens[g, k]) - 1)
+                        if int(nodes[g, k, p]) != int(sd[g])))
         n_csr = int(age_mask[g].sum())
         assert n_csr == n_ctx, \
-            f"seed {int(seeds[g])}: CSR has {n_csr} occurrences, expected {n_ctx} context positions"
-    print("\n[walk_csr] CSR occurrences == context positions (seed slot + padding excluded) OK")
+            f"seed {int(seeds[g])}: CSR has {n_csr} occurrences, expected {n_ctx} (non-origin context)"
+    print("\n[walk_csr] CSR occurrences == non-origin context positions (slot+pad+origin excluded) OK")
 
 
 if __name__ == "__main__":
