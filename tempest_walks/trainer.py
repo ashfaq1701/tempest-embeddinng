@@ -12,18 +12,16 @@ Per-batch ordering (training):
 E (on the unit sphere) and the head are trained together by L (no alignment, no detach)
 by a single RiemannianAdam.
 
-SYMMETRIC CSR TOKEN PREP — the source side (u → μ) and the candidate side (v → connectors)
-go through the shared `walk_token_csr` module: walk for the unique seeds, flatten the (K,L) walk
-axes, and DEDUPLICATE per seed into a compact CSR
-    (node_ids [G,U], node_mask [G,U], ages [G,U,kmax], age_mask [G,U,kmax])
-— distinct neighbour nodes per seed, each carrying its OCCURRENCE AGES (all of them, so the
-recency mean stays exact) and, implicitly, its COUNT = age_mask.sum(-1). Both sides emit the
-SAME layout; they differ only in which seeds (sources vs candidates) and which walk params.
-The source CSR is computed per unique source [Ms,…] and gathered to [B,…]; the candidate CSR
-is computed per unique candidate [Mv,…] and scattered to [B,C,…] via v_inv (the dedup is
-exact — the per-node CSR is query-independent given a single pre-ingest snapshot and the
-shift-invariant recency weighting). IDs are passed to the head, which gathers embeddings from
-the shared table for both sides. Strict-causal: walks + stores reflect the pre-ingest state.
+SYMMETRIC TOKEN PREP — the source side (u → μ) and the candidate side (v → connectors) go
+through the shared `walk_token_csr` module: `build_walk_batch` walks the unique seeds and packs
+the real context tokens into a two-level CSR WalkBatch (seed → walk → position), COUNT-FREE —
+every reached position is its own (node, t_edge) token, with the seed slot, padding, and the
+walk's own origin node-id excluded. `walk_batch_to_dense` collapses the walk level to a per-seed
+dense token bag (node_ids [G,U], node_mask [G,U], pos_ts [G,U]); the source bag is gathered to
+[B,…] and the candidate bag scattered to [B,C,…] via v_inv (each seed's tokens are query-
+independent given a single pre-ingest snapshot). Ages = t_query − t_edge are formed at grid
+level here (each row's own query time), then IDs + ages go to the head, which gathers embeddings
+from the shared table for both sides. Strict-causal: walks + stores reflect the pre-ingest state.
 """
 import time
 from dataclasses import dataclass
@@ -37,12 +35,12 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
-from .link_pred_head import GeometricPointHead
+from .link_pred_head import SymmetricGeometricHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
 from .pair_store import NodeLastSeenStore, PairRecencyStore
 from .utils import make_lr_lambda
-from .walk_token_csr import gather_csr, walk_csr
+from .walk_token_csr import build_walk_batch, gather_dense, walk_batch_to_dense
 from .walks import WalkGenerator
 
 
@@ -108,7 +106,7 @@ class Trainer:
         self.embedding_table = EmbeddingTable(
             num_nodes=config.num_nodes, d_emb=config.d_emb,
         ).to(self.device)
-        self.link_head = GeometricPointHead(
+        self.link_head = SymmetricGeometricHead(
             d_emb=int(config.d_emb),
             use_pair_features=config.use_pair_features,
             t_train=float(config.t_train),
@@ -172,40 +170,37 @@ class Trainer:
                t_query_t: torch.Tensor) -> torch.Tensor:
         """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> logits [B, C].
 
-        SYMMETRIC: build a per-node CSR for the unique sources (→ μ tokens) and a per-node
-        CSR for the unique candidates (→ connectors), via the SAME `walk_csr`. Gather the
-        source CSR to [B,…] and scatter the candidate CSR to [B,C,…]. IDs go to the head;
-        the head gathers embeddings from the shared table for both sides."""
+        SYMMETRIC: build a two-level packed WalkBatch for the unique sources (→ μ tokens)
+        and one for the unique candidates (→ connector tokens), via the SAME
+        `build_walk_batch`. Collapse each to its per-seed dense token view, gather the source
+        view to [B,…] and scatter the candidate view to [B,C,…]. Ages = t_query − t_edge are
+        formed HERE at grid level (each row's own query time; the packed walk-edge times are
+        query-independent), then IDs + ages go to the head, which gathers embeddings from the
+        shared table for both sides."""
         device = self.device
         B, C = cand_t.shape
 
-        # --- SOURCE side: unique sources → CSR → gather to [B] ---
+        # --- SOURCE side: unique sources → WalkBatch → dense → gather to [B] ---
         uniq_s, u_pos = torch.unique(src_t, return_inverse=True)        # [Ms], [B]
-        first_src = torch.argmax(
-            (src_t.view(-1, 1) == uniq_s.view(1, -1)).to(torch.int64), dim=0)
-        csr_s = walk_csr(
-            self.walk_gen, self.device, uniq_s, t_query_t[first_src],
+        wb_s = build_walk_batch(
+            self.walk_gen, device, uniq_s,
             max_walk_len=self.config.max_walk_len_query_side,
             num_walks_per_node=self.config.num_walks_per_node_query_side,
             start_bias=self.config.start_bias_query_side,
             walk_bias=self.config.walk_bias_query_side)
-        src_ids, src_nmask, src_ages, src_amask = gather_csr(csr_s, u_pos, (B,))
+        src_ids, src_nmask, src_ts = gather_dense(walk_batch_to_dense(wb_s), u_pos, (B,))
+        src_ages = (t_query_t.view(B, 1) - src_ts).clamp_min(0).to(torch.float32)  # [B, Us]
 
-        # --- CANDIDATE side: unique candidates → CSR → scatter to [B,C] ---
+        # --- CANDIDATE side: unique candidates → WalkBatch → dense → scatter to [B,C] ---
         uniq_v, v_inv = torch.unique(cand_t.reshape(-1), return_inverse=True)  # [Mv], [B*C]
-        # Each unique candidate is aged against the query time of (one of) the rows that
-        # names it; ages enter only the (recency) reductions and the per-seed snapshot is
-        # shared, so any naming row's t_query is consistent for the dedup.
-        first_row = torch.argmax(
-            (cand_t.reshape(-1).view(-1, 1) == uniq_v.view(1, -1)).to(torch.int64), dim=0)
-        tq_per_v = t_query_t.view(B, 1).expand(B, C).reshape(-1)[first_row]    # [Mv]
-        csr_v = walk_csr(
-            self.walk_gen, self.device, uniq_v, tq_per_v,
+        wb_v = build_walk_batch(
+            self.walk_gen, device, uniq_v,
             max_walk_len=self.config.max_walk_len_candidate_side,
             num_walks_per_node=self.config.num_walks_per_node_candidate_side,
             start_bias=self.config.start_bias_candidate_side,
             walk_bias=self.config.walk_bias_candidate_side)
-        cand_ids, cand_nmask, cand_ages, cand_amask = gather_csr(csr_v, v_inv, (B, C))
+        cand_ids, cand_nmask, cand_ts = gather_dense(walk_batch_to_dense(wb_v), v_inv, (B, C))
+        cand_ages = (t_query_t.view(B, 1, 1) - cand_ts).clamp_min(0).to(torch.float32)  # [B,C,Uv]
 
         E_u = self.embedding_table(src_t)                              # [B, d]
         E_v = self.embedding_table(cand_t)                             # [B, C, d]
@@ -217,12 +212,12 @@ class Trainer:
             pair_dt, pair_count_log = self.pair_store.query(src_t, cand_t, t_query_t)
 
         return self.link_head(
-            # source CSR (μ side)
-            E_u, src_ids, src_nmask, src_ages, src_amask,
-            # candidate CSR (identity + connectors side)
-            E_v, cand_ids, cand_nmask, cand_ages, cand_amask,
+            # source tokens (μ side)
+            E_u, src_ids, src_nmask, src_ages,
+            # candidate tokens (identity + connectors side)
+            E_v, cand_ids, cand_nmask, cand_ages,
             # shared table + additive channels
-            self.embedding_table.E.weight, t_query_t, staleness_dt,
+            self.embedding_table.E.weight, staleness_dt,
             pair_dt=pair_dt, pair_count_log=pair_count_log)
 
     # ──────────────────────────────────────────────────────────────────

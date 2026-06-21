@@ -1,51 +1,72 @@
-"""Symmetric walk-neighbourhood CSR — shared token prep for both scoring sides.
+"""Walk-neighbourhood CSR — two-level packed (seed → walk → position), COUNT-FREE.
 
-The source side (u → μ) and the candidate side (v → connectors) of the geometric link
-head consume the SAME per-seed deduplicated representation. This module holds that prep:
+This replaces the earlier dedup-to-distinct-node CSR. The old layout collapsed each
+seed's walk-neighbours into distinct nodes carrying occurrence ages + an explicit COUNT,
+then re-weighted μ / co-reach by log(1+k). The new layout keeps every reached POSITION as
+its own token (no dedup, no count): a node that recurs k times simply appears as k tokens,
+so multiplicity is carried implicitly by token repetition and the explicit count terms
+disappear from both the data and the head's equations.
 
-  walk_csr(...)   — walk the unique seeds, flatten the (K,L) axes, dedup per seed → CSR.
-  dedup_to_csr()  — collapse a flat per-seed token set (with repeats) into the compact CSR.
-  gather_csr()    — index a per-unique-seed CSR onto the batch grid ([B] or [B,C]).
+  WalkBatch — fully packed, NO padding:
+    seeds           [G]          int64    deduped unique walked seed nodes
+    walk_nodes      [P]          int32    reached-node id at each position
+    walk_pos_ts     [P]          int64    raw edge timestamp t_edge (age = t_query − t_edge
+                                          is formed downstream, per the walk contract)
+    walk_edge_feats [P, d_ef]    float32  per-position edge feature, or None
+    walk_csr        [W+1]        int64    walk  → its slice of positions  (W = G·K walks)
+    seed_csr        [G+1]        int64    seed  → its slice of walks       (uniform stride K)
 
-The CSR bundle (WalkCSR) is:
-  node_ids  [G, U]        distinct neighbour node ids per seed (−1 at padded node slots)
-  node_mask [G, U]        True at a real distinct node
-  ages      [G, U, kmax]  each distinct node's OCCURRENCE ages (raw; 0 at padded slots)
-  age_mask  [G, U, kmax]  True at a real occurrence (count_node = age_mask.sum(-1))
+  Positions are packed walk-major, position-ascending. Walk w owns
+  walk_nodes[walk_csr[w] : walk_csr[w+1]] (and the parallel ts / edge-feat slices); seed g
+  owns walks [seed_csr[g] : seed_csr[g+1]). Because positions are contiguous within a walk
+  and walks are contiguous within a seed, seed g's positions are ALSO one contiguous slice
+  [walk_csr[seed_csr[g]] : walk_csr[seed_csr[g+1]]) — `walk_batch_to_dense` exploits this.
 
-Distinct nodes carry ALL their occurrence ages (recency mean stays exact) and, implicitly,
-their COUNT. Both scoring sides emit this identical layout; they differ only in which seeds
-(sources vs candidates) and which walk params. The dedup is EXACT — the per-node CSR is
-query-independent given a single pre-ingest snapshot and shift-invariant recency weighting —
-so a per-unique-seed CSR can be gathered/scattered to every cell naming that seed.
+Three things are excluded before packing (same contract as before):
+  • the seed SLOT (position lens−1, the INT64_MAX sentinel) and padding (p ≥ lens),
+  • the walk's OWN ORIGIN node-id wherever it recurs at a context position — a backward
+    walk can re-enter its origin as a "neighbour"; since Log_{E[seed]}(E[seed]) = 0 it would
+    pull μ toward the zero vector and let the connector witness itself in co-reach. Each side
+    passes its own seeds, so this drops u from the source batch and v from the candidate
+    batch while keeping u among v's connectors (u is not the candidate walk's origin).
+
+The two-level structure preserves walk identity (which positions form one temporal path),
+which the current μ / co-reach head does not need but a future path-count co-reachability
+signal will. The current head consumes the per-seed dense view from `walk_batch_to_dense`.
+Strict-causal: walks reflect the pre-ingest graph snapshot.
 """
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 
-WalkCSR = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+DenseTokens = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]  # node_ids, node_mask, pos_ts
 
 
-def walk_csr(walk_gen, device: torch.device,
-             seeds_unique: torch.Tensor, t_query_per_seed: torch.Tensor,
-             *, max_walk_len: Optional[int] = None,
-             num_walks_per_node: Optional[int] = None,
-             start_bias: Optional[str] = None,
-             walk_bias: Optional[str] = None) -> WalkCSR:
-    """Walk for `seeds_unique`, then DEDUPLICATE each seed's walk-neighbours into a compact
-    per-node CSR. Symmetric: the source and candidate sides call this with the same contract,
-    differing only in seeds + walk params.
+@dataclass
+class WalkBatch:
+    seeds: torch.Tensor                       # [G]      int64
+    walk_nodes: torch.Tensor                  # [P]      int32
+    walk_pos_ts: torch.Tensor                 # [P]      int64  raw t_edge
+    walk_edge_feats: Optional[torch.Tensor]   # [P, d_ef] float32, or None
+    walk_csr: torch.Tensor                    # [W+1]    int64  walk → positions
+    seed_csr: torch.Tensor                    # [G+1]    int64  seed → walks
 
-       walk_gen          a WalkGenerator (supports per-call walk-param overrides)
-       device            torch device for the CSR tensors
-       seeds_unique      [G] long      unique seed node ids (sources OR candidates)
-       t_query_per_seed  [G] long      the query time to age each seed's tokens against
-       -> WalkCSR (node_ids [G,U], node_mask [G,U], ages [G,U,kmax], age_mask [G,U,kmax])
 
-    Dedup is per seed-row: occurrences of the same neighbour node collapse to ONE node slot
-    carrying ALL its occurrence ages (recency mean stays exact) and its count
-    (= #occurrences = age_mask.sum(-1)). Seed (= the node itself) and walk padding are
-    excluded before dedup. Strict-causal: pre-ingest graph snapshot."""
+def build_walk_batch(walk_gen, device: torch.device, seeds_unique: torch.Tensor,
+                     *, max_walk_len: Optional[int] = None,
+                     num_walks_per_node: Optional[int] = None,
+                     start_bias: Optional[str] = None,
+                     walk_bias: Optional[str] = None) -> WalkBatch:
+    """Walk for `seeds_unique`, pack the real context tokens into a two-level CSR WalkBatch.
+
+       walk_gen        a WalkGenerator (supports per-call walk-param overrides)
+       device          torch device for the packed tensors
+       seeds_unique    [G] long   unique seed node ids (sources OR candidates)
+       -> WalkBatch
+
+    Excludes the seed slot, padding, and the walk's own origin node-id (see module doc).
+    NO dedup, NO counts — every surviving (node, t_edge, edge-feat) position is a token."""
     G = int(seeds_unique.shape[0])
     wd = walk_gen.walks_for_nodes(
         seeds_unique.cpu().numpy(),
@@ -53,101 +74,73 @@ def walk_csr(walk_gen, device: torch.device,
         num_walks_per_node=num_walks_per_node,
         start_bias=start_bias,
         walk_bias=walk_bias)
-    K, L = wd.K, wd.nodes.shape[1]
-    nodes = wd.nodes.to(device).view(G, K, L)               # [G, K, L]
-    ts = wd.timestamps.to(device).view(G, K, L)             # [G, K, L] int64 edge times
-    lens = wd.lens.to(device).view(G, K)                    # [G, K]
-    # Context = real walk-neighbours: exclude the seed slot (lens-1) and padding.
-    is_ctx = torch.arange(L, device=device).view(1, 1, L) < (lens - 1).unsqueeze(-1)
+    K, L = int(wd.K), int(wd.nodes.shape[1])
+    W = int(wd.nodes.shape[0])                                   # G·K walk rows
+    nodes = wd.nodes.to(device)                                 # [W, L] int64 (−1 pad)
+    ts = wd.timestamps.to(device)                               # [W, L] int64 edge times
+    lens = wd.lens.to(device)                                   # [W]
 
-    n = K * L
-    flat_ids = nodes.reshape(G, n)                          # [G, n] node ids (−1 pad)
-    flat_ts = ts.reshape(G, n)                              # [G, n] raw edge times
-    flat_mask = is_ctx.reshape(G, n)                        # [G, n] True at real token
-    # DROP THE WALK'S OWN ORIGIN node-id (not just its seed SLOT): a backward walk that
-    # revisits its origin re-enters the seed as a "neighbour" at a context position. Since
-    # the seed is the most-revisited node, the logsumexp-over-occurrences hands it dominant
-    # softmax mass in μ — but Log_base(E[base]) = 0, so μ is pulled toward a ZERO vector
-    # (≈27% of μ's mass on wiki, ≈50% on cold/low-degree sources), diluting the genuine
-    # neighbours; on the candidate side it also makes the connector v witness ITSELF in
-    # co-reach (the witness collapses to the identity distance). Each side passes its OWN
-    # seeds, so this removes u from the source CSR and v from the candidate CSR while keeping
-    # u-among-v's-connectors (u is not the candidate walk's origin) — the real pair signal.
-    flat_mask = flat_mask & (flat_ids != seeds_unique.view(G, 1).to(flat_ids.dtype))
-    # Per-token RAW age = t_query − t_edge (≥0), masked. clamp_min neutralises the seed
-    # sentinel; the mask zeroes padding's bogus value — finite everywhere.
-    flat_age = ((t_query_per_seed.view(G, 1).to(torch.int64) - flat_ts).clamp_min(0)
-                .to(torch.float32)) * flat_mask.to(torch.float32)       # [G, n]
+    pos = torch.arange(L, device=device).view(1, L)
+    is_ctx = pos < (lens.view(W, 1) - 1)                        # context: excl seed slot + pad
+    # rows [g·K, (g+1)·K) belong to seed g (shuffle_walk_order=False) → origin per walk row.
+    origin = wd.seeds.to(device).repeat_interleave(K)          # [W]
+    valid = is_ctx & (nodes != origin.view(W, 1))              # [W, L] real, non-origin tokens
 
-    return dedup_to_csr(flat_ids, flat_age, flat_mask)
+    flat_valid = valid.reshape(-1)                             # [W·L]
+    walk_nodes = nodes.reshape(-1)[flat_valid].to(torch.int32)         # [P]
+    walk_pos_ts = ts.reshape(-1)[flat_valid].to(torch.int64)          # [P]
+    walk_edge_feats = None
+    if wd.edge_feats is not None:
+        d_ef = wd.edge_feats.shape[-1]
+        walk_edge_feats = wd.edge_feats.to(device).reshape(-1, d_ef)[flat_valid]   # [P, d_ef]
+
+    cnt_walk = valid.sum(dim=1)                                # [W] tokens per walk
+    walk_csr = torch.zeros(W + 1, dtype=torch.int64, device=device)
+    walk_csr[1:] = torch.cumsum(cnt_walk, dim=0)
+    # every seed contributes exactly K walk rows (Tempest pads short/empty walks as rows).
+    seed_csr = torch.arange(G + 1, device=device, dtype=torch.int64) * K
+
+    return WalkBatch(seeds=wd.seeds.to(device), walk_nodes=walk_nodes,
+                     walk_pos_ts=walk_pos_ts, walk_edge_feats=walk_edge_feats,
+                     walk_csr=walk_csr, seed_csr=seed_csr)
 
 
-def dedup_to_csr(flat_ids: torch.Tensor, flat_age: torch.Tensor,
-                 flat_mask: torch.Tensor) -> WalkCSR:
-    """Collapse a flat per-seed token set [G, n] (with repeated nodes) into the compact CSR
-    (node_ids [G,U], node_mask [G,U], ages [G,U,kmax], age_mask [G,U,kmax]) by grouping
-    occurrences of the same node id within each row. Vectorised, dense-padded.
+def walk_batch_to_dense(wb: WalkBatch) -> DenseTokens:
+    """Collapse the walk level — give each seed ONE dense row of its tokens (for the μ /
+    co-reach head, which scores a per-seed token bag and does not need walk identity).
 
-    U = max distinct nodes over rows; kmax = max occurrences of any one node in a row.
-    All occurrence ages are kept (recency stays exact); count = age_mask.sum(-1)."""
-    device = flat_ids.device
-    G, n = flat_ids.shape
+       -> node_ids [G, U] (−1 pad), node_mask [G, U], pos_ts [G, U]   (U = max tokens/seed)
 
-    # Sort each row by node id so equal ids are contiguous; invalids (mask False) pushed to
-    # the end via a large sentinel key. Stable so occurrence order within a node holds.
-    BIG = torch.iinfo(torch.int64).max
-    sort_key = torch.where(flat_mask, flat_ids, torch.full_like(flat_ids, BIG))
-    order = torch.argsort(sort_key, dim=1, stable=True)              # [G, n]
-    ids_s = torch.gather(flat_ids, 1, order)                        # [G, n] sorted ids
-    age_s = torch.gather(flat_age, 1, order)                        # [G, n]
-    msk_s = torch.gather(flat_mask, 1, order)                       # [G, n]
+    Seed g's tokens are the contiguous packed slice [seed_start[g], seed_end[g]); we scatter
+    each token to (its seed, its within-seed slot). Cold seeds (no tokens) → all-False row."""
+    device = wb.walk_nodes.device
+    G = int(wb.seeds.shape[0])
+    seed_start = wb.walk_csr[wb.seed_csr[:-1]]                 # [G] first token of each seed
+    seed_end = wb.walk_csr[wb.seed_csr[1:]]                    # [G] one-past-last token
+    cnt_seed = seed_end - seed_start                          # [G] tokens per seed
+    U = max(int(cnt_seed.max().item()) if G > 0 else 1, 1)
+    P = int(wb.walk_nodes.shape[0])
 
-    # "new distinct node" boundary within a row: first valid slot, or id changes.
-    prev_id = torch.cat([torch.full((G, 1), -2, device=device, dtype=ids_s.dtype),
-                         ids_s[:, :-1]], dim=1)
-    prev_msk = torch.cat([torch.zeros((G, 1), device=device, dtype=torch.bool),
-                          msk_s[:, :-1]], dim=1)
-    is_new = msk_s & (~prev_msk | (ids_s != prev_id))               # [G, n] start of a node-run
-    # distinct-node index per valid slot (cumsum of run-starts − 1); invalids → −1.
-    node_idx = torch.cumsum(is_new.to(torch.int64), dim=1) - 1      # [G, n]
-    node_idx = torch.where(msk_s, node_idx, torch.full_like(node_idx, -1))
-    U = int(node_idx.max().item()) + 1 if msk_s.any() else 1
-
-    # occurrence index WITHIN each distinct node: position minus the run-start position.
-    ar = torch.arange(n, device=device).view(1, n).expand(G, n)     # [G, n] col positions
-    run_start_pos = torch.where(is_new, ar, torch.zeros_like(ar))
-    # cummax of run_start_pos gives, at each slot, the start position of its current run.
-    run_start = torch.cummax(run_start_pos, dim=1).values            # [G, n]
-    occ_idx = torch.where(msk_s, ar - run_start, torch.zeros_like(ar))   # [G, n]
-    kmax = int(occ_idx[msk_s].max().item()) + 1 if msk_s.any() else 1
-
-    # Scatter sorted (id, age) into [G, U, kmax] by (node_idx, occ_idx).
-    node_ids = torch.full((G, U), -1, device=device, dtype=flat_ids.dtype)
+    node_ids = torch.full((G, U), -1, device=device, dtype=wb.walk_nodes.dtype)
     node_mask = torch.zeros((G, U), device=device, dtype=torch.bool)
-    ages = torch.zeros((G, U, kmax), device=device, dtype=flat_age.dtype)
-    age_mask = torch.zeros((G, U, kmax), device=device, dtype=torch.bool)
-
-    valid = msk_s
-    rows = torch.arange(G, device=device).view(G, 1).expand(G, n)[valid]
-    u_at = node_idx[valid]
-    k_at = occ_idx[valid]
-    node_ids[rows, u_at] = ids_s[valid]
-    node_mask[rows, u_at] = True
-    ages[rows, u_at, k_at] = age_s[valid]
-    age_mask[rows, u_at, k_at] = True
-    return node_ids, node_mask, ages, age_mask
+    pos_ts = torch.zeros((G, U), device=device, dtype=wb.walk_pos_ts.dtype)
+    if P > 0:
+        ar = torch.arange(P, device=device)
+        seed_of = torch.searchsorted(seed_start, ar, right=True) - 1   # [P] owning seed
+        slot_of = ar - seed_start[seed_of]                            # [P] within-seed slot
+        node_ids[seed_of, slot_of] = wb.walk_nodes
+        node_mask[seed_of, slot_of] = True
+        pos_ts[seed_of, slot_of] = wb.walk_pos_ts
+    return node_ids, node_mask, pos_ts
 
 
-def gather_csr(csr: WalkCSR, index: torch.Tensor, out_shape) -> WalkCSR:
-    """Index a per-unique-seed CSR [G,…] onto the batch grid via `index` (long [P]),
+def gather_dense(dense: DenseTokens, index: torch.Tensor, out_shape) -> DenseTokens:
+    """Index a per-unique-seed dense view [G, U] onto the batch grid via `index` (long [P]),
     reshaping the leading axis to `out_shape` (e.g. [B] for sources, [B,C] for candidates).
-    The dedup is exact: each seed's CSR is query-independent, so gathering replicates it to
-    every cell naming that seed (scatter-add adjoint on backward)."""
-    node_ids, node_mask, ages, age_mask = csr
+    Each seed's tokens are query-independent, so gathering replicates them to every cell
+    naming that seed (scatter-add adjoint on backward)."""
+    node_ids, node_mask, pos_ts = dense
     U = node_ids.shape[-1]
-    kmax = ages.shape[-1]
-    ni = node_ids[index].view(*out_shape, U)
-    nm = node_mask[index].view(*out_shape, U)
-    ag = ages[index].view(*out_shape, U, kmax)
-    am = age_mask[index].view(*out_shape, U, kmax)
-    return ni, nm, ag, am
+    return (node_ids[index].view(*out_shape, U),
+            node_mask[index].view(*out_shape, U),
+            pos_ts[index].view(*out_shape, U))
