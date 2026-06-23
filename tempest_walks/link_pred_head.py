@@ -13,39 +13,33 @@ sphere FIRST — ⟨q_u, q_v⟩ is then parallel-transport-free. meet rises when
 shared neighbourhood even if E[u], E[v] are structurally far apart (co-reachability as centroid
 convergence). coef_meet init 0 ⇒ the head starts as the proven query-anchored baseline and meet
 earns its weight. Age stays t_query − t_edge throughout (the trainer forms it; the head never
-re-defines it). The original query-anchored terms (μ_u only) are kept:
+re-defines it). The asymmetric query_coreach ∃-witness is DROPPED — the symmetric meet replaces
+it. The score is identity + meet:
 
   TOKEN BASIS — each seed carries a COUNT-FREE bag of walk-reached positions p (one token per
-  reached position; a node recurring k times is k tokens). μ / co-reach sum/logsumexp over those
-  tokens directly — multiplicity is implicit in token repetition, no explicit count. age_p =
+  reached position; a node recurring k times is k tokens). μ sums the softmax over those tokens
+  directly — multiplicity is implicit in token repetition, no explicit count. age_p =
   t_query − t_edge(p).
 
-  μ_u = Σ_p softmax_p(−λ·age_p)·Log_{E[u]}(E[node_p ∈ u-tokens]) ; r_u = ĝate(μ_u)
+  μ_u = Σ_p softmax_p(−λ·age_p)·Log_{E[u]}(E[node_p ∈ u-tokens]) ; r_u = ĝate(μ_u)   (μ_v sym.)
 
-  query_identity = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )         is v in u's region?   [B,C]
-  query_coreach  = logsumexp_p(−α·ellipse(Log_{E[u]}(E[v-conn_p])−μ_u; r_u) − ρ·age_p)     [B,C]
-                   does v have ONE connector token in u's region?  (candidate tokens in u's frame)
-  geo   = coef_query_identity·query_identity + coef_query_coreach·query_coreach
+  identity = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )          is v in u's region?     [B,C]
+  meet     = ⟨ exp_{E[u]}(μ_u), exp_{E[v]}(μ_v) ⟩              do drifted positions meet? [B,C]
+  geo   = coef_identity·identity + coef_meet·meet
   logit = geo + coef_staleness·staleness(v) [+ coef_pair·pair + coef_pair_count·log1p(cnt)]
 
-Candidate walk tokens are used ONLY as the query_coreach connector witnesses (candidate tokens
-in u's frame); there is no candidate-side prediction μ_v here.
+Both sides build μ: the source tokens drive μ_u (identity + the u half of meet), the candidate
+tokens drive μ_v (the v half of meet).
 
-SYMMETRY-READY — the three reductions (_mu_from_csr, _identity, _coreach) and the shared params
-(λ, α, a, b, ρ) are side-agnostic: each takes an arbitrary frame + token bag. Restoring the full
-symmetric head is therefore purely additive — build μ_v from the candidate tokens and add the
-two candidate-anchored terms (candidate_identity, candidate_coreach) with their own coefs; the
-token prep, helpers, and existing terms are unchanged.
-
-BASELINE AT INIT — coef_query_identity=1, coef_query_coreach=0 ⇒ at init the head IS the proven
-identity term and nothing else; query_coreach earns its weight from zero.
+BASELINE AT INIT — coef_identity=1, coef_meet=0 ⇒ at init the head IS the proven identity term
+and nothing else; meet earns its weight from zero.
 
 COUNT-FREE — a node reached k times appears as k tokens, so its μ softmax-mass is summed across
-them and the co-reach soft-OR rises with each token; the old γμ·log(1+k) / γc·log(1+k) emphases
-(both learned ≈ −0.4, suppressed) are gone. The pair channel still carries its own recency+count.
+them; the old γμ·log(1+k) emphasis (learned ≈ −0.4, suppressed) is gone. The pair channel still
+carries its own recency+count.
 
-TIME UNITS — raw ages; μ softmax scale-invariant (λ self-scales), co-reach logsumexp bounded by
-ρ init −log(t_train). E stays the single sphere parameter (link-trained, no detach).
+TIME UNITS — raw ages; μ softmax scale-invariant (λ self-scales). E stays the single sphere
+parameter (link-trained, no detach).
 """
 import math
 
@@ -94,19 +88,14 @@ class GeometricPointHead(nn.Module):
             self.pair_head = nn.Linear(d_time, 1)
 
         # --- geometric mix coefficients ----------------------------------------
-        # query_identity is the proven baseline (init 1); query_coreach + meet earn weight (init 0).
-        self.coef_query_identity = nn.Parameter(torch.ones(1))
-        self.coef_query_coreach = nn.Parameter(torch.zeros(1))
+        # identity is the proven baseline (init 1); meet earns weight (init 0).
+        self.coef_identity = nn.Parameter(torch.ones(1))
         # SYMMETRIC MEET — build μ on BOTH sides and compare the two drifted positions. coef init 0.
         self.coef_meet = nn.Parameter(torch.zeros(1))
         self.coef_staleness = nn.Parameter(torch.ones(1))
         if use_pair_features:
             self.coef_pair = nn.Parameter(torch.ones(1))
             self.coef_pair_count = nn.Parameter(torch.zeros(1))
-
-        # --- shared co-reach recency ρ -----------------------------------------
-        self.log_rate_coreach = nn.Parameter(
-            torch.tensor([-math.log(max(float(t_train), 1.0))], dtype=torch.float32))
 
     # ──────────────────────────────────────────────────────────────────
     # Geometry primitives (shape-agnostic over leading axes)
@@ -175,26 +164,6 @@ class GeometricPointHead(nn.Module):
         return -alpha * dist
 
     # ──────────────────────────────────────────────────────────────────
-    # co-reach — ∃-witness of a token bag against a prediction (frame-agnostic)
-    # ──────────────────────────────────────────────────────────────────
-
-    def _coreach(self, frame: torch.Tensor, mu: torch.Tensor, r: torch.Tensor,
-                 ids: torch.Tensor, nmask: torch.Tensor, ages: torch.Tensor,
-                 e_weight: torch.Tensor,
-                 a: torch.Tensor, b: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
-        """logsumexp_p(−α·ellipse(Log_frame(E[node_p])−μ; r) − ρ·age_p) over connector tokens.
-           frame/mu/r [...,d] ; ids/nmask/ages [...,U]  ->  [...]. Count-free: each connector
-           token contributes once; recurrence raises the soft-OR via more tokens. Neutral 0."""
-        ec = F.normalize(F.embedding(ids.clamp_min(0), e_weight), dim=-1)   # [...,U,d]
-        gc = self._logmap(frame.unsqueeze(-2), ec)                         # [...,U,d]
-        delta = gc - mu.unsqueeze(-2)                                      # [...,U,d]
-        d = self._ellipse_dist_sq(delta, r.unsqueeze(-2), a, b).clamp_min(self.eps).sqrt()  # [...,U]
-        rho = torch.exp(self.log_rate_coreach)
-        lw = (-alpha * d - rho * ages).masked_fill(~nmask, -1e9)          # [...,U]
-        wit = torch.logsumexp(lw, dim=-1)                                 # [...]
-        return torch.where(nmask.any(dim=-1), wit, torch.zeros_like(wit))
-
-    # ──────────────────────────────────────────────────────────────────
     # Forward
     # ──────────────────────────────────────────────────────────────────
 
@@ -204,7 +173,7 @@ class GeometricPointHead(nn.Module):
                 src_ids: torch.Tensor,         # [B, Us]
                 src_nmask: torch.Tensor,       # [B, Us]
                 src_ages: torch.Tensor,        # [B, Us]
-                # ── candidate tokens (v side) — query_coreach connectors ──
+                # ── candidate tokens (v side) — drive μ_v for the meet term ──
                 E_v: torch.Tensor,             # [B, C, d]
                 cand_ids: torch.Tensor,        # [B, C, Uv]
                 cand_nmask: torch.Tensor,      # [B, C, Uv]
@@ -230,13 +199,8 @@ class GeometricPointHead(nn.Module):
         mu_u_bc = mu_u.unsqueeze(1).expand(B, C, d)
         r_u_bc = r_u.unsqueeze(1).expand(B, C, d)
 
-        # --- query_identity: is v in u's region? ---
+        # --- identity: is v in u's region? (proven baseline) ---
         q_ident = self._identity(eu_bc, ev, mu_u_bc, r_u_bc, a, b, alpha)   # [B,C]
-
-        # --- query_coreach: does v have a connector token in u's region? ---
-        q_coreach = self._coreach(eu_bc, mu_u_bc, r_u_bc,
-                                  cand_ids, cand_nmask, cand_ages,
-                                  e_weight, a, b, alpha)           # [B,C]
 
         # --- MEET: build μ_v in v's OWN tangent space, exp BOTH displacements back to the
         # sphere, and compare the two drifted positions. μ_u, μ_v live in different tangent
@@ -249,8 +213,7 @@ class GeometricPointHead(nn.Module):
         q_v = self._expmap(ev, mu_v)                             # [B,C,d] drifted candidate pos
         meet = (q_u.unsqueeze(1) * q_v).sum(-1)                  # [B,C]   ⟨q_u, q_v⟩
 
-        geo = (self.coef_query_identity * q_ident
-               + self.coef_query_coreach * q_coreach
+        geo = (self.coef_identity * q_ident
                + self.coef_meet * meet)
 
         # --- candidate STALENESS channel ---
