@@ -372,10 +372,13 @@ class Trainer:
                 n_batches += 1
             train_dt = time.time() - t0
 
+            lam = float(F.softplus(self.link_head.log_lambda).detach())
+            gain = float(torch.exp(self.link_head.log_gain).detach())
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
                 f"lr={self.opt.param_groups[0]['lr']:.2e}  "
+                f"lam={lam:.3e} (1/lam={1.0/max(lam, 1e-30):.3e}) s={gain:.3f}  "
                 f"train {train_dt:.1f}s"
             )
 
