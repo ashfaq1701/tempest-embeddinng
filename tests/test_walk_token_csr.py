@@ -4,16 +4,15 @@ The new layout is COUNT-FREE: every reached walk position is its own token (no d
 into a two-level CSR (seed → walk → position). Three things are checked:
 
 1. `build_walk_batch` STRUCTURE — offset invariants (walk_csr / seed_csr monotone, lengths,
-   uniform seed stride K), the packed arrays' length == P, and that no packed token is its
-   own seed's origin id (the seed-revisit exclusion).
+   uniform seed stride K), the packed arrays' length == P, and that the seed IS kept — it
+   appears K times at its slot (seed id @ the INT64_MAX sentinel time).
 
 2. `build_walk_batch` CONTENT, END-TO-END vs a live Tempest backward-walk batch — we capture
-   the exact WalkData sampled (walks are stochastic) and INDEPENDENTLY reconstruct the
-   expected per-seed token MULTISET under the contract (context = positions [0, lens-2]; the
-   seed slot lens-1, padding, and the origin node-id excluded; each surviving position kept
-   WITH multiplicity and carrying its raw t_edge), then assert the WalkBatch matches it
-   exactly — node-with-ts multiset and total count. Multiplicity (no dedup) is verified here:
-   a node reached k times must contribute k tokens.
+   the exact WalkData sampled (walks are stochastic) and INDEPENDENTLY reconstruct the expected
+   per-seed token MULTISET under the contract (EVERY non-padding position [0, lens-1] kept WITH
+   multiplicity — INCLUDING the seed slot and revisits; only padding p ≥ lens dropped), then
+   assert the WalkBatch matches it exactly — node-with-ts multiset and total count. Multiplicity
+   (no dedup) is verified here: a node reached k times must contribute k tokens.
 
 3. `walk_batch_to_dense` + `gather_dense` — the per-seed dense token bag reproduces the same
    per-seed multiset; cold seeds give an all-False row; gather replicates rows onto a grid.
@@ -66,24 +65,20 @@ def _seed_multiset_from_dense(node_ids, node_mask, pos_ts):
 
 
 def _expected_multiset_from_walkdata(wd, seeds):
-    """Reconstruct per-seed (node, t_edge) MULTISET from a captured WalkData under the
-    contract: context = positions [0, lens-2]; the walk's OWN ORIGIN node-id is dropped;
-    every surviving position is kept with multiplicity."""
+    """Reconstruct per-seed (node, t_edge) MULTISET from a captured WalkData: EVERY non-padding
+    position [0, lens-1] is kept with multiplicity — INCLUDING the seed slot (seed at the
+    INT64_MAX sentinel) and any seed revisits. Only padding (p ≥ lens) is dropped."""
     G = int(seeds.shape[0])
     K, L = wd.K, wd.nodes.shape[1]
     nodes = wd.nodes.view(G, K, L).cpu().numpy()
     ts = wd.timestamps.view(G, K, L).to(torch.int64).cpu().numpy()
     lens = wd.lens.view(G, K).cpu().numpy()
-    sd = seeds.cpu().numpy().astype(np.int64)
     out = []
     for g in range(G):
         c = Counter()
         for k in range(K):
-            for p in range(0, int(lens[g, k]) - 1):       # context only (excl. seed slot + pad)
-                node = int(nodes[g, k, p])
-                if node == int(sd[g]):                     # drop the walk's own origin
-                    continue
-                c[(node, int(ts[g, k, p]))] += 1
+            for p in range(0, int(lens[g, k])):           # all real positions (incl. seed slot)
+                c[(int(nodes[g, k, p]), int(ts[g, k, p]))] += 1
         out.append(c)
     return out
 
@@ -130,12 +125,14 @@ def test_build_walk_batch_offset_invariants():
     # packed arrays agree on P; no edge features on this graph.
     assert wb.walk_pos_ts.shape[0] == P
     assert wb.walk_edge_feats is None
-    # no packed token is its own seed's origin id (the seed-revisit exclusion).
+    # the seed IS now kept: every walk contributes a seed-slot token (seed id @ INT64_MAX), so
+    # the seed appears K times per seed with the sentinel time.
+    SENT = torch.iinfo(torch.int64).max
     per_seed = _seed_multiset_from_batch(wb)
     for g, s in enumerate(seeds.tolist()):
-        assert all(node != s for (node, _ts) in per_seed[g]), \
-            f"seed {s} origin id leaked into its tokens"
-    print("\n[build] offset invariants + origin-exclusion OK "
+        assert per_seed[g][(s, SENT)] == K, \
+            f"seed {s} should appear K={K} times at its slot (sentinel time); got {per_seed[g][(s, SENT)]}"
+    print("\n[build] offset invariants + seed-inclusion OK "
           f"(G={G}, K={K}, P={P})")
 
 

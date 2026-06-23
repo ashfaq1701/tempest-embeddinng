@@ -22,13 +22,13 @@ disappear from both the data and the head's equations.
   and walks are contiguous within a seed, seed g's positions are ALSO one contiguous slice
   [walk_csr[seed_csr[g]] : walk_csr[seed_csr[g+1]]) — `walk_batch_to_dense` exploits this.
 
-Three things are excluded before packing (same contract as before):
-  • the seed SLOT (position lens−1, the INT64_MAX sentinel) and padding (p ≥ lens),
-  • the walk's OWN ORIGIN node-id wherever it recurs at a context position — a backward
-    walk can re-enter its origin as a "neighbour"; since Log_{E[seed]}(E[seed]) = 0 it would
-    pull μ toward the zero vector and let the connector witness itself in co-reach. Each side
-    passes its own seeds, so this drops u from the source batch and v from the candidate
-    batch while keeping u among v's connectors (u is not the candidate walk's origin).
+ONLY padding (p ≥ lens) is excluded before packing. The seed is KEPT everywhere it appears: once
+per walk at the seed SLOT (position lens−1, INT64_MAX-sentinel time → age 0 downstream → weight 1)
+and at every revisit (real time → discounted). This is deliberate and pairs with the head's μ
+becoming a /P count-AVERAGE (not a softmax): the seed's Log_{E[seed]}(E[seed]) = 0 adds 0 to μ's
+numerator but to the token count P, so it acts as a saturating recency/density GATE on ‖μ‖ rather
+than collapsing μ. (The old softmax μ excluded the seed/origin precisely to avoid that collapse —
+no longer needed.)
 
 The two-level structure preserves walk identity (which positions form one temporal path),
 which the current μ / co-reach head does not need but a future path-count co-reachability
@@ -65,8 +65,13 @@ def build_walk_batch(walk_gen, device: torch.device, seeds_unique: torch.Tensor,
        seeds_unique    [G] long   unique seed node ids (sources OR candidates)
        -> WalkBatch
 
-    Excludes the seed slot, padding, and the walk's own origin node-id (see module doc).
-    NO dedup, NO counts — every surviving (node, t_edge, edge-feat) position is a token."""
+    Excludes ONLY padding (pos ≥ lens). The seed is KEPT everywhere it appears in its walks: once
+    per walk at the seed slot (position lens−1, INT64_MAX-sentinel time → age 0 downstream →
+    weight 1) and at every revisit (real edge time → discounted weight). The seed's tangent vector
+    is Log_{E[seed]}(E[seed]) = 0, so under the head's /P-average μ it adds 0 to the drift
+    NUMERATOR while adding to the token count P — i.e. it gates ‖μ‖ by recency/density, it does NOT
+    pull μ toward zero (the old softmax μ excluded it to avoid collapse; the /P μ wants it IN).
+    NO dedup, NO counts — every non-pad (node, t_edge, edge-feat) position is a token."""
     G = int(seeds_unique.shape[0])
     wd = walk_gen.walks_for_nodes(
         seeds_unique.cpu().numpy(),
@@ -81,11 +86,7 @@ def build_walk_batch(walk_gen, device: torch.device, seeds_unique: torch.Tensor,
     lens = wd.lens.to(device)                                   # [W]
 
     pos = torch.arange(L, device=device).view(1, L)
-    is_ctx = pos < (lens.view(W, 1) - 1)                        # context: excl seed slot + pad
-    # rows [g·K, (g+1)·K) belong to seed g (shuffle_walk_order=False) → origin per walk row.
-    origin = wd.seeds.to(device).repeat_interleave(K)          # [W]
-    valid = is_ctx & (nodes != origin.view(W, 1))              # [W, L] real, non-origin tokens
-
+    valid = pos < lens.view(W, 1)                              # [W, L] all real positions; excl pad
     flat_valid = valid.reshape(-1)                             # [W·L]
     walk_nodes = nodes.reshape(-1)[flat_valid].to(torch.int32)         # [P]
     walk_pos_ts = ts.reshape(-1)[flat_valid].to(torch.int64)          # [P]
