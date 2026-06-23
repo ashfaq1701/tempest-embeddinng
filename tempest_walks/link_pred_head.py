@@ -21,7 +21,10 @@ it. The score is identity + meet:
   directly — multiplicity is implicit in token repetition, no explicit count. age_p =
   t_query − t_edge(p).
 
-  μ_u = Σ_p softmax_p(−λ·age_p)·Log_{E[u]}(E[node_p ∈ u-tokens]) ; r_u = ĝate(μ_u)   (μ_v sym.)
+  μ_u = exp(γ·C_u) · Σ_p softmax_p(−λ·age_p)·Log_{E[u]}(E[node_p]) ; r_u = ĝate(μ_u)   (μ_v sym.)
+        — recency softmax sets the DIRECTION; the COUNT magnitude factor exp(γ·C_u),
+          C_u = Σ_w log1p(count_w) over distinct neighbours (walk multiplicity), sets how FAR it
+          drifts: a strongly/repeatedly-connected seed drifts further. γ init 0 ⇒ no-op baseline.
 
   identity = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )          is v in u's region?     [B,C]
   meet     = ⟨ exp_{E[u]}(μ_u), exp_{E[v]}(μ_v) ⟩              do drifted positions meet? [B,C]
@@ -93,6 +96,10 @@ class GeometricPointHead(nn.Module):
         # SYMMETRIC MEET — build μ on BOTH sides and compare the two drifted positions. coef init 0.
         self.coef_meet = nn.Parameter(torch.zeros(1))
         self.coef_staleness = nn.Parameter(torch.ones(1))
+        # COUNT MAGNITUDE FACTOR — scale μ by exp(γ·C), C = Σ_w log1p(count_w) (walk multiplicity).
+        # γ init 0 ⇒ exp(0)=1 ⇒ no-op (recovers the recency-only μ); the count-magnitude earns its
+        # weight. γ>0: strongly/repeatedly-connected seeds drift further (larger ‖μ‖, capped ≤ π).
+        self.gamma_count = nn.Parameter(torch.zeros(1))
         if use_pair_features:
             self.coef_pair = nn.Parameter(torch.ones(1))
             self.coef_pair_count = nn.Parameter(torch.zeros(1))
@@ -173,11 +180,13 @@ class GeometricPointHead(nn.Module):
                 src_ids: torch.Tensor,         # [B, Us]
                 src_nmask: torch.Tensor,       # [B, Us]
                 src_ages: torch.Tensor,        # [B, Us]
+                src_count: torch.Tensor,       # [B]     Σ_w log1p(count_w) — count magnitude factor
                 # ── candidate tokens (v side) — drive μ_v for the meet term ──
                 E_v: torch.Tensor,             # [B, C, d]
                 cand_ids: torch.Tensor,        # [B, C, Uv]
                 cand_nmask: torch.Tensor,      # [B, C, Uv]
                 cand_ages: torch.Tensor,       # [B, C, Uv]
+                cand_count: torch.Tensor,      # [B, C]  Σ_w log1p(count_w) — count magnitude factor
                 # ── shared table + additive channels ──
                 e_weight: torch.Tensor,        # [N, d]
                 staleness_dt: torch.Tensor,    # [B, C]
@@ -192,8 +201,9 @@ class GeometricPointHead(nn.Module):
         b = F.softplus(self.log_b)
         alpha = self.alpha.clamp_min(1e-3)
 
-        # --- prediction μ_u, broadcast to the [B,C] grid ---
+        # --- prediction μ_u, with COUNT MAGNITUDE FACTOR, broadcast to the [B,C] grid ---
         mu_u = self._mu_from_csr(eu, src_ids, src_nmask, src_ages, e_weight)   # [B,d]
+        mu_u = mu_u * torch.exp(self.gamma_count * src_count).unsqueeze(-1)    # ·exp(γ·C_u)
         r_u = self._heading(mu_u)                                 # [B,d]
         eu_bc = eu.unsqueeze(1).expand(B, C, d)                   # [B,C,d]
         mu_u_bc = mu_u.unsqueeze(1).expand(B, C, d)
@@ -209,6 +219,7 @@ class GeometricPointHead(nn.Module):
         # even if E[u], E[v] are structurally far apart — symmetric co-reachability. Age stays
         # t_query − t_edge (cand_ages already carry it). coef_meet init 0 ⇒ no-op at init.
         mu_v = self._mu_from_csr(ev, cand_ids, cand_nmask, cand_ages, e_weight)  # [B,C,d]
+        mu_v = mu_v * torch.exp(self.gamma_count * cand_count).unsqueeze(-1)     # ·exp(γ·C_v)
         q_u = self._expmap(eu, mu_u)                              # [B,d]   drifted source pos
         q_v = self._expmap(ev, mu_v)                             # [B,C,d] drifted candidate pos
         meet = (q_u.unsqueeze(1) * q_v).sum(-1)                  # [B,C]   ⟨q_u, q_v⟩

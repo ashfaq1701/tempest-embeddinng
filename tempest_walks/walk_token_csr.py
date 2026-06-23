@@ -51,6 +51,14 @@ class WalkBatch:
     walk_edge_feats: Optional[torch.Tensor]   # [P, d_ef] float32, or None
     walk_csr: torch.Tensor                    # [W+1]    int64  walk → positions
     seed_csr: torch.Tensor                    # [G+1]    int64  seed → walks
+    # SEPARATE per-seed neighbour-COUNT CSR (dedup of the token bag): how many times each seed
+    # reached each distinct neighbour this batch (walk multiplicity). Drives μ's magnitude.
+    nbr_node_ids: Optional[torch.Tensor] = None      # [Q]    int32  distinct neighbour ids, per seed
+    nbr_count: Optional[torch.Tensor] = None         # [Q]    int32  count of each neighbour
+    nbr_csr: Optional[torch.Tensor] = None           # [G+1]  int64  seed → its slice of [Q]
+    # per-seed magnitude factor C = Σ_w log1p(count_w) over the seed's distinct neighbours; the
+    # head scales μ by exp(γ·C) so strongly/repeatedly-connected seeds drift further.
+    seed_count_factor: Optional[torch.Tensor] = None  # [G]   float32
 
 
 def build_walk_batch(walk_gen, device: torch.device, seeds_unique: torch.Tensor,
@@ -65,8 +73,10 @@ def build_walk_batch(walk_gen, device: torch.device, seeds_unique: torch.Tensor,
        seeds_unique    [G] long   unique seed node ids (sources OR candidates)
        -> WalkBatch
 
-    Excludes the seed slot, padding, and the walk's own origin node-id (see module doc).
-    NO dedup, NO counts — every surviving (node, t_edge, edge-feat) position is a token."""
+    Excludes the seed slot, padding, and the walk's own origin node-id (see module doc). The
+    TOKEN CSR stays count-free (every surviving (node, t_edge, edge-feat) position is a token);
+    a SEPARATE per-seed neighbour-count CSR (nbr_*) is built alongside by deduping the token bag
+    per seed, plus the per-seed factor seed_count_factor = Σ_w log1p(count_w) for μ's magnitude."""
     G = int(seeds_unique.shape[0])
     wd = walk_gen.walks_for_nodes(
         seeds_unique.cpu().numpy(),
@@ -100,9 +110,35 @@ def build_walk_batch(walk_gen, device: torch.device, seeds_unique: torch.Tensor,
     # every seed contributes exactly K walk rows (Tempest pads short/empty walks as rows).
     seed_csr = torch.arange(G + 1, device=device, dtype=torch.int64) * K
 
+    # ── SEPARATE per-seed neighbour-COUNT CSR (dedup the token bag by node id, count occurrences):
+    # how many times each seed reached each distinct neighbour this batch (walk multiplicity).
+    P = int(walk_nodes.shape[0])
+    nbr_node_ids = torch.empty(0, dtype=torch.int32, device=device)
+    nbr_count = torch.empty(0, dtype=torch.int32, device=device)
+    nbr_csr = torch.zeros(G + 1, dtype=torch.int64, device=device)
+    seed_count_factor = torch.zeros(G, dtype=torch.float32, device=device)
+    if P > 0:
+        seed_start = walk_csr[seed_csr[:-1]]                   # [G] first token of each seed
+        cnt_seed = walk_csr[seed_csr[1:]] - seed_start         # [G] tokens per seed
+        token_seed = torch.repeat_interleave(                  # [P] owning seed of each token
+            torch.arange(G, device=device), cnt_seed)
+        nb = int(walk_nodes.max().item()) + 1                  # node-id space size for the pack key
+        key = token_seed.to(torch.int64) * nb + walk_nodes.to(torch.int64)   # (seed, node) packed
+        uniq_key, counts = torch.unique(key, return_counts=True)   # [Q] sorted → seed-major
+        useed = (uniq_key // nb)                               # [Q] seed of each distinct pair
+        nbr_node_ids = (uniq_key % nb).to(torch.int32)         # [Q] distinct neighbour ids
+        nbr_count = counts.to(torch.int32)                    # [Q] its occurrence count
+        nbr_csr[1:] = torch.cumsum(
+            torch.bincount(useed, minlength=G), dim=0)         # [G+1] seed → slice in [Q]
+        # per-seed magnitude factor C = Σ_w log1p(count_w)
+        seed_count_factor = seed_count_factor.index_add_(
+            0, useed, torch.log1p(counts.to(torch.float32)))
+
     return WalkBatch(seeds=wd.seeds.to(device), walk_nodes=walk_nodes,
                      walk_pos_ts=walk_pos_ts, walk_edge_feats=walk_edge_feats,
-                     walk_csr=walk_csr, seed_csr=seed_csr)
+                     walk_csr=walk_csr, seed_csr=seed_csr,
+                     nbr_node_ids=nbr_node_ids, nbr_count=nbr_count, nbr_csr=nbr_csr,
+                     seed_count_factor=seed_count_factor)
 
 
 def walk_batch_to_dense(wb: WalkBatch) -> DenseTokens:
