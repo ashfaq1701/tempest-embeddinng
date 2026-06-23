@@ -75,16 +75,10 @@ class GeometricPointHead(nn.Module):
         self.d_emb = d_emb
         self.eps = 1e-6
 
-        # Shared μ recency λ — under the /P count-average, λ sets the RECENCY HORIZON only;
-        # the magnitude is carried by a separate learnable gain s (below), so λ no longer has to
-        # collapse to recover drift. init λ ≈ 10/t_train so λ·age ~ O(1).
+        # Shared μ recency λ (softmax, scale-invariant), init λ ≈ C/t_train so λ·age~O(1).
         lam0 = 10.0 / max(float(t_train), 1.0)
         self.log_lambda = nn.Parameter(
             torch.tensor([math.log(math.expm1(lam0))], dtype=torch.float32))
-        # μ GAIN s = exp(log_gain): decouples DRIFT MAGNITUDE from recency. The /P divisor +
-        # the seed tokens shrink ‖μ‖ ~3–5× vs the old softmax convex-combo; init s ≈ 4 restores it
-        # so the head starts near the proven scale, then s and λ tune independently.
-        self.log_gain = nn.Parameter(torch.tensor([math.log(4.0)], dtype=torch.float32))
         self.alpha = nn.Parameter(torch.tensor(10.0))     # shared distance weight
         self.log_a = nn.Parameter(torch.zeros(1))         # anisotropic ellipse (a,b ≥ 0)
         self.log_b = nn.Parameter(torch.zeros(1))
@@ -152,11 +146,8 @@ class GeometricPointHead(nn.Module):
 
     def _mu_from_csr(self, base_emb: torch.Tensor, ids: torch.Tensor, nmask: torch.Tensor,
                      ages: torch.Tensor, e_weight: torch.Tensor) -> torch.Tensor:
-        """μ = s·(1/P)·Σ_p exp(−λ·age_p)·Log_base(E[node_p]) over the seed's token positions —
-           the COUNT-AVERAGE of the raw recency-weighted Log's (NOT a softmax), times a learnable
-           GAIN s that carries the drift MAGNITUDE so λ is free to set the recency horizon alone
-           (without s, λ had to collapse to recover the magnitude the /P + seed tokens removed).
-           The softmax
+        """μ = (1/P)·Σ_p exp(−λ·age_p)·Log_base(E[node_p]) over the seed's token positions —
+           the COUNT-AVERAGE of the raw recency-weighted Log's, NOT a softmax. The softmax
            denominator Σ_p w_p divided out the bag's overall recency/size; dividing by the raw
            token count P instead lets ‖μ‖ carry the MEAN RECENCY (fresh bag → w≈1 → drifts far;
            stale bag → w≈0 → drifts nowhere), same DIRECTION as before. Each term ≤ 1·π and we
@@ -171,8 +162,7 @@ class GeometricPointHead(nn.Module):
         ell = (-lam * ages).masked_fill(~nmask, float("-inf"))            # [...,U]
         w = torch.exp(ell)                                                 # raw weights; masked → 0
         P = nmask.sum(dim=-1, keepdim=True).clamp_min(1).to(w.dtype)       # valid tokens per seed
-        s = torch.exp(self.log_gain)                                       # drift-magnitude gain
-        return s * (w.unsqueeze(-1) * g).sum(dim=-2) / P                   # [...,d] s·mean-weighted
+        return (w.unsqueeze(-1) * g).sum(dim=-2) / P                       # [...,d] mean weighted sum
 
     # ──────────────────────────────────────────────────────────────────
     # identity — probe an embedding against a prediction (frame-agnostic)
