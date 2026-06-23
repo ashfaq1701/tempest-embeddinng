@@ -1,7 +1,19 @@
-"""Geometric link head — ASYMMETRIC (μ_u + query co-reach), COUNT-FREE.
+"""Geometric link head — SYMMETRIC-MEET (μ on BOTH sides), COUNT-FREE.
 
-Builds a prediction μ_u for the source from its walk tokens and scores each candidate against
-it with two query-anchored terms:
+Builds a displacement μ_u for the source from its walk tokens, μ_v for each candidate from ITS
+walk tokens, and scores with the query-anchored terms PLUS a symmetric MEET term that compares
+the two drifted positions:
+
+  μ_u = drift in T_{E[u]} ;  μ_v = drift in T_{E[v]}  (same routine, candidate frame + tokens)
+  q_u = exp_{E[u]}(μ_u) ;  q_v = exp_{E[v]}(μ_v)      (both back ON the sphere)
+  meet(u,v) = ⟨q_u, q_v⟩                              do u's and v's drifted positions coincide?
+
+μ_u and μ_v live in DIFFERENT tangent spaces, so the exp-map sends both to points on the SAME
+sphere FIRST — ⟨q_u, q_v⟩ is then parallel-transport-free. meet rises when u and v drift toward a
+shared neighbourhood even if E[u], E[v] are structurally far apart (co-reachability as centroid
+convergence). coef_meet init 0 ⇒ the head starts as the proven query-anchored baseline and meet
+earns its weight. Age stays t_query − t_edge throughout (the trainer forms it; the head never
+re-defines it). The original query-anchored terms (μ_u only) are kept:
 
   TOKEN BASIS — each seed carries a COUNT-FREE bag of walk-reached positions p (one token per
   reached position; a node recurring k times is k tokens). μ / co-reach sum/logsumexp over those
@@ -82,9 +94,11 @@ class GeometricPointHead(nn.Module):
             self.pair_head = nn.Linear(d_time, 1)
 
         # --- geometric mix coefficients ----------------------------------------
-        # query_identity is the proven baseline (init 1); query_coreach earns weight (init 0).
+        # query_identity is the proven baseline (init 1); query_coreach + meet earn weight (init 0).
         self.coef_query_identity = nn.Parameter(torch.ones(1))
         self.coef_query_coreach = nn.Parameter(torch.zeros(1))
+        # SYMMETRIC MEET — build μ on BOTH sides and compare the two drifted positions. coef init 0.
+        self.coef_meet = nn.Parameter(torch.zeros(1))
         self.coef_staleness = nn.Parameter(torch.ones(1))
         if use_pair_features:
             self.coef_pair = nn.Parameter(torch.ones(1))
@@ -103,6 +117,18 @@ class GeometricPointHead(nn.Module):
         theta = torch.arccos(c)
         orth = x - c * p
         return theta * orth / orth.norm(dim=-1, keepdim=True).clamp_min(self.eps)
+
+    def _expmap(self, p: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+        """exp_p(δ) = cos‖δ‖·p + sin‖δ‖·δ/‖δ‖ ∈ S^{d-1}. δ = μ is a sum of Log_p's (all ⊥ p),
+        so the result is unit-norm; ‖δ‖ capped to the injectivity radius (<π); δ→0 ⇒ exp_p(δ)=p
+        (a cold node drifts nowhere). Final normalize is a numeric belt. Sends a tangent
+        displacement back ONTO the sphere so two drifted positions q_u, q_v live on the SAME
+        manifold and ⟨q_u, q_v⟩ is parallel-transport-free."""
+        norm = delta.norm(dim=-1, keepdim=True)                     # ‖μ‖ = drift angle
+        theta = norm.clamp(max=math.pi - self.eps)
+        coef = torch.sin(theta) / norm.clamp_min(self.eps)         # → 0 as norm→0 (q→p)
+        q = torch.cos(theta) * p + coef * delta
+        return F.normalize(q, dim=-1)
 
     def _ellipse_dist_sq(self, delta: torch.Tensor, r: torch.Tensor,
                          a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -212,8 +238,20 @@ class GeometricPointHead(nn.Module):
                                   cand_ids, cand_nmask, cand_ages,
                                   e_weight, a, b, alpha)           # [B,C]
 
+        # --- MEET: build μ_v in v's OWN tangent space, exp BOTH displacements back to the
+        # sphere, and compare the two drifted positions. μ_u, μ_v live in different tangent
+        # spaces (T_{E[u]} vs T_{E[v]}); the exp-map sends them to points on the SAME sphere so
+        # ⟨q_u, q_v⟩ is transport-free. Rises when u and v drift toward a shared neighbourhood,
+        # even if E[u], E[v] are structurally far apart — symmetric co-reachability. Age stays
+        # t_query − t_edge (cand_ages already carry it). coef_meet init 0 ⇒ no-op at init.
+        mu_v = self._mu_from_csr(ev, cand_ids, cand_nmask, cand_ages, e_weight)  # [B,C,d]
+        q_u = self._expmap(eu, mu_u)                              # [B,d]   drifted source pos
+        q_v = self._expmap(ev, mu_v)                             # [B,C,d] drifted candidate pos
+        meet = (q_u.unsqueeze(1) * q_v).sum(-1)                  # [B,C]   ⟨q_u, q_v⟩
+
         geo = (self.coef_query_identity * q_ident
-               + self.coef_query_coreach * q_coreach)
+               + self.coef_query_coreach * q_coreach
+               + self.coef_meet * meet)
 
         # --- candidate STALENESS channel ---
         staleness = self.staleness_head(self.basis_staleness(staleness_dt)).squeeze(-1)  # [B,C]
