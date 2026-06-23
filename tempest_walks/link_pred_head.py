@@ -16,15 +16,12 @@ earns its weight. Age stays t_query − t_edge throughout (the trainer forms it;
 re-defines it). The asymmetric query_coreach ∃-witness is DROPPED — the symmetric meet replaces
 it. The score is identity + meet:
 
-  TOKEN BASIS — each seed carries a bag of walk-reached positions p (one token per reached
-  position; a node recurring k times is k tokens). The bag INCLUDES the seed itself: once per
-  walk at age 0 (weight 1) and at every revisit (discounted). age_p = t_query − t_edge(p).
+  TOKEN BASIS — each seed carries a COUNT-FREE bag of walk-reached positions p (one token per
+  reached position; a node recurring k times is k tokens). μ sums the softmax over those tokens
+  directly — multiplicity is implicit in token repetition, no explicit count. age_p =
+  t_query − t_edge(p).
 
-  μ_u = (1/P)·Σ_p exp(−λ·age_p)·Log_{E[u]}(E[node_p ∈ u-tokens]) ; r_u = ĝate(μ_u)   (μ_v sym.)
-        — the COUNT-AVERAGE (÷ token count P), NOT a softmax: ‖μ‖ now carries the bag's MEAN
-          RECENCY (fresh→drifts far, stale→nowhere), capped ≤ π (sphere-safe). The seed tokens
-          (Log_{E[·]}(E[seed]) = 0) add 0 to the drift but to P — a saturating recency/density
-          GATE on ‖μ_u‖ AND ‖μ_v‖ (so the meet ⟨q_u,q_v⟩ shrinks for sparse/stale neighbourhoods).
+  μ_u = Σ_p softmax_p(−λ·age_p)·Log_{E[u]}(E[node_p ∈ u-tokens]) ; r_u = ĝate(μ_u)   (μ_v sym.)
 
   identity = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )          is v in u's region?     [B,C]
   meet     = ⟨ exp_{E[u]}(μ_u), exp_{E[v]}(μ_v) ⟩              do drifted positions meet? [B,C]
@@ -37,14 +34,11 @@ tokens drive μ_v (the v half of meet).
 BASELINE AT INIT — coef_identity=1, coef_meet=0 ⇒ at init the head IS the proven identity term
 and nothing else; meet earns its weight from zero.
 
-μ MAGNITUDE — the count-average (÷ P) folds the bag's MEAN RECENCY into ‖μ‖, and the seed tokens
-(value 0) add a saturating count/density gate; both flow through _expmap/_heading (which read
-‖μ‖) into identity and meet. This preserves mean-recency, NOT absolute count (÷P cancels linear
-bag size — {5 fresh A} and {50 fresh A} give the same direction; the seed gate only saturates it).
-The old explicit count emphasis (γμ·log(1+k)) is gone; the pair channel still carries its own
-recency+count.
+COUNT-FREE — a node reached k times appears as k tokens, so its μ softmax-mass is summed across
+them; the old γμ·log(1+k) emphasis (learned ≈ −0.4, suppressed) is gone. The pair channel still
+carries its own recency+count.
 
-TIME UNITS — raw ages; μ is scale-invariant in λ (self-scales). E stays the single sphere
+TIME UNITS — raw ages; μ softmax scale-invariant (λ self-scales). E stays the single sphere
 parameter (link-trained, no detach).
 """
 import math
@@ -146,23 +140,16 @@ class GeometricPointHead(nn.Module):
 
     def _mu_from_csr(self, base_emb: torch.Tensor, ids: torch.Tensor, nmask: torch.Tensor,
                      ages: torch.Tensor, e_weight: torch.Tensor) -> torch.Tensor:
-        """μ = (1/P)·Σ_p exp(−λ·age_p)·Log_base(E[node_p]) over the seed's token positions —
-           the COUNT-AVERAGE of the raw recency-weighted Log's, NOT a softmax. The softmax
-           denominator Σ_p w_p divided out the bag's overall recency/size; dividing by the raw
-           token count P instead lets ‖μ‖ carry the MEAN RECENCY (fresh bag → w≈1 → drifts far;
-           stale bag → w≈0 → drifts nowhere), same DIRECTION as before. Each term ≤ 1·π and we
-           divide by P ⇒ ‖μ‖ ≤ π (sphere-safe, exp-map never wraps). The seed tokens (in the bag
-           now, Log_base(E[seed]) = 0) add 0 to the numerator but to P — a saturating count/recency
-           GATE on the drift (both μ_u and μ_v get it). age = t_query − t_edge ≥ 0 ⇒ weights ≤ 1.
-           base [...,d] ; ids/nmask/ages [...,U]  ->  μ [...,d]."""
+        """μ = Σ_p softmax_p(−λ·age_p)·Log_base(E[node_p]) over the seed's token positions.
+           base [...,d] ; ids/nmask/ages [...,U]  ->  μ [...,d]. Count-free: a node recurring
+           k times is k tokens, so its softmax mass is summed across them automatically."""
         base = F.normalize(base_emb, dim=-1)
         ew = F.normalize(F.embedding(ids.clamp_min(0), e_weight), dim=-1)   # [...,U,d]
         g = self._logmap(base.unsqueeze(-2), ew)                           # [...,U,d]
         lam = F.softplus(self.log_lambda)
         ell = (-lam * ages).masked_fill(~nmask, float("-inf"))            # [...,U]
-        w = torch.exp(ell)                                                 # raw weights; masked → 0
-        P = nmask.sum(dim=-1, keepdim=True).clamp_min(1).to(w.dtype)       # valid tokens per seed
-        return (w.unsqueeze(-1) * g).sum(dim=-2) / P                       # [...,d] mean weighted sum
+        w = torch.nan_to_num(torch.softmax(ell, dim=-1), nan=0.0)
+        return (w.unsqueeze(-1) * g).sum(dim=-2)                          # [...,d]
 
     # ──────────────────────────────────────────────────────────────────
     # identity — probe an embedding against a prediction (frame-agnostic)
