@@ -2,7 +2,7 @@
 #
 # ┌─ IMPORTANT: torch is PINNED to 2.7.1. This is the first PyPI default
 # │  that ships with `nvidia-cuda-runtime-cu12>=12.6`, which is what
-# │  `temporal-random-walk>=1.8.4` requires. torch 2.6.0 looks like the
+# │  `temporal-random-walk>=1.8.6` requires. torch 2.6.0 looks like the
 # │  natural "cu126" pairing but its PyPI metadata actually pins to
 # │  `nvidia-cuda-runtime-cu12==12.4.127`, which collides with the
 # │  temporal-random-walk constraint at pip-resolve time:
@@ -82,6 +82,6 @@ py-tgb>=2.2.0
 # 2.x defaults CoW off and loads fine. Keep pandas <3 until TGB is
 # pandas-3.0-ready (do NOT install pandas 3.x in the env).
 pandas>=2,<3
-temporal-random-walk>=1.8.4
+temporal-random-walk>=1.8.6
 prodigyopt>=1.1
 geoopt>=0.5.0
