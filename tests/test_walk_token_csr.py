@@ -1,23 +1,24 @@
-"""Correctness tests for per-query walk tokens (tempest_walks/walk_token_csr.py).
+"""Correctness tests for the per-query walk CSR (tempest_walks/walk_token_csr.py).
 
-`build_query_walk_tokens` generates K backward walks per QUERY — a (seed node, cutoff time)
-pair — and packs each query's real context tokens left-aligned into [Q, U]. COUNT-FREE:
-every reached position is its own token (no dedup; multiplicity kept). Checks:
+`build_query_walk_tokens` runs K backward walks per QUERY — a (seed node, cutoff time) pair —
+and returns a WalkTokenCSR: a token-stream CSR (raw, count-free, drives μ) and a neighbour CSR
+(per-query unique nodes + counts). Checks:
 
-1. CONTENT vs the SAME captured walks — the per-query (node, t_edge) MULTISET matches the
-   contract reconstruction (context positions [0, lens-2]; seed slot / padding / origin
-   excluded; kept with multiplicity), and the left-packing is dense with -1 on masked slots.
-2. PER-QUERY CUTOFF — every emitted token has t_edge < that query's OWN cutoff; the SAME node
-   at increasing cutoffs yields nested-larger, cutoff-respecting token sets (no dedup means
-   each query is sampled independently).
-3. EDGE CASES — a cutoff at/below the earliest edge, and an isolated node, each give an
-   all-False (empty) row.
+1. TOKEN STREAM vs the SAME captured walks — per-query (node, t_edge) MULTISET (read via
+   node_ids_ptr slices) matches the contract reconstruction; node_ids_ptr is a valid CSR
+   pointer; every token's t_edge < its query's cutoff.
+2. NEIGHBOUR CSR — per query, `neighbors` are exactly the distinct token nodes, `neighbors_count`
+   their occurrence counts, Σ counts == that query's token length; neighbors_ptr is valid.
+3. EMPTY — a cutoff at/below the earliest edge and an isolated node give empty CSR segments.
+4. μ-EQUIVALENCE — the head's segmented `_mu_from_token_csr` over the CSR equals the proven
+   dense `_mu_from_csr` on the same tokens (so switching layout cannot move results).
 """
 from collections import Counter
 
 import numpy as np
 import torch
 
+from tempest_walks.link_pred_head import GeometricPointHead
 from tempest_walks.walk_token_csr import build_query_walk_tokens
 from tempest_walks.walks import WalkGenerator
 
@@ -35,15 +36,12 @@ def _synthetic_graph(n_nodes=10, n_edges=120, seed=0):
     return src, tgt, ts
 
 
-def _per_query_multiset_from_dense(node_ids, node_mask, pos_ts):
-    q_n, u = node_ids.shape
-    return [Counter((int(node_ids[q, j]), int(pos_ts[q, j]))
-                    for j in range(u) if bool(node_mask[q, j])) for q in range(q_n)]
+def _query_token_multiset(csr, q):
+    s, e = int(csr.node_ids_ptr[q]), int(csr.node_ids_ptr[q + 1])
+    return Counter((int(csr.node_ids[i]), int(csr.pos_ts[i])) for i in range(s, e))
 
 
 def _expected_multiset_from_walkdata(wd, seeds):
-    """Per-query (node, t_edge) MULTISET from captured WalkData under the contract:
-    context = positions [0, lens-2]; the walk's OWN ORIGIN node-id dropped; multiplicity kept."""
     q_n = int(seeds.shape[0])
     k, length = wd.K, wd.nodes.shape[1]
     nodes = wd.nodes.view(q_n, k, length).cpu().numpy()
@@ -64,7 +62,6 @@ def _expected_multiset_from_walkdata(wd, seeds):
 
 
 def _run_with_capture(wg, seeds, cutoffs, **params):
-    """Run build_query_walk_tokens while capturing the exact WalkData it sampled."""
     captured = {}
     orig = wg.walks_for_nodes
 
@@ -74,95 +71,169 @@ def _run_with_capture(wg, seeds, cutoffs, **params):
         return wd
 
     wg.walks_for_nodes = _cap
-    out = build_query_walk_tokens(wg, torch.device("cpu"), seeds, cutoffs, **params)
+    csr = build_query_walk_tokens(wg, torch.device("cpu"), seeds, cutoffs, **params)
     wg.walks_for_nodes = orig
-    return out, captured["wd"]
+    return csr, captured["wd"]
+
+
+def _is_valid_ptr(ptr, total, q):
+    return (int(ptr.shape[0]) == q + 1 and int(ptr[0]) == 0 and int(ptr[-1]) == total
+            and bool((ptr[1:] >= ptr[:-1]).all()))
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 1. content end-to-end vs the SAME captured walks (multiplicity preserved)
+# 1. token stream
 # ──────────────────────────────────────────────────────────────────────────
-def test_tokens_match_captured_walks_and_packing():
+def test_token_stream_matches_captured_walks():
     src, tgt, ts = _synthetic_graph()
     k, mwl = 6, 8
     wg = WalkGenerator(use_gpu=False, num_walks_per_node=k, max_walk_len=mwl,
                        walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
     wg.reset(); wg.add_edges(src, tgt, ts, None)
     seeds = torch.tensor([1, 3, 5, 7, 9], dtype=torch.long)
-    cutoffs = torch.full((5,), 50_000, dtype=torch.long)        # above all edges -> unconstrained
+    cutoffs = torch.full((5,), 50_000, dtype=torch.long)
 
-    (ids, mask, pts), wd = _run_with_capture(
+    csr, wd = _run_with_capture(
         wg, seeds, cutoffs, max_walk_len=mwl, num_walks_per_node=k,
         walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
-    got = _per_query_multiset_from_dense(ids, mask, pts)
     exp = _expected_multiset_from_walkdata(wd, seeds)
 
-    assert any(len(c) > 0 for c in exp), "no context tokens sampled — graph too sparse"
+    assert _is_valid_ptr(csr.node_ids_ptr, int(csr.node_ids.shape[0]), len(seeds))
+    assert any(len(c) > 0 for c in exp), "graph too sparse"
     for q in range(len(seeds)):
-        assert got[q] == exp[q], (
-            f"query {q} (seed {int(seeds[q])}): token multiset mismatch\n"
-            f" got {sorted(got[q].items())}\n exp {sorted(exp[q].items())}")
-    # multiplicity is real (no dedup): some node reached more than once.
-    assert any(any(v > 1 for v in c.values()) for c in exp), \
-        "expected a recurring node to exercise the multiplicity path"
-    # packing: masked slots hold node id -1.
-    assert bool((ids[~mask] == -1).all())
-    print(f"\n[tokens] per-query multiset + multiplicity + packing OK ({len(seeds)} queries)")
+        assert _query_token_multiset(csr, q) == exp[q], f"query {q}: token multiset mismatch"
+    assert any(any(v > 1 for v in c.values()) for c in exp), "expected a multiplicity case"
+    print(f"\n[token-stream] per-query multiset + multiplicity OK ({len(seeds)} queries, "
+          f"T={int(csr.node_ids.shape[0])})")
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# 2. per-query cutoff
-# ──────────────────────────────────────────────────────────────────────────
 def test_per_query_cutoff_is_honoured():
     src, tgt, ts = _synthetic_graph(seed=4)
     k, mwl = 8, 8
     wg = WalkGenerator(use_gpu=False, num_walks_per_node=k, max_walk_len=mwl,
                        walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
     wg.reset(); wg.add_edges(src, tgt, ts, None)
-
     uniq = np.unique(ts)
     node = int(src[len(src) // 2])
     cuts = [int(uniq[len(uniq) // 4]), int(uniq[len(uniq) // 2]), 50_000]
-    seeds = torch.tensor([node, node, node], dtype=torch.long)     # SAME node, 3 cutoffs
+    seeds = torch.tensor([node, node, node], dtype=torch.long)
     cutoffs = torch.tensor(cuts, dtype=torch.long)
 
-    (ids, mask, pts), _ = _run_with_capture(
+    csr, _ = _run_with_capture(
         wg, seeds, cutoffs, max_walk_len=mwl, num_walks_per_node=k,
         walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
-    max_ts = []
     for q in range(3):
-        realts = pts[q][mask[q]].tolist()
-        assert all(t < cuts[q] for t in realts), \
-            f"query {q}: a token is at/after its cutoff {cuts[q]} (max {max(realts) if realts else None})"
-        max_ts.append(max(realts) if realts else None)
-    # Walks are stochastic with independent per-query RNG, so token COUNT is not monotone in
-    # the cutoff. The deterministic invariant is the per-cutoff strictness checked above; the
-    # loosest cutoff (unconstrained) must still sample some tokens.
-    assert max_ts[2] is not None, "the unconstrained query should sample at least one token"
-    print(f"\n[cutoff] every token strictly before its query's cutoff OK (max_ts {max_ts})")
+        s, e = int(csr.node_ids_ptr[q]), int(csr.node_ids_ptr[q + 1])
+        assert all(int(t) < cuts[q] for t in csr.pos_ts[s:e]), f"query {q}: token at/after cutoff"
+    print("\n[cutoff] every token strictly before its query's cutoff OK")
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 3. edge cases
+# 2. neighbour CSR
 # ──────────────────────────────────────────────────────────────────────────
-def test_empty_query_rows():
+def test_neighbour_csr_matches_token_stream():
+    src, tgt, ts = _synthetic_graph(seed=1)
+    k, mwl = 6, 8
+    wg = WalkGenerator(use_gpu=False, num_walks_per_node=k, max_walk_len=mwl,
+                       walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
+    wg.reset(); wg.add_edges(src, tgt, ts, None)
+    seeds = torch.tensor([2, 4, 6, 8], dtype=torch.long)
+    cutoffs = torch.full((4,), 50_000, dtype=torch.long)
+
+    csr, _ = _run_with_capture(
+        wg, seeds, cutoffs, max_walk_len=mwl, num_walks_per_node=k,
+        walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
+    assert _is_valid_ptr(csr.neighbors_ptr, int(csr.neighbors.shape[0]), len(seeds))
+
+    saw_dedup = False
+    for q in range(len(seeds)):
+        ts_s, ts_e = int(csr.node_ids_ptr[q]), int(csr.node_ids_ptr[q + 1])
+        token_counts = Counter(int(n) for n in csr.node_ids[ts_s:ts_e])     # node -> occurrences
+        ns, ne = int(csr.neighbors_ptr[q]), int(csr.neighbors_ptr[q + 1])
+        nbr = {int(csr.neighbors[i]): int(csr.neighbors_count[i]) for i in range(ns, ne)}
+        assert nbr == dict(token_counts), f"query {q}: neighbour CSR != token-stream dedup"
+        # Σ counts == token length; uniques ≤ tokens
+        assert sum(nbr.values()) == (ts_e - ts_s)
+        if (ne - ns) < (ts_e - ts_s):
+            saw_dedup = True
+    assert saw_dedup, "expected at least one query whose tokens dedup to fewer neighbours"
+    print(f"\n[neighbour-csr] unique nodes + counts match token stream OK "
+          f"(Tn={int(csr.neighbors.shape[0])})")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 3. empty segments
+# ──────────────────────────────────────────────────────────────────────────
+def test_empty_query_segments():
     src, tgt, ts = _synthetic_graph(n_nodes=6, n_edges=40, seed=2)
     wg = WalkGenerator(use_gpu=False, num_walks_per_node=4, max_walk_len=6)
     wg.reset(); wg.add_edges(src, tgt, ts, None)
-
-    t_min = int(ts.min())                       # no edge has t_edge < global min
-    seeds = torch.tensor([int(src[0]), 999], dtype=torch.long)   # active node, isolated node 999
+    t_min = int(ts.min())
+    seeds = torch.tensor([int(src[0]), 999], dtype=torch.long)
     cutoffs = torch.tensor([t_min, 50_000], dtype=torch.long)
 
-    (ids, mask, _pts), _ = _run_with_capture(
-        wg, seeds, cutoffs, max_walk_len=6, num_walks_per_node=4)
-    assert not bool(mask[0].any()), "cutoff at/below earliest edge must yield an empty row"
-    assert not bool(mask[1].any()), "isolated node must yield an empty row"
-    print("\n[edge] cutoff-excluded query + isolated node give empty rows OK")
+    csr, _ = _run_with_capture(wg, seeds, cutoffs, max_walk_len=6, num_walks_per_node=4)
+    for q in (0, 1):
+        assert int(csr.node_ids_ptr[q]) == int(csr.node_ids_ptr[q + 1]), f"query {q} not empty"
+        assert int(csr.neighbors_ptr[q]) == int(csr.neighbors_ptr[q + 1])
+    print("\n[empty] cutoff-excluded + isolated queries → empty CSR segments OK")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 4. μ-equivalence: segmented CSR μ == proven dense μ
+# ──────────────────────────────────────────────────────────────────────────
+def _densify(csr, t_query):
+    q = int(csr.seeds.shape[0])
+    counts = (csr.node_ids_ptr[1:] - csr.node_ids_ptr[:-1])
+    u = max(int(counts.max()) if q else 1, 1)
+    ids = torch.zeros((q, u), dtype=torch.long)
+    nmask = torch.zeros((q, u), dtype=torch.bool)
+    ages = torch.zeros((q, u), dtype=torch.float32)
+    for qi in range(q):
+        s, e = int(csr.node_ids_ptr[qi]), int(csr.node_ids_ptr[qi + 1])
+        n = e - s
+        if n:
+            ids[qi, :n] = csr.node_ids[s:e]
+            nmask[qi, :n] = True
+            ages[qi, :n] = (t_query[qi] - csr.pos_ts[s:e]).clamp_min(0).float()
+    return ids, nmask, ages
+
+
+def test_mu_csr_equals_dense():
+    torch.manual_seed(0)
+    src, tgt, ts = _synthetic_graph(seed=3)
+    k, mwl = 6, 8
+    wg = WalkGenerator(use_gpu=False, num_walks_per_node=k, max_walk_len=mwl,
+                       walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
+    wg.reset(); wg.add_edges(src, tgt, ts, None)
+    n_nodes = int(max(src.max(), tgt.max())) + 1
+    seeds = torch.tensor([1, 3, 5, 7, 9], dtype=torch.long)
+    t_query = torch.full((5,), 45_000, dtype=torch.long)
+    cutoffs = t_query.clone()
+
+    csr = build_query_walk_tokens(wg, torch.device("cpu"), seeds, cutoffs,
+                                  max_walk_len=mwl, num_walks_per_node=k,
+                                  walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
+    ids, nmask, ages = _densify(csr, t_query)
+
+    d = 16
+    head = GeometricPointHead(d_emb=d, t_train=50_000.0)
+    e_weight = torch.randn(n_nodes, d)
+    E_u = e_weight[seeds]                                          # base = E[seed]
+
+    mu_dense = head._mu_from_csr(E_u, ids, nmask, ages, e_weight)  # [Q, d]
+    mu_csr = head._mu_from_token_csr(
+        E_u, csr.node_ids, csr.pos_ts, csr.node_ids_ptr, t_query, e_weight)
+    assert torch.allclose(mu_dense, mu_csr, atol=1e-5, rtol=1e-4), \
+        f"segmented CSR μ diverges from dense μ (max |Δ| = {(mu_dense - mu_csr).abs().max():.2e})"
+    print(f"\n[μ-equiv] segmented CSR μ == dense μ (max |Δ| = "
+          f"{(mu_dense - mu_csr).abs().max():.2e})")
 
 
 if __name__ == "__main__":
-    test_tokens_match_captured_walks_and_packing()
+    test_token_stream_matches_captured_walks()
     test_per_query_cutoff_is_honoured()
-    test_empty_query_rows()
-    print("\nALL PER-QUERY WALK-TOKEN CHECKS PASSED")
+    test_neighbour_csr_matches_token_stream()
+    test_empty_query_segments()
+    test_mu_csr_equals_dense()
+    print("\nALL WALK-CSR CHECKS PASSED")
