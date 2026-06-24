@@ -190,7 +190,6 @@ class Trainer:
             walk_bias=self.config.walk_bias_query_side)
         src_ids, src_nmask, src_ts = gather_dense(walk_batch_to_dense(wb_s), u_pos, (B,))
         src_ages = (t_query_t.view(B, 1) - src_ts).clamp_min(0).to(torch.float32)  # [B, Us]
-        src_count = wb_s.seed_count_factor[u_pos]                       # [B] Σ log1p(count) per src
 
         # --- CANDIDATE side: unique candidates → WalkBatch → dense → scatter to [B,C] ---
         uniq_v, v_inv = torch.unique(cand_t.reshape(-1), return_inverse=True)  # [Mv], [B*C]
@@ -202,7 +201,6 @@ class Trainer:
             walk_bias=self.config.walk_bias_candidate_side)
         cand_ids, cand_nmask, cand_ts = gather_dense(walk_batch_to_dense(wb_v), v_inv, (B, C))
         cand_ages = (t_query_t.view(B, 1, 1) - cand_ts).clamp_min(0).to(torch.float32)  # [B,C,Uv]
-        cand_count = wb_v.seed_count_factor[v_inv].view(B, C)           # [B,C] Σ log1p(count) per cand
 
         E_u = self.embedding_table(src_t)                              # [B, d]
         E_v = self.embedding_table(cand_t)                             # [B, C, d]
@@ -214,10 +212,10 @@ class Trainer:
             pair_dt, pair_count_log = self.pair_store.query(src_t, cand_t, t_query_t)
 
         return self.link_head(
-            # source tokens (μ side) + per-seed count magnitude factor
-            E_u, src_ids, src_nmask, src_ages, src_count,
-            # candidate tokens (meet side) + per-seed count magnitude factor
-            E_v, cand_ids, cand_nmask, cand_ages, cand_count,
+            # source tokens (μ side)
+            E_u, src_ids, src_nmask, src_ages,
+            # candidate tokens (identity + connectors side)
+            E_v, cand_ids, cand_nmask, cand_ages,
             # shared table + additive channels
             self.embedding_table.E.weight, staleness_dt,
             pair_dt=pair_dt, pair_count_log=pair_count_log)
