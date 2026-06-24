@@ -1,28 +1,34 @@
-"""Strict-causal training + eval loop — link-supervised geometric walk head (REACH).
+"""Per-query-causal training + eval loop — link-supervised geometric walk head (REACH).
 
-Per-batch ordering (training):
-  1. neg = neg_sampler.sample(batch)                 — [B, K_train] uniform negs
-  2. candidates = [pos | negs]                       — [B, 1+K_train]
-  3. logits = score(src, candidates)                 — sample walks for the unique sources
-       (→ μ_u), pack to tokens, score with GeometricPointHead (identity + reach).
-       The candidate side samples no walks — it enters via its static E[v].
-  4. L = cross_entropy(logits / tau_link, target=0)  — Bruch 2019, upper-bounds 1-MRR
-  5. one backward + single optimizer step
-  6. walk_gen.add_edges(batch)                        — post-scoring, LAST
+Causality is now enforced PER QUERY by Tempest's cutoff, not by ingestion order. Per-batch
+ordering (training):
+  1. walk_gen.add_edges(batch)                        — ingest the batch's true edges FIRST
+  2. neg = neg_sampler.sample(batch)                 — [B, K_train] uniform negs
+  3. candidates = [pos | negs]                       — [B, 1+K_train]
+  4. logits = score(src, candidates)                 — for each query (u_i, t_i) sample K
+       backward walks with cutoff = t_i (→ μ_u), pack to tokens, score with
+       GeometricPointHead (identity + reach). Candidate side samples no walks (static E[v]).
+  5. L = cross_entropy(logits / tau_link, target=0)  — Bruch 2019, upper-bounds 1-MRR
+  6. one backward + single optimizer step
+  7. node_last / pair_store update                    — post-scoring (stores have no cutoff)
+
+Why ingest-first is valid (and == TPNet): a walk for (u, t) with cutoff = t traverses only
+edges with t_edge < t (EXCLUSIVE), so the target edge at t — and any simultaneous/future
+batch edge — is never seen, while same-batch-earlier edges (t' < t) legitimately are. This is
+exactly TPNet's prebuilt-time-index queried strictly-before-t per edge, and it removes the
+batch-size coupling of the old "walk the pre-ingest snapshot" scheme (which hid same-batch-
+earlier edges). The stores have no per-query cutoff, so they keep a pre-batch snapshot
+(updated last) — their strictly-causal form.
 
 E (on the unit sphere) and the head are trained together by L (no alignment, no detach)
 by a single RiemannianAdam.
 
-TOKEN PREP — only the source side (u → μ_u) goes through `walk_token_csr`: `build_walk_batch`
-walks the unique sources and packs the real context tokens into a two-level CSR WalkBatch
-(seed → walk → position), COUNT-FREE — every reached position is its own (node, t_edge) token,
-with the seed slot, padding, and the walk's own origin node-id excluded. `walk_batch_to_dense`
-collapses the walk level to a per-seed dense token bag (node_ids [G,U], node_mask [G,U],
-pos_ts [G,U]); the source bag is gathered to [B,…] (each seed's tokens are query-independent
-given a single pre-ingest snapshot). Ages = t_query − t_edge are formed at grid level here (each
-row's own query time), then IDs + ages go to the head, which builds μ_u and scores identity +
-reach against the candidate's static E[v]. Strict-causal: walks + stores reflect the pre-ingest
-state.
+TOKEN PREP — the source side (u → μ_u) goes through `walk_token_csr.build_query_walk_tokens`:
+walks are generated PER QUERY (no dedup — each row's (node, t) needs its own cutoff) and the
+real context tokens of each query's K walks are packed left-aligned into a [B, U] bag
+(node_ids, node_mask, pos_ts), COUNT-FREE, with the seed slot / padding / origin excluded.
+Ages = t_query − t_edge are formed here (all > 0 by the cutoff); IDs + ages go to the head,
+which builds μ_u and scores identity + reach against the candidate's static E[v].
 """
 import time
 from dataclasses import dataclass
@@ -41,7 +47,7 @@ from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
 from .pair_store import NodeLastSeenStore, PairRecencyStore
 from .utils import make_lr_lambda
-from .walk_token_csr import build_walk_batch, gather_dense, walk_batch_to_dense
+from .walk_token_csr import build_query_walk_tokens
 from .walks import WalkGenerator
 
 
@@ -165,25 +171,25 @@ class Trainer:
                t_query_t: torch.Tensor) -> torch.Tensor:
         """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> logits [B, C].
 
-        Build a two-level packed WalkBatch for the unique sources ONLY (→ μ_u tokens), via
-        `build_walk_batch`. Collapse it to its per-seed dense token view and gather to [B,…].
-        Ages = t_query − t_edge are formed HERE at grid level (each row's own query time; the
-        packed walk-edge times are query-independent), then IDs + ages go to the head. The
+        PER-QUERY walks: the source side samples K backward walks for each query (u_i, t_i)
+        with cutoff = t_i, so every token has t_edge < t_i (strict causal past of that query).
+        No dedup — each batch row is its own query (the same node at two query times needs two
+        different cutoffs). `build_query_walk_tokens` packs each query's tokens left-aligned
+        into [B, U]; ages = t_query − t_edge are formed here (all > 0 by the cutoff). The
         candidate side samples no walks — it enters only through its static embedding E[v]
-        (identity + reach) and the staleness / pair channels."""
+        (identity + reach) and the staleness / pair channels. Strict causality comes from the
+        per-query cutoff, NOT from ingestion order, so the batch may already be in Tempest."""
         device = self.device
         B, C = cand_t.shape
 
-        # --- SOURCE side: unique sources → WalkBatch → dense → gather to [B] ---
-        uniq_s, u_pos = torch.unique(src_t, return_inverse=True)        # [Ms], [B]
-        wb_s = build_walk_batch(
-            self.walk_gen, device, uniq_s,
+        # --- SOURCE side: per-query (u_i, t_i) → K cutoff=t_i walks → [B, U] tokens ---
+        src_ids, src_nmask, src_ts = build_query_walk_tokens(
+            self.walk_gen, device, src_t, t_query_t,
             max_walk_len=self.config.max_walk_len_query_side,
             num_walks_per_node=self.config.num_walks_per_node_query_side,
             start_bias=self.config.start_bias_query_side,
             walk_bias=self.config.walk_bias_query_side)
-        src_ids, src_nmask, src_ts = gather_dense(walk_batch_to_dense(wb_s), u_pos, (B,))
-        src_ages = (t_query_t.view(B, 1) - src_ts).clamp_min(0).to(torch.float32)  # [B, Us]
+        src_ages = (t_query_t.view(B, 1) - src_ts).clamp_min(0).to(torch.float32)  # [B, U]
 
         E_u = self.embedding_table(src_t)                              # [B, d]
         E_v = self.embedding_table(cand_t)                             # [B, C, d]
@@ -211,6 +217,16 @@ class Trainer:
         device = self.device
         B = len(batch.src)
 
+        # Ingest the batch's true edges into Tempest BEFORE scoring. This is causally
+        # valid — and exactly TPNet's protocol (prebuilt time-sorted index queried
+        # strictly-before-t per edge) — because every per-query walk is bounded by
+        # cutoff = t_query (EXCLUSIVE): the walk for (u, t) only traverses edges with
+        # t_edge < t, so the target edge at t (and any simultaneous/future batch edge) is
+        # never visible, while same-batch-earlier edges (t' < t) legitimately are. The
+        # stores below have NO cutoff mechanism, so they stay strictly causal the only way
+        # they can — a pre-batch snapshot, updated AFTER scoring.
+        self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
+
         _, neg_tgt = self.neg_sampler_train.sample(batch)              # [B, K_train]
         src_t = torch.from_numpy(batch.src.astype(np.int64)).to(device)
         cand_np = np.concatenate(
@@ -230,8 +246,8 @@ class Trainer:
             self.sched.step()
             self._global_step += 1
 
-        # Strict-causal: ingest into Tempest LAST.
-        self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
+        # Tempest was ingested at the top of the step (cutoff keeps it causal). The stores
+        # have no cutoff, so update them LAST — their pre-batch state is their causal form.
         if self.pair_store is not None:
             self.pair_store.update(batch.src, batch.tgt, batch.ts)
         self.node_last.update(batch.src, batch.tgt, batch.ts)
@@ -255,11 +271,15 @@ class Trainer:
                 B = len(batch.src)
                 if recorder is not None:
                     recorder.before_batch(batch)
+
+                # Ingest into Tempest BEFORE scoring — the per-query cutoff keeps every
+                # walk causal (t_edge < t_query), so eval edges in the index never leak.
+                self.walk_gen.add_edges(
+                    batch.src, batch.tgt, batch.ts, batch.edge_feat)
+
                 if B == 0:
                     if recorder is not None:
                         recorder.after_batch(batch)
-                    self.walk_gen.add_edges(
-                        batch.src, batch.tgt, batch.ts, batch.edge_feat)
                     if self.pair_store is not None:
                         self.pair_store.update(batch.src, batch.tgt, batch.ts)
                     self.node_last.update(batch.src, batch.tgt, batch.ts)
@@ -290,8 +310,7 @@ class Trainer:
 
                 if recorder is not None:
                     recorder.after_batch(batch)
-                self.walk_gen.add_edges(
-                    batch.src, batch.tgt, batch.ts, batch.edge_feat)
+                # Tempest already ingested above; stores (no cutoff) update last.
                 if self.pair_store is not None:
                     self.pair_store.update(batch.src, batch.tgt, batch.ts)
                 self.node_last.update(batch.src, batch.tgt, batch.ts)

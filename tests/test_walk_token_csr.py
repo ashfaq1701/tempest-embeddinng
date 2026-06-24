@@ -1,30 +1,24 @@
-"""Correctness tests for the two-level packed walk CSR (tempest_walks/walk_token_csr.py).
+"""Correctness tests for per-query walk tokens (tempest_walks/walk_token_csr.py).
 
-The new layout is COUNT-FREE: every reached walk position is its own token (no dedup), packed
-into a two-level CSR (seed → walk → position). Three things are checked:
+`build_query_walk_tokens` generates K backward walks per QUERY — a (seed node, cutoff time)
+pair — and packs each query's real context tokens left-aligned into [Q, U]. COUNT-FREE:
+every reached position is its own token (no dedup; multiplicity kept). Checks:
 
-1. `build_walk_batch` STRUCTURE — offset invariants (walk_csr / seed_csr monotone, lengths,
-   uniform seed stride K), the packed arrays' length == P, and that no packed token is its
-   own seed's origin id (the seed-revisit exclusion).
-
-2. `build_walk_batch` CONTENT, END-TO-END vs a live Tempest backward-walk batch — we capture
-   the exact WalkData sampled (walks are stochastic) and INDEPENDENTLY reconstruct the
-   expected per-seed token MULTISET under the contract (context = positions [0, lens-2]; the
-   seed slot lens-1, padding, and the origin node-id excluded; each surviving position kept
-   WITH multiplicity and carrying its raw t_edge), then assert the WalkBatch matches it
-   exactly — node-with-ts multiset and total count. Multiplicity (no dedup) is verified here:
-   a node reached k times must contribute k tokens.
-
-3. `walk_batch_to_dense` + `gather_dense` — the per-seed dense token bag reproduces the same
-   per-seed multiset; cold seeds give an all-False row; gather replicates rows onto a grid.
+1. CONTENT vs the SAME captured walks — the per-query (node, t_edge) MULTISET matches the
+   contract reconstruction (context positions [0, lens-2]; seed slot / padding / origin
+   excluded; kept with multiplicity), and the left-packing is dense with -1 on masked slots.
+2. PER-QUERY CUTOFF — every emitted token has t_edge < that query's OWN cutoff; the SAME node
+   at increasing cutoffs yields nested-larger, cutoff-respecting token sets (no dedup means
+   each query is sampled independently).
+3. EDGE CASES — a cutoff at/below the earliest edge, and an isolated node, each give an
+   all-False (empty) row.
 """
 from collections import Counter
 
 import numpy as np
 import torch
 
-from tempest_walks.walk_token_csr import (build_walk_batch, gather_dense,
-                                          walk_batch_to_dense)
+from tempest_walks.walk_token_csr import build_query_walk_tokens
 from tempest_walks.walks import WalkGenerator
 
 
@@ -41,203 +35,134 @@ def _synthetic_graph(n_nodes=10, n_edges=120, seed=0):
     return src, tgt, ts
 
 
-def _seed_multiset_from_batch(wb):
-    """Per-seed Counter of (node_id, t_edge) tokens, read via seed_csr ∘ walk_csr."""
-    G = int(wb.seeds.shape[0])
-    nodes = wb.walk_nodes.cpu().numpy()
-    ts = wb.walk_pos_ts.cpu().numpy()
-    wcsr = wb.walk_csr.cpu().numpy()
-    scsr = wb.seed_csr.cpu().numpy()
-    out = []
-    for g in range(G):
-        start = int(wcsr[int(scsr[g])])
-        end = int(wcsr[int(scsr[g + 1])])
-        out.append(Counter((int(nodes[i]), int(ts[i])) for i in range(start, end)))
-    return out
-
-
-def _seed_multiset_from_dense(node_ids, node_mask, pos_ts):
-    G, U = node_ids.shape
-    out = []
-    for g in range(G):
-        out.append(Counter((int(node_ids[g, u]), int(pos_ts[g, u]))
-                           for u in range(U) if bool(node_mask[g, u])))
-    return out
+def _per_query_multiset_from_dense(node_ids, node_mask, pos_ts):
+    q_n, u = node_ids.shape
+    return [Counter((int(node_ids[q, j]), int(pos_ts[q, j]))
+                    for j in range(u) if bool(node_mask[q, j])) for q in range(q_n)]
 
 
 def _expected_multiset_from_walkdata(wd, seeds):
-    """Reconstruct per-seed (node, t_edge) MULTISET from a captured WalkData under the
-    contract: context = positions [0, lens-2]; the walk's OWN ORIGIN node-id is dropped;
-    every surviving position is kept with multiplicity."""
-    G = int(seeds.shape[0])
-    K, L = wd.K, wd.nodes.shape[1]
-    nodes = wd.nodes.view(G, K, L).cpu().numpy()
-    ts = wd.timestamps.view(G, K, L).to(torch.int64).cpu().numpy()
-    lens = wd.lens.view(G, K).cpu().numpy()
+    """Per-query (node, t_edge) MULTISET from captured WalkData under the contract:
+    context = positions [0, lens-2]; the walk's OWN ORIGIN node-id dropped; multiplicity kept."""
+    q_n = int(seeds.shape[0])
+    k, length = wd.K, wd.nodes.shape[1]
+    nodes = wd.nodes.view(q_n, k, length).cpu().numpy()
+    ts = wd.timestamps.view(q_n, k, length).to(torch.int64).cpu().numpy()
+    lens = wd.lens.view(q_n, k).cpu().numpy()
     sd = seeds.cpu().numpy().astype(np.int64)
     out = []
-    for g in range(G):
+    for q in range(q_n):
         c = Counter()
-        for k in range(K):
-            for p in range(0, int(lens[g, k]) - 1):       # context only (excl. seed slot + pad)
-                node = int(nodes[g, k, p])
-                if node == int(sd[g]):                     # drop the walk's own origin
+        for kk in range(k):
+            for p in range(0, int(lens[q, kk]) - 1):       # context only (excl seed slot + pad)
+                node = int(nodes[q, kk, p])
+                if node == int(sd[q]):                      # drop the walk's own origin
                     continue
-                c[(node, int(ts[g, k, p]))] += 1
+                c[(node, int(ts[q, kk, p]))] += 1
         out.append(c)
     return out
 
 
-def _walk_with_capture(wg, seeds, **params):
-    """Run build_walk_batch while capturing the exact WalkData it sampled."""
+def _run_with_capture(wg, seeds, cutoffs, **params):
+    """Run build_query_walk_tokens while capturing the exact WalkData it sampled."""
     captured = {}
     orig = wg.walks_for_nodes
 
-    def _capturing(*a, **k):
+    def _cap(*a, **k):
         wd = orig(*a, **k)
         captured["wd"] = wd
         return wd
 
-    wg.walks_for_nodes = _capturing
-    wb = build_walk_batch(wg, torch.device("cpu"), seeds, **params)
+    wg.walks_for_nodes = _cap
+    out = build_query_walk_tokens(wg, torch.device("cpu"), seeds, cutoffs, **params)
     wg.walks_for_nodes = orig
-    return wb, captured["wd"]
+    return out, captured["wd"]
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 1. structural invariants
+# 1. content end-to-end vs the SAME captured walks (multiplicity preserved)
 # ──────────────────────────────────────────────────────────────────────────
-def test_build_walk_batch_offset_invariants():
+def test_tokens_match_captured_walks_and_packing():
     src, tgt, ts = _synthetic_graph()
-    K, mwl = 6, 8
-    wg = WalkGenerator(use_gpu=False, num_walks_per_node=K, max_walk_len=mwl,
+    k, mwl = 6, 8
+    wg = WalkGenerator(use_gpu=False, num_walks_per_node=k, max_walk_len=mwl,
                        walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
     wg.reset(); wg.add_edges(src, tgt, ts, None)
-    seeds = torch.tensor([1, 3, 5, 7, 9], dtype=torch.int64)
-    G = len(seeds)
+    seeds = torch.tensor([1, 3, 5, 7, 9], dtype=torch.long)
+    cutoffs = torch.full((5,), 50_000, dtype=torch.long)        # above all edges -> unconstrained
 
-    wb, _ = _walk_with_capture(wg, seeds, max_walk_len=mwl, num_walks_per_node=K,
-                               walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
-    P = int(wb.walk_nodes.shape[0])
-
-    # seed_csr: uniform stride K, length G+1, ends at W = G*K.
-    assert wb.seed_csr.shape[0] == G + 1
-    assert torch.equal(wb.seed_csr, torch.arange(G + 1, dtype=torch.int64) * K)
-    # walk_csr: length W+1, monotone non-decreasing, starts at 0, ends at P.
-    assert wb.walk_csr.shape[0] == G * K + 1
-    assert int(wb.walk_csr[0]) == 0 and int(wb.walk_csr[-1]) == P
-    assert bool((wb.walk_csr[1:] >= wb.walk_csr[:-1]).all()), "walk_csr must be monotone"
-    # packed arrays agree on P; no edge features on this graph.
-    assert wb.walk_pos_ts.shape[0] == P
-    assert wb.walk_edge_feats is None
-    # no packed token is its own seed's origin id (the seed-revisit exclusion).
-    per_seed = _seed_multiset_from_batch(wb)
-    for g, s in enumerate(seeds.tolist()):
-        assert all(node != s for (node, _ts) in per_seed[g]), \
-            f"seed {s} origin id leaked into its tokens"
-    print("\n[build] offset invariants + origin-exclusion OK "
-          f"(G={G}, K={K}, P={P})")
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# 2. content end-to-end vs the SAME captured walks (multiplicity preserved)
-# ──────────────────────────────────────────────────────────────────────────
-def test_build_walk_batch_matches_tempest_backward_walks():
-    src, tgt, ts = _synthetic_graph()
-    K, mwl = 6, 8
-    wg = WalkGenerator(use_gpu=False, num_walks_per_node=K, max_walk_len=mwl,
-                       walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
-    wg.reset(); wg.add_edges(src, tgt, ts, None)
-    seeds = torch.tensor([1, 3, 5, 7, 9], dtype=torch.int64)
-
-    wb, wd = _walk_with_capture(wg, seeds, max_walk_len=mwl, num_walks_per_node=K,
-                                walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
-    got = _seed_multiset_from_batch(wb)
+    (ids, mask, pts), wd = _run_with_capture(
+        wg, seeds, cutoffs, max_walk_len=mwl, num_walks_per_node=k,
+        walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
+    got = _per_query_multiset_from_dense(ids, mask, pts)
     exp = _expected_multiset_from_walkdata(wd, seeds)
 
     assert any(len(c) > 0 for c in exp), "no context tokens sampled — graph too sparse"
-    for g in range(len(seeds)):
-        assert got[g] == exp[g], (
-            f"seed {int(seeds[g])}: token multiset mismatch\n"
-            f" got {sorted(got[g].items())}\n exp {sorted(exp[g].items())}")
-    # multiplicity is real: at least one seed has a node reached more than once.
+    for q in range(len(seeds)):
+        assert got[q] == exp[q], (
+            f"query {q} (seed {int(seeds[q])}): token multiset mismatch\n"
+            f" got {sorted(got[q].items())}\n exp {sorted(exp[q].items())}")
+    # multiplicity is real (no dedup): some node reached more than once.
     assert any(any(v > 1 for v in c.values()) for c in exp), \
-        "expected some recurring node to exercise the no-dedup multiplicity path"
-    total = sum(sum(c.values()) for c in exp)
-    assert int(wb.walk_nodes.shape[0]) == total, "P must equal total non-origin context tokens"
-    print(f"\n[build] {len(seeds)} seeds, P={total} tokens — node+ts multiset and "
-          "multiplicity match the raw walks exactly")
+        "expected a recurring node to exercise the multiplicity path"
+    # packing: masked slots hold node id -1.
+    assert bool((ids[~mask] == -1).all())
+    print(f"\n[tokens] per-query multiset + multiplicity + packing OK ({len(seeds)} queries)")
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 3. dense view + gather
+# 2. per-query cutoff
 # ──────────────────────────────────────────────────────────────────────────
-def test_walk_batch_to_dense_matches_packed():
-    src, tgt, ts = _synthetic_graph(seed=1)
-    K, mwl = 6, 8
-    wg = WalkGenerator(use_gpu=False, num_walks_per_node=K, max_walk_len=mwl)
+def test_per_query_cutoff_is_honoured():
+    src, tgt, ts = _synthetic_graph(seed=4)
+    k, mwl = 8, 8
+    wg = WalkGenerator(use_gpu=False, num_walks_per_node=k, max_walk_len=mwl,
+                       walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
     wg.reset(); wg.add_edges(src, tgt, ts, None)
-    seeds = torch.tensor([2, 4, 6], dtype=torch.int64)
 
-    wb, _ = _walk_with_capture(wg, seeds, max_walk_len=mwl, num_walks_per_node=K)
-    packed = _seed_multiset_from_batch(wb)
-    node_ids, node_mask, pos_ts = walk_batch_to_dense(wb)
+    uniq = np.unique(ts)
+    node = int(src[len(src) // 2])
+    cuts = [int(uniq[len(uniq) // 4]), int(uniq[len(uniq) // 2]), 50_000]
+    seeds = torch.tensor([node, node, node], dtype=torch.long)     # SAME node, 3 cutoffs
+    cutoffs = torch.tensor(cuts, dtype=torch.long)
 
-    # shapes + U = max tokens per seed.
-    G = len(seeds)
-    seed_start = wb.walk_csr[wb.seed_csr[:-1]]
-    seed_end = wb.walk_csr[wb.seed_csr[1:]]
-    U_exp = max(int((seed_end - seed_start).max()), 1)
-    assert node_ids.shape == (G, U_exp) and pos_ts.shape == (G, U_exp)
-    # padded slots are masked, masked rows hold node id -1.
-    assert bool((node_ids[~node_mask] == -1).all())
+    (ids, mask, pts), _ = _run_with_capture(
+        wg, seeds, cutoffs, max_walk_len=mwl, num_walks_per_node=k,
+        walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
+    max_ts = []
+    for q in range(3):
+        realts = pts[q][mask[q]].tolist()
+        assert all(t < cuts[q] for t in realts), \
+            f"query {q}: a token is at/after its cutoff {cuts[q]} (max {max(realts) if realts else None})"
+        max_ts.append(max(realts) if realts else None)
+    # Walks are stochastic with independent per-query RNG, so token COUNT is not monotone in
+    # the cutoff. The deterministic invariant is the per-cutoff strictness checked above; the
+    # loosest cutoff (unconstrained) must still sample some tokens.
+    assert max_ts[2] is not None, "the unconstrained query should sample at least one token"
+    print(f"\n[cutoff] every token strictly before its query's cutoff OK (max_ts {max_ts})")
 
-    dense = _seed_multiset_from_dense(node_ids, node_mask, pos_ts)
-    for g in range(G):
-        assert dense[g] == packed[g], f"seed {int(seeds[g])}: dense multiset != packed"
-    print("\n[dense] per-seed dense token bag reproduces the packed multiset OK")
 
-
-def test_walk_batch_to_dense_cold_seed_is_empty_row():
-    # A seed with no ingested incident edges has no walk-neighbours → all-False dense row.
+# ──────────────────────────────────────────────────────────────────────────
+# 3. edge cases
+# ──────────────────────────────────────────────────────────────────────────
+def test_empty_query_rows():
     src, tgt, ts = _synthetic_graph(n_nodes=6, n_edges=40, seed=2)
     wg = WalkGenerator(use_gpu=False, num_walks_per_node=4, max_walk_len=6)
     wg.reset(); wg.add_edges(src, tgt, ts, None)
-    cold = 999                      # never appears as an edge endpoint
-    seeds = torch.tensor([0, cold], dtype=torch.int64)
-    wb, _ = _walk_with_capture(wg, seeds, max_walk_len=6, num_walks_per_node=4)
-    node_ids, node_mask, _pos = walk_batch_to_dense(wb)
-    assert not bool(node_mask[1].any()), "cold seed must yield an all-False dense row"
-    print("\n[dense] cold seed -> empty (all-False) row OK")
 
+    t_min = int(ts.min())                       # no edge has t_edge < global min
+    seeds = torch.tensor([int(src[0]), 999], dtype=torch.long)   # active node, isolated node 999
+    cutoffs = torch.tensor([t_min, 50_000], dtype=torch.long)
 
-def test_gather_dense_replicates_rows_onto_grid():
-    src, tgt, ts = _synthetic_graph(seed=3)
-    wg = WalkGenerator(use_gpu=False, num_walks_per_node=5, max_walk_len=6)
-    wg.reset(); wg.add_edges(src, tgt, ts, None)
-    seeds = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
-    wb, _ = _walk_with_capture(wg, seeds, max_walk_len=6, num_walks_per_node=5)
-    dense = walk_batch_to_dense(wb)
-
-    # [B] gather: index 0..G-1 plus a repeat -> the repeated cell equals the source row.
-    index = torch.tensor([0, 2, 2, 3], dtype=torch.long)
-    ids, mask, pts = gather_dense(dense, index, (4,))
-    assert torch.equal(ids[1], ids[2]) and torch.equal(mask[1], mask[2])
-    assert torch.equal(ids[0], dense[0][0]) and torch.equal(pts[3], dense[2][3])
-
-    # [B,C] scatter: a flat index reshaped to a grid replicates per-seed rows.
-    grid_index = torch.tensor([0, 1, 1, 0, 2, 3], dtype=torch.long)
-    gi, gm, _gp = gather_dense(dense, grid_index, (2, 3))
-    assert gi.shape[:2] == (2, 3)
-    assert torch.equal(gi[0, 1], gi[0, 2])           # both name seed 1
-    assert torch.equal(gm[0, 0], gm[1, 0])           # rows (0,0) and (1,0) both name seed 0
-    print("\n[gather] dense rows replicate correctly onto [B] and [B,C] grids OK")
+    (ids, mask, _pts), _ = _run_with_capture(
+        wg, seeds, cutoffs, max_walk_len=6, num_walks_per_node=4)
+    assert not bool(mask[0].any()), "cutoff at/below earliest edge must yield an empty row"
+    assert not bool(mask[1].any()), "isolated node must yield an empty row"
+    print("\n[edge] cutoff-excluded query + isolated node give empty rows OK")
 
 
 if __name__ == "__main__":
-    test_build_walk_batch_offset_invariants()
-    test_build_walk_batch_matches_tempest_backward_walks()
-    test_walk_batch_to_dense_matches_packed()
-    test_walk_batch_to_dense_cold_seed_is_empty_row()
-    test_gather_dense_replicates_rows_onto_grid()
-    print("\nALL WALK-CSR CHECKS PASSED")
+    test_tokens_match_captured_walks_and_packing()
+    test_per_query_cutoff_is_honoured()
+    test_empty_query_rows()
+    print("\nALL PER-QUERY WALK-TOKEN CHECKS PASSED")

@@ -74,19 +74,32 @@ class WalkGenerator:
     def walks_for_nodes(self, seeds: np.ndarray, max_walk_len: Optional[int] = None,
                         num_walks_per_node: Optional[int] = None,
                         start_bias: Optional[str] = None,
-                        walk_bias: Optional[str] = None) -> WalkData:
+                        walk_bias: Optional[str] = None,
+                        cutoff_times: Optional[np.ndarray] = None) -> WalkData:
         """K BACKWARD walks per seed. ``nodes`` is [N*K, L] with rows
         [i*K, (i+1)*K) = seed i's walks; seed at lens-1, padding = -1.
 
+        ``cutoff_times`` (int64, one per seed, same length as ``seeds``) makes each
+        seed's walk STRICTLY CAUSAL "as of" its own query time: the start edge — and
+        therefore the whole backward walk — may only use edges with t_edge < cutoff
+        (exclusive). This is what lets the caller ingest the current batch into Tempest
+        BEFORE scoring: a query (u, t) walked with cutoff=t never sees the edge at t
+        (incl. the target), only the strict causal past. None = unbounded.
+
         Walk length / count / start-bias / walk-bias default to the instance values
-        but accept per-call overrides — the query is read-only over the SAME ingested
-        graph, so query-side and candidate-side walks (different lengths/biases) reuse
-        this one generator instead of a second Tempest instance."""
+        but accept per-call overrides."""
         mwl = self.max_walk_len if max_walk_len is None else int(max_walk_len)
         nw = self.num_walks_per_node if num_walks_per_node is None else int(num_walks_per_node)
         sb = self.start_bias if start_bias is None else start_bias
         wb = self.walk_bias if walk_bias is None else walk_bias
         seed_arr = np.ascontiguousarray(seeds, dtype=np.int32)
+        cutoff_arr = None
+        if cutoff_times is not None:
+            cutoff_arr = np.ascontiguousarray(cutoff_times, dtype=np.int64)
+            if cutoff_arr.shape[0] != seed_arr.shape[0]:
+                raise ValueError(
+                    "cutoff_times must have the same length as seeds "
+                    f"({cutoff_arr.shape[0]} vs {seed_arr.shape[0]})")
         nodes, ts, lens, ef = self.trw.get_random_walks_and_times_for_nodes(
             seed_nodes=seed_arr,
             max_walk_len=mwl,
@@ -94,6 +107,7 @@ class WalkGenerator:
             initial_edge_bias=sb,
             num_walks_per_node=nw,
             walk_direction="Backward_In_Time",
+            cutoff_times=cutoff_arr,
         )
         nodes_t = torch.from_numpy(np.asarray(nodes).astype(np.int64))
 
