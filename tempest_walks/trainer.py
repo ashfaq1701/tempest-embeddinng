@@ -192,22 +192,19 @@ class Trainer:
             start_bias=self.config.start_bias_query_side,
             walk_bias=self.config.walk_bias_query_side)
 
-        E_u = self.embedding_table(src_t)                              # [B, d]
-        E_v = self.embedding_table(cand_t)                             # [B, C, d]
-
-        # Candidate staleness + (flagged) pair channel — unchanged stores.
+        # Candidate staleness + (flagged) pair channel — store-derived (sequential side
+        # state the head can't own); everything embedding-related the head derives itself.
         staleness_dt = self.node_last.query(cand_t, t_query_t)         # [B, C]
         pair_dt = pair_count_log = None
         if self.pair_store is not None:
             pair_dt, pair_count_log = self.pair_store.query(src_t, cand_t, t_query_t)
 
         return self.link_head(
-            # source walk CSR + query times (μ side)
-            E_u, src_csr, t_query_t,
-            # candidate static embedding (identity + reach)
-            E_v,
-            # shared table + additive channels
-            self.embedding_table.E.weight, staleness_dt,
+            self.embedding_table.E.weight,   # the whole table; head indexes E_u / E_v / tokens
+            src_csr,                         # source walk CSR (seeds == sources)
+            cand_t,                          # candidate node ids
+            t_query_t,                       # prediction times
+            staleness_dt,
             pair_dt=pair_dt, pair_count_log=pair_count_log)
 
     # ──────────────────────────────────────────────────────────────────

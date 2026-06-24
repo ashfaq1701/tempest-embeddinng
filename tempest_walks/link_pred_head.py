@@ -208,23 +208,25 @@ class GeometricPointHead(nn.Module):
     # ──────────────────────────────────────────────────────────────────
 
     def forward(self,
-                # ── source (u side) ──
-                E_u: torch.Tensor,             # [B, d]
-                src_tokens: WalkTokenCSR,      # source walk CSR (uses the token stream; the
-                                               # neighbour CSR is reserved for co-reach)
-                t_query: torch.Tensor,         # [B]   prediction times (to form token ages)
-                # ── candidate (v side) — static embedding only, no walks ──
-                E_v: torch.Tensor,             # [B, C, d]
-                # ── shared table + additive channels ──
-                e_weight: torch.Tensor,        # [N, d]
+                e_weight: torch.Tensor,        # [N, d]  the whole node-embedding table
+                src_tokens: WalkTokenCSR,      # source walk CSR — its `seeds` ARE the sources;
+                                               # uses the token stream (neighbour CSR reserved)
+                cand_ids: torch.Tensor,        # [B, C]  candidate node ids
+                t_query: torch.Tensor,         # [B]     prediction times (to form token ages)
                 staleness_dt: torch.Tensor,    # [B, C]
                 pair_dt: torch.Tensor = None,
                 pair_count_log: torch.Tensor = None) -> torch.Tensor:
-        """-> logits [B, C]."""
-        B, C = E_v.shape[0], E_v.shape[1]
+        """-> logits [B, C]. The head owns all embedding lookups: E_u, E_v and the token
+        embeddings all come from `e_weight` (E_u = e_weight[src_tokens.seeds],
+        E_v = e_weight[cand_ids]); ages come from t_query − the CSR's pos_ts. The trainer only
+        hands over the table, the source walk CSR, the candidate ids, the query times, and the
+        store-derived staleness / pair channels."""
+        B, C = cand_ids.shape[0], cand_ids.shape[1]
         d = self.d_emb
-        eu = F.normalize(E_u, dim=-1)                              # [B, d]
-        ev = F.normalize(E_v, dim=-1)                              # [B, C, d]
+        E_u = F.embedding(src_tokens.seeds, e_weight)             # [B, d]
+        E_v = F.embedding(cand_ids, e_weight)                     # [B, C, d]
+        eu = F.normalize(E_u, dim=-1)                             # [B, d]
+        ev = F.normalize(E_v, dim=-1)                             # [B, C, d]
         a = F.softplus(self.log_a)
         b = F.softplus(self.log_b)
         alpha = self.alpha.clamp_min(1e-3)
