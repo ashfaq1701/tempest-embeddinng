@@ -5,16 +5,15 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# wiki   (val ~0.816 / test ~0.794 — GeometricVelocityPerWalkAvgHead: per-walk
-#         trajectory fit, averaged, ellipse along the mean motion + learnable channel
-#         coeffs, pair features, K_train=300, unbounded. NOTE: still carries the OLD
-#         motion-frame ellipse; the heading-frame "ellipse point fix" that made the
-#         retired Point head win wiki no-pf is not yet ported — TODO.)
+# wiki   (val 0.8262 / test 0.8027 @ ep17, no-pf — GeometricPointHead REACH on the
+#         PER-QUERY CAUSAL substrate: ingest the batch into Tempest BEFORE scoring, then
+#         walk each query (u, t) with cutoff=t (strict-before-t, == TPNet). Same head as
+#         old reach (val 0.8046 / test 0.7779); +0.025 test from the substrate alone.
+#         REQUIRES temporal-random-walk>=1.8.6 (cutoff_times). Smooth monotone curve.)
 .venv/bin/python scripts/train.py \
   --dataset tgbl-wiki \
-  --use-pair-features \
-  --k-train 300 \
-  --num-walks-per-node 10 --max-walk-len 20 \
+  --k-train 100 \
+  --num-walks-per-node-query-side 5 --max-walk-len-query-side 5 \
   --d-emb 128 \
   --batch-size 200 --eval-batch-size 20 \
   --num-epochs 50 --early-stop-patience 5 \
