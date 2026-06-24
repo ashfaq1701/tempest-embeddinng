@@ -1,11 +1,11 @@
-"""Strict-causal training + eval loop — link-supervised geometric walk head (SYMMETRIC-MEET).
+"""Strict-causal training + eval loop — link-supervised geometric walk head (REACH).
 
 Per-batch ordering (training):
   1. neg = neg_sampler.sample(batch)                 — [B, K_train] uniform negs
   2. candidates = [pos | negs]                       — [B, 1+K_train]
   3. logits = score(src, candidates)                 — sample walks for the unique sources
-       (→ μ_u) AND the unique candidates (→ μ_v), pack each to tokens,
-       score with GeometricPointHead (identity + meet).
+       (→ μ_u), pack to tokens, score with GeometricPointHead (identity + reach).
+       The candidate side samples no walks — it enters via its static E[v].
   4. L = cross_entropy(logits / tau_link, target=0)  — Bruch 2019, upper-bounds 1-MRR
   5. one backward + single optimizer step
   6. walk_gen.add_edges(batch)                        — post-scoring, LAST
@@ -13,16 +13,16 @@ Per-batch ordering (training):
 E (on the unit sphere) and the head are trained together by L (no alignment, no detach)
 by a single RiemannianAdam.
 
-TOKEN PREP — the source side (u → μ_u) and the candidate side (v → μ_v) go through the shared
-`walk_token_csr` module: `build_walk_batch` walks the unique seeds and packs the real context
-tokens into a two-level CSR WalkBatch (seed → walk → position), COUNT-FREE — every reached
-position is its own (node, t_edge) token, with the seed slot, padding, and the walk's own origin
-node-id excluded. `walk_batch_to_dense` collapses the walk level to a per-seed dense token bag
-(node_ids [G,U], node_mask [G,U], pos_ts [G,U]); the source bag is gathered to [B,…] and the
-candidate bag scattered to [B,C,…] via v_inv (each seed's tokens are query-independent given a
-single pre-ingest snapshot). Ages = t_query − t_edge are formed at grid level here (each row's
-own query time), then IDs + ages go to the head, which builds μ on BOTH sides (μ_u, μ_v) and
-scores identity + meet. Strict-causal: walks + stores reflect the pre-ingest state.
+TOKEN PREP — only the source side (u → μ_u) goes through `walk_token_csr`: `build_walk_batch`
+walks the unique sources and packs the real context tokens into a two-level CSR WalkBatch
+(seed → walk → position), COUNT-FREE — every reached position is its own (node, t_edge) token,
+with the seed slot, padding, and the walk's own origin node-id excluded. `walk_batch_to_dense`
+collapses the walk level to a per-seed dense token bag (node_ids [G,U], node_mask [G,U],
+pos_ts [G,U]); the source bag is gathered to [B,…] (each seed's tokens are query-independent
+given a single pre-ingest snapshot). Ages = t_query − t_edge are formed at grid level here (each
+row's own query time), then IDs + ages go to the head, which builds μ_u and scores identity +
+reach against the candidate's static E[v]. Strict-causal: walks + stores reflect the pre-ingest
+state.
 """
 import time
 from dataclasses import dataclass
@@ -67,17 +67,12 @@ class TrainerConfig:
     # in-geometry count term aims to make it droppable.
     use_pair_features: bool = False
 
-    # Walks (BACKWARD only, undirected). Decoupled QUERY-side (source u → μ) and
-    # CANDIDATE-side (v → connectors), both sampled from the SAME Tempest graph via
-    # per-call overrides. Both sides now go through the SAME CSR dedup phase.
+    # Walks (BACKWARD only, undirected). QUERY-side only: source u → μ_u tokens. The candidate
+    # side samples no walks (reach compares against v's static embedding).
     num_walks_per_node_query_side: int = 5
     max_walk_len_query_side: int = 5
     walk_bias_query_side: str = "ExponentialWeight"
     start_bias_query_side: str = "ExponentialWeight"
-    num_walks_per_node_candidate_side: int = 5
-    max_walk_len_candidate_side: int = 5
-    walk_bias_candidate_side: str = "Linear"
-    start_bias_candidate_side: str = "Linear"
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
     # Optimisation.
@@ -119,8 +114,7 @@ class Trainer:
         )
         self.node_last = NodeLastSeenStore()
 
-        # One generator, configured QUERY-side; candidate-side walks reuse it via
-        # per-call overrides (different length / count / biases, same graph).
+        # One generator, configured QUERY-side; only the source side samples walks.
         self.walk_gen = WalkGenerator(
             use_gpu=config.use_gpu_tempest,
             walk_bias=config.walk_bias_query_side,
@@ -171,12 +165,12 @@ class Trainer:
                t_query_t: torch.Tensor) -> torch.Tensor:
         """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> logits [B, C].
 
-        Build a two-level packed WalkBatch for the unique sources (→ μ_u tokens) and one for the
-        unique candidates (→ μ_v tokens), via the SAME `build_walk_batch`. Collapse each to its
-        per-seed dense token view, gather the source view to [B,…] and scatter the candidate view
-        to [B,C,…]. Ages = t_query − t_edge are formed HERE at grid level (each row's own query
-        time; the packed walk-edge times are query-independent), then IDs + ages go to the head,
-        which builds μ on both sides and scores identity + meet."""
+        Build a two-level packed WalkBatch for the unique sources ONLY (→ μ_u tokens), via
+        `build_walk_batch`. Collapse it to its per-seed dense token view and gather to [B,…].
+        Ages = t_query − t_edge are formed HERE at grid level (each row's own query time; the
+        packed walk-edge times are query-independent), then IDs + ages go to the head. The
+        candidate side samples no walks — it enters only through its static embedding E[v]
+        (identity + reach) and the staleness / pair channels."""
         device = self.device
         B, C = cand_t.shape
 
@@ -191,17 +185,6 @@ class Trainer:
         src_ids, src_nmask, src_ts = gather_dense(walk_batch_to_dense(wb_s), u_pos, (B,))
         src_ages = (t_query_t.view(B, 1) - src_ts).clamp_min(0).to(torch.float32)  # [B, Us]
 
-        # --- CANDIDATE side: unique candidates → WalkBatch → dense → scatter to [B,C] ---
-        uniq_v, v_inv = torch.unique(cand_t.reshape(-1), return_inverse=True)  # [Mv], [B*C]
-        wb_v = build_walk_batch(
-            self.walk_gen, device, uniq_v,
-            max_walk_len=self.config.max_walk_len_candidate_side,
-            num_walks_per_node=self.config.num_walks_per_node_candidate_side,
-            start_bias=self.config.start_bias_candidate_side,
-            walk_bias=self.config.walk_bias_candidate_side)
-        cand_ids, cand_nmask, cand_ts = gather_dense(walk_batch_to_dense(wb_v), v_inv, (B, C))
-        cand_ages = (t_query_t.view(B, 1, 1) - cand_ts).clamp_min(0).to(torch.float32)  # [B,C,Uv]
-
         E_u = self.embedding_table(src_t)                              # [B, d]
         E_v = self.embedding_table(cand_t)                             # [B, C, d]
 
@@ -214,8 +197,8 @@ class Trainer:
         return self.link_head(
             # source tokens (μ side)
             E_u, src_ids, src_nmask, src_ages,
-            # candidate tokens (identity + connectors side)
-            E_v, cand_ids, cand_nmask, cand_ages,
+            # candidate static embedding (identity + reach)
+            E_v,
             # shared table + additive channels
             self.embedding_table.E.weight, staleness_dt,
             pair_dt=pair_dt, pair_count_log=pair_count_log)

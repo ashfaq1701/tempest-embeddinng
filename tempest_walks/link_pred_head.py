@@ -1,38 +1,36 @@
-"""Geometric link head — SYMMETRIC-MEET (μ on BOTH sides), COUNT-FREE.
+"""Geometric link head — REACH (one-sided drift), COUNT-FREE.
 
-Builds a displacement μ_u for the source from its walk tokens, μ_v for each candidate from ITS
-walk tokens, and scores with the query-anchored terms PLUS a symmetric MEET term that compares
-the two drifted positions:
+Builds a displacement μ_u for the source ONLY, from its walk tokens, and scores each candidate
+by how close its STATIC embedding E[v] is to u's drifted position:
 
-  μ_u = drift in T_{E[u]} ;  μ_v = drift in T_{E[v]}  (same routine, candidate frame + tokens)
-  q_u = exp_{E[u]}(μ_u) ;  q_v = exp_{E[v]}(μ_v)      (both back ON the sphere)
-  meet(u,v) = ⟨q_u, q_v⟩                              do u's and v's drifted positions coincide?
+  μ_u = drift in T_{E[u]}                             (recency centroid of u's Log vectors)
+  q_u = exp_{E[u]}(μ_u)                               u's drifted position, back ON the sphere
+  reach(u,v) = ⟨q_u, E[v]⟩                            does u's drift reach v?
 
-μ_u and μ_v live in DIFFERENT tangent spaces, so the exp-map sends both to points on the SAME
-sphere FIRST — ⟨q_u, q_v⟩ is then parallel-transport-free. meet rises when u and v drift toward a
-shared neighbourhood even if E[u], E[v] are structurally far apart (co-reachability as centroid
-convergence). coef_meet init 0 ⇒ the head starts as the proven query-anchored baseline and meet
-earns its weight. Age stays t_query − t_edge throughout (the trainer forms it; the head never
-re-defines it). The asymmetric query_coreach ∃-witness is DROPPED — the symmetric meet replaces
-it. The score is identity + meet:
+The candidate side samples NO walks — there is no μ_v. q_u is u's neighbourhood pushed off
+E[u]; the inner product with the unit E[v] asks "how close is v to where u's neighbourhood is
+heading?". reach rises when v sits in the region u drifts toward, even if E[u], E[v] are far
+apart. coef_reach init 0 ⇒ the head starts as the proven query-anchored baseline and reach earns
+its weight. Age stays t_query − t_edge throughout (the trainer forms it; the head never
+re-defines it). The score is identity + reach:
 
-  TOKEN BASIS — each seed carries a COUNT-FREE bag of walk-reached positions p (one token per
-  reached position; a node recurring k times is k tokens). μ sums the softmax over those tokens
-  directly — multiplicity is implicit in token repetition, no explicit count. age_p =
+  TOKEN BASIS — the source seed carries a COUNT-FREE bag of walk-reached positions p (one token
+  per reached position; a node recurring k times is k tokens). μ sums the softmax over those
+  tokens directly — multiplicity is implicit in token repetition, no explicit count. age_p =
   t_query − t_edge(p).
 
-  μ_u = Σ_p softmax_p(−λ·age_p)·Log_{E[u]}(E[node_p ∈ u-tokens]) ; r_u = ĝate(μ_u)   (μ_v sym.)
+  μ_u = Σ_p softmax_p(−λ·age_p)·Log_{E[u]}(E[node_p ∈ u-tokens]) ; r_u = ĝate(μ_u)
 
   identity = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )          is v in u's region?     [B,C]
-  meet     = ⟨ exp_{E[u]}(μ_u), exp_{E[v]}(μ_v) ⟩              do drifted positions meet? [B,C]
-  geo   = coef_identity·identity + coef_meet·meet
+  reach    = ⟨ exp_{E[u]}(μ_u), E_v ⟩                          does u's drift reach v?  [B,C]
+  geo   = coef_identity·identity + coef_reach·reach
   logit = geo + coef_staleness·staleness(v) [+ coef_pair·pair + coef_pair_count·log1p(cnt)]
 
-Both sides build μ: the source tokens drive μ_u (identity + the u half of meet), the candidate
-tokens drive μ_v (the v half of meet).
+Only the source builds μ — the candidate enters solely through its static embedding E[v]
+(identity + reach) and the staleness / pair channels.
 
-BASELINE AT INIT — coef_identity=1, coef_meet=0 ⇒ at init the head IS the proven identity term
-and nothing else; meet earns its weight from zero.
+BASELINE AT INIT — coef_identity=1, coef_reach=0 ⇒ at init the head IS the proven identity term
+and nothing else; reach earns its weight from zero.
 
 COUNT-FREE — a node reached k times appears as k tokens, so its μ softmax-mass is summed across
 them; the old γμ·log(1+k) emphasis (learned ≈ −0.4, suppressed) is gone. The pair channel still
@@ -88,10 +86,10 @@ class GeometricPointHead(nn.Module):
             self.pair_head = nn.Linear(d_time, 1)
 
         # --- geometric mix coefficients ----------------------------------------
-        # identity is the proven baseline (init 1); meet earns weight (init 0).
+        # identity is the proven baseline (init 1); reach earns weight (init 0).
         self.coef_identity = nn.Parameter(torch.ones(1))
-        # SYMMETRIC MEET — build μ on BOTH sides and compare the two drifted positions. coef init 0.
-        self.coef_meet = nn.Parameter(torch.zeros(1))
+        # REACH — ⟨exp_{E[u]}(μ_u), E_v⟩: does u's one-sided drift reach v? coef init 0.
+        self.coef_reach = nn.Parameter(torch.zeros(1))
         self.coef_staleness = nn.Parameter(torch.ones(1))
         if use_pair_features:
             self.coef_pair = nn.Parameter(torch.ones(1))
@@ -110,9 +108,9 @@ class GeometricPointHead(nn.Module):
     def _expmap(self, p: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
         """exp_p(δ) = cos‖δ‖·p + sin‖δ‖·δ/‖δ‖ ∈ S^{d-1}. δ = μ is a sum of Log_p's (all ⊥ p),
         so the result is unit-norm; ‖δ‖ capped to the injectivity radius (<π); δ→0 ⇒ exp_p(δ)=p
-        (a cold node drifts nowhere). Final normalize is a numeric belt. Sends a tangent
-        displacement back ONTO the sphere so two drifted positions q_u, q_v live on the SAME
-        manifold and ⟨q_u, q_v⟩ is parallel-transport-free."""
+        (a cold node drifts nowhere). Final normalize is a numeric belt. Sends u's tangent
+        displacement back ONTO the sphere so q_u = exp_{E[u]}(μ_u) lives on the SAME manifold as
+        the candidate's unit E[v] and ⟨q_u, E[v]⟩ is a plain inner product."""
         norm = delta.norm(dim=-1, keepdim=True)                     # ‖μ‖ = drift angle
         theta = norm.clamp(max=math.pi - self.eps)
         coef = torch.sin(theta) / norm.clamp_min(self.eps)         # → 0 as norm→0 (q→p)
@@ -173,11 +171,8 @@ class GeometricPointHead(nn.Module):
                 src_ids: torch.Tensor,         # [B, Us]
                 src_nmask: torch.Tensor,       # [B, Us]
                 src_ages: torch.Tensor,        # [B, Us]
-                # ── candidate tokens (v side) — drive μ_v for the meet term ──
+                # ── candidate (v side) — static embedding only, no walks ──
                 E_v: torch.Tensor,             # [B, C, d]
-                cand_ids: torch.Tensor,        # [B, C, Uv]
-                cand_nmask: torch.Tensor,      # [B, C, Uv]
-                cand_ages: torch.Tensor,       # [B, C, Uv]
                 # ── shared table + additive channels ──
                 e_weight: torch.Tensor,        # [N, d]
                 staleness_dt: torch.Tensor,    # [B, C]
@@ -202,19 +197,16 @@ class GeometricPointHead(nn.Module):
         # --- identity: is v in u's region? (proven baseline) ---
         q_ident = self._identity(eu_bc, ev, mu_u_bc, r_u_bc, a, b, alpha)   # [B,C]
 
-        # --- MEET: build μ_v in v's OWN tangent space, exp BOTH displacements back to the
-        # sphere, and compare the two drifted positions. μ_u, μ_v live in different tangent
-        # spaces (T_{E[u]} vs T_{E[v]}); the exp-map sends them to points on the SAME sphere so
-        # ⟨q_u, q_v⟩ is transport-free. Rises when u and v drift toward a shared neighbourhood,
-        # even if E[u], E[v] are structurally far apart — symmetric co-reachability. Age stays
-        # t_query − t_edge (cand_ages already carry it). coef_meet init 0 ⇒ no-op at init.
-        mu_v = self._mu_from_csr(ev, cand_ids, cand_nmask, cand_ages, e_weight)  # [B,C,d]
+        # --- REACH: push u's drift off E[u] back onto the sphere and inner-product it with the
+        # candidate's STATIC embedding. No μ_v — the candidate side samples no walks. q_u is u's
+        # neighbourhood centroid drifted off E[u]; ⟨q_u, E_v⟩ asks whether v sits where u's
+        # neighbourhood is heading. Rises when v is in u's drift region even if E[u], E[v] are
+        # structurally far apart. coef_reach init 0 ⇒ no-op at init.
         q_u = self._expmap(eu, mu_u)                              # [B,d]   drifted source pos
-        q_v = self._expmap(ev, mu_v)                             # [B,C,d] drifted candidate pos
-        meet = (q_u.unsqueeze(1) * q_v).sum(-1)                  # [B,C]   ⟨q_u, q_v⟩
+        reach = (q_u.unsqueeze(1) * ev).sum(-1)                  # [B,C]   ⟨q_u, E_v⟩
 
         geo = (self.coef_identity * q_ident
-               + self.coef_meet * meet)
+               + self.coef_reach * reach)
 
         # --- candidate STALENESS channel ---
         staleness = self.staleness_head(self.basis_staleness(staleness_dt)).squeeze(-1)  # [B,C]
