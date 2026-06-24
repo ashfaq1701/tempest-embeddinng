@@ -11,6 +11,14 @@ InfoNCE contrastive loss + a separate BCE link head.
 > current best for a dataset, update that dataset's command in `best_configs.sh`
 > in the same change.
 
+> **ALWAYS launch training runs with `PYTHONUNBUFFERED=1` (and prefer `python -u`).**
+> When stdout is redirected to a log file Python block-buffers it, so epoch
+> val/test lines do not appear until ~4 KB has accumulated — a backgrounded run
+> looks dead (empty log) for many minutes even while healthy. Set
+> `PYTHONUNBUFFERED=1` so epoch lines stream as they print and the log can be
+> tailed live. Example:
+> `PYTHONUNBUFFERED=1 nohup .venv/bin/python -u scripts/train.py ... > run.log 2>&1 &`
+
 ---
 
 ## Architecture
