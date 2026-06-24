@@ -24,7 +24,12 @@ re-defines it). The score is identity + reach:
   identity = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )          is v in u's region?     [B,C]
   reach    = ⟨ exp_{E[u]}(μ_u), E_v ⟩                          does u's drift reach v?  [B,C]
   geo   = coef_identity·identity + coef_reach·reach
-  logit = geo + coef_staleness·staleness(v) [+ coef_pair·pair + coef_pair_count·log1p(cnt)]
+  logit = geo + coef_staleness·staleness(v) + coef_reach_count·reach_count(u,v)
+                [+ coef_pair·pair + coef_pair_count·log1p(cnt)]
+
+  reach_count(u,v) = head([log1p(Σ_p∈u exp(−λ_c·age_p)·[node_p==v]), recency_basis(min_age)])
+  — the sampled multi-hop analogue of pair_count, recency-weighted from the token bag (always
+  on, init 0); added alongside pair so the coefficients reveal if it absorbs pair's signal.
 
 Only the source builds μ — the candidate enters solely through its static embedding E[v]
 (identity + reach) and the staleness / pair channels.
@@ -80,6 +85,19 @@ class GeometricPointHead(nn.Module):
         # --- candidate staleness channel ---------------------------------------
         self.basis_staleness = ExpDecayBasis(d_time, t_train)
         self.staleness_head = nn.Linear(d_time, 1)
+
+        # --- walk-reach count channel (always on) ------------------------------
+        # The sampled multi-hop analogue of pair_count: how many (recency-weighted) of u's
+        # walk tokens equal candidate v, plus the recency basis of v's MOST-RECENT hit. Unlike
+        # the deduped neighbours_count this keeps the ages, so the recency half (the stronger
+        # one on recurrence-heavy data) survives. Init coef 0 ⇒ earns weight; added ALONGSIDE
+        # pair so the learned coefficients reveal whether it absorbs pair's signal.
+        self.lam_reach = nn.Parameter(
+            torch.tensor([math.log(math.expm1(10.0 / max(float(t_train), 1.0)))],
+                         dtype=torch.float32))
+        self.basis_reach = ExpDecayBasis(d_time, t_train)
+        self.reach_head = nn.Linear(1 + d_time, 1)         # [log1p(mass), recency basis] -> scalar
+        self.coef_reach_count = nn.Parameter(torch.zeros(1))
 
         # --- pair channel (FLAGGED) --------------------------------------------
         self.use_pair_features = use_pair_features
@@ -164,6 +182,29 @@ class GeometricPointHead(nn.Module):
         return -alpha * dist
 
     # ──────────────────────────────────────────────────────────────────
+    # walk-reach count — candidate v looked up in the source u's token bag
+    # ──────────────────────────────────────────────────────────────────
+
+    def _reach_count(self, node_ids: torch.Tensor, node_mask: torch.Tensor,
+                     pos_ts: torch.Tensor, cutoffs: torch.Tensor,
+                     cand_ids: torch.Tensor) -> torch.Tensor:
+        """Per-(u, v) walk-reach feature -> [B, C]. For each candidate v, look it up in u's
+        token bag: `mass` = Σ exp(−λ·age) over u's tokens equal to v (recency-weighted count;
+        repeats sum their decayed weights), and `min_age` = age of v's most-recent hit (large
+        if never reached). [log1p(mass), recency_basis(min_age)] → reach_head → scalar.
+        Neighbours are unique per query, so a candidate matches its own token positions only."""
+        age = (cutoffs.unsqueeze(1) - pos_ts).clamp_min(0).to(torch.float32)                # [B,U]
+        match = (cand_ids.unsqueeze(-1) == node_ids.unsqueeze(1)) & node_mask.unsqueeze(1)   # [B,C,U]
+        lam_c = F.softplus(self.lam_reach)
+        wgt = torch.exp(-lam_c * age) * node_mask                                            # [B,U]
+        mass = (match * wgt.unsqueeze(1)).sum(-1)                                            # [B,C]
+        big = torch.full_like(age, 1e9)
+        min_age = torch.where(match, age.unsqueeze(1).expand_as(match),
+                              big.unsqueeze(1).expand_as(match)).amin(-1)                    # [B,C]
+        feat = torch.cat([torch.log1p(mass).unsqueeze(-1), self.basis_reach(min_age)], dim=-1)
+        return self.reach_head(feat).squeeze(-1)                                             # [B,C]
+
+    # ──────────────────────────────────────────────────────────────────
     # Forward
     # ──────────────────────────────────────────────────────────────────
 
@@ -217,6 +258,13 @@ class GeometricPointHead(nn.Module):
         # --- candidate STALENESS channel ---
         staleness = self.staleness_head(self.basis_staleness(staleness_dt)).squeeze(-1)  # [B,C]
         logit = geo + self.coef_staleness * staleness
+
+        # --- walk-reach COUNT channel (always on; sampled multi-hop analogue of pair_count,
+        # but recency-weighted from the token bag so the ages survive). coef init 0. ---
+        reach_count = self._reach_count(
+            src_tokens.node_ids, src_tokens.node_mask, src_tokens.pos_ts,
+            src_tokens.cutoffs, cand_ids)                                              # [B,C]
+        logit = logit + self.coef_reach_count * reach_count
 
         # --- PAIR channel (FLAGGED) ---
         if self.use_pair_features:
