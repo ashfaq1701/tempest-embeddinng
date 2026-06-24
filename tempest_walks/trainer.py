@@ -25,11 +25,11 @@ by a single RiemannianAdam.
 
 TOKEN PREP — the source side (u → μ_u) goes through `walk_token_csr.build_query_walk_tokens`:
 walks are generated PER QUERY (no dedup — each row's (node, t) needs its own cutoff) and the
-real context tokens of each query's K walks become a WalkTokenCSR — a token-stream CSR
-(node_ids / pos_ts / node_ids_ptr, COUNT-FREE, seed slot / padding / origin excluded) plus a
-per-query neighbour CSR (deduped nodes + counts, reserved for future co-reach signals). The
-head consumes the token stream + t_query to build μ_u SEGMENTWISE (forming ages = t_query −
-t_edge itself) and scores identity + reach against the candidate's static E[v].
+real context tokens of each query's K walks become a WalkTokens — a DENSE token bag
+([Q, U] node_ids / node_mask / pos_ts, COUNT-FREE, seed slot / padding / origin excluded) plus
+a dense per-query neighbour bag (deduped nodes + counts, reserved for future co-reach signals).
+The head consumes the (self-contained: seeds + cutoffs) token bag to build μ_u with a per-row
+softmax (forming ages = cutoffs − t_edge itself) and scores identity + reach against E[v].
 """
 import time
 from dataclasses import dataclass
@@ -175,9 +175,9 @@ class Trainer:
         PER-QUERY walks: the source side samples K backward walks for each query (u_i, t_i)
         with cutoff = t_i, so every token has t_edge < t_i (strict causal past of that query).
         No dedup — each batch row is its own query. `build_query_walk_tokens` returns a
-        WalkTokenCSR; the head consumes the token-stream CSR (node_ids / pos_ts / node_ids_ptr)
-        plus t_query to build μ_u segmentwise (forming ages = t_query − t_edge itself, all > 0
-        by the cutoff). The candidate side samples no walks — it enters only through its static
+        self-contained WalkTokens (seeds + cutoffs + dense token bag); the head builds μ_u with
+        a per-row softmax over the token bag (forming ages = cutoffs − t_edge itself, all > 0 by
+        the cutoff). The candidate side samples no walks — it enters only through its static
         embedding E[v] (identity + reach) and the staleness / pair channels. Strict causality
         comes from the per-query cutoff, NOT from ingestion order, so the batch may already be
         in Tempest."""

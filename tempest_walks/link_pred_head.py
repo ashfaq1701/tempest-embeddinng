@@ -45,7 +45,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .walk_token_csr import WalkTokenCSR
+from .walk_token_csr import WalkTokens
 
 
 class ExpDecayBasis(nn.Module):
@@ -151,46 +151,6 @@ class GeometricPointHead(nn.Module):
         w = torch.nan_to_num(torch.softmax(ell, dim=-1), nan=0.0)
         return (w.unsqueeze(-1) * g).sum(dim=-2)                          # [...,d]
 
-    def _mu_from_token_csr(self, base_emb: torch.Tensor, node_ids: torch.Tensor,
-                           pos_ts: torch.Tensor, node_ids_ptr: torch.Tensor,
-                           t_query: torch.Tensor, e_weight: torch.Tensor) -> torch.Tensor:
-        """μ over a token-stream CSR (WalkTokenCSR), one row per query:
-             μ_q = Σ_{p ∈ query q} softmax_p(−λ·age_p) · Log_{base_q}(E[node_p]),
-             age_p = t_query_q − pos_ts_p.
-           base_emb [Q, d] (E[seed_q]) ; node_ids/pos_ts [T] ; node_ids_ptr [Q+1] ;
-           t_query [Q]  ->  μ [Q, d]. Segmented (no [Q,U] padding); MATHEMATICALLY IDENTICAL
-           to `_mu_from_csr` on the same tokens. Count-free: a node recurring k times is k
-           token entries, so its softmax mass is summed across them automatically."""
-        q = int(base_emb.shape[0])
-        mu = torch.zeros(q, self.d_emb, device=base_emb.device, dtype=base_emb.dtype)
-        t = int(node_ids.shape[0])
-        if t == 0:
-            return mu                                                # all-cold → no drift
-
-        counts = node_ids_ptr[1:] - node_ids_ptr[:-1]                # [Q] tokens per query
-        seg = torch.repeat_interleave(
-            torch.arange(q, device=base_emb.device), counts)         # [T] query per token
-
-        base = F.normalize(base_emb, dim=-1)                         # [Q, d]
-        base_tok = base.index_select(0, seg)                        # [T, d]
-        ew = F.normalize(F.embedding(node_ids, e_weight), dim=-1)   # [T, d]
-        g = self._logmap(base_tok, ew)                             # [T, d]
-
-        lam = F.softplus(self.log_lambda)
-        age = (t_query.index_select(0, seg) - pos_ts).clamp_min(0).to(g.dtype)  # [T]
-        ell = (-lam * age).reshape(-1)                             # [T]
-
-        # segmented softmax over `seg`; the max shift is a detached numeric stabiliser.
-        seg_max = torch.full((q,), float("-inf"), device=base_emb.device, dtype=ell.dtype)
-        seg_max = seg_max.scatter_reduce(0, seg, ell.detach(), reduce="amax",
-                                         include_self=False)
-        e = torch.exp(ell - seg_max.index_select(0, seg))          # [T]
-        denom = torch.zeros(q, device=base_emb.device, dtype=e.dtype)
-        denom = denom.scatter_add(0, seg, e)                       # [Q]
-        wgt = (e / denom.index_select(0, seg).clamp_min(self.eps)).unsqueeze(-1)  # [T,1]
-
-        return mu.scatter_add(0, seg.unsqueeze(-1).expand(t, self.d_emb), wgt * g)
-
     # ──────────────────────────────────────────────────────────────────
     # identity — probe an embedding against a prediction (frame-agnostic)
     # ──────────────────────────────────────────────────────────────────
@@ -209,8 +169,8 @@ class GeometricPointHead(nn.Module):
 
     def forward(self,
                 e_weight: torch.Tensor,        # [N, d]  the whole node-embedding table
-                src_tokens: WalkTokenCSR,      # source walk CSR — self-contained: `seeds` ARE
-                                               # the sources, `cutoffs` ARE the query times
+                src_tokens: WalkTokens,        # source walk tokens — self-contained: `seeds`
+                                               # ARE the sources, `cutoffs` ARE the query times
                 cand_ids: torch.Tensor,        # [B, C]  candidate node ids
                 staleness_dt: torch.Tensor,    # [B, C]
                 pair_dt: torch.Tensor = None,
@@ -218,7 +178,7 @@ class GeometricPointHead(nn.Module):
         """-> logits [B, C]. The head owns all embedding lookups and timing: E_u, E_v and the
         token embeddings all come from `e_weight` (E_u = e_weight[src_tokens.seeds],
         E_v = e_weight[cand_ids]); token ages come from src_tokens.cutoffs − src_tokens.pos_ts.
-        The trainer only hands over the table, the (self-contained) source walk CSR, the
+        The trainer only hands over the table, the (self-contained) source walk tokens, the
         candidate ids, and the store-derived staleness / pair channels."""
         B, C = cand_ids.shape[0], cand_ids.shape[1]
         d = self.d_emb
@@ -230,10 +190,11 @@ class GeometricPointHead(nn.Module):
         b = F.softplus(self.log_b)
         alpha = self.alpha.clamp_min(1e-3)
 
-        # --- prediction μ_u (segmented over the source token CSR), broadcast to [B,C] ---
-        mu_u = self._mu_from_token_csr(
-            E_u, src_tokens.node_ids, src_tokens.pos_ts, src_tokens.node_ids_ptr,
-            src_tokens.cutoffs, e_weight)                         # [B,d]
+        # --- prediction μ_u (dense per-row softmax over the source token bag) ---
+        src_ages = (src_tokens.cutoffs.unsqueeze(-1)
+                    - src_tokens.pos_ts).clamp_min(0).to(eu.dtype)   # [B, U]
+        mu_u = self._mu_from_csr(
+            E_u, src_tokens.node_ids, src_tokens.node_mask, src_ages, e_weight)  # [B,d]
         r_u = self._heading(mu_u)                                 # [B,d]
         eu_bc = eu.unsqueeze(1).expand(B, C, d)                   # [B,C,d]
         mu_u_bc = mu_u.unsqueeze(1).expand(B, C, d)
