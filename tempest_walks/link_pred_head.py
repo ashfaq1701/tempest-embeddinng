@@ -209,18 +209,17 @@ class GeometricPointHead(nn.Module):
 
     def forward(self,
                 e_weight: torch.Tensor,        # [N, d]  the whole node-embedding table
-                src_tokens: WalkTokenCSR,      # source walk CSR — its `seeds` ARE the sources;
-                                               # uses the token stream (neighbour CSR reserved)
+                src_tokens: WalkTokenCSR,      # source walk CSR — self-contained: `seeds` ARE
+                                               # the sources, `cutoffs` ARE the query times
                 cand_ids: torch.Tensor,        # [B, C]  candidate node ids
-                t_query: torch.Tensor,         # [B]     prediction times (to form token ages)
                 staleness_dt: torch.Tensor,    # [B, C]
                 pair_dt: torch.Tensor = None,
                 pair_count_log: torch.Tensor = None) -> torch.Tensor:
-        """-> logits [B, C]. The head owns all embedding lookups: E_u, E_v and the token
-        embeddings all come from `e_weight` (E_u = e_weight[src_tokens.seeds],
-        E_v = e_weight[cand_ids]); ages come from t_query − the CSR's pos_ts. The trainer only
-        hands over the table, the source walk CSR, the candidate ids, the query times, and the
-        store-derived staleness / pair channels."""
+        """-> logits [B, C]. The head owns all embedding lookups and timing: E_u, E_v and the
+        token embeddings all come from `e_weight` (E_u = e_weight[src_tokens.seeds],
+        E_v = e_weight[cand_ids]); token ages come from src_tokens.cutoffs − src_tokens.pos_ts.
+        The trainer only hands over the table, the (self-contained) source walk CSR, the
+        candidate ids, and the store-derived staleness / pair channels."""
         B, C = cand_ids.shape[0], cand_ids.shape[1]
         d = self.d_emb
         E_u = F.embedding(src_tokens.seeds, e_weight)             # [B, d]
@@ -234,7 +233,7 @@ class GeometricPointHead(nn.Module):
         # --- prediction μ_u (segmented over the source token CSR), broadcast to [B,C] ---
         mu_u = self._mu_from_token_csr(
             E_u, src_tokens.node_ids, src_tokens.pos_ts, src_tokens.node_ids_ptr,
-            t_query, e_weight)                                    # [B,d]
+            src_tokens.cutoffs, e_weight)                         # [B,d]
         r_u = self._heading(mu_u)                                 # [B,d]
         eu_bc = eu.unsqueeze(1).expand(B, C, d)                   # [B,C,d]
         mu_u_bc = mu_u.unsqueeze(1).expand(B, C, d)

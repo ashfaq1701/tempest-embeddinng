@@ -201,9 +201,8 @@ class Trainer:
 
         return self.link_head(
             self.embedding_table.E.weight,   # the whole table; head indexes E_u / E_v / tokens
-            src_csr,                         # source walk CSR (seeds == sources)
+            src_csr,                         # self-contained source walk CSR (seeds + cutoffs)
             cand_t,                          # candidate node ids
-            t_query_t,                       # prediction times
             staleness_dt,
             pair_dt=pair_dt, pair_count_log=pair_count_log)
 

@@ -33,6 +33,10 @@ class WalkTokenCSR:
     entries). Drives μ.
 
         seeds         [Q]      int64   origin node of each query (NOT deduped across queries)
+        cutoffs       [Q]      int64   each query's exclusive cutoff t (== its prediction
+                                       time); every token has pos_ts < cutoffs[q], so token
+                                       ages = cutoffs[q] − pos_ts are all > 0. Self-contained:
+                                       a consumer needs no external t_query.
         node_ids      [T]      int64   flat token node ids, all queries concatenated
         pos_ts        [T]      int64   raw t_edge per token, index-aligned with node_ids
         node_ids_ptr  [Q + 1]  int64   row pointer: query q owns node_ids[node_ids_ptr[q] : node_ids_ptr[q+1]]
@@ -53,6 +57,7 @@ class WalkTokenCSR:
     """
 
     seeds: torch.Tensor            # [Q]
+    cutoffs: torch.Tensor          # [Q]  per-query cutoff t (== prediction time)
     node_ids: torch.Tensor         # [T]
     pos_ts: torch.Tensor           # [T]
     node_ids_ptr: torch.Tensor     # [Q + 1]
@@ -82,15 +87,15 @@ def build_query_walk_tokens(
        -> WalkTokenCSR
     """
     seeds_t = query_seeds.detach().to(device=device, dtype=torch.long)        # [Q]
+    cutoffs_t = query_cutoffs.detach().to(device=device, dtype=torch.long)    # [Q]
     seeds_np = np.ascontiguousarray(seeds_t.cpu().numpy(), dtype=np.int32)
-    cutoffs_np = np.ascontiguousarray(
-        query_cutoffs.detach().cpu().numpy(), dtype=np.int64)
+    cutoffs_np = np.ascontiguousarray(cutoffs_t.cpu().numpy(), dtype=np.int64)
     q = int(seeds_t.shape[0])
 
     empty_ptr = torch.zeros(q + 1, device=device, dtype=torch.int64)
     if q == 0:
         e = torch.empty(0, device=device, dtype=torch.int64)
-        return WalkTokenCSR(seeds_t, e, e, empty_ptr, e, e.clone(), empty_ptr.clone())
+        return WalkTokenCSR(seeds_t, cutoffs_t, e, e, empty_ptr, e, e.clone(), empty_ptr.clone())
 
     wd = walk_gen.walks_for_nodes(
         seeds_np,
@@ -132,7 +137,7 @@ def build_query_walk_tokens(
     # then node) gives the deduped neighbours grouped by query in one shot.
     if t == 0:
         e = torch.empty(0, device=device, dtype=torch.int64)
-        return WalkTokenCSR(seeds_t, node_ids, pos_ts, node_ids_ptr,
+        return WalkTokenCSR(seeds_t, cutoffs_t, node_ids, pos_ts, node_ids_ptr,
                             e, e.clone(), torch.zeros(q + 1, device=device, dtype=torch.int64))
 
     seg = torch.repeat_interleave(
@@ -148,6 +153,7 @@ def build_query_walk_tokens(
 
     return WalkTokenCSR(
         seeds=seeds_t,
+        cutoffs=cutoffs_t,
         node_ids=node_ids,
         pos_ts=pos_ts,
         node_ids_ptr=node_ids_ptr,
