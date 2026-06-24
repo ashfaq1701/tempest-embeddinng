@@ -1,4 +1,4 @@
-"""Correctness tests for the per-query dense walk tokens (tempest_walks/walk_token_csr.py).
+"""Correctness tests for the per-query dense walk tokens (tempest_walks/walk_tokens.py).
 
 `build_query_walk_tokens` runs K backward walks per QUERY — a (seed node, cutoff time) pair —
 and returns a dense `WalkTokens`: a token bag [Q, U] (raw, count-free, drives μ via a per-row
@@ -16,7 +16,7 @@ from collections import Counter
 import numpy as np
 import torch
 
-from tempest_walks.walk_token_csr import build_query_walk_tokens
+from tempest_walks.walk_tokens import build_query_walk_tokens
 from tempest_walks.walks import WalkGenerator
 
 

@@ -23,7 +23,7 @@ earlier edges). The stores have no per-query cutoff, so they keep a pre-batch sn
 E (on the unit sphere) and the head are trained together by L (no alignment, no detach)
 by a single RiemannianAdam.
 
-TOKEN PREP — the source side (u → μ_u) goes through `walk_token_csr.build_query_walk_tokens`:
+TOKEN PREP — the source side (u → μ_u) goes through `walk_tokens.build_query_walk_tokens`:
 walks are generated PER QUERY (no dedup — each row's (node, t) needs its own cutoff) and the
 real context tokens of each query's K walks become a WalkTokens — a DENSE token bag
 ([Q, U] node_ids / node_mask / pos_ts, COUNT-FREE, seed slot / padding / origin excluded) plus
@@ -48,7 +48,7 @@ from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
 from .pair_store import NodeLastSeenStore, PairRecencyStore
 from .utils import make_lr_lambda
-from .walk_token_csr import build_query_walk_tokens
+from .walk_tokens import build_query_walk_tokens
 from .walks import WalkGenerator
 
 

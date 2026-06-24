@@ -45,7 +45,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .walk_token_csr import WalkTokens
+from .walk_tokens import WalkTokens
 
 
 class ExpDecayBasis(nn.Module):
