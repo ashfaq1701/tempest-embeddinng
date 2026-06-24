@@ -44,15 +44,12 @@ def _expected_multiset_from_walkdata(wd, seeds):
     nodes = wd.nodes.view(q_n, k, length).cpu().numpy()
     ts = wd.timestamps.view(q_n, k, length).to(torch.int64).cpu().numpy()
     lens = wd.lens.view(q_n, k).cpu().numpy()
-    sd = seeds.cpu().numpy().astype(np.int64)
     out = []
     for q in range(q_n):
         c = Counter()
         for kk in range(k):
             for p in range(0, int(lens[q, kk]) - 1):       # context only (excl seed slot + pad)
-                node = int(nodes[q, kk, p])
-                if node == int(sd[q]):                      # drop the walk's own origin
-                    continue
+                node = int(nodes[q, kk, p])                 # self-recurrences KEPT (no origin drop)
                 c[(node, int(ts[q, kk, p]))] += 1
         out.append(c)
     return out
