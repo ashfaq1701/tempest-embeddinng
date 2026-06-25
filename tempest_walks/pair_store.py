@@ -21,9 +21,12 @@ from .sparse_store import SparseStreamStore
 
 
 class PairRecencyStore:
-    """Streaming exact last-interaction time per undirected node pair. Supplies the
-    (u,v)-recency Δt for the head's pair channel. The `count` column is kept only to
-    detect never-seen pairs (count==0 ⇒ Δt=∞ ⇒ ExpDecayBasis φ=0)."""
+    """Streaming exact last-interaction time + count per undirected node pair.
+
+    NOTE: the model's pair-feature channel was removed — this store is now used ONLY by the
+    stratification analysis (`stratify.py`), which queries `count` to split test edges into
+    repeat-pair (count>0) vs new-pair (count==0) and localize where MRR is lost. The `pair_dt`
+    return is vestigial (kept so the analysis recorder's call signature is unchanged)."""
 
     def __init__(self, num_nodes: int):
         self.N = int(num_nodes)
@@ -51,9 +54,10 @@ class PairRecencyStore:
     def query(self, src: torch.Tensor, cand: torch.Tensor, t_query: torch.Tensor):
         """src [B] long, cand [B, C] long, t_query [B] long ->
         (pair_dt [B, C], pair_count_log [B, C]) on cand.device.
-          pair_dt        : RAW Δt_uv = t_query − t_last[(u,v)] (clamped ≥0; → ExpDecayBasis).
-                           NEVER-seen (count==0) ⇒ Δt = +inf (1e18) ⇒ φ → 0 (clean baseline).
-          pair_count_log : log1p(#(u,v) interactions) (0 for never-seen → no count term)."""
+          pair_dt        : RAW Δt_uv = t_query − t_last[(u,v)] (clamped ≥0; → Time2Vec cos).
+                           NEVER-seen (count==0) ⇒ Δt = +inf (1e18); under Time2Vec this is a
+                           large oscillating value (NOT a clean 0 — see class note).
+          pair_count_log : log1p(#(u,v) interactions) (0 for never-seen → flags never-seen)."""
         device = cand.device
         B, C = cand.shape
         s = src.detach().to("cpu", torch.int64).numpy()
@@ -69,38 +73,3 @@ class PairRecencyStore:
         count_log = np.log1p(cnt.astype(np.float32))               # 0 for never-seen
         return (torch.from_numpy(rec).to(device),
                 torch.from_numpy(count_log).to(device))
-
-
-class NodeLastSeenStore:
-    """Streaming per-node last-activity time (undirected). Supplies the candidate
-    recency term `t_query - t_last[v]` without sampling candidate-side walks — used
-    by the source-side-only head, where only the source's walks are sampled."""
-
-    def __init__(self):
-        self._store = SparseStreamStore({"last_ts": ("max", 0)})
-
-    def reset(self) -> None:
-        self._store.reset()
-
-    @torch.no_grad()
-    def update(self, src: np.ndarray, tgt: np.ndarray, ts: np.ndarray) -> None:
-        """Both endpoints of every edge get their last-seen time bumped. AFTER scoring."""
-        s = np.asarray(src, dtype=np.int64)
-        t = np.asarray(tgt, dtype=np.int64)
-        ti = np.asarray(ts, dtype=np.int64)
-        self._store.upsert(
-            np.concatenate([s, t]), {"last_ts": np.concatenate([ti, ti])})
-
-    @torch.no_grad()
-    def query(self, cand: torch.Tensor, t_query: torch.Tensor) -> torch.Tensor:
-        """cand [B, C] long, t_query [B] long -> staleness_dt [B, C] RAW Δt on cand.device
-        (t_query − t_last[v], clamped ≥0; fed to the head's ExpDecayBasis). Cold nodes
-        get last_ts=0 ⇒ Δt = t_query (very stale)."""
-        device = cand.device
-        B, C = cand.shape
-        c = cand.detach().to("cpu", torch.int64).numpy().reshape(-1)
-        tq = t_query.detach().to("cpu", torch.int64).numpy()
-        out, _ = self._store.get(c)
-        last = out["last_ts"].reshape(B, C)
-        rec = np.clip(tq[:, None] - last, 0, None)
-        return torch.from_numpy(rec.astype(np.float32)).to(device)

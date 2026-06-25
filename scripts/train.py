@@ -74,13 +74,6 @@ def parse_args() -> argparse.Namespace:
 
     # Pair features. Off by default => the baseline cross-GRU head is reproduced
     # byte-identically.
-    p.add_argument(
-        "--use-pair-features", action="store_true",
-        help="Add a (u,v) pair-recency channel: ExpDecayBasis(raw Δt since the last "
-             "(u,v) interaction) → Linear, with a learnable coef. Never-connected "
-             "pairs → Δt=∞ → φ=0 (clean baseline). Streaming, strict-causal.",
-    )
-
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
     p.add_argument(
         "--max-train-edges", default=0, type=int,
@@ -104,6 +97,15 @@ def parse_args() -> argparse.Namespace:
                    help="Per-hop edge bias for the query-side backward walks.")
     p.add_argument("--start-bias-query-side", default="ExponentialWeight", type=str,
                    help="Initial-edge bias for the query-side backward walks.")
+    p.add_argument("--num-walks-per-node-candidate-side", default=10, type=int,
+                   help="K walks per candidate v (mirror of the query side). Candidate-side "
+                        "connector walks, reserved for a candidate-side / cross scoring path.")
+    p.add_argument("--max-walk-len-candidate-side", default=5, type=int,
+                   help="L, max walk length for the candidate-side walks (mirror of query side).")
+    p.add_argument("--walk-bias-candidate-side", default="ExponentialWeight", type=str,
+                   help="Per-hop edge bias for the candidate-side backward walks.")
+    p.add_argument("--start-bias-candidate-side", default="ExponentialWeight", type=str,
+                   help="Initial-edge bias for the candidate-side backward walks.")
 
     # The link head (LinkPredHead) has no architecture knobs beyond
     # max_walk_len, which is set from --link-pred-max-walk-len.
@@ -297,12 +299,15 @@ def main() -> Dict[str, Any]:
         tau_link=args.tau_link,
         K_train=args.k_train,
 
-        use_pair_features=args.use_pair_features,
-
         num_walks_per_node_query_side=args.num_walks_per_node_query_side,
         max_walk_len_query_side=args.max_walk_len_query_side,
         walk_bias_query_side=args.walk_bias_query_side,
         start_bias_query_side=args.start_bias_query_side,
+
+        num_walks_per_node_candidate_side=args.num_walks_per_node_candidate_side,
+        max_walk_len_candidate_side=args.max_walk_len_candidate_side,
+        walk_bias_candidate_side=args.walk_bias_candidate_side,
+        start_bias_candidate_side=args.start_bias_candidate_side,
         max_time_capacity=compute_max_time_capacity(
             args.tempest_batch_window_multiplier,
             args.batch_size,
@@ -364,8 +369,7 @@ def main() -> Dict[str, Any]:
         meta = {
             "dataset": args.dataset, "seed": args.seed, "d_emb": args.d_emb,
             "batch_size": args.batch_size, "eval_batch_size": args.eval_batch_size,
-            "head": type(trainer.link_head).__name__
-            + (" + pair features" if args.use_pair_features else ""),
+            "head": type(trainer.link_head).__name__,
             "best_epoch": result["stopped_at_epoch"],
             "best_val": result["best_val_mrr"], "best_test": result["best_test_mrr"],
         }
