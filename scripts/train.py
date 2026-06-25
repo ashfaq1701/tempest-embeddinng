@@ -76,9 +76,10 @@ def parse_args() -> argparse.Namespace:
     # byte-identically.
     p.add_argument(
         "--use-pair-features", action="store_true",
-        help="Add a (u,v) pair-recency channel: ExpDecayBasis(raw Δt since the last "
-             "(u,v) interaction) → Linear, with a learnable coef. Never-connected "
-             "pairs → Δt=∞ → φ=0 (clean baseline). Streaming, strict-causal.",
+        help="Add a (u,v) pair-recency channel: Time2Vec(raw Δt since the last "
+             "(u,v) interaction) → Linear, with a learnable coef. Never-connected pairs are "
+             "flagged by count_log=0 (the Time2Vec recency term is not a clean 0 for them). "
+             "Streaming, strict-causal.",
     )
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).

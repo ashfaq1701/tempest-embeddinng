@@ -49,18 +49,23 @@ import torch.nn.functional as F
 from .walk_tokens import WalkTokens
 
 
-class ExpDecayBasis(nn.Module):
-    """Multi-rate exp-decay Δt encoder (used by the pair channel): φ(Δt) = [exp(−ρ_k·Δt)]_{k=1..K}, ρ_k =
-    exp(log_rates_k) log-spaced 1/t_train→1. Scale-free on RAW Δt, bounded [0,1]; Δt→∞ ⇒ 0."""
+class Time2Vec(nn.Module):
+    """Bochner time encoding (Time2Vec / TGN-style), ported from TGB_TPNet
+    models/modules.py:TimeEncoder. φ(Δt) = cos(w·Δt + b); w init to log-spaced frequencies
+    1/10^linspace(0,9) (so channels span fast→slow oscillations on RAW Δt), b init 0. Output
+    in [-1, 1], shape [..., time_dim] (drop-in for the old ExpDecayBasis interface)."""
 
-    def __init__(self, dim: int, t_train: float):
+    def __init__(self, time_dim: int):
         super().__init__()
-        r_lo = -math.log(max(float(t_train), 1.0))
-        r_hi = 0.0
-        self.log_rates = nn.Parameter(torch.linspace(r_lo, r_hi, dim))
+        self.time_dim = time_dim
+        self.w = nn.Linear(1, time_dim)
+        # log-spaced frequencies 1/10^0 … 1/10^9, exactly as TGB_TPNet's TimeEncoder.
+        self.w.weight = nn.Parameter(
+            (1.0 / 10 ** torch.linspace(0, 9, time_dim)).reshape(time_dim, 1))
+        self.w.bias = nn.Parameter(torch.zeros(time_dim))
 
     def forward(self, dt: torch.Tensor) -> torch.Tensor:
-        return torch.exp(-torch.exp(self.log_rates) * dt.unsqueeze(-1))
+        return torch.cos(self.w(dt.unsqueeze(-1)))
 
 
 class GeometricPointHead(nn.Module):
@@ -81,7 +86,7 @@ class GeometricPointHead(nn.Module):
         # --- pair channel (FLAGGED) --------------------------------------------
         self.use_pair_features = use_pair_features
         if use_pair_features:
-            self.basis_pair = ExpDecayBasis(d_time, t_train)
+            self.basis_pair = Time2Vec(d_time)
             self.pair_head = nn.Linear(d_time, 1)
 
         # --- geometric mix coefficients ----------------------------------------

@@ -58,9 +58,9 @@ class TrainerConfig:
     num_nodes: int
     dst_pool: np.ndarray
 
-    # Frozen train-split span. Sets the log-spaced init of the head's exp-decay rates:
-    # the μ recency λ (init ≈ 10/t_train) and the ExpDecayBasis rates (1/t_train … 1).
-    # Init only — never a per-step scaler.
+    # Frozen train-split span. Sets the log-spaced init of the μ recency λ (init ≈ 10/t_train).
+    # (The pair channel's time encoder is now Time2Vec, whose frequencies are fixed at
+    # 1/10^[0..9] and do NOT depend on t_train.) Init only — never a per-step scaler.
     t_train: float = 1.0
 
     # Model.

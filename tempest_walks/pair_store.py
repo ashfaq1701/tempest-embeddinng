@@ -22,8 +22,10 @@ from .sparse_store import SparseStreamStore
 
 class PairRecencyStore:
     """Streaming exact last-interaction time per undirected node pair. Supplies the
-    (u,v)-recency Δt for the head's pair channel. The `count` column is kept only to
-    detect never-seen pairs (count==0 ⇒ Δt=∞ ⇒ ExpDecayBasis φ=0)."""
+    (u,v)-recency Δt for the head's pair channel (now encoded by Time2Vec). The `count`
+    column is kept only to detect never-seen pairs (count==0). NOTE: the Δt=1e18 sentinel
+    for never-seen pairs was a clean φ→0 under the old ExpDecayBasis; under Time2Vec
+    cos(·) it is NOT 0, so never-seen is flagged by count_log=0, not by the recency term."""
 
     def __init__(self, num_nodes: int):
         self.N = int(num_nodes)
@@ -51,9 +53,10 @@ class PairRecencyStore:
     def query(self, src: torch.Tensor, cand: torch.Tensor, t_query: torch.Tensor):
         """src [B] long, cand [B, C] long, t_query [B] long ->
         (pair_dt [B, C], pair_count_log [B, C]) on cand.device.
-          pair_dt        : RAW Δt_uv = t_query − t_last[(u,v)] (clamped ≥0; → ExpDecayBasis).
-                           NEVER-seen (count==0) ⇒ Δt = +inf (1e18) ⇒ φ → 0 (clean baseline).
-          pair_count_log : log1p(#(u,v) interactions) (0 for never-seen → no count term)."""
+          pair_dt        : RAW Δt_uv = t_query − t_last[(u,v)] (clamped ≥0; → Time2Vec cos).
+                           NEVER-seen (count==0) ⇒ Δt = +inf (1e18); under Time2Vec this is a
+                           large oscillating value (NOT a clean 0 — see class note).
+          pair_count_log : log1p(#(u,v) interactions) (0 for never-seen → flags never-seen)."""
         device = cand.device
         B, C = cand.shape
         s = src.detach().to("cpu", torch.int64).numpy()
