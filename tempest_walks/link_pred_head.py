@@ -5,14 +5,15 @@ by how close its STATIC embedding E[v] is to u's drifted position:
 
   μ_u = drift in T_{E[u]}                             (recency centroid of u's Log vectors)
   q_u = exp_{E[u]}(μ_u)                               u's drifted position, back ON the sphere
-  reach(u,v) = ⟨q_u, E[v]⟩                            does u's drift reach v?
+  μ_v, q_v = the SAME, built from the candidate's own walk bag (symmetric)
+  reach(u,v) = ⟨q_u, E[v]⟩ + ⟨E[u], q_v⟩             does u reach v AND v reach u?
 
-The candidate side samples NO walks — there is no μ_v. q_u is u's neighbourhood pushed off
-E[u]; the inner product with the unit E[v] asks "how close is v to where u's neighbourhood is
-heading?". reach rises when v sits in the region u drifts toward, even if E[u], E[v] are far
-apart. coef_reach init 0 ⇒ the head starts as the proven query-anchored baseline and reach earns
-its weight. Age stays t_query − t_edge throughout (the trainer forms it; the head never
-re-defines it). The score is identity + reach:
+SYMMETRIC: both sides sample walks. q_u is u's neighbourhood drifted off E[u]; q_v is v's
+neighbourhood drifted off E[v]. The first inner product asks "does v sit where u is heading?",
+the second "does u sit where v is heading?". reach rises when each lands in the other's drift
+region, even if E[u], E[v] are structurally far apart. coef_reach init 0 ⇒ the head starts as
+the proven query-anchored baseline and reach earns its weight. Age stays t_query − t_edge
+throughout (the trainer forms it; the head never re-defines it). The score is identity + reach:
 
   TOKEN BASIS — the source seed carries a COUNT-FREE bag of walk-reached positions p (one token
   per reached position; a node recurring k times is k tokens). μ sums the softmax over those
@@ -22,12 +23,12 @@ re-defines it). The score is identity + reach:
   μ_u = Σ_p softmax_p(−λ·age_p)·Log_{E[u]}(E[node_p ∈ u-tokens]) ; r_u = ĝate(μ_u)
 
   identity = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )          is v in u's region?     [B,C]
-  reach    = ⟨ exp_{E[u]}(μ_u), E_v ⟩                          does u's drift reach v?  [B,C]
+  reach    = ⟨ exp_{E[u]}(μ_u), E_v ⟩ + ⟨ E_u, exp_{E[v]}(μ_v) ⟩   symmetric drift     [B,C]
   geo   = coef_identity·identity + coef_reach·reach
   logit = geo + coef_staleness·staleness(v) [+ coef_pair·pair + coef_pair_count·log1p(cnt)]
 
-Only the source builds μ — the candidate enters solely through its static embedding E[v]
-(identity + reach) and the staleness / pair channels.
+identity stays ASYMMETRIC (anchored at the source u); reach is SYMMETRIC — both u and v build a
+μ from their own candidate/source walk bag. The candidate side now samples walks (cand_tokens).
 
 BASELINE AT INIT — coef_identity=1, coef_reach=0 ⇒ at init the head IS the proven identity term
 and nothing else; reach earns its weight from zero.
@@ -171,17 +172,22 @@ class GeometricPointHead(nn.Module):
                 e_weight: torch.Tensor,        # [N, d]  the whole node-embedding table
                 src_tokens: WalkTokens,        # source walk tokens — self-contained: `seeds`
                                                # ARE the sources, `cutoffs` ARE the query times
-                cand_ids: torch.Tensor,        # [B, C]  candidate node ids
+                cand_tokens: WalkTokens,       # candidate walk tokens (Q = B*C rows). `seeds`
+                                               # ARE the candidate ids (row-major over [B, C]);
+                                               # `cutoffs` ARE the query times. No separate
+                                               # cand_ids — it is just seeds reshaped to [B, C].
                 staleness_dt: torch.Tensor,    # [B, C]
                 pair_dt: torch.Tensor = None,
                 pair_count_log: torch.Tensor = None) -> torch.Tensor:
         """-> logits [B, C]. The head owns all embedding lookups and timing: E_u, E_v and the
-        token embeddings all come from `e_weight` (E_u = e_weight[src_tokens.seeds],
-        E_v = e_weight[cand_ids]); token ages come from src_tokens.cutoffs − src_tokens.pos_ts.
-        The trainer only hands over the table, the (self-contained) source walk tokens, the
-        candidate ids, and the store-derived staleness / pair channels."""
-        B, C = cand_ids.shape[0], cand_ids.shape[1]
+        token embeddings all come from `e_weight`. The candidate ids are recovered from the
+        candidate bag (`cand_tokens.seeds` reshaped to [B, C]); B = #source seeds, C = (B*C)/B.
+        Token ages come from each bag's cutoffs − pos_ts. The trainer hands over only the table,
+        the source bag, the candidate bag, and the store-derived staleness / pair channels."""
+        B = src_tokens.seeds.shape[0]
+        C = cand_tokens.seeds.shape[0] // B
         d = self.d_emb
+        cand_ids = cand_tokens.seeds.view(B, C)                   # [B, C]  recovered, not passed
         E_u = F.embedding(src_tokens.seeds, e_weight)             # [B, d]
         E_v = F.embedding(cand_ids, e_weight)                     # [B, C, d]
         eu = F.normalize(E_u, dim=-1)                             # [B, d]
@@ -203,13 +209,24 @@ class GeometricPointHead(nn.Module):
         # --- identity: is v in u's region? (proven baseline) ---
         q_ident = self._identity(eu_bc, ev, mu_u_bc, r_u_bc, a, b, alpha)   # [B,C]
 
-        # --- REACH: push u's drift off E[u] back onto the sphere and inner-product it with the
-        # candidate's STATIC embedding. No μ_v — the candidate side samples no walks. q_u is u's
-        # neighbourhood centroid drifted off E[u]; ⟨q_u, E_v⟩ asks whether v sits where u's
-        # neighbourhood is heading. Rises when v is in u's drift region even if E[u], E[v] are
-        # structurally far apart. coef_reach init 0 ⇒ no-op at init.
+        # --- SYMMETRIC REACH: both sides drift their neighbourhood off their own embedding and
+        # inner-product against the OTHER side's static embedding, so the score is symmetric in
+        # (u, v):   reach(u,v) = ⟨q_u, E_v⟩ + ⟨E_u, q_v⟩
+        # q_u = exp_{E[u]}(μ_u) drifts u's neighbourhood off E[u]; q_v = exp_{E[v]}(μ_v) drifts
+        # each candidate's neighbourhood off E[v] (μ_v from the candidate walk bag). The first
+        # term asks "does v sit where u is heading?", the second "does u sit where v is heading?".
+        # coef_reach init 0 ⇒ no-op at init.
         q_u = self._expmap(eu, mu_u)                              # [B,d]   drifted source pos
-        reach = (q_u.unsqueeze(1) * ev).sum(-1)                  # [B,C]   ⟨q_u, E_v⟩
+        # candidate-side μ_v from the candidate token bag (Q = B*C rows; base frame = E[v]).
+        E_v_flat = E_v.reshape(B * C, d)                          # [B*C,d]
+        ev_flat = ev.reshape(B * C, d)                            # [B*C,d] unit base frame
+        cand_ages = (cand_tokens.cutoffs.unsqueeze(-1)
+                     - cand_tokens.pos_ts).clamp_min(0).to(eu.dtype)   # [B*C, U_v]
+        mu_v = self._mu_from_csr(
+            E_v_flat, cand_tokens.node_ids, cand_tokens.node_mask, cand_ages, e_weight)  # [B*C,d]
+        q_v = self._expmap(ev_flat, mu_v).reshape(B, C, d)       # [B,C,d] drifted candidate pos
+        reach = ((q_u.unsqueeze(1) * ev).sum(-1)                 # ⟨q_u, E_v⟩  [B,C]
+                 + (eu.unsqueeze(1) * q_v).sum(-1))              # ⟨E_u, q_v⟩  [B,C]
 
         geo = (self.coef_identity * q_ident
                + self.coef_reach * reach)

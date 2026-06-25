@@ -104,6 +104,15 @@ def parse_args() -> argparse.Namespace:
                    help="Per-hop edge bias for the query-side backward walks.")
     p.add_argument("--start-bias-query-side", default="ExponentialWeight", type=str,
                    help="Initial-edge bias for the query-side backward walks.")
+    p.add_argument("--num-walks-per-node-candidate-side", default=10, type=int,
+                   help="K walks per candidate v (mirror of the query side). Candidate-side "
+                        "connector walks, reserved for a candidate-side / cross scoring path.")
+    p.add_argument("--max-walk-len-candidate-side", default=5, type=int,
+                   help="L, max walk length for the candidate-side walks (mirror of query side).")
+    p.add_argument("--walk-bias-candidate-side", default="ExponentialWeight", type=str,
+                   help="Per-hop edge bias for the candidate-side backward walks.")
+    p.add_argument("--start-bias-candidate-side", default="ExponentialWeight", type=str,
+                   help="Initial-edge bias for the candidate-side backward walks.")
 
     # The link head (LinkPredHead) has no architecture knobs beyond
     # max_walk_len, which is set from --link-pred-max-walk-len.
@@ -303,6 +312,11 @@ def main() -> Dict[str, Any]:
         max_walk_len_query_side=args.max_walk_len_query_side,
         walk_bias_query_side=args.walk_bias_query_side,
         start_bias_query_side=args.start_bias_query_side,
+
+        num_walks_per_node_candidate_side=args.num_walks_per_node_candidate_side,
+        max_walk_len_candidate_side=args.max_walk_len_candidate_side,
+        walk_bias_candidate_side=args.walk_bias_candidate_side,
+        start_bias_candidate_side=args.start_bias_candidate_side,
         max_time_capacity=compute_max_time_capacity(
             args.tempest_batch_window_multiplier,
             args.batch_size,

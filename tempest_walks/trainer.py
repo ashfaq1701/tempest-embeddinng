@@ -74,12 +74,18 @@ class TrainerConfig:
     # in-geometry count term aims to make it droppable.
     use_pair_features: bool = False
 
-    # Walks (BACKWARD only, undirected). QUERY-side only: source u → μ_u tokens. The candidate
-    # side samples no walks (reach compares against v's static embedding).
+    # Walks (BACKWARD only, undirected). QUERY-side: source u → μ_u tokens.
     num_walks_per_node_query_side: int = 5
     max_walk_len_query_side: int = 5
     walk_bias_query_side: str = "ExponentialWeight"
     start_bias_query_side: str = "ExponentialWeight"
+    # CANDIDATE-side: v → connector tokens (mirror of the query side). Reserved for a
+    # candidate-side / cross scoring path; the current one-sided reach head does not consume
+    # these yet, but the knobs are plumbed so the candidate walks can be wired without churn.
+    num_walks_per_node_candidate_side: int = 5
+    max_walk_len_candidate_side: int = 5
+    walk_bias_candidate_side: str = "ExponentialWeight"
+    start_bias_candidate_side: str = "ExponentialWeight"
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
     # Optimisation.
@@ -192,6 +198,21 @@ class Trainer:
             start_bias=self.config.start_bias_query_side,
             walk_bias=self.config.walk_bias_query_side)
 
+        # --- CANDIDATE side (symmetric reach): per (query, candidate) walk bag. Each candidate
+        # v in row i is walked with cutoff = t_i (the query's time), so its tokens are also the
+        # strict causal past of the query. Flatten [B, C] → [B*C] seeds; the head reshapes μ_v
+        # back to [B, C]. Cost scales with B*C — tune via --num-walks-per-node-candidate-side /
+        # --max-walk-len-candidate-side / eval batch size.
+        Bc, Cc = cand_t.shape
+        cand_flat = cand_t.reshape(Bc * Cc)
+        cand_cut_flat = t_query_t.unsqueeze(1).expand(Bc, Cc).reshape(Bc * Cc)
+        cand_csr = build_query_walk_tokens(
+            self.walk_gen, device, cand_flat, cand_cut_flat,
+            max_walk_len=self.config.max_walk_len_candidate_side,
+            num_walks_per_node=self.config.num_walks_per_node_candidate_side,
+            start_bias=self.config.start_bias_candidate_side,
+            walk_bias=self.config.walk_bias_candidate_side)
+
         # Candidate staleness + (flagged) pair channel — store-derived (sequential side
         # state the head can't own); everything embedding-related the head derives itself.
         staleness_dt = self.node_last.query(cand_t, t_query_t)         # [B, C]
@@ -202,7 +223,7 @@ class Trainer:
         return self.link_head(
             self.embedding_table.E.weight,   # the whole table; head indexes E_u / E_v / tokens
             src_csr,                         # self-contained source walk CSR (seeds + cutoffs)
-            cand_t,                          # candidate node ids
+            cand_csr,                        # candidate walk CSR (B*C rows); seeds == cand ids → E_v, μ_v
             staleness_dt,
             pair_dt=pair_dt, pair_count_log=pair_count_log)
 
