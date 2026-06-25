@@ -25,7 +25,7 @@ throughout (the trainer forms it; the head never re-defines it). The score is id
   identity = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )          is v in u's region?     [B,C]
   reach    = ⟨ exp_{E[u]}(μ_u), E_v ⟩ + ⟨ E_u, exp_{E[v]}(μ_v) ⟩   symmetric drift     [B,C]
   geo   = coef_identity·identity + coef_reach·reach
-  logit = geo + coef_staleness·staleness(v) [+ coef_pair·pair + coef_pair_count·log1p(cnt)]
+  logit = geo [+ coef_pair·pair + coef_pair_count·log1p(cnt)]
 
 identity stays ASYMMETRIC (anchored at the source u); reach is SYMMETRIC — both u and v build a
 μ from their own candidate/source walk bag. The candidate side now samples walks (cand_tokens).
@@ -50,7 +50,7 @@ from .walk_tokens import WalkTokens
 
 
 class ExpDecayBasis(nn.Module):
-    """Multi-rate exp-decay staleness encoder: φ(Δt) = [exp(−ρ_k·Δt)]_{k=1..K}, ρ_k =
+    """Multi-rate exp-decay Δt encoder (used by the pair channel): φ(Δt) = [exp(−ρ_k·Δt)]_{k=1..K}, ρ_k =
     exp(log_rates_k) log-spaced 1/t_train→1. Scale-free on RAW Δt, bounded [0,1]; Δt→∞ ⇒ 0."""
 
     def __init__(self, dim: int, t_train: float):
@@ -78,10 +78,6 @@ class GeometricPointHead(nn.Module):
         self.log_a = nn.Parameter(torch.zeros(1))         # anisotropic ellipse (a,b ≥ 0)
         self.log_b = nn.Parameter(torch.zeros(1))
 
-        # --- candidate staleness channel ---------------------------------------
-        self.basis_staleness = ExpDecayBasis(d_time, t_train)
-        self.staleness_head = nn.Linear(d_time, 1)
-
         # --- pair channel (FLAGGED) --------------------------------------------
         self.use_pair_features = use_pair_features
         if use_pair_features:
@@ -93,7 +89,6 @@ class GeometricPointHead(nn.Module):
         self.coef_identity = nn.Parameter(torch.ones(1))
         # REACH — ⟨exp_{E[u]}(μ_u), E_v⟩: does u's one-sided drift reach v? coef init 0.
         self.coef_reach = nn.Parameter(torch.zeros(1))
-        self.coef_staleness = nn.Parameter(torch.ones(1))
         if use_pair_features:
             self.coef_pair = nn.Parameter(torch.ones(1))
             self.coef_pair_count = nn.Parameter(torch.zeros(1))
@@ -176,14 +171,13 @@ class GeometricPointHead(nn.Module):
                                                # ARE the candidate ids (row-major over [B, C]);
                                                # `cutoffs` ARE the query times. No separate
                                                # cand_ids — it is just seeds reshaped to [B, C].
-                staleness_dt: torch.Tensor,    # [B, C]
                 pair_dt: torch.Tensor = None,
                 pair_count_log: torch.Tensor = None) -> torch.Tensor:
         """-> logits [B, C]. The head owns all embedding lookups and timing: E_u, E_v and the
         token embeddings all come from `e_weight`. The candidate ids are recovered from the
         candidate bag (`cand_tokens.seeds` reshaped to [B, C]); B = #source seeds, C = (B*C)/B.
         Token ages come from each bag's cutoffs − pos_ts. The trainer hands over only the table,
-        the source bag, the candidate bag, and the store-derived staleness / pair channels."""
+        the source bag, the candidate bag, and the (flagged) pair channel."""
         B = src_tokens.seeds.shape[0]
         C = cand_tokens.seeds.shape[0] // B
         d = self.d_emb
@@ -230,10 +224,7 @@ class GeometricPointHead(nn.Module):
 
         geo = (self.coef_identity * q_ident
                + self.coef_reach * reach)
-
-        # --- candidate STALENESS channel ---
-        staleness = self.staleness_head(self.basis_staleness(staleness_dt)).squeeze(-1)  # [B,C]
-        logit = geo + self.coef_staleness * staleness
+        logit = geo
 
         # --- PAIR channel (FLAGGED) ---
         if self.use_pair_features:

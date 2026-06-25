@@ -109,7 +109,7 @@ def create_batches(split: SplitData, batch_size: int) -> Iterator[Batch]:
     can land in different batches, so the later batch sees the earlier edge's
     ingested graph / pair / last-seen state. Same-timestamp edges that land in
     the SAME batch still don't inform each other (ingest is post-batch). Per-edge
-    quantities (t_query, the head's tok_age, pair_store/node_last queries) are
+    quantities (t_query, the head's tok_age, pair_store queries) are
     computed element-wise from `batch.ts` and are unaffected. Eval MRR is
     identical regardless of batching — TGB negatives are keyed per positive edge,
     not per batch — only causal-state freshness changes.

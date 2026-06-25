@@ -69,38 +69,3 @@ class PairRecencyStore:
         count_log = np.log1p(cnt.astype(np.float32))               # 0 for never-seen
         return (torch.from_numpy(rec).to(device),
                 torch.from_numpy(count_log).to(device))
-
-
-class NodeLastSeenStore:
-    """Streaming per-node last-activity time (undirected). Supplies the candidate
-    recency term `t_query - t_last[v]` without sampling candidate-side walks — used
-    by the source-side-only head, where only the source's walks are sampled."""
-
-    def __init__(self):
-        self._store = SparseStreamStore({"last_ts": ("max", 0)})
-
-    def reset(self) -> None:
-        self._store.reset()
-
-    @torch.no_grad()
-    def update(self, src: np.ndarray, tgt: np.ndarray, ts: np.ndarray) -> None:
-        """Both endpoints of every edge get their last-seen time bumped. AFTER scoring."""
-        s = np.asarray(src, dtype=np.int64)
-        t = np.asarray(tgt, dtype=np.int64)
-        ti = np.asarray(ts, dtype=np.int64)
-        self._store.upsert(
-            np.concatenate([s, t]), {"last_ts": np.concatenate([ti, ti])})
-
-    @torch.no_grad()
-    def query(self, cand: torch.Tensor, t_query: torch.Tensor) -> torch.Tensor:
-        """cand [B, C] long, t_query [B] long -> staleness_dt [B, C] RAW Δt on cand.device
-        (t_query − t_last[v], clamped ≥0; fed to the head's ExpDecayBasis). Cold nodes
-        get last_ts=0 ⇒ Δt = t_query (very stale)."""
-        device = cand.device
-        B, C = cand.shape
-        c = cand.detach().to("cpu", torch.int64).numpy().reshape(-1)
-        tq = t_query.detach().to("cpu", torch.int64).numpy()
-        out, _ = self._store.get(c)
-        last = out["last_ts"].reshape(B, C)
-        rec = np.clip(tq[:, None] - last, 0, None)
-        return torch.from_numpy(rec.astype(np.float32)).to(device)

@@ -224,14 +224,13 @@ def run_stratification(trainer, train_f, val_f, test_eval, test_f,
     strict-causal test eval and write tables. Returns (strata, headroom).
 
     Call AFTER `trainer.train(...)` (which restores best-val weights). Assumes the
-    trainer exposes `walk_gen`, `pair_store` (optional), `node_last`, and the
+    trainer exposes `walk_gen`, `pair_store` (optional), and the
     `_eval(evaluator, batches, recorder=...)` hook.
     """
     print("\n=== Re-seeding train+val, then stratified test eval ===")
     trainer.walk_gen.reset()
     if getattr(trainer, "pair_store", None) is not None:
         trainer.pair_store.reset()
-    trainer.node_last.reset()
 
     rec = TestStratRecorder(num_nodes)
     rec.reset()
@@ -240,7 +239,6 @@ def run_stratification(trainer, train_f, val_f, test_eval, test_f,
             trainer.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
             if getattr(trainer, "pair_store", None) is not None:
                 trainer.pair_store.update(batch.src, batch.tgt, batch.ts)
-            trainer.node_last.update(batch.src, batch.tgt, batch.ts)
             rec.after_batch(batch)
 
     test_mrr = trainer._eval(test_eval, test_f(), recorder=rec)
