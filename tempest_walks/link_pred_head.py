@@ -89,13 +89,6 @@ class GeometricPointHead(nn.Module):
         lam0 = 10.0 / max(float(t_train), 1.0)
         self.log_lambda = nn.Parameter(
             torch.tensor([math.log(math.expm1(lam0))], dtype=torch.float32))
-        # Adaptive sharpening strength γ = softplus(log_gamma). The CENTER direction uses
-        # w_p^{1+γ·r̄} (r̄ = detached unsharpened coherence), so a coherent bag sharpens toward
-        # its most-recent member (pointer, good for recurrence) while a dispersed bag stays a
-        # democratic summary (good for cold-start). init γ≈0.1 (near-democratic; at γ=0 this is
-        # byte-equivalent to the plain vMF). mass/coh stay on the UNSHARPENED weights.
-        self.log_gamma = nn.Parameter(
-            torch.tensor([math.log(math.expm1(0.1))], dtype=torch.float32))
         self.alpha = nn.Parameter(torch.tensor(10.0))     # shared distance weight
         self.log_a = nn.Parameter(torch.zeros(1))         # anisotropic ellipse (a,b ≥ 0)
         self.log_b = nn.Parameter(torch.zeros(1))
@@ -160,32 +153,20 @@ class GeometricPointHead(nn.Module):
     def _directional_mean(self, ids: torch.Tensor, nmask: torch.Tensor,
                           ages: torch.Tensor, e_weight: torch.Tensor):
         """Weighted spherical resultant of the token bag → (center, mass, coherence).
-           Honest summary stats (mass, coh) come from the UNSHARPENED weights w_p = exp(−λ·age_p);
-           the DIRECTION is sharpened by w_p^{1+γ·r̄} (r̄ = detached unsharpened coherence), so a
-           coherent bag concentrates toward its most-recent member (pointer) while a dispersed bag
-           stays democratic (summary).
-             center    [...,d]  = normalize(Σ w_p^{1+γ·r̄}·Ê[node_p])   sharpened mean direction
-             mass      [...]     = Σ_p w_p                            recency-weighted COUNT
-             coherence [...]     = ‖Σ w_p Ê‖/mass ∈[0,1]              unsharpened peakedness r̄
-           ids/nmask/ages [...,U]. Cold bag (all-pad) ⇒ center ≈ 0, mass = 0, coherence = 0.
-           At γ=0 this is byte-equivalent to the plain vMF (w^1, center = R/‖R‖)."""
+           R = Σ_p w_p·Ê[node_p], w_p = exp(−λ·age_p) (0 on padding).
+             center    [...,d]  = R/‖R‖           vMF mean direction (a unit sphere point)
+             mass      [...]     = Σ_p w_p         recency-weighted COUNT (age+count scalar)
+             coherence [...]     = ‖R‖/mass ∈[0,1] how tightly the neighbourhood agrees
+           ids/nmask/ages [...,U]. Count-free bag: a node reached k times is k tokens ⇒ k·w_p
+           mass in R. Cold bag (all-pad) ⇒ R = 0 ⇒ center ≈ 0, mass = 0, coherence = 0."""
         ew = F.normalize(F.embedding(ids.clamp_min(0), e_weight), dim=-1)   # [...,U,d]
         lam = F.softplus(self.log_lambda)
-        logw = -lam * ages + torch.where(nmask, 0.0, -1e9)                 # [...,U] log-w, pad→−inf
-
-        # --- honest summary stats from the UNSHARPENED weights (exponent 1) ---
-        w = torch.exp(logw)                                              # [...,U] (0 on pad)
-        R0 = (w.unsqueeze(-1) * ew).sum(dim=-2)                          # [...,d]
-        mass = w.sum(dim=-1)                                             # [...]
-        r_bar = R0.norm(dim=-1) / mass.clamp_min(self.eps)              # [...] coherence/peakedness
-        coherence = r_bar
-
-        # --- sharpen ONLY the direction, by the DETACHED peakedness (no feedback loop) ---
-        gamma = F.softplus(self.log_gamma)
-        expo = (1.0 + gamma * r_bar.detach()).unsqueeze(-1)            # [...,1]
-        ws = torch.exp(logw * expo)                                    # [...,U] w_p^{1+γ·r̄}
-        Rs = (ws.unsqueeze(-1) * ew).sum(dim=-2)                       # [...,d]
-        center = Rs / Rs.norm(dim=-1, keepdim=True).clamp_min(self.eps)  # [...,d] sphere-safe
+        w = torch.exp(-lam * ages) * nmask.to(ages.dtype)                  # [...,U] (0 on pad)
+        R = (w.unsqueeze(-1) * ew).sum(dim=-2)                            # [...,d]
+        mass = w.sum(dim=-1)                                              # [...]
+        Rnorm = R.norm(dim=-1)                                            # [...]
+        center = R / Rnorm.clamp_min(self.eps).unsqueeze(-1)             # [...,d]
+        coherence = Rnorm / mass.clamp_min(self.eps)                     # [...]
         return center, mass, coherence
 
     # ──────────────────────────────────────────────────────────────────
