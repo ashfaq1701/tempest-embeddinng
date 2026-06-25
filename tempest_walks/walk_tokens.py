@@ -10,12 +10,9 @@ and packs the result into two parallel DENSE [Q, ·] views (see `WalkTokens`):
                     counts, for set-overlap / common-neighbour / path-density (co-reach) signals.
 
 Excluded before packing:
-  * the seed slot (position lens-1, the INT64_MAX sentinel) and padding (pos >= lens).
-
-Self-recurrences (the origin node re-entering its own neighbourhood at a context position) are
-KEPT: under the vMF ambient-resultant head a self-token contributes w_self·Ê[origin] (a real
-unit vector, not the zero tangent vector the old softmax-Log centroid produced), so it is
-legitimate self-activity evidence rather than a μ-toward-zero pull.
+  * the seed slot (position lens-1, the INT64_MAX sentinel) and padding (pos >= lens),
+  * the origin node-id wherever it recurs at a context position
+    (Log_{E[seed]}(E[seed]) = 0 — it would pull μ toward zero and let a node witness itself).
 
 Requires shuffle_walk_order=False at the Tempest constructor so a query's K walk rows are
 contiguous (rows [q*K, (q+1)*K)).
@@ -176,9 +173,11 @@ def build_query_walk_tokens(
     ts = wd.timestamps.to(device)                                 # [W, L] int64 t_edge
     lens = wd.lens.to(device)                                     # [W]
 
-    # ── 2. Keep every real, non-seed-slot context position (self-recurrences INCLUDED). ──
+    # ── 2. Keep only real, non-seed-slot, non-origin context positions. ──
     pos = torch.arange(length, device=device).view(1, length)
-    valid = pos < (lens.view(w, 1) - 1)                          # drop seed slot + padding only
+    is_ctx = pos < (lens.view(w, 1) - 1)                          # drop seed slot + padding
+    origin = wd.seeds.to(device).repeat_interleave(k)             # [W] each row's seed id
+    valid = is_ctx & (nodes != origin.view(w, 1))                # [W, L]
 
     # ── 3. Collapse each query's K walk rows: [Q*K, L] -> [Q, K*L], query-major. ──
     nodes_q = nodes.reshape(q, k * length)

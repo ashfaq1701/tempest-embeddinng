@@ -1,59 +1,43 @@
-"""Geometric link head — REACH (one-sided drift), vMF NEIGHBOURHOOD SUMMARY.
+"""Geometric link head — REACH (one-sided drift), COUNT-FREE.
 
-The source's walk tokens are summarised by the WEIGHTED SPHERICAL RESULTANT — the von
-Mises–Fisher (vMF) summary of the neighbourhood — which keeps the COUNT and AGE that the old
-softmax centroid normalized away:
+Builds a displacement μ_u for the source ONLY, from its walk tokens, and scores each candidate
+by how close its STATIC embedding E[v] is to u's drifted position:
 
-  R_u       = Σ_p w_p · Ê[node_p] ,  w_p = exp(−λ·age_p)        (ambient, UN-normalized)
-  center_u  = R_u / ‖R_u‖                                        representative point ON the sphere
-  mass_u    = Σ_p w_p                                            recency-weighted COUNT (age+count)
-  coh_u     = ‖R_u‖ / mass_u ∈ [0,1]                             COHERENCE (1 = agree, 0 = dispersed)
+  μ_u = drift in T_{E[u]}                             (recency centroid of u's Log vectors)
+  q_u = exp_{E[u]}(μ_u)                               u's drifted position, back ON the sphere
+  reach(u,v) = ⟨q_u, E[v]⟩                            does u's drift reach v?
 
-One arrow R_u carries everything. The DIRECTION (center_u) is the consensus point of the
-neighbourhood — age and relative multiplicity bend it (recent / repeated neighbours pull
-harder). The LENGTH splits into mass_u (how many recent neighbours — the absolute count×recency
-softmax destroyed by dividing by Σw) and coh_u (how tightly they agree). A single sphere point
-is a pure direction and cannot store an absolute count, so the count lives in the companion
-scalar mass_u — that is the correct factorisation, not a workaround: direction = WHERE,
-concentration = HOW SURE.
+The candidate side samples NO walks — there is no μ_v. q_u is u's neighbourhood pushed off
+E[u]; the inner product with the unit E[v] asks "how close is v to where u's neighbourhood is
+heading?". reach rises when v sits in the region u drifts toward, even if E[u], E[v] are far
+apart. coef_reach init 0 ⇒ the head starts as the proven query-anchored baseline and reach earns
+its weight. Age stays t_query − t_edge throughout (the trainer forms it; the head never
+re-defines it). The score is identity + reach:
 
-  μ_u   = Log_{E[u]}(center_u)            tangent drift to the centre (feeds identity)
-  r_u   = ĝate(coh_u) · μ̂_u              heading, gated by COHERENCE (not ‖μ‖)
-  q_u   = center_u                        u's drifted position is the centre itself
-  reach(u,v) = κ(mass_u, coh_u) · ⟨ center_u , E_v ⟩    sharpened by count + coherence
+  TOKEN BASIS — the source seed carries a COUNT-FREE bag of walk-reached positions p (one token
+  per reached position; a node recurring k times is k tokens). μ sums the softmax over those
+  tokens directly — multiplicity is implicit in token repetition, no explicit count. age_p =
+  t_query − t_edge(p).
 
-The token bag now KEEPS self-recurrences (u re-entering its own neighbourhood) — in this
-ambient-resultant construction a self-token contributes w_self·Ê[u] (a real unit vector), not
-the zero tangent vector the old softmax-Log centroid produced, so it is legitimate evidence of
-u's self-activity that bends the centre toward E[u] and feeds mass/coherence.
-
-The score is identity + reach:
+  μ_u = Σ_p softmax_p(−λ·age_p)·Log_{E[u]}(E[node_p ∈ u-tokens]) ; r_u = ĝate(μ_u)
 
   identity = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )          is v in u's region?     [B,C]
-  reach    = κ_u · ⟨ center_u , E_v ⟩                          does v match u's centre, [B,C]
-                                                                how confidently?
+  reach    = ⟨ exp_{E[u]}(μ_u), E_v ⟩                          does u's drift reach v?  [B,C]
   geo   = coef_identity·identity + coef_reach·reach
   logit = geo + coef_staleness·staleness(v) [+ coef_pair·pair + coef_pair_count·log1p(cnt)]
 
-κ(mass, coh) = softplus(W·[log1p(mass), coh] + b) is the vMF CONCENTRATION: many recent agreeing
-neighbours ⇒ sharp, trustworthy centre ⇒ strong reach; few / old / scattered ⇒ flat ⇒ weak. This
-is the native way a spherical centre expresses how much evidence backs it — and the place AGE and
-COUNT do real work in the score.
+Only the source builds μ — the candidate enters solely through its static embedding E[v]
+(identity + reach) and the staleness / pair channels.
 
-SPHERE-VALID — center_u is a unit vector by construction (normalize never leaves the sphere), so
-μ_u = Log_{E[u]}(center_u) has ‖μ‖ = angle(E[u], center_u) ≤ π (no exp-map wrap, no clamp).
+BASELINE AT INIT — coef_identity=1, coef_reach=0 ⇒ at init the head IS the proven identity term
+and nothing else; reach earns its weight from zero.
 
-BASELINE AT INIT — coef_identity=1, coef_reach=0 ⇒ at init the head is the identity term over the
-vMF centre; reach (where the absolute count enters via κ) earns its weight from zero. Age and
-RELATIVE count already act at init through the centre direction.
+COUNT-FREE — a node reached k times appears as k tokens, so its μ softmax-mass is summed across
+them; the old γμ·log(1+k) emphasis (learned ≈ −0.4, suppressed) is gone. The pair channel still
+carries its own recency+count.
 
-WHY THIS CENTRE — center_u is the maximum-likelihood mean direction of a vMF distribution: the
-textbook "average of points on a sphere". The softmax tangent centroid only approximated it (a
-tangent-space average) and, by summing weights to 1, discarded mass_u and coh_u entirely.
-
-Only the source builds the summary — the candidate enters via its static E[v] (identity + reach)
-and the staleness / pair channels. E stays the single sphere parameter (link-trained, no detach).
-Ages are raw t_query − t_edge (cutoffs − pos_ts).
+TIME UNITS — raw ages; μ softmax scale-invariant (λ self-scales). E stays the single sphere
+parameter (link-trained, no detach).
 """
 import math
 
@@ -85,20 +69,13 @@ class GeometricPointHead(nn.Module):
         self.d_emb = d_emb
         self.eps = 1e-6
 
-        # Recency λ for the resultant weights w_p = exp(−λ·age_p). init λ ≈ 10/t_train.
+        # Shared μ recency λ (softmax, scale-invariant), init λ ≈ C/t_train so λ·age~O(1).
         lam0 = 10.0 / max(float(t_train), 1.0)
         self.log_lambda = nn.Parameter(
             torch.tensor([math.log(math.expm1(lam0))], dtype=torch.float32))
         self.alpha = nn.Parameter(torch.tensor(10.0))     # shared distance weight
         self.log_a = nn.Parameter(torch.zeros(1))         # anisotropic ellipse (a,b ≥ 0)
         self.log_b = nn.Parameter(torch.zeros(1))
-
-        # vMF concentration κ(mass, coh) = softplus(W·[log1p(mass), coh] + b).
-        # init: W=0, b→softplus≈1 ⇒ reach starts as plain ⟨center, E_v⟩; count/coherence
-        # sharpening earns its weight.
-        self.kappa_head = nn.Linear(2, 1)
-        nn.init.zeros_(self.kappa_head.weight)
-        nn.init.constant_(self.kappa_head.bias, math.log(math.expm1(1.0)))
 
         # --- candidate staleness channel ---------------------------------------
         self.basis_staleness = ExpDecayBasis(d_time, t_train)
@@ -113,6 +90,7 @@ class GeometricPointHead(nn.Module):
         # --- geometric mix coefficients ----------------------------------------
         # identity is the proven baseline (init 1); reach earns weight (init 0).
         self.coef_identity = nn.Parameter(torch.ones(1))
+        # REACH — ⟨exp_{E[u]}(μ_u), E_v⟩: does u's one-sided drift reach v? coef init 0.
         self.coef_reach = nn.Parameter(torch.zeros(1))
         self.coef_staleness = nn.Parameter(torch.ones(1))
         if use_pair_features:
@@ -129,6 +107,18 @@ class GeometricPointHead(nn.Module):
         orth = x - c * p
         return theta * orth / orth.norm(dim=-1, keepdim=True).clamp_min(self.eps)
 
+    def _expmap(self, p: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+        """exp_p(δ) = cos‖δ‖·p + sin‖δ‖·δ/‖δ‖ ∈ S^{d-1}. δ = μ is a sum of Log_p's (all ⊥ p),
+        so the result is unit-norm; ‖δ‖ capped to the injectivity radius (<π); δ→0 ⇒ exp_p(δ)=p
+        (a cold node drifts nowhere). Final normalize is a numeric belt. Sends u's tangent
+        displacement back ONTO the sphere so q_u = exp_{E[u]}(μ_u) lives on the SAME manifold as
+        the candidate's unit E[v] and ⟨q_u, E[v]⟩ is a plain inner product."""
+        norm = delta.norm(dim=-1, keepdim=True)                     # ‖μ‖ = drift angle
+        theta = norm.clamp(max=math.pi - self.eps)
+        coef = torch.sin(theta) / norm.clamp_min(self.eps)         # → 0 as norm→0 (q→p)
+        q = torch.cos(theta) * p + coef * delta
+        return F.normalize(q, dim=-1)
+
     def _ellipse_dist_sq(self, delta: torch.Tensor, r: torch.Tensor,
                          a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         """Ellipse distance² a‖δ∥‖²+b‖δ⊥‖² in the heading frame r. delta [...,d];
@@ -137,37 +127,29 @@ class GeometricPointHead(nn.Module):
         dperp2 = ((delta * delta).sum(-1) - dpar2).clamp_min(0.0)
         return a * dpar2 + b * dperp2
 
-    def _heading(self, mu: torch.Tensor, coh: torch.Tensor) -> torch.Tensor:
-        """Gated heading r = g(coh)·μ̂, g = coh²/(coh²+m0²) → 0 dispersed (isotropic), 1 coherent.
-        Gated by neighbourhood COHERENCE — under the resultant centre ‖μ‖ is distance-to-centre,
-        not agreement, so coh (the mean resultant length) is the right anisotropy signal."""
-        c = coh.unsqueeze(-1)
-        m0 = 0.3
-        gate = (c * c) / (c * c + m0 * m0)
-        return gate * mu / mu.norm(dim=-1, keepdim=True).clamp_min(self.eps)
+    def _heading(self, mu: torch.Tensor) -> torch.Tensor:
+        """Gated heading r = g(‖μ‖)·μ/‖μ‖, g=‖μ‖²/(‖μ‖²+m0²) → 0 cold (isotropic), 1 warm."""
+        mu_norm = mu.norm(dim=-1, keepdim=True)
+        m0 = 0.05
+        gate = (mu_norm * mu_norm) / (mu_norm * mu_norm + m0 * m0)
+        return gate * mu / mu_norm.clamp_min(self.eps)
 
     # ──────────────────────────────────────────────────────────────────
-    # Neighbourhood summary — weighted spherical resultant (vMF MLE)
+    # μ — recency center of mass over a token bag (frame-agnostic)
     # ──────────────────────────────────────────────────────────────────
 
-    def _directional_mean(self, ids: torch.Tensor, nmask: torch.Tensor,
-                          ages: torch.Tensor, e_weight: torch.Tensor):
-        """Weighted spherical resultant of the token bag → (center, mass, coherence).
-           R = Σ_p w_p·Ê[node_p], w_p = exp(−λ·age_p) (0 on padding).
-             center    [...,d]  = R/‖R‖           vMF mean direction (a unit sphere point)
-             mass      [...]     = Σ_p w_p         recency-weighted COUNT (age+count scalar)
-             coherence [...]     = ‖R‖/mass ∈[0,1] how tightly the neighbourhood agrees
-           ids/nmask/ages [...,U]. Count-free bag: a node reached k times is k tokens ⇒ k·w_p
-           mass in R. Cold bag (all-pad) ⇒ R = 0 ⇒ center ≈ 0, mass = 0, coherence = 0."""
+    def _mu_from_csr(self, base_emb: torch.Tensor, ids: torch.Tensor, nmask: torch.Tensor,
+                     ages: torch.Tensor, e_weight: torch.Tensor) -> torch.Tensor:
+        """μ = Σ_p softmax_p(−λ·age_p)·Log_base(E[node_p]) over the seed's token positions.
+           base [...,d] ; ids/nmask/ages [...,U]  ->  μ [...,d]. Count-free: a node recurring
+           k times is k tokens, so its softmax mass is summed across them automatically."""
+        base = F.normalize(base_emb, dim=-1)
         ew = F.normalize(F.embedding(ids.clamp_min(0), e_weight), dim=-1)   # [...,U,d]
+        g = self._logmap(base.unsqueeze(-2), ew)                           # [...,U,d]
         lam = F.softplus(self.log_lambda)
-        w = torch.exp(-lam * ages) * nmask.to(ages.dtype)                  # [...,U] (0 on pad)
-        R = (w.unsqueeze(-1) * ew).sum(dim=-2)                            # [...,d]
-        mass = w.sum(dim=-1)                                              # [...]
-        Rnorm = R.norm(dim=-1)                                            # [...]
-        center = R / Rnorm.clamp_min(self.eps).unsqueeze(-1)             # [...,d]
-        coherence = Rnorm / mass.clamp_min(self.eps)                     # [...]
-        return center, mass, coherence
+        ell = (-lam * ages).masked_fill(~nmask, float("-inf"))            # [...,U]
+        w = torch.nan_to_num(torch.softmax(ell, dim=-1), nan=0.0)
+        return (w.unsqueeze(-1) * g).sum(dim=-2)                          # [...,d]
 
     # ──────────────────────────────────────────────────────────────────
     # identity — probe an embedding against a prediction (frame-agnostic)
@@ -193,8 +175,11 @@ class GeometricPointHead(nn.Module):
                 staleness_dt: torch.Tensor,    # [B, C]
                 pair_dt: torch.Tensor = None,
                 pair_count_log: torch.Tensor = None) -> torch.Tensor:
-        """-> logits [B, C]. E_u = e_weight[src_tokens.seeds], E_v = e_weight[cand_ids];
-        token ages = src_tokens.cutoffs − src_tokens.pos_ts."""
+        """-> logits [B, C]. The head owns all embedding lookups and timing: E_u, E_v and the
+        token embeddings all come from `e_weight` (E_u = e_weight[src_tokens.seeds],
+        E_v = e_weight[cand_ids]); token ages come from src_tokens.cutoffs − src_tokens.pos_ts.
+        The trainer only hands over the table, the (self-contained) source walk tokens, the
+        candidate ids, and the store-derived staleness / pair channels."""
         B, C = cand_ids.shape[0], cand_ids.shape[1]
         d = self.d_emb
         E_u = F.embedding(src_tokens.seeds, e_weight)             # [B, d]
@@ -205,25 +190,26 @@ class GeometricPointHead(nn.Module):
         b = F.softplus(self.log_b)
         alpha = self.alpha.clamp_min(1e-3)
 
-        # --- neighbourhood summary: vMF resultant (centre + count/age mass + coherence) ---
+        # --- prediction μ_u (dense per-row softmax over the source token bag) ---
         src_ages = (src_tokens.cutoffs.unsqueeze(-1)
                     - src_tokens.pos_ts).clamp_min(0).to(eu.dtype)   # [B, U]
-        center, mass, coh = self._directional_mean(
-            src_tokens.node_ids, src_tokens.node_mask, src_ages, e_weight)   # [B,d],[B],[B]
-
-        mu_u = self._logmap(eu, center)                          # [B,d] drift to the centre
-        r_u = self._heading(mu_u, coh)                           # [B,d] coherence-gated heading
-        eu_bc = eu.unsqueeze(1).expand(B, C, d)                  # [B,C,d]
+        mu_u = self._mu_from_csr(
+            E_u, src_tokens.node_ids, src_tokens.node_mask, src_ages, e_weight)  # [B,d]
+        r_u = self._heading(mu_u)                                 # [B,d]
+        eu_bc = eu.unsqueeze(1).expand(B, C, d)                   # [B,C,d]
         mu_u_bc = mu_u.unsqueeze(1).expand(B, C, d)
         r_u_bc = r_u.unsqueeze(1).expand(B, C, d)
 
         # --- identity: is v in u's region? (proven baseline) ---
         q_ident = self._identity(eu_bc, ev, mu_u_bc, r_u_bc, a, b, alpha)   # [B,C]
 
-        # --- reach: κ(mass, coh)·⟨centre, E_v⟩ — count & age set the centre's confidence ---
-        kappa = F.softplus(self.kappa_head(
-            torch.stack([torch.log1p(mass), coh], dim=-1))).squeeze(-1)     # [B]
-        reach = kappa.unsqueeze(-1) * (center.unsqueeze(1) * ev).sum(-1)    # [B,C]
+        # --- REACH: push u's drift off E[u] back onto the sphere and inner-product it with the
+        # candidate's STATIC embedding. No μ_v — the candidate side samples no walks. q_u is u's
+        # neighbourhood centroid drifted off E[u]; ⟨q_u, E_v⟩ asks whether v sits where u's
+        # neighbourhood is heading. Rises when v is in u's drift region even if E[u], E[v] are
+        # structurally far apart. coef_reach init 0 ⇒ no-op at init.
+        q_u = self._expmap(eu, mu_u)                              # [B,d]   drifted source pos
+        reach = (q_u.unsqueeze(1) * ev).sum(-1)                  # [B,C]   ⟨q_u, E_v⟩
 
         geo = (self.coef_identity * q_ident
                + self.coef_reach * reach)
