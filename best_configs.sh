@@ -5,15 +5,16 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# wiki   (val 0.8262 / test 0.8027 @ ep17, no-pf — GeometricPointHead REACH on the
-#         PER-QUERY CAUSAL substrate: ingest the batch into Tempest BEFORE scoring, then
-#         walk each query (u, t) with cutoff=t (strict-before-t, == TPNet). Same head as
-#         old reach (val 0.8046 / test 0.7779); +0.025 test from the substrate alone.
-#         REQUIRES temporal-random-walk>=1.8.6 (cutoff_times). Smooth monotone curve.)
+# wiki   (val 0.8268 / test 0.8035 @ ep15, no-pf — GeometricPointHead REACH (softmax-μ,
+#         COUNT-FREE, self-excluded) on the PER-QUERY CAUSAL substrate: ingest the batch into
+#         Tempest BEFORE scoring, then walk each query (u, t) with cutoff=t (strict-before-t,
+#         == TPNet). REQUIRES temporal-random-walk>=1.8.6 (cutoff_times).
+#         Walk-config campaign (seed42, 2026-06-25): walks 10 > 5 (+0.0010 val, best of {5,10});
+#         longer walks HURT (len10 −0.009, len20 −0.011 val) so len stays 5. d_emb 128.)
 .venv/bin/python scripts/train.py \
   --dataset tgbl-wiki \
   --k-train 100 \
-  --num-walks-per-node-query-side 5 --max-walk-len-query-side 5 \
+  --num-walks-per-node-query-side 10 --max-walk-len-query-side 5 \
   --d-emb 128 \
   --batch-size 200 --eval-batch-size 20 \
   --num-epochs 50 --early-stop-patience 5 \

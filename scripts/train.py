@@ -93,8 +93,10 @@ def parse_args() -> argparse.Namespace:
 
     # Walks (BACKWARD only, undirected). Decoupled QUERY-side (source u → μ) and
     # CANDIDATE-side (v → connectors for the cross channel); same Tempest graph.
-    p.add_argument("--num-walks-per-node-query-side", default=5, type=int,
-                   help="K walks per source u (build μ).")
+    p.add_argument("--num-walks-per-node-query-side", default=10, type=int,
+                   help="K walks per source u (build μ). (Sweep on wiki seed42: 10 > 5 by "
+                        "+0.0010 val / +0.0001 test — best of {5,10}, within noise but the "
+                        "best, so adopted as default.)")
     p.add_argument("--max-walk-len-query-side", default=5, type=int,
                    help="L, max walk length for the query-side walks. (Sweep on wiki: "
                         "shorter is better — 20→5 gave +0.006 test, monotone, more stable.)")
