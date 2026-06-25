@@ -10,7 +10,6 @@ ordering (training):
        GeometricPointHead (identity + reach). Candidate side samples no walks (static E[v]).
   5. L = cross_entropy(logits / tau_link, target=0)  — Bruch 2019, upper-bounds 1-MRR
   6. one backward + single optimizer step
-  7. pair_store update                                — post-scoring (store has no cutoff)
 
 Why ingest-first is valid (and == TPNet): a walk for (u, t) with cutoff = t traverses only
 edges with t_edge < t (EXCLUSIVE), so the target edge at t — and any simultaneous/future
@@ -46,7 +45,6 @@ from .evaluator import Evaluator
 from .link_pred_head import GeometricPointHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
-from .pair_store import PairRecencyStore
 from .utils import make_lr_lambda
 from .walk_tokens import build_query_walk_tokens
 from .walks import WalkGenerator
@@ -69,10 +67,6 @@ class TrainerConfig:
     # Link loss / head.
     tau_link: float = 1.0       # softmax-CE temperature
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
-
-    # Exact pairwise (u,v) recurrence channel, added as one logit term. Flagged; the
-    # in-geometry count term aims to make it droppable.
-    use_pair_features: bool = False
 
     # Walks (BACKWARD only, undirected). QUERY-side: source u → μ_u tokens.
     num_walks_per_node_query_side: int = 5
@@ -117,14 +111,8 @@ class Trainer:
         ).to(self.device)
         self.link_head = GeometricPointHead(
             d_emb=int(config.d_emb),
-            use_pair_features=config.use_pair_features,
             t_train=float(config.t_train),
         ).to(self.device)
-
-        self.pair_store = (
-            PairRecencyStore(num_nodes=config.num_nodes)
-            if config.use_pair_features else None
-        )
 
         # One generator, configured QUERY-side; only the source side samples walks.
         self.walk_gen = WalkGenerator(
@@ -213,17 +201,10 @@ class Trainer:
             start_bias=self.config.start_bias_candidate_side,
             walk_bias=self.config.walk_bias_candidate_side)
 
-        # (Flagged) pair channel — store-derived (sequential side state the head can't own);
-        # everything embedding-related the head derives itself.
-        pair_dt = pair_count_log = None
-        if self.pair_store is not None:
-            pair_dt, pair_count_log = self.pair_store.query(src_t, cand_t, t_query_t)
-
         return self.link_head(
             self.embedding_table.E.weight,   # the whole table; head indexes E_u / E_v / tokens
             src_csr,                         # self-contained source walk CSR (seeds + cutoffs)
-            cand_csr,                        # candidate walk CSR (B*C rows); seeds == cand ids → E_v, μ_v
-            pair_dt=pair_dt, pair_count_log=pair_count_log)
+            cand_csr)                        # candidate walk CSR (B*C rows); seeds == cand ids → E_v, μ_v
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
@@ -262,11 +243,6 @@ class Trainer:
             self.sched.step()
             self._global_step += 1
 
-        # Tempest was ingested at the top of the step (cutoff keeps it causal). The stores
-        # have no cutoff, so update them LAST — their pre-batch state is their causal form.
-        if self.pair_store is not None:
-            self.pair_store.update(batch.src, batch.tgt, batch.ts)
-
         return {
             "link": float(loss.detach()),
             "lr": float(self.opt.param_groups[0]["lr"]),
@@ -295,8 +271,6 @@ class Trainer:
                 if B == 0:
                     if recorder is not None:
                         recorder.after_batch(batch)
-                    if self.pair_store is not None:
-                        self.pair_store.update(batch.src, batch.tgt, batch.ts)
                     continue
 
                 _, neg_tgt_list = evaluator.sample_negatives(batch)
@@ -324,9 +298,6 @@ class Trainer:
 
                 if recorder is not None:
                     recorder.after_batch(batch)
-                # Tempest already ingested above; stores (no cutoff) update last.
-                if self.pair_store is not None:
-                    self.pair_store.update(batch.src, batch.tgt, batch.ts)
         return total / max(n, 1)
 
     # ──────────────────────────────────────────────────────────────────
@@ -373,8 +344,6 @@ class Trainer:
 
         for ep in range(1, n_epochs + 1):
             self.walk_gen.reset()
-            if self.pair_store is not None:
-                self.pair_store.reset()
             self.embedding_table.train()
             self.link_head.train()
 

@@ -21,11 +21,12 @@ from .sparse_store import SparseStreamStore
 
 
 class PairRecencyStore:
-    """Streaming exact last-interaction time per undirected node pair. Supplies the
-    (u,v)-recency Δt for the head's pair channel (now encoded by Time2Vec). The `count`
-    column is kept only to detect never-seen pairs (count==0). NOTE: the Δt=1e18 sentinel
-    for never-seen pairs was a clean φ→0 under the old ExpDecayBasis; under Time2Vec
-    cos(·) it is NOT 0, so never-seen is flagged by count_log=0, not by the recency term."""
+    """Streaming exact last-interaction time + count per undirected node pair.
+
+    NOTE: the model's pair-feature channel was removed — this store is now used ONLY by the
+    stratification analysis (`stratify.py`), which queries `count` to split test edges into
+    repeat-pair (count>0) vs new-pair (count==0) and localize where MRR is lost. The `pair_dt`
+    return is vestigial (kept so the analysis recorder's call signature is unchanged)."""
 
     def __init__(self, num_nodes: int):
         self.N = int(num_nodes)

@@ -25,7 +25,7 @@ throughout (the trainer forms it; the head never re-defines it). The score is id
   identity = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )          is v in u's region?     [B,C]
   reach    = ⟨ exp_{E[u]}(μ_u), E_v ⟩ + ⟨ E_u, exp_{E[v]}(μ_v) ⟩   symmetric drift     [B,C]
   geo   = coef_identity·identity + coef_reach·reach
-  logit = geo [+ coef_pair·pair + coef_pair_count·log1p(cnt)]
+  logit = geo + coef_timeline·timeline(u, v)
 
 identity stays ASYMMETRIC (anchored at the source u); reach is SYMMETRIC — both u and v build a
 μ from their own candidate/source walk bag. The candidate side now samples walks (cand_tokens).
@@ -34,8 +34,7 @@ BASELINE AT INIT — coef_identity=1, coef_reach=0 ⇒ at init the head IS the p
 and nothing else; reach earns its weight from zero.
 
 COUNT-FREE — a node reached k times appears as k tokens, so its μ softmax-mass is summed across
-them; the old γμ·log(1+k) emphasis (learned ≈ −0.4, suppressed) is gone. The pair channel still
-carries its own recency+count.
+them; the old γμ·log(1+k) emphasis (learned ≈ −0.4, suppressed) is gone.
 
 TIME UNITS — raw ages; μ softmax scale-invariant (λ self-scales). E stays the single sphere
 parameter (link-trained, no detach).
@@ -69,8 +68,7 @@ class Time2Vec(nn.Module):
 
 
 class GeometricPointHead(nn.Module):
-    def __init__(self, d_emb: int, d_time: int = 16,
-                 use_pair_features: bool = False, t_train: float = 1.0):
+    def __init__(self, d_emb: int, d_time: int = 16, t_train: float = 1.0):
         super().__init__()
         self.d_emb = d_emb
         self.eps = 1e-6
@@ -82,12 +80,6 @@ class GeometricPointHead(nn.Module):
         self.alpha = nn.Parameter(torch.tensor(10.0))     # shared distance weight
         self.log_a = nn.Parameter(torch.zeros(1))         # anisotropic ellipse (a,b ≥ 0)
         self.log_b = nn.Parameter(torch.zeros(1))
-
-        # --- pair channel (FLAGGED) --------------------------------------------
-        self.use_pair_features = use_pair_features
-        if use_pair_features:
-            self.basis_pair = Time2Vec(d_time)
-            self.pair_head = nn.Linear(d_time, 1)
 
         # --- TIMELINE channel (BOTH sides, ALWAYS ON, init-0) — replaces staleness ------------
         # Staleness was just "v's last gap" (one number). This encodes the whole timeline of BOTH
@@ -108,9 +100,6 @@ class GeometricPointHead(nn.Module):
         # REACH — ⟨exp_{E[u]}(μ_u), E_v⟩: does u's one-sided drift reach v? coef init 0.
         self.coef_reach = nn.Parameter(torch.zeros(1))
         self.coef_timeline = nn.Parameter(torch.zeros(1))   # both-sided timeline, init 0 → no-op
-        if use_pair_features:
-            self.coef_pair = nn.Parameter(torch.ones(1))
-            self.coef_pair_count = nn.Parameter(torch.zeros(1))
 
     # ──────────────────────────────────────────────────────────────────
     # Geometry primitives (shape-agnostic over leading axes)
@@ -234,13 +223,12 @@ class GeometricPointHead(nn.Module):
                                                # ARE the candidate ids (row-major over [B, C]);
                                                # `cutoffs` ARE the query times. No separate
                                                # cand_ids — it is just seeds reshaped to [B, C].
-                pair_dt: torch.Tensor = None,
-                pair_count_log: torch.Tensor = None) -> torch.Tensor:
+                ) -> torch.Tensor:
         """-> logits [B, C]. The head owns all embedding lookups and timing: E_u, E_v and the
         token embeddings all come from `e_weight`. The candidate ids are recovered from the
         candidate bag (`cand_tokens.seeds` reshaped to [B, C]); B = #source seeds, C = (B*C)/B.
         Token ages come from each bag's cutoffs − pos_ts. The trainer hands over only the table,
-        the source bag, the candidate bag, and the (flagged) pair channel."""
+        the source bag, and the candidate bag."""
         B = src_tokens.seeds.shape[0]
         C = cand_tokens.seeds.shape[0] // B
         d = self.d_emb
@@ -297,11 +285,5 @@ class GeometricPointHead(nn.Module):
         pair_tl = torch.cat([fu.unsqueeze(1).expand(B, C, fu.shape[-1]), fv], dim=-1)  # [B,C,2·d_tl]
         timeline = self.timeline_head(pair_tl).squeeze(-1)               # [B, C]
         logit = logit + self.coef_timeline * timeline
-
-        # --- PAIR channel (FLAGGED) ---
-        if self.use_pair_features:
-            pair = self.pair_head(self.basis_pair(pair_dt)).squeeze(-1)
-            logit = (logit + self.coef_pair * pair
-                     + self.coef_pair_count * pair_count_log)
 
         return logit
