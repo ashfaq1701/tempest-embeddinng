@@ -21,6 +21,63 @@ InfoNCE contrastive loss + a separate BCE link head.
 
 ---
 
+## How to look at this project — the batch-blindness lesson (READ THIS FIRST)
+
+This is the most important methodological lesson of the project. It was learned the hard
+way (the AI explored for nights in the wrong place), so it is pinned here for every future
+session.
+
+### The discovery — the +0.025 substrate win
+
+For a long time we sat ~0.025 test below TPNet on tgbl-wiki and chased the gap in the
+**model** — head architectures, losses, biases (vMF resultant, reach_count, symmetric reach,
+timeline/gap-stats, …). The gap was not in the model. It was in the **substrate**:
+
+- **TPNet** ingests the FULL graph once, then answers each query with a **time cutoff**:
+  "neighbours of node n with `t_edge < t`". So a later edge in a batch CAN use connectivity
+  from earlier edges in the same batch. TPNet is **not batch-blind**.
+- **Our original pipeline** ingested each batch's edges into Tempest at the **END** of the
+  batch, after scoring. So inside a batch we had NO knowledge of same-batch interactions —
+  **batch-blind**.
+
+The fix: add a **`cutoff_time`** parameter to Tempest walk queries — "even if the graph holds
+future edges, walk only up to cutoff time (EXCLUSIVE)". Ingest the batch FIRST, then walk each
+query `(u, t)` with `cutoff = t`. This is exactly TPNet's strictly-before-`t` neighbour query,
+and it is causally valid (the target edge at `t` and any simultaneous/future edge are never
+seen; same-batch-EARLIER edges legitimately are). This lifted reach **+0.025 test from the
+SUBSTRATE alone** — "the TPNet gap was a substrate problem, not a head problem."
+
+### The meta-lesson (the part that matters going forward)
+
+The failure that cost nights was one of FRAMING, and it has a general form:
+
+1. **A "ceiling" / "tie within noise" / "structural gap" / "wiki is the wrong workload" is a
+   statement about the CHOICES you froze — not about the problem.** When you hit one, the
+   question is NOT "what head knob next"; it is "which frozen choice produces this boundary,
+   and why is it frozen?"
+2. **The one-line refutation of any claimed wiki ceiling: TPNet gets 0.827 on the SAME wiki,
+   same negatives, same split.** If a competitor clears the band on identical data, there is
+   no ceiling — there is a band you reach under your current substrate+architecture, and a
+   findable mechanistic difference. Do NOT report the band as a destination.
+3. **Substrate, protocol, loss, eval, walk-sampling, AND architecture are all variables — none
+   is a given.** The biggest win came from the layer that "obviously" looked correct. Nothing
+   is off-limits to change; do not silently restrict the search to head-space.
+4. **When there is a gap to a SPECIFIC baseline, audit that baseline MECHANISTICALLY before
+   tuning knobs.** Reconstruct, edge by edge, what it can see/compute at scoring time vs what
+   you can — the information-set audit finds substrate asymmetries (it found batch-blindness);
+   the architecture audit finds the rest (TPNet's joint decoder, link-trained E, random-
+   projection recurrence features, …).
+5. **Stratify to localize the gap, then change the layer that OWNS it — even the "fixed" one.**
+   The wiki gap lives on the new-pair / cold-start slice; a recency channel that ties on
+   repeats cannot close it. Match the baseline's mechanism for that slice rather than
+   approximating it in the head.
+
+Default posture: treat every boundary as provisional and every frozen choice as a candidate to
+change. The substrate fix is the proof, and `--stratify` (see `stratify.py`) is the tool for
+step 5.
+
+---
+
 ## Architecture
 
 ### Loss
