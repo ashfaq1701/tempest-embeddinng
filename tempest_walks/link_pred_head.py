@@ -89,23 +89,25 @@ class GeometricPointHead(nn.Module):
             self.basis_pair = Time2Vec(d_time)
             self.pair_head = nn.Linear(d_time, 1)
 
-        # --- candidate freshness channel (ALWAYS ON, init-0) -------------------
-        # Per candidate v: "how recently AND how repeatedly was v's neighbourhood active before
-        # the query". Time2Vec(age) on every candidate-bag token, recency-weighted SUM (not mean —
-        # the sum keeps the count half), → Linear → scalar. Its OWN λ_fresh + Time2Vec, decoupled
-        # from μ's softmax recency. Per-(B,C) so it reorders candidates within a query.
-        self.basis_fresh = Time2Vec(d_time)
-        self.log_lambda_fresh = nn.Parameter(
-            torch.tensor([math.log(math.expm1(10.0 / max(float(t_train), 1.0)))],
-                         dtype=torch.float32))
-        self.fresh_head = nn.Linear(d_time, 1)
+        # --- TIMELINE channel (BOTH sides, ALWAYS ON, init-0) — replaces staleness ------------
+        # Staleness was just "v's last gap" (one number). This encodes the whole timeline of BOTH
+        # u and v: per node, [Time2Vec(age_since_last) ⊕ log1p(mean_gap), cv(gap), overdue] — the
+        # recency staleness had PLUS the inter-event STRUCTURE (burstiness via cv, periodicity via
+        # overdue=age/mean_gap) a recency weight can't express. d_fresh = d_time + 3 per node.
+        # A purely-additive SOURCE scalar is a no-op under per-query softmax (shifts all candidates
+        # equally), so u and v are combined by a JOINT pairwise MLP over [u_feat ⊕ v_feat] → scalar
+        # — u's timeline contributes only through its nonlinear interaction with v. coef init 0.
+        self.basis_timeline = Time2Vec(d_time)
+        d_tl = d_time + 3
+        self.timeline_head = nn.Sequential(
+            nn.Linear(2 * d_tl, d_time), nn.ReLU(), nn.Linear(d_time, 1))
 
         # --- geometric mix coefficients ----------------------------------------
         # identity is the proven baseline (init 1); reach earns weight (init 0).
         self.coef_identity = nn.Parameter(torch.ones(1))
         # REACH — ⟨exp_{E[u]}(μ_u), E_v⟩: does u's one-sided drift reach v? coef init 0.
         self.coef_reach = nn.Parameter(torch.zeros(1))
-        self.coef_fresh = nn.Parameter(torch.zeros(1))   # candidate freshness, init 0 → no-op
+        self.coef_timeline = nn.Parameter(torch.zeros(1))   # both-sided timeline, init 0 → no-op
         if use_pair_features:
             self.coef_pair = nn.Parameter(torch.ones(1))
             self.coef_pair_count = nn.Parameter(torch.zeros(1))
@@ -165,21 +167,48 @@ class GeometricPointHead(nn.Module):
         return (w.unsqueeze(-1) * g).sum(dim=-2)                          # [...,d]
 
     # ──────────────────────────────────────────────────────────────────
-    # candidate freshness — Time2Vec(age) recency-weighted SUM over the candidate bag
+    # timeline features — recency + inter-event (gap) STRUCTURE of a node's token bag
     # ──────────────────────────────────────────────────────────────────
 
-    def _candidate_freshness(self, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Per candidate (B*C rows): Σ_p w_p·Time2Vec(age_p), w_p = exp(−λ_fresh·age_p) on real
-           tokens, 0 on padding. SUM (not mean) keeps the count half — a busy-recent candidate
-           gets a larger-magnitude feature than a one-off. -> feat [B*C, d_time]. Cold candidate
-           (all-pad) ⇒ w=0 ⇒ feat=0 ⇒ fresh_head(0)=bias (a constant 'no recent activity')."""
-        ages = (cand_tokens.cutoffs.unsqueeze(-1)
-                - cand_tokens.pos_ts).clamp_min(0).float()                # [B*C, U_v]
-        mask = cand_tokens.node_mask.to(ages.dtype)                       # [B*C, U_v]
-        phi = self.basis_fresh(ages)                                     # [B*C, U_v, d_time]
-        lam = F.softplus(self.log_lambda_fresh)
-        w = torch.exp(-lam * ages) * mask                               # [B*C, U_v] (0 on pad)
-        return (w.unsqueeze(-1) * phi).sum(dim=-2)                      # [B*C, d_time]
+    def _timeline_features(self, pos_ts: torch.Tensor, node_mask: torch.Tensor,
+                           cutoffs: torch.Tensor) -> torch.Tensor:
+        """Per node (M rows): -> [M, d_time+3] =
+             [ Time2Vec(age_since_last)  (d_time, the recency staleness had),
+               log1p(mean_gap),          characteristic inter-event spacing,
+               cv(gap)=std/mean,         burstiness vs regularity,
+               age_since_last/mean_gap ] overdue-ness (periodicity signal).
+           pos_ts/node_mask [M, U], cutoffs [M]. Gaps = Δ between a row's consecutive token times
+           (sorted, masked). Cold (count<1) and single-token (count<2 ⇒ no gaps) rows are guarded
+           to 0 stats — the head learns their bias. NaN-safe: pad → +inf in the sort, invalid gaps
+           masked to 0 before any reduction; all divisors clamp_min."""
+        M, U = pos_ts.shape
+        ts = pos_ts.float()
+        mask = node_mask
+        count = mask.sum(-1)                                              # [M]
+        cutoff = cutoffs.float()                                          # [M]
+        # most-recent real timestamp → age_since_last
+        ts_max = ts.masked_fill(~mask, float("-inf")).max(-1).values      # [M]; -inf if cold
+        age_last = torch.where(count >= 1, (cutoff - ts_max).clamp_min(0.0),
+                               torch.zeros_like(cutoff))                  # [M]
+        # gaps between consecutive real times (sort pad to the end with +inf)
+        ts_sorted, _ = ts.masked_fill(~mask, float("inf")).sort(dim=-1)   # [M, U]
+        gaps = ts_sorted[:, 1:] - ts_sorted[:, :-1]                       # [M, U-1]
+        pos = torch.arange(U - 1, device=ts.device).unsqueeze(0)         # [1, U-1]
+        gap_valid = pos < (count.unsqueeze(-1) - 1)                       # [M, U-1] both ends real
+        gaps = torch.where(gap_valid, gaps, torch.zeros_like(gaps))      # invalid (incl inf) → 0
+        n_gaps = (count - 1).clamp_min(1).float()                        # [M]
+        mean_gap = gaps.sum(-1) / n_gaps                                 # [M]
+        mean_g2 = (gaps * gaps).sum(-1) / n_gaps
+        std_gap = (mean_g2 - mean_gap * mean_gap).clamp_min(0.0).sqrt()  # [M]
+        cv = std_gap / mean_gap.clamp_min(self.eps)
+        overdue = (age_last / mean_gap.clamp_min(self.eps)).clamp(max=1e3)
+        has_gaps = (count >= 2).to(ts.dtype)                            # log1p(mean_gap) safe at 0
+        valid = ((count >= 2) & (mean_gap > self.eps)).to(ts.dtype)     # cv/overdue need spacing>0
+        phi = self.basis_timeline(age_last)                            # [M, d_time]
+        scal = torch.stack([torch.log1p(mean_gap) * has_gaps,
+                            cv * valid,
+                            overdue * valid], dim=-1)                   # [M, 3]
+        return torch.cat([phi, scal], dim=-1)                          # [M, d_time+3]
 
     # ──────────────────────────────────────────────────────────────────
     # identity — probe an embedding against a prediction (frame-agnostic)
@@ -260,9 +289,14 @@ class GeometricPointHead(nn.Module):
                + self.coef_reach * reach)
         logit = geo
 
-        # --- candidate FRESHNESS channel (ALWAYS ON, init 0) ---
-        fresh = self.fresh_head(self._candidate_freshness(cand_tokens)).view(B, C)   # [B,C]
-        logit = logit + self.coef_fresh * fresh
+        # --- TIMELINE channel (BOTH sides, ALWAYS ON, init 0) — replaces staleness ---
+        fu = self._timeline_features(src_tokens.pos_ts, src_tokens.node_mask,
+                                     src_tokens.cutoffs)                  # [B, d_tl]
+        fv = self._timeline_features(cand_tokens.pos_ts, cand_tokens.node_mask,
+                                     cand_tokens.cutoffs).view(B, C, -1)  # [B, C, d_tl]
+        pair_tl = torch.cat([fu.unsqueeze(1).expand(B, C, fu.shape[-1]), fv], dim=-1)  # [B,C,2·d_tl]
+        timeline = self.timeline_head(pair_tl).squeeze(-1)               # [B, C]
+        logit = logit + self.coef_timeline * timeline
 
         # --- PAIR channel (FLAGGED) ---
         if self.use_pair_features:
