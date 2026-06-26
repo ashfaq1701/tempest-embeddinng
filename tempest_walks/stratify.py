@@ -226,7 +226,7 @@ def run_stratification(trainer, train_f, val_f, test_eval, test_f,
     Call AFTER `trainer.train(...)` (which restores best-val weights). Assumes the
     trainer exposes `walk_gen` and the `_eval(evaluator, batches, recorder=...)` hook.
     (The recorder keeps its OWN dedicated PairRecencyStore for the new-pair/repeat-pair
-    analysis; the model's pair-feature channel was removed.)
+    analysis; the model has no staleness/pair stores.)
     """
     print("\n=== Re-seeding train+val, then stratified test eval ===")
     trainer.walk_gen.reset()

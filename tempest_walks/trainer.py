@@ -57,8 +57,7 @@ class TrainerConfig:
     dst_pool: np.ndarray
 
     # Frozen train-split span. Sets the log-spaced init of the μ recency λ (init ≈ 10/t_train).
-    # (The pair channel's time encoder is now Time2Vec, whose frequencies are fixed at
-    # 1/10^[0..9] and do NOT depend on t_train.) Init only — never a per-step scaler.
+    # Init only — never a per-step scaler.
     t_train: float = 1.0
 
     # Model.
@@ -68,18 +67,12 @@ class TrainerConfig:
     tau_link: float = 1.0       # softmax-CE temperature
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
 
-    # Walks (BACKWARD only, undirected). QUERY-side: source u → μ_u tokens.
+    # Walks (BACKWARD only, undirected). QUERY-side only: source u → μ_u tokens. The candidate
+    # side samples no walks (reach compares against v's static embedding).
     num_walks_per_node_query_side: int = 5
     max_walk_len_query_side: int = 5
     walk_bias_query_side: str = "ExponentialWeight"
     start_bias_query_side: str = "ExponentialWeight"
-    # CANDIDATE-side: v → connector tokens (mirror of the query side). Reserved for a
-    # candidate-side / cross scoring path; the current one-sided reach head does not consume
-    # these yet, but the knobs are plumbed so the candidate walks can be wired without churn.
-    num_walks_per_node_candidate_side: int = 5
-    max_walk_len_candidate_side: int = 5
-    walk_bias_candidate_side: str = "ExponentialWeight"
-    start_bias_candidate_side: str = "ExponentialWeight"
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
     # Optimisation.
@@ -170,11 +163,9 @@ class Trainer:
         No dedup — each batch row is its own query. `build_query_walk_tokens` returns a
         self-contained WalkTokens (seeds + cutoffs + dense token bag); the head builds μ_u with
         a per-row softmax over the token bag (forming ages = cutoffs − t_edge itself, all > 0 by
-        the cutoff). The candidate side ALSO samples walks now (cand_csr → μ_v for the symmetric
-        reach term); it additionally enters through its static embedding E[v] (identity) and the
-        (flagged) pair channel. Strict causality comes from the per-query cutoff (both sides),
-        NOT from ingestion order, so the batch may already be
-        in Tempest."""
+        the cutoff). The candidate side samples no walks — it enters only through its static
+        embedding E[v] (identity + reach). Strict causality comes from the per-query cutoff, NOT
+        from ingestion order, so the batch may already be in Tempest."""
         device = self.device
 
         # --- SOURCE side: per-query (u_i, t_i) → K cutoff=t_i walks → token-stream CSR.
@@ -186,25 +177,10 @@ class Trainer:
             start_bias=self.config.start_bias_query_side,
             walk_bias=self.config.walk_bias_query_side)
 
-        # --- CANDIDATE side (symmetric reach): per (query, candidate) walk bag. Each candidate
-        # v in row i is walked with cutoff = t_i (the query's time), so its tokens are also the
-        # strict causal past of the query. Flatten [B, C] → [B*C] seeds; the head reshapes μ_v
-        # back to [B, C]. Cost scales with B*C — tune via --num-walks-per-node-candidate-side /
-        # --max-walk-len-candidate-side / eval batch size.
-        Bc, Cc = cand_t.shape
-        cand_flat = cand_t.reshape(Bc * Cc)
-        cand_cut_flat = t_query_t.unsqueeze(1).expand(Bc, Cc).reshape(Bc * Cc)
-        cand_csr = build_query_walk_tokens(
-            self.walk_gen, device, cand_flat, cand_cut_flat,
-            max_walk_len=self.config.max_walk_len_candidate_side,
-            num_walks_per_node=self.config.num_walks_per_node_candidate_side,
-            start_bias=self.config.start_bias_candidate_side,
-            walk_bias=self.config.walk_bias_candidate_side)
-
         return self.link_head(
             self.embedding_table.E.weight,   # the whole table; head indexes E_u / E_v / tokens
             src_csr,                         # self-contained source walk CSR (seeds + cutoffs)
-            cand_csr)                        # candidate walk CSR (B*C rows); seeds == cand ids → E_v, μ_v
+            cand_t)                          # candidate node ids
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step

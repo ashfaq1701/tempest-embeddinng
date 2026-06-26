@@ -107,7 +107,7 @@ def create_batches(split: SplitData, batch_size: int) -> Iterator[Batch]:
     Strict-causality consequence (intentional — this is what the stateful TGB
     baselines do): with timestamps now splittable, two edges sharing a timestamp
     can land in different batches, so the later batch sees the earlier edge's
-    ingested graph / last-seen state. Same-timestamp edges that land in
+    ingested graph state. Same-timestamp edges that land in
     the SAME batch still don't inform each other (ingest is post-batch). Per-edge
     quantities (t_query, the head's tok_age) are
     computed element-wise from `batch.ts` and are unaffected. Eval MRR is

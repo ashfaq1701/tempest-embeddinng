@@ -23,10 +23,9 @@ from .sparse_store import SparseStreamStore
 class PairRecencyStore:
     """Streaming exact last-interaction time + count per undirected node pair.
 
-    NOTE: the model's pair-feature channel was removed — this store is now used ONLY by the
-    stratification analysis (`stratify.py`), which queries `count` to split test edges into
-    repeat-pair (count>0) vs new-pair (count==0) and localize where MRR is lost. The `pair_dt`
-    return is vestigial (kept so the analysis recorder's call signature is unchanged)."""
+    Used ONLY by the stratification analysis (`stratify.py`) — there is no model pair
+    channel. stratify queries `count` to split test edges into repeat-pair (count>0) vs
+    new-pair (count==0) and localize where MRR is lost; the `pair_dt` return is vestigial."""
 
     def __init__(self, num_nodes: int):
         self.N = int(num_nodes)
@@ -54,10 +53,9 @@ class PairRecencyStore:
     def query(self, src: torch.Tensor, cand: torch.Tensor, t_query: torch.Tensor):
         """src [B] long, cand [B, C] long, t_query [B] long ->
         (pair_dt [B, C], pair_count_log [B, C]) on cand.device.
-          pair_dt        : RAW Δt_uv = t_query − t_last[(u,v)] (clamped ≥0; → Time2Vec cos).
-                           NEVER-seen (count==0) ⇒ Δt = +inf (1e18); under Time2Vec this is a
-                           large oscillating value (NOT a clean 0 — see class note).
-          pair_count_log : log1p(#(u,v) interactions) (0 for never-seen → flags never-seen)."""
+          pair_dt        : RAW Δt_uv = t_query − t_last[(u,v)] (clamped ≥0; → ExpDecayBasis).
+                           NEVER-seen (count==0) ⇒ Δt = +inf (1e18) ⇒ φ → 0 (clean baseline).
+          pair_count_log : log1p(#(u,v) interactions) (0 for never-seen → no count term)."""
         device = cand.device
         B, C = cand.shape
         s = src.detach().to("cpu", torch.int64).numpy()

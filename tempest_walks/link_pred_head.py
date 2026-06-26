@@ -5,15 +5,14 @@ by how close its STATIC embedding E[v] is to u's drifted position:
 
   μ_u = drift in T_{E[u]}                             (recency centroid of u's Log vectors)
   q_u = exp_{E[u]}(μ_u)                               u's drifted position, back ON the sphere
-  μ_v, q_v = the SAME, built from the candidate's own walk bag (symmetric)
-  reach(u,v) = ⟨q_u, E[v]⟩ + ⟨E[u], q_v⟩             does u reach v AND v reach u?
+  reach(u,v) = ⟨q_u, E[v]⟩                            does u's drift reach v?
 
-SYMMETRIC: both sides sample walks. q_u is u's neighbourhood drifted off E[u]; q_v is v's
-neighbourhood drifted off E[v]. The first inner product asks "does v sit where u is heading?",
-the second "does u sit where v is heading?". reach rises when each lands in the other's drift
-region, even if E[u], E[v] are structurally far apart. coef_reach init 0 ⇒ the head starts as
-the proven query-anchored baseline and reach earns its weight. Age stays t_query − t_edge
-throughout (the trainer forms it; the head never re-defines it). The score is identity + reach:
+The candidate side samples NO walks — there is no μ_v. q_u is u's neighbourhood pushed off
+E[u]; the inner product with the unit E[v] asks "how close is v to where u's neighbourhood is
+heading?". reach rises when v sits in the region u drifts toward, even if E[u], E[v] are far
+apart. coef_reach init 0 ⇒ the head starts as the proven query-anchored baseline and reach earns
+its weight. Age stays t_query − t_edge throughout (the trainer forms it; the head never
+re-defines it). The score is identity + reach:
 
   TOKEN BASIS — the source seed carries a COUNT-FREE bag of walk-reached positions p (one token
   per reached position; a node recurring k times is k tokens). μ sums the softmax over those
@@ -23,12 +22,12 @@ throughout (the trainer forms it; the head never re-defines it). The score is id
   μ_u = Σ_p softmax_p(−λ·age_p)·Log_{E[u]}(E[node_p ∈ u-tokens]) ; r_u = ĝate(μ_u)
 
   identity = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )          is v in u's region?     [B,C]
-  reach    = ⟨ exp_{E[u]}(μ_u), E_v ⟩ + ⟨ E_u, exp_{E[v]}(μ_v) ⟩   symmetric drift     [B,C]
-  geo   = coef_identity·identity + coef_reach·reach
-  logit = geo + coef_timeline·timeline(u, v)
+  reach    = ⟨ exp_{E[u]}(μ_u), E_v ⟩                          does u's drift reach v?  [B,C]
+  logit = coef_identity·identity + coef_reach·reach
 
-identity stays ASYMMETRIC (anchored at the source u); reach is SYMMETRIC — both u and v build a
-μ from their own candidate/source walk bag. The candidate side now samples walks (cand_tokens).
+Only the source builds μ — the candidate enters solely through its static embedding E[v]
+(identity + reach). This is the MINIMAL one-sided geometric head: no staleness, no time-encoding
+(ExpDecayBasis/Time2Vec), no pair channel — a clean base for an end-to-end redesign.
 
 BASELINE AT INIT — coef_identity=1, coef_reach=0 ⇒ at init the head IS the proven identity term
 and nothing else; reach earns its weight from zero.
@@ -48,27 +47,8 @@ import torch.nn.functional as F
 from .walk_tokens import WalkTokens
 
 
-class Time2Vec(nn.Module):
-    """Bochner time encoding (Time2Vec / TGN-style), ported from TGB_TPNet
-    models/modules.py:TimeEncoder. φ(Δt) = cos(w·Δt + b); w init to log-spaced frequencies
-    1/10^linspace(0,9) (so channels span fast→slow oscillations on RAW Δt), b init 0. Output
-    in [-1, 1], shape [..., time_dim] (drop-in for the old ExpDecayBasis interface)."""
-
-    def __init__(self, time_dim: int):
-        super().__init__()
-        self.time_dim = time_dim
-        self.w = nn.Linear(1, time_dim)
-        # log-spaced frequencies 1/10^0 … 1/10^9, exactly as TGB_TPNet's TimeEncoder.
-        self.w.weight = nn.Parameter(
-            (1.0 / 10 ** torch.linspace(0, 9, time_dim)).reshape(time_dim, 1))
-        self.w.bias = nn.Parameter(torch.zeros(time_dim))
-
-    def forward(self, dt: torch.Tensor) -> torch.Tensor:
-        return torch.cos(self.w(dt.unsqueeze(-1)))
-
-
 class GeometricPointHead(nn.Module):
-    def __init__(self, d_emb: int, d_time: int = 16, t_train: float = 1.0):
+    def __init__(self, d_emb: int, t_train: float = 1.0):
         super().__init__()
         self.d_emb = d_emb
         self.eps = 1e-6
@@ -81,25 +61,11 @@ class GeometricPointHead(nn.Module):
         self.log_a = nn.Parameter(torch.zeros(1))         # anisotropic ellipse (a,b ≥ 0)
         self.log_b = nn.Parameter(torch.zeros(1))
 
-        # --- TIMELINE channel (BOTH sides, ALWAYS ON, init-0) — replaces staleness ------------
-        # Staleness was just "v's last gap" (one number). This encodes the whole timeline of BOTH
-        # u and v: per node, [Time2Vec(age_since_last) ⊕ log1p(mean_gap), cv(gap), overdue] — the
-        # recency staleness had PLUS the inter-event STRUCTURE (burstiness via cv, periodicity via
-        # overdue=age/mean_gap) a recency weight can't express. d_fresh = d_time + 3 per node.
-        # A purely-additive SOURCE scalar is a no-op under per-query softmax (shifts all candidates
-        # equally), so u and v are combined by a JOINT pairwise MLP over [u_feat ⊕ v_feat] → scalar
-        # — u's timeline contributes only through its nonlinear interaction with v. coef init 0.
-        self.basis_timeline = Time2Vec(d_time)
-        d_tl = d_time + 3
-        self.timeline_head = nn.Sequential(
-            nn.Linear(2 * d_tl, d_time), nn.ReLU(), nn.Linear(d_time, 1))
-
         # --- geometric mix coefficients ----------------------------------------
         # identity is the proven baseline (init 1); reach earns weight (init 0).
         self.coef_identity = nn.Parameter(torch.ones(1))
         # REACH — ⟨exp_{E[u]}(μ_u), E_v⟩: does u's one-sided drift reach v? coef init 0.
         self.coef_reach = nn.Parameter(torch.zeros(1))
-        self.coef_timeline = nn.Parameter(torch.zeros(1))   # both-sided timeline, init 0 → no-op
 
     # ──────────────────────────────────────────────────────────────────
     # Geometry primitives (shape-agnostic over leading axes)
@@ -156,50 +122,6 @@ class GeometricPointHead(nn.Module):
         return (w.unsqueeze(-1) * g).sum(dim=-2)                          # [...,d]
 
     # ──────────────────────────────────────────────────────────────────
-    # timeline features — recency + inter-event (gap) STRUCTURE of a node's token bag
-    # ──────────────────────────────────────────────────────────────────
-
-    def _timeline_features(self, pos_ts: torch.Tensor, node_mask: torch.Tensor,
-                           cutoffs: torch.Tensor) -> torch.Tensor:
-        """Per node (M rows): -> [M, d_time+3] =
-             [ Time2Vec(age_since_last)  (d_time, the recency staleness had),
-               log1p(mean_gap),          characteristic inter-event spacing,
-               cv(gap)=std/mean,         burstiness vs regularity,
-               age_since_last/mean_gap ] overdue-ness (periodicity signal).
-           pos_ts/node_mask [M, U], cutoffs [M]. Gaps = Δ between a row's consecutive token times
-           (sorted, masked). Cold (count<1) and single-token (count<2 ⇒ no gaps) rows are guarded
-           to 0 stats — the head learns their bias. NaN-safe: pad → +inf in the sort, invalid gaps
-           masked to 0 before any reduction; all divisors clamp_min."""
-        M, U = pos_ts.shape
-        ts = pos_ts.float()
-        mask = node_mask
-        count = mask.sum(-1)                                              # [M]
-        cutoff = cutoffs.float()                                          # [M]
-        # most-recent real timestamp → age_since_last
-        ts_max = ts.masked_fill(~mask, float("-inf")).max(-1).values      # [M]; -inf if cold
-        age_last = torch.where(count >= 1, (cutoff - ts_max).clamp_min(0.0),
-                               torch.zeros_like(cutoff))                  # [M]
-        # gaps between consecutive real times (sort pad to the end with +inf)
-        ts_sorted, _ = ts.masked_fill(~mask, float("inf")).sort(dim=-1)   # [M, U]
-        gaps = ts_sorted[:, 1:] - ts_sorted[:, :-1]                       # [M, U-1]
-        pos = torch.arange(U - 1, device=ts.device).unsqueeze(0)         # [1, U-1]
-        gap_valid = pos < (count.unsqueeze(-1) - 1)                       # [M, U-1] both ends real
-        gaps = torch.where(gap_valid, gaps, torch.zeros_like(gaps))      # invalid (incl inf) → 0
-        n_gaps = (count - 1).clamp_min(1).float()                        # [M]
-        mean_gap = gaps.sum(-1) / n_gaps                                 # [M]
-        mean_g2 = (gaps * gaps).sum(-1) / n_gaps
-        std_gap = (mean_g2 - mean_gap * mean_gap).clamp_min(0.0).sqrt()  # [M]
-        cv = std_gap / mean_gap.clamp_min(self.eps)
-        overdue = (age_last / mean_gap.clamp_min(self.eps)).clamp(max=1e3)
-        has_gaps = (count >= 2).to(ts.dtype)                            # log1p(mean_gap) safe at 0
-        valid = ((count >= 2) & (mean_gap > self.eps)).to(ts.dtype)     # cv/overdue need spacing>0
-        phi = self.basis_timeline(age_last)                            # [M, d_time]
-        scal = torch.stack([torch.log1p(mean_gap) * has_gaps,
-                            cv * valid,
-                            overdue * valid], dim=-1)                   # [M, 3]
-        return torch.cat([phi, scal], dim=-1)                          # [M, d_time+3]
-
-    # ──────────────────────────────────────────────────────────────────
     # identity — probe an embedding against a prediction (frame-agnostic)
     # ──────────────────────────────────────────────────────────────────
 
@@ -219,20 +141,15 @@ class GeometricPointHead(nn.Module):
                 e_weight: torch.Tensor,        # [N, d]  the whole node-embedding table
                 src_tokens: WalkTokens,        # source walk tokens — self-contained: `seeds`
                                                # ARE the sources, `cutoffs` ARE the query times
-                cand_tokens: WalkTokens,       # candidate walk tokens (Q = B*C rows). `seeds`
-                                               # ARE the candidate ids (row-major over [B, C]);
-                                               # `cutoffs` ARE the query times. No separate
-                                               # cand_ids — it is just seeds reshaped to [B, C].
+                cand_ids: torch.Tensor,        # [B, C]  candidate node ids
                 ) -> torch.Tensor:
         """-> logits [B, C]. The head owns all embedding lookups and timing: E_u, E_v and the
-        token embeddings all come from `e_weight`. The candidate ids are recovered from the
-        candidate bag (`cand_tokens.seeds` reshaped to [B, C]); B = #source seeds, C = (B*C)/B.
-        Token ages come from each bag's cutoffs − pos_ts. The trainer hands over only the table,
-        the source bag, and the candidate bag."""
-        B = src_tokens.seeds.shape[0]
-        C = cand_tokens.seeds.shape[0] // B
+        token embeddings all come from `e_weight` (E_u = e_weight[src_tokens.seeds],
+        E_v = e_weight[cand_ids]); token ages come from src_tokens.cutoffs − src_tokens.pos_ts.
+        The trainer only hands over the table, the (self-contained) source walk tokens, and the
+        candidate ids. Score = identity + reach (no staleness / time-encoding / pair channels)."""
+        B, C = cand_ids.shape[0], cand_ids.shape[1]
         d = self.d_emb
-        cand_ids = cand_tokens.seeds.view(B, C)                   # [B, C]  recovered, not passed
         E_u = F.embedding(src_tokens.seeds, e_weight)             # [B, d]
         E_v = F.embedding(cand_ids, e_weight)                     # [B, C, d]
         eu = F.normalize(E_u, dim=-1)                             # [B, d]
@@ -254,36 +171,15 @@ class GeometricPointHead(nn.Module):
         # --- identity: is v in u's region? (proven baseline) ---
         q_ident = self._identity(eu_bc, ev, mu_u_bc, r_u_bc, a, b, alpha)   # [B,C]
 
-        # --- SYMMETRIC REACH: both sides drift their neighbourhood off their own embedding and
-        # inner-product against the OTHER side's static embedding, so the score is symmetric in
-        # (u, v):   reach(u,v) = ⟨q_u, E_v⟩ + ⟨E_u, q_v⟩
-        # q_u = exp_{E[u]}(μ_u) drifts u's neighbourhood off E[u]; q_v = exp_{E[v]}(μ_v) drifts
-        # each candidate's neighbourhood off E[v] (μ_v from the candidate walk bag). The first
-        # term asks "does v sit where u is heading?", the second "does u sit where v is heading?".
-        # coef_reach init 0 ⇒ no-op at init.
+        # --- REACH: push u's drift off E[u] back onto the sphere and inner-product it with the
+        # candidate's STATIC embedding. No μ_v — the candidate side samples no walks. q_u is u's
+        # neighbourhood centroid drifted off E[u]; ⟨q_u, E_v⟩ asks whether v sits where u's
+        # neighbourhood is heading. Rises when v is in u's drift region even if E[u], E[v] are
+        # structurally far apart. coef_reach init 0 ⇒ no-op at init.
         q_u = self._expmap(eu, mu_u)                              # [B,d]   drifted source pos
-        # candidate-side μ_v from the candidate token bag (Q = B*C rows; base frame = E[v]).
-        E_v_flat = E_v.reshape(B * C, d)                          # [B*C,d]
-        ev_flat = ev.reshape(B * C, d)                            # [B*C,d] unit base frame
-        cand_ages = (cand_tokens.cutoffs.unsqueeze(-1)
-                     - cand_tokens.pos_ts).clamp_min(0).to(eu.dtype)   # [B*C, U_v]
-        mu_v = self._mu_from_csr(
-            E_v_flat, cand_tokens.node_ids, cand_tokens.node_mask, cand_ages, e_weight)  # [B*C,d]
-        q_v = self._expmap(ev_flat, mu_v).reshape(B, C, d)       # [B,C,d] drifted candidate pos
-        reach = ((q_u.unsqueeze(1) * ev).sum(-1)                 # ⟨q_u, E_v⟩  [B,C]
-                 + (eu.unsqueeze(1) * q_v).sum(-1))              # ⟨E_u, q_v⟩  [B,C]
+        reach = (q_u.unsqueeze(1) * ev).sum(-1)                  # [B,C]   ⟨q_u, E_v⟩
 
-        geo = (self.coef_identity * q_ident
-               + self.coef_reach * reach)
-        logit = geo
-
-        # --- TIMELINE channel (BOTH sides, ALWAYS ON, init 0) — replaces staleness ---
-        fu = self._timeline_features(src_tokens.pos_ts, src_tokens.node_mask,
-                                     src_tokens.cutoffs)                  # [B, d_tl]
-        fv = self._timeline_features(cand_tokens.pos_ts, cand_tokens.node_mask,
-                                     cand_tokens.cutoffs).view(B, C, -1)  # [B, C, d_tl]
-        pair_tl = torch.cat([fu.unsqueeze(1).expand(B, C, fu.shape[-1]), fv], dim=-1)  # [B,C,2·d_tl]
-        timeline = self.timeline_head(pair_tl).squeeze(-1)               # [B, C]
-        logit = logit + self.coef_timeline * timeline
+        logit = (self.coef_identity * q_ident
+                 + self.coef_reach * reach)
 
         return logit
