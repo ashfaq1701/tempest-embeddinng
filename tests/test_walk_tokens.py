@@ -1,15 +1,13 @@
 """Correctness tests for the per-query dense walk tokens (tempest_walks/walk_tokens.py).
 
 `build_query_walk_tokens` runs K backward walks per QUERY — a (seed node, cutoff time) pair —
-and returns a dense `WalkTokens`: a token bag [Q, U] (raw, count-free, drives μ via a per-row
-softmax) and a neighbour bag [Q, Un] (per-query unique nodes + counts). Checks:
+and returns a dense `WalkTokens` token bag [Q, U] (raw, count-free, drives μ via a per-row
+softmax). Checks:
 
 1. TOKEN BAG vs the SAME captured walks — per-query (node, t_edge) MULTISET (read via the mask)
    matches the contract reconstruction; padding slots are -1/False; every token's t_edge < its
    query's cutoff; cutoffs field round-trips.
-2. NEIGHBOUR BAG — per query, masked `neighbors` are exactly the distinct token nodes,
-   `neighbors_count` their occurrence counts, Σ counts == that query's token count.
-3. EMPTY — a cutoff at/below the earliest edge and an isolated node give all-False rows.
+2. EMPTY — a cutoff at/below the earliest edge and an isolated node give all-False rows.
 """
 from collections import Counter
 
@@ -122,39 +120,7 @@ def test_per_query_cutoff_is_honoured():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 2. neighbour bag
-# ──────────────────────────────────────────────────────────────────────────
-def test_neighbour_bag_matches_token_bag():
-    src, tgt, ts = _synthetic_graph(seed=1)
-    k, mwl = 6, 8
-    wg = WalkGenerator(use_gpu=False, num_walks_per_node=k, max_walk_len=mwl,
-                       walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
-    wg.reset(); wg.add_edges(src, tgt, ts, None)
-    seeds = torch.tensor([2, 4, 6, 8], dtype=torch.long)
-    cutoffs = torch.full((4,), 50_000, dtype=torch.long)
-
-    wt, _ = _run_with_capture(
-        wg, seeds, cutoffs, max_walk_len=mwl, num_walks_per_node=k,
-        walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
-    assert bool((wt.neighbors_count[~wt.neighbors_mask] == 0).all()), "padding counts must be 0"
-
-    saw_dedup = False
-    for q in range(len(seeds)):
-        tm = wt.node_mask[q]
-        token_counts = Counter(int(n) for n in wt.node_ids[q][tm])     # node -> occurrences
-        nm = wt.neighbors_mask[q]
-        nbr = {int(n): int(c) for n, c in zip(wt.neighbors[q][nm], wt.neighbors_count[q][nm])}
-        assert nbr == dict(token_counts), f"query {q}: neighbour bag != token-bag dedup"
-        assert sum(nbr.values()) == int(tm.sum())
-        if int(nm.sum()) < int(tm.sum()):
-            saw_dedup = True
-    assert saw_dedup, "expected at least one query whose tokens dedup to fewer neighbours"
-    print(f"\n[neighbour-bag] unique nodes + counts match token bag OK "
-          f"(Un={wt.neighbors.shape[1]})")
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# 3. empty rows
+# 2. empty rows
 # ──────────────────────────────────────────────────────────────────────────
 def test_empty_query_rows():
     src, tgt, ts = _synthetic_graph(n_nodes=6, n_edges=40, seed=2)
@@ -167,13 +133,11 @@ def test_empty_query_rows():
     wt, _ = _run_with_capture(wg, seeds, cutoffs, max_walk_len=6, num_walks_per_node=4)
     for q in (0, 1):
         assert not bool(wt.node_mask[q].any()), f"query {q}: token row not empty"
-        assert not bool(wt.neighbors_mask[q].any()), f"query {q}: neighbour row not empty"
     print("\n[empty] cutoff-excluded + isolated queries → all-False rows OK")
 
 
 if __name__ == "__main__":
     test_token_bag_matches_captured_walks()
     test_per_query_cutoff_is_honoured()
-    test_neighbour_bag_matches_token_bag()
     test_empty_query_rows()
     print("\nALL DENSE WALK-TOKEN CHECKS PASSED")
