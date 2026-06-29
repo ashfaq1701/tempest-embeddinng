@@ -1146,3 +1146,46 @@ from v landing in u's region), not just node-overlap.
    with it. If CN predicts but coreach ignores it → gap proven, prize
    bounded.
 2. Go straight to **building** the set-interaction channel.
+
+---
+
+## Last REACH-head run — epoch-by-epoch MRR (tgbl-wiki, 2026-06-29)
+
+Reference baseline for the velocity-head work. Head: `GeometricPointHead` REACH
+(identity + reach, count-free, one-sided — μ_u from the source's walk tokens,
+`logit = coef_identity·identity + coef_reach·reach`). Per-query causal substrate
+(ingest-first + cutoff=t walks, == TPNet). Config: seed 42, `d_emb 256`,
+`num_walks_per_node_query_side 10`, `max_walk_len_query_side 5`, `k_train 100`,
+`batch_size 200`, `eval_batch_size 20`, `lr 1e-3`, `num_epochs 50`,
+`early_stop_patience 5`. Ran on the post-neighbour-bag-removal `walk_tokens` (token
+bag only). Registered best in `best_configs.sh` is `0.8280 / 0.8062 @ ep22`; this
+run landed lower and peaked earlier (walk-sampler nondeterminism — μ tokens are
+verified identical, so it is not the neighbour-bag removal).
+
+**Best: val 0.8240 / test 0.8011 @ ep13; early-stopped ep18 (patience 5).**
+
+| epoch | val | test | note |
+|---|---|---|---|
+| 1  | 0.8079 | 0.7864 | new best |
+| 2  | 0.8135 | 0.7901 | new best |
+| 3  | 0.8163 | 0.7937 | new best |
+| 4  | 0.8185 | 0.7959 | new best |
+| 5  | 0.8200 | 0.7973 | new best |
+| 6  | 0.8201 | 0.7982 | new best |
+| 7  | 0.8206 | 0.7992 | new best |
+| 8  | 0.8231 | 0.7992 | new best |
+| 9  | 0.8223 | — | patience 1/5 |
+| 10 | 0.8226 | — | patience 2/5 |
+| 11 | 0.8230 | — | patience 3/5 |
+| 12 | 0.8225 | — | patience 4/5 |
+| 13 | **0.8240** | **0.8011** | **new best (peak)** |
+| 14 | 0.8228 | — | patience 1/5 |
+| 15 | 0.8239 | — | patience 2/5 |
+| 16 | 0.8224 | — | patience 3/5 |
+| 17 | 0.8229 | — | patience 4/5 |
+| 18 | 0.8229 | — | patience 5/5 → stop |
+
+Test MRR is only logged on new-best (val-improving) epochs — the trainer evals the
+test split only when val improves, so the `—` rows have no test number.
+
+Log: `logs/master/wiki_geomreach_20260629_203006.log`.
