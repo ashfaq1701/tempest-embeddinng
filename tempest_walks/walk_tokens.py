@@ -4,6 +4,9 @@ A "query" is a (seed node, cutoff time t) pair. `build_query_walk_tokens` runs K
 per query, each bounded by cutoff = t (every edge has t_edge < t — strict causal past), and
 returns them in their RAW per-walk layout — no packing, no dedup, no seed/origin exclusions:
 
+    seeds       [Q]         int64  the query/source node u of each query (the walk origin). Kept
+                                   explicitly so the consumer has u even for cold/empty walks,
+                                   where the seed is not placed in `nodes`.
     nodes       [Q, K, L]   int64  walk node ids; backward — oldest predecessor at position 0,
                                    the seed at the LAST real position (lens-1); padding = -1.
     nodes_mask  [Q, K, L]   bool   True on real walk positions (nodes != -1), False on padding.
@@ -32,12 +35,14 @@ _TS_SENTINEL = torch.iinfo(torch.int64).max
 class WalkTokens:
     """Raw per-query backward walks (see module docstring).
 
+        seeds       [Q]         int64  query/source node u (walk origin; present even when cold)
         nodes       [Q, K, L]   int64  node ids; seed at the last real position, padding -1
         nodes_mask  [Q, K, L]   bool   True on real walk positions
         timestamps  [Q, K, L]   int64  node-aligned times; seed = cutoff, edges < cutoff, pad -1
         cutoffs     [Q]         int64  per-query exclusive cutoff t
     """
 
+    seeds: torch.Tensor        # [Q]
     nodes: torch.Tensor        # [Q, K, L]
     nodes_mask: torch.Tensor   # [Q, K, L]
     timestamps: torch.Tensor   # [Q, K, L]
@@ -63,6 +68,7 @@ def build_query_walk_tokens(
     if q == 0:
         shape = (0, num_walks_per_node, max_walk_len)
         return WalkTokens(
+            seeds_t,
             torch.empty(shape, dtype=torch.int64, device=device),
             torch.empty(shape, dtype=torch.bool, device=device),
             torch.empty(shape, dtype=torch.int64, device=device),
@@ -88,4 +94,4 @@ def build_query_walk_tokens(
     ts = wd.timestamps.to(device=device, dtype=torch.int64).reshape(q, k, length)      # [Q, K, L]
     timestamps = torch.where(ts == _TS_SENTINEL, cutoffs_t.view(q, 1, 1), ts)
 
-    return WalkTokens(nodes, nodes_mask, timestamps, cutoffs_t)
+    return WalkTokens(seeds_t, nodes, nodes_mask, timestamps, cutoffs_t)

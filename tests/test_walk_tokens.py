@@ -77,8 +77,9 @@ def test_shapes_nodes_mask_cutoffs():
 
     for name, t in (("nodes", wt.nodes), ("nodes_mask", wt.nodes_mask), ("timestamps", wt.timestamps)):
         assert t.shape == (q, k, length), f"{name} shape {tuple(t.shape)}"
-    assert wt.cutoffs.shape == (q,)
+    assert wt.cutoffs.shape == (q,) and wt.seeds.shape == (q,)
     assert torch.equal(wt.cutoffs, cutoffs), "cutoffs must round-trip"
+    assert torch.equal(wt.seeds, seeds), "seeds must round-trip"
     assert torch.equal(wt.nodes, wd.nodes.to(torch.int64).reshape(q, k, length)), \
         "nodes must equal the raw walk output reshaped to [Q, K, L]"
     assert torch.equal(wt.nodes_mask, wt.nodes != -1), "nodes_mask must be (nodes != -1)"
@@ -145,11 +146,12 @@ def test_empty_walks_when_no_predecessors():
     cutoffs = torch.tensor([t_min, 50_000], dtype=torch.long)
 
     wt, _ = _run_with_capture(wg, seeds, cutoffs, max_walk_len=6, num_walks_per_node=4)
+    assert torch.equal(wt.seeds, seeds), "seeds must be kept even for cold/empty walks"
     for q in (0, 1):
         assert not bool(wt.nodes_mask[q].any()), f"query {q}: expected all-False mask"
         assert bool((wt.nodes[q] == -1).all()), f"query {q}: expected all-padding nodes"
         assert bool((wt.timestamps[q] == -1).all()), f"query {q}: expected all-padding timestamps"
-    print("\n[empty] cutoff-excluded + isolated queries → fully empty walks OK")
+    print("\n[empty] cutoff-excluded + isolated queries → fully empty walks (seeds kept) OK")
 
 
 if __name__ == "__main__":
