@@ -22,17 +22,18 @@ earlier edges). The stores have no per-query cutoff, so they keep a pre-batch sn
 E (on the unit sphere) and the head are trained together by L (no alignment, no detach)
 by a single RiemannianAdam.
 
-TOKEN PREP — the source side (u → μ_u) goes through `walk_tokens.build_query_walk_tokens`:
-walks are generated PER QUERY (no dedup — each row's (node, t) needs its own cutoff) and the
-real context tokens of each query's K walks become a WalkTokens — a DENSE token bag
-([Q, U] node_ids / node_mask / pos_ts, COUNT-FREE, seed slot / padding / origin excluded) plus
-a dense per-query neighbour bag (deduped nodes + counts, reserved for future co-reach signals).
-The head consumes the (self-contained: seeds + cutoffs) token bag to build μ_u with a per-row
-softmax (forming ages = cutoffs − t_edge itself) and scores identity + reach against E[v].
+TOKEN PREP — the source side (u → μ_u) goes through `walk_tokens.build_query_walk_tokens_multi`:
+walks are generated PER QUERY (no dedup — each row's (node, t) needs its own cutoff) and returned
+in the RAW per-walk WalkTokens layout ([Q, K, L] nodes / nodes_mask / node-aligned timestamps,
+seeds + cutoffs). One or more (num_walks, start_bias, walk_bias) configs are sampled and
+concatenated along K (see query_walk_configs). This RAW layout is the SHARED walk contract for
+every head; GeometricPointHead flattens it to a [Q, K*L] token bag and masks padding + the seed
+node u via `walk_tokens.flatten_and_exclude_seed`, then builds μ_u with a per-row softmax (ages =
+cutoffs − t_edge) and scores identity + reach against E[v].
 """
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import geoopt
 import numpy as np
@@ -46,7 +47,7 @@ from .link_pred_head import GeometricPointHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
 from .utils import make_lr_lambda
-from .walk_tokens import build_query_walk_tokens
+from .walk_tokens import build_query_walk_tokens_multi
 from .walks import WalkGenerator
 
 
@@ -69,10 +70,15 @@ class TrainerConfig:
 
     # Walks (BACKWARD only, undirected). QUERY-side only: source u → μ_u tokens. The candidate
     # side samples no walks (reach compares against v's static embedding).
-    num_walks_per_node_query_side: int = 5
+    #
+    # query_walk_configs: one or more (num_walks, start_bias, walk_bias) sampling configs. Each is
+    # sampled per query and their per-query walk bags are concatenated along K into one token bag
+    # (all share max_walk_len_query_side so the bags are L-compatible). A single config reproduces
+    # the prior behaviour; multiple configs diversify the μ-fit sample (e.g. an ExponentialWeight
+    # bag + an ExponentialWeightInverseDegree bag). Total walks/node = Σ num_walks over configs.
+    query_walk_configs: List[Tuple[int, str, str]] = field(
+        default_factory=lambda: [(5, "ExponentialWeight", "ExponentialWeight")])
     max_walk_len_query_side: int = 5
-    walk_bias_query_side: str = "ExponentialWeight"
-    start_bias_query_side: str = "ExponentialWeight"
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
     # Optimisation.
@@ -107,12 +113,15 @@ class Trainer:
             t_train=float(config.t_train),
         ).to(self.device)
 
-        # One generator, configured QUERY-side; only the source side samples walks.
+        # One generator, configured QUERY-side; only the source side samples walks. The biases /
+        # num_walks are overridden per-config at sample time (see _score), so the constructor just
+        # seeds sensible defaults from the first config.
+        _nw0, _sb0, _wb0 = config.query_walk_configs[0]
         self.walk_gen = WalkGenerator(
             use_gpu=config.use_gpu_tempest,
-            walk_bias=config.walk_bias_query_side,
-            start_bias=config.start_bias_query_side,
-            num_walks_per_node=config.num_walks_per_node_query_side,
+            walk_bias=_wb0,
+            start_bias=_sb0,
+            num_walks_per_node=_nw0,
             max_walk_len=config.max_walk_len_query_side,
             max_time_capacity=config.max_time_capacity,
         )
@@ -160,26 +169,24 @@ class Trainer:
 
         PER-QUERY walks: the source side samples K backward walks for each query (u_i, t_i)
         with cutoff = t_i, so every token has t_edge < t_i (strict causal past of that query).
-        No dedup — each batch row is its own query. `build_query_walk_tokens` returns a
-        self-contained WalkTokens (seeds + cutoffs + dense token bag); the head builds μ_u with
-        a per-row softmax over the token bag (forming ages = cutoffs − t_edge itself, all > 0 by
-        the cutoff). The candidate side samples no walks — it enters only through its static
+        No dedup — each batch row is its own query. `build_query_walk_tokens_multi` returns a
+        self-contained raw WalkTokens (seeds + cutoffs + [Q,K,L] walks); the head flattens + masks
+        the seed and builds μ_u with a per-row softmax over the token bag (ages = cutoffs − t_edge,
+        all > 0 by the cutoff). The candidate side samples no walks — it enters only through its static
         embedding E[v] (identity + reach). Strict causality comes from the per-query cutoff, NOT
         from ingestion order, so the batch may already be in Tempest."""
         device = self.device
 
-        # --- SOURCE side: per-query (u_i, t_i) → K cutoff=t_i walks → token-stream CSR.
-        # (src_csr also carries the per-query neighbour CSR for future co-reach signals.) ---
-        src_csr = build_query_walk_tokens(
+        # --- SOURCE side: per-query (u_i, t_i) → K cutoff=t_i walks per config → raw [Q,K,L]
+        # token bag (configs concatenated along K). The head flattens + masks the seed. ---
+        src_tokens = build_query_walk_tokens_multi(
             self.walk_gen, device, src_t, t_query_t,
             max_walk_len=self.config.max_walk_len_query_side,
-            num_walks_per_node=self.config.num_walks_per_node_query_side,
-            start_bias=self.config.start_bias_query_side,
-            walk_bias=self.config.walk_bias_query_side)
+            configs=self.config.query_walk_configs)
 
         return self.link_head(
             self.embedding_table.E.weight,   # the whole table; head indexes E_u / E_v / tokens
-            src_csr,                         # self-contained source walk CSR (seeds + cutoffs)
+            src_tokens,                      # raw source walk tokens (self-contained: seeds+cutoffs)
             cand_t)                          # candidate node ids
 
     # ──────────────────────────────────────────────────────────────────

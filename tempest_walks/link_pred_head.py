@@ -44,7 +44,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .walk_tokens import WalkTokens
+from .walk_tokens import WalkTokens, flatten_and_exclude_seed
 
 
 class GeometricPointHead(nn.Module):
@@ -158,11 +158,12 @@ class GeometricPointHead(nn.Module):
         b = F.softplus(self.log_b)
         alpha = self.alpha.clamp_min(1e-3)
 
-        # --- prediction μ_u (dense per-row softmax over the source token bag) ---
-        src_ages = (src_tokens.cutoffs.unsqueeze(-1)
-                    - src_tokens.pos_ts).clamp_min(0).to(eu.dtype)   # [B, U]
+        # --- prediction μ_u (per-row softmax over the source token bag) ---
+        # Flatten the raw [B, K, L] walks to one [B, T] token bag, masking padding + the seed node
+        # u (the K/per-walk structure is unused by this head — see flatten_and_exclude_seed).
+        ids, nmask, ages = flatten_and_exclude_seed(src_tokens)       # [B, T] each
         mu_u = self._mu_from_csr(
-            E_u, src_tokens.node_ids, src_tokens.node_mask, src_ages, e_weight)  # [B,d]
+            E_u, ids, nmask, ages.to(eu.dtype), e_weight)            # [B,d]
         r_u = self._heading(mu_u)                                 # [B,d]
         eu_bc = eu.unsqueeze(1).expand(B, C, d)                   # [B,C,d]
         mu_u_bc = mu_u.unsqueeze(1).expand(B, C, d)
