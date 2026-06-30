@@ -95,9 +95,12 @@ class VelocityHead(nn.Module):
 
     def _context(self, e_weight: torch.Tensor, tokens: WalkTokens, p: torch.Tensor):
         """Per context token (real, non-seed): tangent vector v = Log_p(E[node]), signed time s,
-        recency weight w. p [Q, d] -> v [Q, K, L, d], s [Q, K, L], w [Q, K, L] (0 off-context)."""
+        recency weight w. p [Q, d] -> v [Q, K, L, d], s [Q, K, L], w [Q, K, L] (0 off-context).
+        The seed node u is excluded at EVERY position it occurs (not just the t==cutoff slot):
+        Log_p(E[u]) = 0, so a u-recurrence is a zero tangent vector that biases the centroid/line
+        toward the origin."""
         cut = tokens.cutoffs.view(-1, 1, 1)
-        is_seed = (tokens.timestamps == cut) & tokens.nodes_mask         # seed slot = the t==cutoff one
+        is_seed = tokens.nodes == tokens.seeds.view(-1, 1, 1)            # u at ANY walk position
         ctx = (tokens.nodes_mask & ~is_seed).to(p.dtype)                 # [Q, K, L] 1 on context
 
         s = (tokens.timestamps - cut).to(p.dtype) / self.T_train         # ≤ 0; 0 at the (excluded) seed
