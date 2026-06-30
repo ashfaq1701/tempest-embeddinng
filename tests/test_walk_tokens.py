@@ -155,36 +155,7 @@ def test_empty_walks_when_no_predecessors():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 5. multi-config sampling — concatenation along K
-# ──────────────────────────────────────────────────────────────────────────
-def test_multi_config_concatenates_along_k():
-    from tempest_walks.walk_tokens import build_query_walk_tokens_multi
-
-    src, tgt, ts = _synthetic_graph(seed=3)
-    wg = WalkGenerator(use_gpu=False, num_walks_per_node=5, max_walk_len=6)
-    wg.reset(); wg.add_edges(src, tgt, ts, None)
-    seeds = torch.tensor([1, 3, 5], dtype=torch.long)
-    cutoffs = torch.full((3,), 50_000, dtype=torch.long)
-    EW, INV = "ExponentialWeight", "ExponentialWeightInverseDegree"
-
-    # single config == build_query_walk_tokens (K = 5)
-    one = build_query_walk_tokens_multi(
-        wg, torch.device("cpu"), seeds, cutoffs, max_walk_len=6, configs=[(5, EW, EW)])
-    assert one.nodes.shape[1] == 5
-
-    # two configs (5 + 7) -> K = 12, concatenated along the K axis; L shared (6)
-    two = build_query_walk_tokens_multi(
-        wg, torch.device("cpu"), seeds, cutoffs, max_walk_len=6, configs=[(5, EW, EW), (7, EW, INV)])
-    assert two.nodes.shape == (3, 12, 6), f"expected [3,12,6], got {tuple(two.nodes.shape)}"
-    for name in ("nodes", "nodes_mask", "timestamps"):
-        assert getattr(two, name).shape == (3, 12, 6)
-    assert torch.equal(two.seeds, seeds) and torch.equal(two.cutoffs, cutoffs)
-    assert torch.equal(two.nodes_mask, two.nodes != -1)
-    print("\n[multi] 5+7 configs concatenate to K=12, L shared, seeds/cutoffs preserved OK")
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# 6. flatten_and_exclude_seed — flat [Q, K*L] bag, seed + padding masked
+# 5. flatten_and_exclude_seed — flat [Q, K*L] bag, seed + padding masked
 # ──────────────────────────────────────────────────────────────────────────
 def test_flatten_excludes_seed_and_padding():
     from tempest_walks.walk_tokens import flatten_and_exclude_seed
@@ -216,6 +187,5 @@ if __name__ == "__main__":
     test_timestamps_node_aligned_seed_is_cutoff()
     test_seed_is_last_real_node()
     test_empty_walks_when_no_predecessors()
-    test_multi_config_concatenates_along_k()
     test_flatten_excludes_seed_and_padding()
     print("\nALL RAW WALK-TENSOR CHECKS PASSED")

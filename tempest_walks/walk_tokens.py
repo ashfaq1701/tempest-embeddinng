@@ -19,15 +19,15 @@ returns them in their RAW per-walk layout — no packing, no dedup, no seed/orig
                                    the seed time == t.
 
 This RAW layout is the SHARED walk contract for every head (point / velocity / …): the trainer
-samples one or more bias configs into it (`build_query_walk_tokens_multi`) and each head turns it
-into the flat token bag its μ needs via `flatten_and_exclude_seed` — so the sampling pipeline is
+samples a query's backward walks into it (`build_query_walk_tokens`) and each head turns it into
+the flat token bag its μ needs via `flatten_and_exclude_seed` — so the sampling pipeline is
 identical across heads and only the scoring model differs.
 
 Requires shuffle_walk_order=False at the Tempest constructor so a query's K walk rows are
 contiguous (rows [q*K, (q+1)*K)) and reshape cleanly to [Q, K, L].
 """
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import numpy as np
 import torch
@@ -100,46 +100,6 @@ def build_query_walk_tokens(
     timestamps = torch.where(ts == _TS_SENTINEL, cutoffs_t.view(q, 1, 1), ts)
 
     return WalkTokens(seeds_t, nodes, nodes_mask, timestamps, cutoffs_t)
-
-
-def build_query_walk_tokens_multi(
-    walk_gen,
-    device: torch.device,
-    query_seeds: torch.Tensor,
-    query_cutoffs: torch.Tensor,
-    *,
-    max_walk_len: int,
-    configs: List[Tuple[int, str, str]],
-) -> WalkTokens:
-    """Sample several (num_walks, start_bias, walk_bias) walk configs for the SAME queries and
-    concatenate them into one token bag.
-
-    Each config samples its own per-query backward walks (sharing seeds, cutoffs, and `max_walk_len`
-    so all bags are [Q, K_i, L] with a common L), and the bags are concatenated along the K axis →
-    [Q, ΣK_i, L]. The head consumes the union, so e.g. (ExponentialWeight) + (ExponentialWeight­-
-    InverseDegree) gives a μ-fit over both a degree-favouring and a degree-discounting sample.
-    `seeds`/`cutoffs` are identical across configs and taken from the first."""
-    if len(configs) == 1:
-        nw, sb, wb = configs[0]
-        return build_query_walk_tokens(
-            walk_gen, device, query_seeds, query_cutoffs,
-            max_walk_len=max_walk_len, num_walks_per_node=nw,
-            start_bias=sb, walk_bias=wb)
-
-    parts = [
-        build_query_walk_tokens(
-            walk_gen, device, query_seeds, query_cutoffs,
-            max_walk_len=max_walk_len, num_walks_per_node=nw,
-            start_bias=sb, walk_bias=wb)
-        for (nw, sb, wb) in configs
-    ]
-    return WalkTokens(
-        parts[0].seeds,
-        torch.cat([p.nodes for p in parts], dim=1),
-        torch.cat([p.nodes_mask for p in parts], dim=1),
-        torch.cat([p.timestamps for p in parts], dim=1),
-        parts[0].cutoffs,
-    )
 
 
 def flatten_and_exclude_seed(tokens: WalkTokens):

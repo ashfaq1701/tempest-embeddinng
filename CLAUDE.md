@@ -1208,11 +1208,14 @@ model differs:
   and masks padding + every occurrence of the seed node u. BOTH heads call it — the
   seed-exclusion rule has one home; the per-walk (K) structure is unused (μ pools all
   walks per query, so flatten-then-sum ≡ sum-over-(K,L)).
-- Multi-bias query-side sampling is exposed on `--walk-bias-query-side` /
-  `--start-bias-query-side` (comma-separated, broadcast / pairwise-zipped) and
-  `--num-walks-per-node-query-side` (one value reused per config, or per-config). A new
-  Tempest picker `ExponentialWeightInverseDegree` (favours low-degree nodes) is
-  available as a bias.
+- Multi-bias query-side sampling (comma-separated `--walk-bias-query-side` /
+  `--start-bias-query-side` with broadcast / pairwise-zip, plus a new Tempest picker
+  `ExponentialWeightInverseDegree` that favours low-degree nodes) was BUILT then
+  REMOVED: splitting the 10 walks into 5 `ExponentialWeight` + 5
+  `ExponentialWeightInverseDegree` tied single-bias on the velocity head (peak
+  0.8257/0.8033 vs 0.8255/0.8032 — +0.0002/+0.0001, dead tie; epoch wins 9/10). The
+  dual-sampling infra was reverted to single bias; the picker remains in Tempest. To
+  resurrect dual-bias, revert the "remove dual-bias sampling" commit.
 
 Result: master's head is now the **velocity head**, identical to the point head EXCEPT
 the drift channel's prediction. `_centroid_and_line()` returns both the recency centroid
