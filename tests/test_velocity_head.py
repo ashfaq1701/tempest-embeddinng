@@ -36,10 +36,10 @@ def _sphere_E(n, d, seed=0):
 
 
 def _qhat(head, e, tok):
-    """Run the head's pieces to get the predicted q̂ (and intermediates) for assertions."""
+    """Run the head's pieces to get the VELOCITY prediction q̂ (and intermediates) for assertions."""
     p = head._base_point(e, tok)
     v, s, w = head._context(e, tok, p)
-    mu = head._fit_at_query(v, s, w)
+    _, mu = head._fit_at_query(v, s, w)
     return sphere_exp(p, mu, head.eps), p, v, w
 
 

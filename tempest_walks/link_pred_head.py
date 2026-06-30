@@ -17,15 +17,21 @@ t), base point p = normalize(E[u]):
       W   = Σ w ; s̄ = Σ w·s / W ; v̄ = Σ w·v / W
       b   = Σ w·(s−s̄)·v / Σ w·(s−s̄)²            (velocity / slope; v̄ is the weighted centroid)
       μ   = v̄ − b·s̄                             (the line at s = 0)
-      q̂   = exp_p(μ) ;  score(u,v) = γ·⟨q̂, normalize(E[v])⟩      (γ = softplus(logit_scale))
+
+Two channels (point-head style), blended by learnable coefficients:
+      score(u,v) = γ·( a·⟨exp_p(v̄), Ê_v⟩  +  c·⟨exp_p(μ), Ê_v⟩ )
+  * IDENTITY  a·⟨exp_p(v̄), Ê_v⟩  — score v against the CENTROID point: "is v in u's recent
+    neighbourhood?" (the recurrence detector). a init 1 ⇒ at init the head IS the centroid baseline.
+  * VELOCITY  c·⟨exp_p(μ), Ê_v⟩  — score v against the EXTRAPOLATED point: "is v where u is
+    heading?" c init 0 ⇒ velocity earns weight (on the drift slice).
 
 Fallbacks fall out of the algebra (never worse than the centroid by construction):
-  * COLD (no context, W = 0): μ = 0 ⇒ q̂ = p ⇒ score = γ·cosine(E[u], E[v]) — the proven baseline.
+  * COLD (no context, W = 0): v̄ = μ = 0 ⇒ both points = p ⇒ score = γ·a·cosine(E[u], E[v]).
   * DEGENERATE time (Σ w·(s−s̄)² ≈ 0, one distinct timestamp / single neighbour): b = 0 ⇒ μ = v̄ —
-    the head reduces to the centroid; velocity only ADDS where there is genuine temporal spread.
+    velocity collapses onto identity; it only DIVERGES where there is genuine temporal spread.
 
-The whole head is two learnable scalars {log_lambda, logit_scale} over the sphere embedding table.
-No identity/ellipse, no heading gate, no reach coefficient, no forward Δτ horizon. T_train is the
+The whole head is four learnable scalars {log_lambda, logit_scale, coef_identity, coef_velocity}
+over the sphere embedding table. No ellipse/heading gate, no forward Δτ horizon. T_train is the
 frozen train-split span (NOT a per-batch t_max).
 """
 import math
@@ -71,6 +77,13 @@ class VelocityHead(nn.Module):
         # logit temperature on cosine ∈ [−1, 1]; init ≈ 10 to sharpen the softmax-CE.
         self.logit_scale = nn.Parameter(torch.tensor(math.log(math.expm1(10.0)), dtype=torch.float32))
 
+        # Two channels (point-head style): IDENTITY scores v against the CENTROID point exp_p(v̄)
+        # — "is v in u's recent neighbourhood?" (the recurrence detector, init 1 = proven baseline);
+        # VELOCITY scores v against the EXTRAPOLATED point exp_p(μ) — "is v where u is heading?"
+        # (init 0, earns weight on the drift slice). At init the head IS the centroid baseline.
+        self.coef_identity = nn.Parameter(torch.ones(1))
+        self.coef_velocity = nn.Parameter(torch.zeros(1))
+
     # ──────────────────────────────────────────────────────────────────
     # Pieces (each does one job; `forward` orchestrates)
     # ──────────────────────────────────────────────────────────────────
@@ -95,19 +108,22 @@ class VelocityHead(nn.Module):
         v = sphere_log(p[:, None, None, :], ev, self.eps)                # [Q, K, L, d]
         return v, s, w
 
-    def _fit_at_query(self, v: torch.Tensor, s: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        """Weighted free-line fit over (K, L), evaluated at s = 0 (the query time) -> μ [Q, d].
-        Cold (W ≤ ε) → μ = 0 (exact). Degenerate time (Σw·(s−s̄)² ≈ 0) → b = 0 → μ = v̄ (centroid)."""
+    def _fit_at_query(self, v: torch.Tensor, s: torch.Tensor, w: torch.Tensor):
+        """Weighted free-line fit over (K, L) -> (v̄, μ), both [Q, d]: v̄ = weighted CENTROID (the
+        identity prediction), μ = the line evaluated at s = 0 (the velocity prediction). Cold
+        (W ≤ ε) → v̄ = μ = 0 (exact). Degenerate time (Σw·(s−s̄)² ≈ 0) → b = 0 → μ = v̄."""
         wsum = w.sum((1, 2))                                             # [Q] raw (for the cold mask)
         W = wsum.clamp_min(self.eps)
         sbar = (w * s).sum((1, 2)) / W                                   # [Q]
-        vbar = (w.unsqueeze(-1) * v).sum((1, 2)) / W.unsqueeze(-1)       # [Q, d]
+        vbar = (w.unsqueeze(-1) * v).sum((1, 2)) / W.unsqueeze(-1)       # [Q, d] centroid
         ds = s - sbar[:, None, None]                                     # [Q, K, L]
         Sss = (w * ds * ds).sum((1, 2))                                  # [Q]
         Sdv = (w.unsqueeze(-1) * ds.unsqueeze(-1) * v).sum((1, 2))       # [Q, d]
         b = Sdv / Sss.clamp_min(self.eps).unsqueeze(-1)                  # [Q, d] velocity (0 if degenerate)
         mu = vbar - b * sbar.unsqueeze(-1)                               # [Q, d] line at s = 0
-        return torch.where((wsum <= self.eps).unsqueeze(-1), torch.zeros_like(mu), mu)
+        cold = (wsum <= self.eps).unsqueeze(-1)
+        z = torch.zeros_like(mu)
+        return torch.where(cold, z, vbar), torch.where(cold, z, mu)
 
     # ──────────────────────────────────────────────────────────────────
     # Forward
@@ -119,9 +135,12 @@ class VelocityHead(nn.Module):
         seeds + cutoffs); cand_ids [Q, C]. -> logits [Q, C]."""
         p = self._base_point(e_weight, tokens)                          # [Q, d]
         v, s, w = self._context(e_weight, tokens, p)
-        mu = self._fit_at_query(v, s, w)                                # [Q, d] prediction in T_p
-        qhat = sphere_exp(p, mu, self.eps)                              # [Q, d] on the sphere
+        vbar, mu = self._fit_at_query(v, s, w)                          # [Q, d] centroid, velocity
+        q_id = sphere_exp(p, vbar, self.eps)                            # [Q, d] centroid point
+        q_vel = sphere_exp(p, mu, self.eps)                            # [Q, d] extrapolated point
 
         evc = F.normalize(F.embedding(cand_ids, e_weight), dim=-1)      # [Q, C, d]
+        identity = (q_id.unsqueeze(1) * evc).sum(-1)                   # [Q, C] ⟨centroid, E_v⟩
+        velocity = (q_vel.unsqueeze(1) * evc).sum(-1)                  # [Q, C] ⟨extrapolation, E_v⟩
         gamma = F.softplus(self.logit_scale)
-        return gamma * (qhat.unsqueeze(1) * evc).sum(-1)               # [Q, C]
+        return gamma * (self.coef_identity * identity + self.coef_velocity * velocity)   # [Q, C]
