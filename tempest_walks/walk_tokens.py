@@ -18,11 +18,16 @@ returns them in their RAW per-walk layout — no packing, no dedup, no seed/orig
     cutoffs     [Q]         int64  each query's exclusive cutoff t; every non-seed time is < t,
                                    the seed time == t.
 
+This RAW layout is the SHARED walk contract for every head (point / velocity / …): the trainer
+samples one or more bias configs into it (`build_query_walk_tokens_multi`) and each head turns it
+into the flat token bag its μ needs via `flatten_and_exclude_seed` — so the sampling pipeline is
+identical across heads and only the scoring model differs.
+
 Requires shuffle_walk_order=False at the Tempest constructor so a query's K walk rows are
 contiguous (rows [q*K, (q+1)*K)) and reshape cleanly to [Q, K, L].
 """
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -104,7 +109,7 @@ def build_query_walk_tokens_multi(
     query_cutoffs: torch.Tensor,
     *,
     max_walk_len: int,
-    configs: "list[tuple[int, str, str]]",
+    configs: List[Tuple[int, str, str]],
 ) -> WalkTokens:
     """Sample several (num_walks, start_bias, walk_bias) walk configs for the SAME queries and
     concatenate them into one token bag.
@@ -135,3 +140,22 @@ def build_query_walk_tokens_multi(
         torch.cat([p.timestamps for p in parts], dim=1),
         parts[0].cutoffs,
     )
+
+
+def flatten_and_exclude_seed(tokens: WalkTokens):
+    """Collapse the raw [Q, K, L] walks into one flat [Q, K*L] token bag for the μ softmax.
+
+    Masks out (a) padding (nodes == -1) and (b) EVERY occurrence of the seed node u — both its slot
+    at the walk end and any earlier recurrence, since Log_{E[u]}(E[u]) = 0 would pull μ toward the
+    origin and let u witness itself. Returns:
+        ids   [Q, T]  int64  token node ids (−1 in masked slots; clamp before embedding)
+        mask  [Q, T]  bool   True on kept (real, non-seed) tokens
+        ages  [Q, T]  int64  cutoff − t_edge (≥ 0), meaningful only where mask is True
+    with T = K*L. The per-walk (K) structure is intentionally flattened away — every head consumes
+    one flat token bag; the raw [Q, K, L] shape exists only to share the walk-sampling pipeline."""
+    q = tokens.nodes.shape[0]
+    ids = tokens.nodes.reshape(q, -1)                                       # [Q, T]
+    is_seed = ids == tokens.seeds.view(q, 1)
+    mask = tokens.nodes_mask.reshape(q, -1) & ~is_seed                      # [Q, T]
+    ages = (tokens.cutoffs.view(q, 1) - tokens.timestamps.reshape(q, -1)).clamp_min(0)
+    return ids, mask, ages

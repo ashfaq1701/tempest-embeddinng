@@ -1,4 +1,4 @@
-"""Per-query-causal training + eval loop — link-supervised geometric walk head (VELOCITY).
+"""Per-query-causal training + eval loop — link-supervised geometric walk head (REACH).
 
 Causality is now enforced PER QUERY by Tempest's cutoff, not by ingestion order. Per-batch
 ordering (training):
@@ -6,9 +6,8 @@ ordering (training):
   2. neg = neg_sampler.sample(batch)                 — [B, K_train] uniform negs
   3. candidates = [pos | negs]                       — [B, 1+K_train]
   4. logits = score(src, candidates)                 — for each query (u_i, t_i) sample K
-       backward walks with cutoff = t_i, pack to raw tokens, score with VelocityHead: fit a
-       weighted free line to u's neighbour trajectory in T_{E[u]} and extrapolate to t_query
-       (q̂ = exp_{E[u]}(μ)). Candidate side samples no walks (static E[v]); score = γ·⟨q̂, E[v]⟩.
+       backward walks with cutoff = t_i (→ μ_u), pack to tokens, score with
+       GeometricPointHead (identity + reach). Candidate side samples no walks (static E[v]).
   5. L = cross_entropy(logits / tau_link, target=0)  — Bruch 2019, upper-bounds 1-MRR
   6. one backward + single optimizer step
 
@@ -23,12 +22,14 @@ earlier edges). The stores have no per-query cutoff, so they keep a pre-batch sn
 E (on the unit sphere) and the head are trained together by L (no alignment, no detach)
 by a single RiemannianAdam.
 
-TOKEN PREP — the source side goes through `walk_tokens.build_query_walk_tokens`: walks are
-generated PER QUERY (no dedup — each row's (node, t) needs its own cutoff) and returned RAW as a
-WalkTokens (seeds [Q]; nodes / nodes_mask / node-aligned timestamps [Q, K, L]; cutoffs [Q]; the
-seed slot carries t_cutoff). The head is self-contained from it: base point E[seeds], context =
-real non-seed positions, signed time s = (timestamps − cutoffs)/T_train, recency-weighted free-
-line fit, score γ·⟨q̂, E[v]⟩.
+TOKEN PREP — the source side (u → μ_u) goes through `walk_tokens.build_query_walk_tokens_multi`:
+walks are generated PER QUERY (no dedup — each row's (node, t) needs its own cutoff) and returned
+in the RAW per-walk WalkTokens layout ([Q, K, L] nodes / nodes_mask / node-aligned timestamps,
+seeds + cutoffs). One or more (num_walks, start_bias, walk_bias) configs are sampled and
+concatenated along K (see query_walk_configs). This RAW layout is the SHARED walk contract for
+every head; GeometricPointHead flattens it to a [Q, K*L] token bag and masks padding + the seed
+node u via `walk_tokens.flatten_and_exclude_seed`, then builds μ_u with a per-row softmax (ages =
+cutoffs − t_edge) and scores identity + reach against E[v].
 """
 import time
 from dataclasses import dataclass, field
@@ -42,7 +43,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
-from .link_pred_head import VelocityHead
+from .link_pred_head import GeometricPointHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
 from .utils import make_lr_lambda
@@ -107,7 +108,7 @@ class Trainer:
         self.embedding_table = EmbeddingTable(
             num_nodes=config.num_nodes, d_emb=config.d_emb,
         ).to(self.device)
-        self.link_head = VelocityHead(
+        self.link_head = GeometricPointHead(
             d_emb=int(config.d_emb),
             t_train=float(config.t_train),
         ).to(self.device)
@@ -168,24 +169,24 @@ class Trainer:
 
         PER-QUERY walks: the source side samples K backward walks for each query (u_i, t_i)
         with cutoff = t_i, so every token has t_edge < t_i (strict causal past of that query).
-        No dedup — each batch row is its own query. `build_query_walk_tokens` returns a
-        self-contained WalkTokens (seeds + cutoffs + dense token bag); the head builds μ_u with
-        a per-row softmax over the token bag (forming ages = cutoffs − t_edge itself, all > 0 by
-        the cutoff). The candidate side samples no walks — it enters only through its static
+        No dedup — each batch row is its own query. `build_query_walk_tokens_multi` returns a
+        self-contained raw WalkTokens (seeds + cutoffs + [Q,K,L] walks); the head flattens + masks
+        the seed and builds μ_u with a per-row softmax over the token bag (ages = cutoffs − t_edge,
+        all > 0 by the cutoff). The candidate side samples no walks — it enters only through its static
         embedding E[v] (identity + reach). Strict causality comes from the per-query cutoff, NOT
         from ingestion order, so the batch may already be in Tempest."""
         device = self.device
 
-        # --- SOURCE side: per-query (u_i, t_i) → K cutoff=t_i walks → token-stream CSR.
-        # (src_csr also carries the per-query neighbour CSR for future co-reach signals.) ---
-        src_csr = build_query_walk_tokens_multi(
+        # --- SOURCE side: per-query (u_i, t_i) → K cutoff=t_i walks per config → raw [Q,K,L]
+        # token bag (configs concatenated along K). The head flattens + masks the seed. ---
+        src_tokens = build_query_walk_tokens_multi(
             self.walk_gen, device, src_t, t_query_t,
             max_walk_len=self.config.max_walk_len_query_side,
             configs=self.config.query_walk_configs)
 
         return self.link_head(
             self.embedding_table.E.weight,   # the whole table; head indexes E_u / E_v / tokens
-            src_csr,                         # self-contained source walk CSR (seeds + cutoffs)
+            src_tokens,                      # raw source walk tokens (self-contained: seeds+cutoffs)
             cand_t)                          # candidate node ids
 
     # ──────────────────────────────────────────────────────────────────

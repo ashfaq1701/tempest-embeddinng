@@ -1,40 +1,42 @@
-"""Velocity head — extrapolate u's drifting neighbourhood to the query time.
+"""Geometric link head — REACH (one-sided drift), COUNT-FREE.
 
-The previous head built a recency-weighted CENTROID of u's past neighbours in the tangent space
-at E[u] — an AVERAGING read-out that can only land *among* nodes u has already touched, never
-*ahead* of them. Where u's neighbourhood DRIFTS through embedding space, the next partner is a
-point no past neighbour occupies and the centroid structurally cannot reach it.
+Builds a displacement μ_u for the source ONLY, from its walk tokens, and scores each candidate
+by how close its STATIC embedding E[v] is to u's drifted position:
 
-The velocity head fits a LINE (intercept + slope) to u's neighbour trajectory in tangent space
-and evaluates it at the query time — an EXTRAPOLATION, not an average. Per query (seed u, cutoff
-t), base point p = normalize(E[u]):
+  μ_u = drift in T_{E[u]}                             (recency centroid of u's Log vectors)
+  q_u = exp_{E[u]}(μ_u)                               u's drifted position, back ON the sphere
+  reach(u,v) = ⟨q_u, E[v]⟩                            does u's drift reach v?
 
-  context tokens: every real, non-seed walk position; v = Log_p(E[node]) ∈ T_p, node-aligned time
-  signed normalized time:  s = (time − t) / T_train          (≤ 0; query → s = 0)
-  recency weight:          w = exp(λ·s) · ctx                 (λ = softplus(log_lambda))
+The candidate side samples NO walks — there is no μ_v. q_u is u's neighbourhood pushed off
+E[u]; the inner product with the unit E[v] asks "how close is v to where u's neighbourhood is
+heading?". reach rises when v sits in the region u drifts toward, even if E[u], E[v] are far
+apart. coef_reach init 0 ⇒ the head starts as the proven query-anchored baseline and reach earns
+its weight. Age stays t_query − t_edge throughout (the trainer forms it; the head never
+re-defines it). The score is identity + reach:
 
-  Weighted free-line fit (per query), evaluated at s = 0 (i.e. at t_query):
-      W   = Σ w ; s̄ = Σ w·s / W ; v̄ = Σ w·v / W
-      b   = Σ w·(s−s̄)·v / Σ w·(s−s̄)²            (velocity / slope; v̄ is the weighted centroid)
-      μ   = v̄ − b·s̄                             (the line at s = 0)
+  TOKEN BASIS — the source seed carries a COUNT-FREE bag of walk-reached positions p (one token
+  per reached position; a node recurring k times is k tokens). μ sums the softmax over those
+  tokens directly — multiplicity is implicit in token repetition, no explicit count. age_p =
+  t_query − t_edge(p).
 
-Two channels (point-head style), blended by learnable coefficients:
-      score(u,v) = γ·( a·⟨exp_p(v̄), Ê_v⟩  +  c·⟨exp_p(μ), Ê_v⟩ )
-  * IDENTITY  a·⟨exp_p(v̄), Ê_v⟩  — score v against the CENTROID point: "is v in u's recent
-    neighbourhood?" (the recurrence detector). a init 1 ⇒ at init the head IS the centroid baseline.
-  * VELOCITY  c·⟨exp_p(μ), Ê_v⟩  — score v against the EXTRAPOLATED point: "is v where u is
-    heading?" c init 0 ⇒ velocity earns weight (on the drift slice).
+  μ_u = Σ_p softmax_p(−λ·age_p)·Log_{E[u]}(E[node_p ∈ u-tokens]) ; r_u = ĝate(μ_u)
 
-Fallbacks fall out of the algebra (never worse than the centroid by construction):
-  * COLD (no context, W = 0): v̄ = μ = 0 ⇒ both points = p ⇒ score = γ·a·cosine(E[u], E[v]).
-  * DEGENERATE time (Σ w·(s−s̄)² ≈ 0, one distinct timestamp / single neighbour): b = 0 ⇒ μ = v̄ —
-    velocity collapses onto identity; it only DIVERGES where there is genuine temporal spread.
+  identity = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )          is v in u's region?     [B,C]
+  reach    = ⟨ exp_{E[u]}(μ_u), E_v ⟩                          does u's drift reach v?  [B,C]
+  logit = coef_identity·identity + coef_reach·reach
 
-The whole head is six learnable scalars {log_lambda, logit_scale, coef_identity, coef_velocity,
-log_a, log_b} over the sphere embedding table. The identity channel matches candidates to the
-centroid v̄ by an anisotropic ellipse distance in the centroid-direction frame (log_a along the
-heading, log_b perpendicular; init 0 ⇒ isotropic ⇒ cosine), mirroring the point head. No forward
-Δτ horizon. T_train is the frozen train-split span (NOT a per-batch t_max).
+Only the source builds μ — the candidate enters solely through its static embedding E[v]
+(identity + reach). This is the MINIMAL one-sided geometric head: no staleness, no time-encoding
+(ExpDecayBasis/Time2Vec), no pair channel — a clean base for an end-to-end redesign.
+
+BASELINE AT INIT — coef_identity=1, coef_reach=0 ⇒ at init the head IS the proven identity term
+and nothing else; reach earns its weight from zero.
+
+COUNT-FREE — a node reached k times appears as k tokens, so its μ softmax-mass is summed across
+them; the old γμ·log(1+k) emphasis (learned ≈ −0.4, suppressed) is gone.
+
+TIME UNITS — raw ages; μ softmax scale-invariant (λ self-scales). E stays the single sphere
+parameter (link-trained, no detach).
 """
 import math
 
@@ -42,137 +44,143 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .walk_tokens import WalkTokens
+from .walk_tokens import WalkTokens, flatten_and_exclude_seed
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Sphere geometry primitives (shape-agnostic over leading axes)
-# ──────────────────────────────────────────────────────────────────────────
-
-def sphere_log(p: torch.Tensor, x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Log_p(x) ∈ T_p S^{d-1}: the tangent vector (⊥ p) of length = geodesic angle(p, x).
-    p, x unit and broadcastable; -> [..., d]. ⟨p,x⟩ clamped to the injectivity radius."""
-    c = (p * x).sum(-1, keepdim=True).clamp(-1 + eps, 1 - eps)
-    orth = x - c * p
-    return torch.arccos(c) * orth / orth.norm(dim=-1, keepdim=True).clamp_min(eps)
-
-
-def sphere_exp(p: torch.Tensor, v: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """exp_p(v) = cos‖v‖·p + sin‖v‖·v/‖v‖ ∈ S^{d-1}. v ⊥ p (a tangent vector); ‖v‖ capped to the
-    injectivity radius (<π); v→0 ⇒ exp_p(v)=p (cold drifts nowhere). Final normalize is a belt."""
-    norm = v.norm(dim=-1, keepdim=True)
-    theta = norm.clamp(max=math.pi - eps)
-    coef = torch.sin(theta) / norm.clamp_min(eps)              # → 0 as norm → 0 (q̂ → p)
-    return F.normalize(torch.cos(theta) * p + coef * v, dim=-1)
-
-
-class VelocityHead(nn.Module):
-    """Velocity (free-WLS-line) link head — see module docstring. forward -> logits [Q, C]."""
-
+class GeometricPointHead(nn.Module):
     def __init__(self, d_emb: int, t_train: float = 1.0):
         super().__init__()
-        self.d_emb = int(d_emb)
-        self.T_train = max(float(t_train), 1.0)         # time normalizer for s = (time − t)/T_train
+        self.d_emb = d_emb
         self.eps = 1e-6
-        # recency λ; init ≈ 3 so λ·s spans ~O(1) over the normalized window s ∈ [−1, 0].
-        self.log_lambda = nn.Parameter(torch.tensor(math.log(math.expm1(3.0)), dtype=torch.float32))
-        # logit temperature on cosine ∈ [−1, 1]; init ≈ 10 to sharpen the softmax-CE.
-        self.logit_scale = nn.Parameter(torch.tensor(math.log(math.expm1(10.0)), dtype=torch.float32))
 
-        # Two channels (point-head style): IDENTITY scores v against the CENTROID point exp_p(v̄)
-        # — "is v in u's recent neighbourhood?" (the recurrence detector, init 1 = proven baseline);
-        # VELOCITY scores v against the EXTRAPOLATED point exp_p(μ) — "is v where u is heading?"
-        # (init 0, earns weight on the drift slice). At init the head IS the centroid baseline.
+        # Shared μ recency λ (softmax, scale-invariant), init λ ≈ C/t_train so λ·age~O(1).
+        lam0 = 10.0 / max(float(t_train), 1.0)
+        self.log_lambda = nn.Parameter(
+            torch.tensor([math.log(math.expm1(lam0))], dtype=torch.float32))
+        self.alpha = nn.Parameter(torch.tensor(10.0))     # shared distance weight
+        self.log_a = nn.Parameter(torch.zeros(1))         # anisotropic ellipse (a,b ≥ 0)
+        self.log_b = nn.Parameter(torch.zeros(1))
+
+        # --- geometric mix coefficients ----------------------------------------
+        # identity is the proven baseline (init 1); reach earns weight (init 0).
         self.coef_identity = nn.Parameter(torch.ones(1))
-        self.coef_velocity = nn.Parameter(torch.zeros(1))
-
-        # Anisotropic ellipse on the IDENTITY channel (matching the point head): candidates are
-        # matched to the centroid v̄ by an ellipse distance in the centroid-direction frame —
-        # tolerance along the heading vs perpendicular learned. log_a/log_b init 0 ⇒ isotropic.
-        self.log_a = nn.Parameter(torch.zeros(1))      # weight ALONG the centroid heading
-        self.log_b = nn.Parameter(torch.zeros(1))      # weight PERPENDICULAR to it
+        # REACH — ⟨exp_{E[u]}(μ_u), E_v⟩: does u's one-sided drift reach v? coef init 0.
+        self.coef_reach = nn.Parameter(torch.zeros(1))
 
     # ──────────────────────────────────────────────────────────────────
-    # Pieces (each does one job; `forward` orchestrates)
+    # Geometry primitives (shape-agnostic over leading axes)
     # ──────────────────────────────────────────────────────────────────
 
-    def _base_point(self, e_weight: torch.Tensor, tokens: WalkTokens) -> torch.Tensor:
-        """p = normalize(E[u]) per query -> [Q, d]. From tokens.seeds (robust to cold/empty walks
-        where the seed is not placed in `nodes`)."""
-        return F.normalize(F.embedding(tokens.seeds, e_weight), dim=-1)
+    def _logmap(self, p: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        c = (p * x).sum(-1, keepdim=True).clamp(-1 + self.eps, 1 - self.eps)
+        theta = torch.arccos(c)
+        orth = x - c * p
+        return theta * orth / orth.norm(dim=-1, keepdim=True).clamp_min(self.eps)
 
-    def _context(self, e_weight: torch.Tensor, tokens: WalkTokens, p: torch.Tensor):
-        """Per context token (real, non-seed): tangent vector v = Log_p(E[node]), signed time s,
-        recency weight w. p [Q, d] -> v [Q, K, L, d], s [Q, K, L], w [Q, K, L] (0 off-context).
-        The seed node u is excluded at EVERY position it occurs (not just the t==cutoff slot):
-        Log_p(E[u]) = 0, so a u-recurrence is a zero tangent vector that biases the centroid/line
-        toward the origin."""
-        cut = tokens.cutoffs.view(-1, 1, 1)
-        is_seed = tokens.nodes == tokens.seeds.view(-1, 1, 1)            # u at ANY walk position
-        ctx = (tokens.nodes_mask & ~is_seed).to(p.dtype)                 # [Q, K, L] 1 on context
+    def _expmap(self, p: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+        """exp_p(δ) = cos‖δ‖·p + sin‖δ‖·δ/‖δ‖ ∈ S^{d-1}. δ = μ is a sum of Log_p's (all ⊥ p),
+        so the result is unit-norm; ‖δ‖ capped to the injectivity radius (<π); δ→0 ⇒ exp_p(δ)=p
+        (a cold node drifts nowhere). Final normalize is a numeric belt. Sends u's tangent
+        displacement back ONTO the sphere so q_u = exp_{E[u]}(μ_u) lives on the SAME manifold as
+        the candidate's unit E[v] and ⟨q_u, E[v]⟩ is a plain inner product."""
+        norm = delta.norm(dim=-1, keepdim=True)                     # ‖μ‖ = drift angle
+        theta = norm.clamp(max=math.pi - self.eps)
+        coef = torch.sin(theta) / norm.clamp_min(self.eps)         # → 0 as norm→0 (q→p)
+        q = torch.cos(theta) * p + coef * delta
+        return F.normalize(q, dim=-1)
 
-        s = (tokens.timestamps - cut).to(p.dtype) / self.T_train         # ≤ 0; 0 at the (excluded) seed
-        s = s * ctx                                                      # 0 off-context (w kills it too)
-        w = torch.exp(F.softplus(self.log_lambda) * s) * ctx             # [Q, K, L]
-
-        ev = F.normalize(F.embedding(tokens.nodes.clamp_min(0), e_weight), dim=-1)   # [Q, K, L, d]
-        v = sphere_log(p[:, None, None, :], ev, self.eps)                # [Q, K, L, d]
-        return v, s, w
-
-    def _fit_at_query(self, v: torch.Tensor, s: torch.Tensor, w: torch.Tensor):
-        """Weighted free-line fit over (K, L) -> (v̄, μ), both [Q, d]: v̄ = weighted CENTROID (the
-        identity prediction), μ = the line evaluated at s = 0 (the velocity prediction). Cold
-        (W ≤ ε) → v̄ = μ = 0 (exact). Degenerate time (Σw·(s−s̄)² ≈ 0) → b = 0 → μ = v̄."""
-        wsum = w.sum((1, 2))                                             # [Q] raw (for the cold mask)
-        W = wsum.clamp_min(self.eps)
-        sbar = (w * s).sum((1, 2)) / W                                   # [Q]
-        vbar = (w.unsqueeze(-1) * v).sum((1, 2)) / W.unsqueeze(-1)       # [Q, d] centroid
-        ds = s - sbar[:, None, None]                                     # [Q, K, L]
-        Sss = (w * ds * ds).sum((1, 2))                                  # [Q]
-        Sdv = (w.unsqueeze(-1) * ds.unsqueeze(-1) * v).sum((1, 2))       # [Q, d]
-        b = Sdv / Sss.clamp_min(self.eps).unsqueeze(-1)                  # [Q, d] velocity (0 if degenerate)
-        mu = vbar - b * sbar.unsqueeze(-1)                               # [Q, d] line at s = 0
-        cold = (wsum <= self.eps).unsqueeze(-1)
-        z = torch.zeros_like(mu)
-        return torch.where(cold, z, vbar), torch.where(cold, z, mu)
-
-    def _heading(self, c: torch.Tensor) -> torch.Tensor:
-        """Gated heading r = g(‖c‖)·c/‖c‖, g = ‖c‖²/(‖c‖²+m0²) → 0 when c small (isotropic)."""
-        cn = c.norm(dim=-1, keepdim=True)
-        gate = (cn * cn) / (cn * cn + 0.05 * 0.05)
-        return gate * c / cn.clamp_min(self.eps)
-
-    def _ellipse_dist(self, delta: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
-        """Anisotropic distance √(a·‖δ∥‖² + b·‖δ⊥‖²) in the heading frame r (a along r, b ⊥ r;
-        a = b ⇒ isotropic). delta [...,d], r broadcastable -> [...]."""
-        a, b = F.softplus(self.log_a), F.softplus(self.log_b)
+    def _ellipse_dist_sq(self, delta: torch.Tensor, r: torch.Tensor,
+                         a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Ellipse distance² a‖δ∥‖²+b‖δ⊥‖² in the heading frame r. delta [...,d];
+           r broadcastable to delta (caller unsqueezes the U axis where needed) -> [...]."""
         dpar2 = (delta * r).sum(-1).pow(2)
         dperp2 = ((delta * delta).sum(-1) - dpar2).clamp_min(0.0)
-        return (a * dpar2 + b * dperp2).clamp_min(self.eps).sqrt()
+        return a * dpar2 + b * dperp2
+
+    def _heading(self, mu: torch.Tensor) -> torch.Tensor:
+        """Gated heading r = g(‖μ‖)·μ/‖μ‖, g=‖μ‖²/(‖μ‖²+m0²) → 0 cold (isotropic), 1 warm."""
+        mu_norm = mu.norm(dim=-1, keepdim=True)
+        m0 = 0.05
+        gate = (mu_norm * mu_norm) / (mu_norm * mu_norm + m0 * m0)
+        return gate * mu / mu_norm.clamp_min(self.eps)
+
+    # ──────────────────────────────────────────────────────────────────
+    # μ — recency center of mass over a token bag (frame-agnostic)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _mu_from_csr(self, base_emb: torch.Tensor, ids: torch.Tensor, nmask: torch.Tensor,
+                     ages: torch.Tensor, e_weight: torch.Tensor) -> torch.Tensor:
+        """μ = Σ_p softmax_p(−λ·age_p)·Log_base(E[node_p]) over the seed's token positions.
+           base [...,d] ; ids/nmask/ages [...,U]  ->  μ [...,d]. Count-free: a node recurring
+           k times is k tokens, so its softmax mass is summed across them automatically."""
+        base = F.normalize(base_emb, dim=-1)
+        ew = F.normalize(F.embedding(ids.clamp_min(0), e_weight), dim=-1)   # [...,U,d]
+        g = self._logmap(base.unsqueeze(-2), ew)                           # [...,U,d]
+        lam = F.softplus(self.log_lambda)
+        ell = (-lam * ages).masked_fill(~nmask, float("-inf"))            # [...,U]
+        w = torch.nan_to_num(torch.softmax(ell, dim=-1), nan=0.0)
+        return (w.unsqueeze(-1) * g).sum(dim=-2)                          # [...,d]
+
+    # ──────────────────────────────────────────────────────────────────
+    # identity — probe an embedding against a prediction (frame-agnostic)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _identity(self, frame: torch.Tensor, probe: torch.Tensor, mu: torch.Tensor,
+                  r: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
+                  alpha: torch.Tensor) -> torch.Tensor:
+        """−α·ellipse( Log_frame(probe) − μ ; r ). All [...,d] (caller broadcasts) -> [...]."""
+        nu = self._logmap(frame, probe)                                  # [...,d]
+        dist = self._ellipse_dist_sq(nu - mu, r, a, b).clamp_min(self.eps).sqrt()
+        return -alpha * dist
 
     # ──────────────────────────────────────────────────────────────────
     # Forward
     # ──────────────────────────────────────────────────────────────────
 
-    def forward(self, e_weight: torch.Tensor, tokens: WalkTokens,
-                cand_ids: torch.Tensor) -> torch.Tensor:
-        """e_weight [N, d] the whole sphere table; tokens the source walks (self-contained:
-        seeds + cutoffs); cand_ids [Q, C]. -> logits [Q, C]."""
-        p = self._base_point(e_weight, tokens)                          # [Q, d]
-        v, s, w = self._context(e_weight, tokens, p)
-        vbar, mu = self._fit_at_query(v, s, w)                          # [Q, d] centroid, velocity
-        q_vel = sphere_exp(p, mu, self.eps)                            # [Q, d] extrapolated point
-        evc = F.normalize(F.embedding(cand_ids, e_weight), dim=-1)      # [Q, C, d]
+    def forward(self,
+                e_weight: torch.Tensor,        # [N, d]  the whole node-embedding table
+                src_tokens: WalkTokens,        # source walk tokens — self-contained: `seeds`
+                                               # ARE the sources, `cutoffs` ARE the query times
+                cand_ids: torch.Tensor,        # [B, C]  candidate node ids
+                ) -> torch.Tensor:
+        """-> logits [B, C]. The head owns all embedding lookups and timing: E_u, E_v and the
+        token embeddings all come from `e_weight` (E_u = e_weight[src_tokens.seeds],
+        E_v = e_weight[cand_ids]); token ages come from src_tokens.cutoffs − src_tokens.pos_ts.
+        The trainer only hands over the table, the (self-contained) source walk tokens, and the
+        candidate ids. Score = identity + reach (no staleness / time-encoding / pair channels)."""
+        B, C = cand_ids.shape[0], cand_ids.shape[1]
+        d = self.d_emb
+        E_u = F.embedding(src_tokens.seeds, e_weight)             # [B, d]
+        E_v = F.embedding(cand_ids, e_weight)                     # [B, C, d]
+        eu = F.normalize(E_u, dim=-1)                             # [B, d]
+        ev = F.normalize(E_v, dim=-1)                             # [B, C, d]
+        a = F.softplus(self.log_a)
+        b = F.softplus(self.log_b)
+        alpha = self.alpha.clamp_min(1e-3)
 
-        # IDENTITY: anisotropic ellipse distance of each candidate's tangent vector to the CENTROID
-        # v̄, in the centroid-direction frame (closer ⇒ higher, hence the minus). Matches the point
-        # head's identity (a richer recurrence detector than a plain cosine to the centroid point).
-        nu_v = sphere_log(p.unsqueeze(1), evc, self.eps)               # [Q, C, d] Log_p(E_v)
-        r_id = self._heading(vbar)                                    # [Q, d] centroid heading
-        identity = -self._ellipse_dist(nu_v - vbar.unsqueeze(1), r_id.unsqueeze(1))   # [Q, C]
+        # --- prediction μ_u (per-row softmax over the source token bag) ---
+        # Flatten the raw [B, K, L] walks to one [B, T] token bag, masking padding + the seed node
+        # u (the K/per-walk structure is unused by this head — see flatten_and_exclude_seed).
+        ids, nmask, ages = flatten_and_exclude_seed(src_tokens)       # [B, T] each
+        mu_u = self._mu_from_csr(
+            E_u, ids, nmask, ages.to(eu.dtype), e_weight)            # [B,d]
+        r_u = self._heading(mu_u)                                 # [B,d]
+        eu_bc = eu.unsqueeze(1).expand(B, C, d)                   # [B,C,d]
+        mu_u_bc = mu_u.unsqueeze(1).expand(B, C, d)
+        r_u_bc = r_u.unsqueeze(1).expand(B, C, d)
 
-        # VELOCITY: cosine to the extrapolated point (the drift term).
-        velocity = (q_vel.unsqueeze(1) * evc).sum(-1)                  # [Q, C] ⟨extrapolation, E_v⟩
+        # --- identity: is v in u's region? (proven baseline) ---
+        q_ident = self._identity(eu_bc, ev, mu_u_bc, r_u_bc, a, b, alpha)   # [B,C]
 
-        gamma = F.softplus(self.logit_scale)
-        return gamma * (self.coef_identity * identity + self.coef_velocity * velocity)   # [Q, C]
+        # --- REACH: push u's drift off E[u] back onto the sphere and inner-product it with the
+        # candidate's STATIC embedding. No μ_v — the candidate side samples no walks. q_u is u's
+        # neighbourhood centroid drifted off E[u]; ⟨q_u, E_v⟩ asks whether v sits where u's
+        # neighbourhood is heading. Rises when v is in u's drift region even if E[u], E[v] are
+        # structurally far apart. coef_reach init 0 ⇒ no-op at init.
+        q_u = self._expmap(eu, mu_u)                              # [B,d]   drifted source pos
+        reach = (q_u.unsqueeze(1) * ev).sum(-1)                  # [B,C]   ⟨q_u, E_v⟩
+
+        logit = (self.coef_identity * q_ident
+                 + self.coef_reach * reach)
+
+        return logit
