@@ -1189,3 +1189,89 @@ Test MRR is only logged on new-best (val-improving) epochs — the trainer evals
 test split only when val improves, so the `—` rows have no test number.
 
 Log: `logs/master/wiki_geomreach_20260629_203006.log`.
+
+---
+
+## Pipeline unification + velocity head beats point head (2026-06-30)
+
+### The unification
+
+The point head (`GeometricPointHead`, REACH) and the velocity head (free-WLS-line
+extrapolation) were unified onto ONE walk-sampling pipeline so that only the scoring
+model differs:
+
+- `walk_tokens.py` builds the RAW per-walk `WalkTokens` (`[Q, K, L]` nodes /
+  nodes_mask / node-aligned timestamps, seeds + cutoffs), and
+  `build_query_walk_tokens_multi` samples one or more `(num_walks, start_bias,
+  walk_bias)` configs and concatenates them along K.
+- A SHARED `flatten_and_exclude_seed(tokens)` helper flattens `[Q, K, L] → [Q, K*L]`
+  and masks padding + every occurrence of the seed node u. BOTH heads call it — the
+  seed-exclusion rule has one home; the per-walk (K) structure is unused (μ pools all
+  walks per query, so flatten-then-sum ≡ sum-over-(K,L)).
+- Multi-bias query-side sampling is exposed on `--walk-bias-query-side` /
+  `--start-bias-query-side` (comma-separated, broadcast / pairwise-zipped) and
+  `--num-walks-per-node-query-side` (one value reused per config, or per-config). A new
+  Tempest picker `ExponentialWeightInverseDegree` (favours low-degree nodes) is
+  available as a bias.
+
+Result: master's head is now the **velocity head**, identical to the point head EXCEPT
+the drift channel's prediction. `_centroid_and_line()` returns both the recency centroid
+v̄ (identity) and the WLS line at the query time μ = v̄ − b·s̄ (velocity); μ is
+scale-invariant in time so it reuses the softmax recency weights.
+
+  identity = −α·ellipse( Log_{E[u]}(E_v) − v̄ ; r(v̄) )      (centroid — recurrence baseline)
+  velocity = ⟨ exp_{E[u]}(μ), E_v ⟩                          (line extrapolation, not centroid)
+
+(The old REACH head used `exp_{E[u]}(v̄)` for the drift channel — the centroid, not the
+line.)
+
+### Clean A/B — velocity (line-fit drift μ) vs point (centroid drift μ)
+
+First clean isolation of "line-extrapolation drift vs centroid drift": both heads the
+SAME scaffold (same pipeline, identity channel, geometry, weighting), differing ONLY in
+the drift μ. Two runs, seed 42, single `ExponentialWeight`, 10 walks, `max_walk_len 5`,
+`d_emb 256`, `batch_size 200`, `lr 1e-3`, patience 5.
+
+| | run 1 | run 2 |
+|---|---|---|
+| epoch-by-epoch VAL wins (vel / pt) | 17 / 3 | 13 / 3 |
+| peak val — velocity vs point | 0.8255 vs 0.8237 (**+0.0018**) | 0.8255 vs 0.8236 (**+0.0019**) |
+| peak test — velocity vs point | 0.8033 vs 0.8016 (**+0.0017**) | 0.8032 vs 0.8016 (**+0.0016**) |
+
+Velocity wins the large majority of epochs; the point head only wins ~3 noise-level
+early epochs (where `coef_velocity ≈ 0`, so the heads are near-identical). The peak lands
+at 0.8255/0.803 BOTH runs — stable, replicating.
+
+### Where the gain is — BROAD, not localized (`--stratify`, run 2)
+
+Per-slice test MRR, velocity − point:
+
+| stratum | Δ(VEL−PT) |
+|---|---|
+| repeat-pair (~87% of mass) | +0.0013 |
+| new-pair (~13%) | +0.0015 |
+| both-seen | +0.0013 |
+| new × both-seen | +0.0021 |
+| deg=0 (cold source) | +0.0011 |
+| deg 1 / 2–5 / 6–20 | +0.0032 / +0.0029 / **+0.0042** |
+| v-only-inductive | **−0.0256** (small, noisy slice) |
+
+Velocity is slightly better on nearly every slice (+0.001 to +0.004). I had hypothesised
+the line-extrapolation would specifically help the new-pair / cold-start slice — it does
+NOT. It's a small UNIFORM refinement of the drift channel; the mass-weighted overall gain
+(+0.0013 stratified) is carried mostly by the repeat-pair slice because that is ~87% of
+the data. One small regression on the tiny `v-only-inductive` slice.
+
+### Verdict + caveat
+
+The line-fit μ genuinely beats the centroid μ on wiki — small (+0.0016–0.0019) but
+**consistent and replicated** (2 runs: same peak, same epoch dominance, broad per-slice
+improvement — much harder to dismiss than a one-off peak). Caveat: **single-SEED** (both
+runs seed 42, only walk-sample variation differs); +0.0016 test is at the noise threshold,
+so 2–3 *different* seeds would make it conclusive.
+
+Shipped: merged to master (`8c2dc59`). This supersedes the earlier "velocity ties /
+falsified" conclusion, which was an artifact of comparing two differently-built heads
+rather than this clean single-variable A/B.
+
+Logs: `logs/velocity/strat_velocity_*.log`, `logs/master/strat_point_*.log`.
