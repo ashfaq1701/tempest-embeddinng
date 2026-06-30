@@ -30,9 +30,11 @@ Fallbacks fall out of the algebra (never worse than the centroid by construction
   * DEGENERATE time (Σ w·(s−s̄)² ≈ 0, one distinct timestamp / single neighbour): b = 0 ⇒ μ = v̄ —
     velocity collapses onto identity; it only DIVERGES where there is genuine temporal spread.
 
-The whole head is four learnable scalars {log_lambda, logit_scale, coef_identity, coef_velocity}
-over the sphere embedding table. No ellipse/heading gate, no forward Δτ horizon. T_train is the
-frozen train-split span (NOT a per-batch t_max).
+The whole head is six learnable scalars {log_lambda, logit_scale, coef_identity, coef_velocity,
+log_a, log_b} over the sphere embedding table. The identity channel matches candidates to the
+centroid v̄ by an anisotropic ellipse distance in the centroid-direction frame (log_a along the
+heading, log_b perpendicular; init 0 ⇒ isotropic ⇒ cosine), mirroring the point head. No forward
+Δτ horizon. T_train is the frozen train-split span (NOT a per-batch t_max).
 """
 import math
 
@@ -84,6 +86,12 @@ class VelocityHead(nn.Module):
         self.coef_identity = nn.Parameter(torch.ones(1))
         self.coef_velocity = nn.Parameter(torch.zeros(1))
 
+        # Anisotropic ellipse on the IDENTITY channel (matching the point head): candidates are
+        # matched to the centroid v̄ by an ellipse distance in the centroid-direction frame —
+        # tolerance along the heading vs perpendicular learned. log_a/log_b init 0 ⇒ isotropic.
+        self.log_a = nn.Parameter(torch.zeros(1))      # weight ALONG the centroid heading
+        self.log_b = nn.Parameter(torch.zeros(1))      # weight PERPENDICULAR to it
+
     # ──────────────────────────────────────────────────────────────────
     # Pieces (each does one job; `forward` orchestrates)
     # ──────────────────────────────────────────────────────────────────
@@ -128,6 +136,20 @@ class VelocityHead(nn.Module):
         z = torch.zeros_like(mu)
         return torch.where(cold, z, vbar), torch.where(cold, z, mu)
 
+    def _heading(self, c: torch.Tensor) -> torch.Tensor:
+        """Gated heading r = g(‖c‖)·c/‖c‖, g = ‖c‖²/(‖c‖²+m0²) → 0 when c small (isotropic)."""
+        cn = c.norm(dim=-1, keepdim=True)
+        gate = (cn * cn) / (cn * cn + 0.05 * 0.05)
+        return gate * c / cn.clamp_min(self.eps)
+
+    def _ellipse_dist(self, delta: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+        """Anisotropic distance √(a·‖δ∥‖² + b·‖δ⊥‖²) in the heading frame r (a along r, b ⊥ r;
+        a = b ⇒ isotropic). delta [...,d], r broadcastable -> [...]."""
+        a, b = F.softplus(self.log_a), F.softplus(self.log_b)
+        dpar2 = (delta * r).sum(-1).pow(2)
+        dperp2 = ((delta * delta).sum(-1) - dpar2).clamp_min(0.0)
+        return (a * dpar2 + b * dperp2).clamp_min(self.eps).sqrt()
+
     # ──────────────────────────────────────────────────────────────────
     # Forward
     # ──────────────────────────────────────────────────────────────────
@@ -139,11 +161,18 @@ class VelocityHead(nn.Module):
         p = self._base_point(e_weight, tokens)                          # [Q, d]
         v, s, w = self._context(e_weight, tokens, p)
         vbar, mu = self._fit_at_query(v, s, w)                          # [Q, d] centroid, velocity
-        q_id = sphere_exp(p, vbar, self.eps)                            # [Q, d] centroid point
         q_vel = sphere_exp(p, mu, self.eps)                            # [Q, d] extrapolated point
-
         evc = F.normalize(F.embedding(cand_ids, e_weight), dim=-1)      # [Q, C, d]
-        identity = (q_id.unsqueeze(1) * evc).sum(-1)                   # [Q, C] ⟨centroid, E_v⟩
+
+        # IDENTITY: anisotropic ellipse distance of each candidate's tangent vector to the CENTROID
+        # v̄, in the centroid-direction frame (closer ⇒ higher, hence the minus). Matches the point
+        # head's identity (a richer recurrence detector than a plain cosine to the centroid point).
+        nu_v = sphere_log(p.unsqueeze(1), evc, self.eps)               # [Q, C, d] Log_p(E_v)
+        r_id = self._heading(vbar)                                    # [Q, d] centroid heading
+        identity = -self._ellipse_dist(nu_v - vbar.unsqueeze(1), r_id.unsqueeze(1))   # [Q, C]
+
+        # VELOCITY: cosine to the extrapolated point (the drift term).
         velocity = (q_vel.unsqueeze(1) * evc).sum(-1)                  # [Q, C] ⟨extrapolation, E_v⟩
+
         gamma = F.softplus(self.logit_scale)
         return gamma * (self.coef_identity * identity + self.coef_velocity * velocity)   # [Q, C]
