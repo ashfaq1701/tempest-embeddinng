@@ -18,9 +18,10 @@ The score is identity + velocity:
   logit = coef_identity·identity + coef_velocity·velocity
 
 Identity is anchored on the CENTROID v̄ (the proven recurrence baseline); only the velocity channel
-uses the extrapolated μ. Both coefs init 1 (the earn-from-zero velocity start gave no advantage).
-Degenerate time (one distinct timestamp / single token) ⇒ slope b = 0 ⇒ μ = v̄ ⇒ velocity collapses
-onto the centroid; it only diverges where there is genuine temporal spread.
+uses the extrapolated μ. coef_velocity init 0 ⇒ at init the head IS the centroid-identity baseline
+and velocity earns its weight from zero. Degenerate time (one distinct timestamp / single token)
+⇒ slope b = 0 ⇒ μ = v̄ ⇒ velocity collapses onto the centroid; it only diverges where there is
+genuine temporal spread.
 
 This is the same one-sided geometric head as the point/reach baseline, identical EXCEPT the drift
 channel's prediction is the line extrapolation μ rather than the centroid v̄ (reach used exp(v̄)).
@@ -53,12 +54,10 @@ class VelocityHead(nn.Module):
         self.log_b = nn.Parameter(torch.zeros(1))
 
         # --- geometric mix coefficients ----------------------------------------
-        # Both channels active from the start (init 1). The earn-from-zero start (velocity init 0)
-        # gave no advantage — it just tracks the centroid baseline until velocity warms up — so both
-        # the centroid-identity and the line-extrapolation velocity contribute from step 0.
+        # identity is the proven baseline (init 1); velocity earns weight (init 0).
         self.coef_identity = nn.Parameter(torch.ones(1))
-        # VELOCITY — ⟨exp_{E[u]}(μ_line), E_v⟩: does u's drift EXTRAPOLATION reach v?
-        self.coef_velocity = nn.Parameter(torch.ones(1))
+        # VELOCITY — ⟨exp_{E[u]}(μ_line), E_v⟩: does u's drift EXTRAPOLATION reach v? coef init 0.
+        self.coef_velocity = nn.Parameter(torch.zeros(1))
 
     # ──────────────────────────────────────────────────────────────────
     # Geometry primitives (shape-agnostic over leading axes)
@@ -189,7 +188,7 @@ class VelocityHead(nn.Module):
         # query time, not the centroid) back onto the sphere and inner-product it with the
         # candidate's STATIC embedding. No μ_v — the candidate side samples no walks. ⟨q_u, E_v⟩
         # asks whether v sits where u's neighbourhood is HEADING (extrapolation, not average).
-        # coef_velocity init 1 (active from the start, alongside identity).
+        # coef_velocity init 0 ⇒ no-op at init; the head starts as the centroid-identity baseline.
         q_u = self._expmap(eu, mu_line)                          # [B,d]   extrapolated source pos
         velocity = (q_u.unsqueeze(1) * ev).sum(-1)              # [B,C]   ⟨q_u, E_v⟩
 
