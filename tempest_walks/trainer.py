@@ -7,7 +7,7 @@ ordering (training):
   3. candidates = [pos | negs]                       — [B, 1+K_train]
   4. logits = score(src, candidates)                 — for each query (u_i, t_i) sample K
        backward walks with cutoff = t_i (→ μ_u), pack to tokens, score with
-       GeometricPointHead (identity + reach). Candidate side samples no walks (static E[v]).
+       VelocityHead (identity + velocity-line). Candidate side samples no walks (static E[v]).
   5. L = cross_entropy(logits / tau_link, target=0)  — Bruch 2019, upper-bounds 1-MRR
   6. one backward + single optimizer step
 
@@ -27,7 +27,7 @@ walks are generated PER QUERY (no dedup — each row's (node, t) needs its own c
 in the RAW per-walk WalkTokens layout ([Q, K, L] nodes / nodes_mask / node-aligned timestamps,
 seeds + cutoffs). One or more (num_walks, start_bias, walk_bias) configs are sampled and
 concatenated along K (see query_walk_configs). This RAW layout is the SHARED walk contract for
-every head; GeometricPointHead flattens it to a [Q, K*L] token bag and masks padding + the seed
+every head; VelocityHead flattens it to a [Q, K*L] token bag and masks padding + the seed
 node u via `walk_tokens.flatten_and_exclude_seed`, then builds μ_u with a per-row softmax (ages =
 cutoffs − t_edge) and scores identity + reach against E[v].
 """
@@ -43,7 +43,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
-from .link_pred_head import GeometricPointHead
+from .link_pred_head import VelocityHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
 from .utils import make_lr_lambda
@@ -108,7 +108,7 @@ class Trainer:
         self.embedding_table = EmbeddingTable(
             num_nodes=config.num_nodes, d_emb=config.d_emb,
         ).to(self.device)
-        self.link_head = GeometricPointHead(
+        self.link_head = VelocityHead(
             d_emb=int(config.d_emb),
             t_train=float(config.t_train),
         ).to(self.device)

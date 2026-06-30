@@ -1,42 +1,34 @@
-"""Geometric link head — REACH (one-sided drift), COUNT-FREE.
+"""Velocity link head — one-sided drift EXTRAPOLATION, COUNT-FREE.
 
-Builds a displacement μ_u for the source ONLY, from its walk tokens, and scores each candidate
-by how close its STATIC embedding E[v] is to u's drifted position:
+Builds, for the source ONLY, a weighted free LINE through u's walk-token trajectory in T_{E[u]}
+and scores each candidate by how close its STATIC embedding E[v] is to the line evaluated at the
+QUERY time — an extrapolation, not an average. Per query, over the flat token bag (the K walks
+pooled; see flatten_and_exclude_seed):
 
-  μ_u = drift in T_{E[u]}                             (recency centroid of u's Log vectors)
-  q_u = exp_{E[u]}(μ_u)                               u's drifted position, back ON the sphere
-  reach(u,v) = ⟨q_u, E[v]⟩                            does u's drift reach v?
+  v̄ = Σ_p softmax_p(−λ·age_p)·Log_{E[u]}(E[node_p])    recency CENTROID (the identity prediction)
+  μ  = v̄ − b·s̄  with b the weighted slope, s = −age   the LINE at the query time (s = 0)
+  q_u = exp_{E[u]}(μ)                                  u's extrapolated position, back ON the sphere
 
-The candidate side samples NO walks — there is no μ_v. q_u is u's neighbourhood pushed off
-E[u]; the inner product with the unit E[v] asks "how close is v to where u's neighbourhood is
-heading?". reach rises when v sits in the region u drifts toward, even if E[u], E[v] are far
-apart. coef_reach init 0 ⇒ the head starts as the proven query-anchored baseline and reach earns
-its weight. Age stays t_query − t_edge throughout (the trainer forms it; the head never
-re-defines it). The score is identity + reach:
+The candidate side samples NO walks — there is no μ_v. q_u is u's trajectory pushed off E[u]; the
+inner product with the unit E[v] asks "how close is v to where u's neighbourhood is HEADING?".
+The score is identity + velocity:
 
-  TOKEN BASIS — the source seed carries a COUNT-FREE bag of walk-reached positions p (one token
-  per reached position; a node recurring k times is k tokens). μ sums the softmax over those
-  tokens directly — multiplicity is implicit in token repetition, no explicit count. age_p =
-  t_query − t_edge(p).
+  identity = −α·ellipse( Log_{E[u]}(E_v) − v̄ ; r(v̄) )          is v in u's region?         [B,C]
+  velocity = ⟨ exp_{E[u]}(μ), E_v ⟩                            does u's drift extrapolate to v?  [B,C]
+  logit = coef_identity·identity + coef_velocity·velocity
 
-  μ_u = Σ_p softmax_p(−λ·age_p)·Log_{E[u]}(E[node_p ∈ u-tokens]) ; r_u = ĝate(μ_u)
+Identity is anchored on the CENTROID v̄ (the proven recurrence baseline); only the velocity channel
+uses the extrapolated μ. coef_velocity init 0 ⇒ at init the head IS the centroid-identity baseline
+and velocity earns its weight from zero. Degenerate time (one distinct timestamp / single token)
+⇒ slope b = 0 ⇒ μ = v̄ ⇒ velocity collapses onto the centroid; it only diverges where there is
+genuine temporal spread.
 
-  identity = −α·ellipse( Log_{E[u]}(E_v) − μ_u ; r_u )          is v in u's region?     [B,C]
-  reach    = ⟨ exp_{E[u]}(μ_u), E_v ⟩                          does u's drift reach v?  [B,C]
-  logit = coef_identity·identity + coef_reach·reach
+This is the same one-sided geometric head as the point/reach baseline, identical EXCEPT the drift
+channel's prediction is the line extrapolation μ rather than the centroid v̄ (reach used exp(v̄)).
 
-Only the source builds μ — the candidate enters solely through its static embedding E[v]
-(identity + reach). This is the MINIMAL one-sided geometric head: no staleness, no time-encoding
-(ExpDecayBasis/Time2Vec), no pair channel — a clean base for an end-to-end redesign.
-
-BASELINE AT INIT — coef_identity=1, coef_reach=0 ⇒ at init the head IS the proven identity term
-and nothing else; reach earns its weight from zero.
-
-COUNT-FREE — a node reached k times appears as k tokens, so its μ softmax-mass is summed across
-them; the old γμ·log(1+k) emphasis (learned ≈ −0.4, suppressed) is gone.
-
-TIME UNITS — raw ages; μ softmax scale-invariant (λ self-scales). E stays the single sphere
-parameter (link-trained, no detach).
+TOKEN BASIS — COUNT-FREE: a node recurring k times is k tokens, summed automatically; μ is
+scale-invariant in time (λ self-scales). E stays the single sphere parameter (link-trained, no
+detach).
 """
 import math
 
@@ -47,7 +39,7 @@ import torch.nn.functional as F
 from .walk_tokens import WalkTokens, flatten_and_exclude_seed
 
 
-class GeometricPointHead(nn.Module):
+class VelocityHead(nn.Module):
     def __init__(self, d_emb: int, t_train: float = 1.0):
         super().__init__()
         self.d_emb = d_emb
@@ -62,10 +54,10 @@ class GeometricPointHead(nn.Module):
         self.log_b = nn.Parameter(torch.zeros(1))
 
         # --- geometric mix coefficients ----------------------------------------
-        # identity is the proven baseline (init 1); reach earns weight (init 0).
+        # identity is the proven baseline (init 1); velocity earns weight (init 0).
         self.coef_identity = nn.Parameter(torch.ones(1))
-        # REACH — ⟨exp_{E[u]}(μ_u), E_v⟩: does u's one-sided drift reach v? coef init 0.
-        self.coef_reach = nn.Parameter(torch.zeros(1))
+        # VELOCITY — ⟨exp_{E[u]}(μ_line), E_v⟩: does u's drift EXTRAPOLATION reach v? coef init 0.
+        self.coef_velocity = nn.Parameter(torch.zeros(1))
 
     # ──────────────────────────────────────────────────────────────────
     # Geometry primitives (shape-agnostic over leading axes)
@@ -108,18 +100,36 @@ class GeometricPointHead(nn.Module):
     # μ — recency center of mass over a token bag (frame-agnostic)
     # ──────────────────────────────────────────────────────────────────
 
-    def _mu_from_csr(self, base_emb: torch.Tensor, ids: torch.Tensor, nmask: torch.Tensor,
-                     ages: torch.Tensor, e_weight: torch.Tensor) -> torch.Tensor:
-        """μ = Σ_p softmax_p(−λ·age_p)·Log_base(E[node_p]) over the seed's token positions.
-           base [...,d] ; ids/nmask/ages [...,U]  ->  μ [...,d]. Count-free: a node recurring
-           k times is k tokens, so its softmax mass is summed across them automatically."""
+    def _centroid_and_line(self, base_emb: torch.Tensor, ids: torch.Tensor, nmask: torch.Tensor,
+                           ages: torch.Tensor, e_weight: torch.Tensor):
+        """Recency-softmax CENTROID v̄ (identity prediction) AND the weighted free-LINE μ
+        extrapolated to the query time s = 0 (velocity prediction), over one flat token bag.
+        base [...,d] ; ids/nmask/ages [...,U]  ->  v̄ [...,d], μ [...,d].
+
+          w_p = softmax_p(−λ·age_p)                              recency weights (Σ = 1, or 0 if cold)
+          v̄   = Σ_p w_p · g_p          (g_p = Log_base(E[node_p]))   the centroid
+          b   = Σ w·(s−s̄)·g / Σ w·(s−s̄)²   (s = −age, query at s = 0)  the WLS slope
+          μ   = v̄ − b·s̄                                          the line at s = 0
+
+        μ is SCALE-INVARIANT in s (b·s̄ is unit-free), so raw ages give the same line as any time
+        unit. Count-free: a node recurring k times is k tokens, summed automatically. Cold (all
+        masked) → w = 0 → v̄ = μ = 0 (exact)."""
         base = F.normalize(base_emb, dim=-1)
         ew = F.normalize(F.embedding(ids.clamp_min(0), e_weight), dim=-1)   # [...,U,d]
         g = self._logmap(base.unsqueeze(-2), ew)                           # [...,U,d]
         lam = F.softplus(self.log_lambda)
         ell = (-lam * ages).masked_fill(~nmask, float("-inf"))            # [...,U]
-        w = torch.nan_to_num(torch.softmax(ell, dim=-1), nan=0.0)
-        return (w.unsqueeze(-1) * g).sum(dim=-2)                          # [...,d]
+        w = torch.nan_to_num(torch.softmax(ell, dim=-1), nan=0.0)         # [...,U]  Σ = 1 (0 if cold)
+
+        vbar = (w.unsqueeze(-1) * g).sum(dim=-2)                          # [...,d]  centroid (Σw = 1)
+        s = -ages.to(g.dtype)                                             # signed time; query at s = 0
+        sbar = (w * s).sum(dim=-1)                                        # [...]    weighted mean (Σw = 1)
+        ds = s - sbar.unsqueeze(-1)                                       # [...,U]
+        Sss = (w * ds * ds).sum(dim=-1)                                   # [...]
+        Sgv = (w.unsqueeze(-1) * ds.unsqueeze(-1) * g).sum(dim=-2)        # [...,d]
+        b = Sgv / Sss.clamp_min(self.eps).unsqueeze(-1)                   # [...,d]  slope (0 if degenerate)
+        mu = vbar - b * sbar.unsqueeze(-1)                               # [...,d]  line at s = 0
+        return vbar, mu
 
     # ──────────────────────────────────────────────────────────────────
     # identity — probe an embedding against a prediction (frame-agnostic)
@@ -158,29 +168,31 @@ class GeometricPointHead(nn.Module):
         b = F.softplus(self.log_b)
         alpha = self.alpha.clamp_min(1e-3)
 
-        # --- prediction μ_u (per-row softmax over the source token bag) ---
+        # --- predictions: centroid v̄ (identity) + line extrapolation μ (velocity) ---
         # Flatten the raw [B, K, L] walks to one [B, T] token bag, masking padding + the seed node
-        # u (the K/per-walk structure is unused by this head — see flatten_and_exclude_seed).
+        # u (the K/per-walk structure is unused by this head — see flatten_and_exclude_seed). One
+        # weighted free-line fit per query over the pooled tokens gives BOTH the centroid v̄ and the
+        # line at the query time μ.
         ids, nmask, ages = flatten_and_exclude_seed(src_tokens)       # [B, T] each
-        mu_u = self._mu_from_csr(
-            E_u, ids, nmask, ages.to(eu.dtype), e_weight)            # [B,d]
-        r_u = self._heading(mu_u)                                 # [B,d]
+        vbar, mu_line = self._centroid_and_line(
+            E_u, ids, nmask, ages.to(eu.dtype), e_weight)            # [B,d], [B,d]
+        r_u = self._heading(vbar)                                 # [B,d]   identity frame = centroid heading
         eu_bc = eu.unsqueeze(1).expand(B, C, d)                   # [B,C,d]
-        mu_u_bc = mu_u.unsqueeze(1).expand(B, C, d)
+        vbar_bc = vbar.unsqueeze(1).expand(B, C, d)
         r_u_bc = r_u.unsqueeze(1).expand(B, C, d)
 
-        # --- identity: is v in u's region? (proven baseline) ---
-        q_ident = self._identity(eu_bc, ev, mu_u_bc, r_u_bc, a, b, alpha)   # [B,C]
+        # --- identity: is v in u's region? ellipse to the CENTROID v̄ (proven baseline) ---
+        q_ident = self._identity(eu_bc, ev, vbar_bc, r_u_bc, a, b, alpha)   # [B,C]
 
-        # --- REACH: push u's drift off E[u] back onto the sphere and inner-product it with the
-        # candidate's STATIC embedding. No μ_v — the candidate side samples no walks. q_u is u's
-        # neighbourhood centroid drifted off E[u]; ⟨q_u, E_v⟩ asks whether v sits where u's
-        # neighbourhood is heading. Rises when v is in u's drift region even if E[u], E[v] are
-        # structurally far apart. coef_reach init 0 ⇒ no-op at init.
-        q_u = self._expmap(eu, mu_u)                              # [B,d]   drifted source pos
-        reach = (q_u.unsqueeze(1) * ev).sum(-1)                  # [B,C]   ⟨q_u, E_v⟩
+        # --- VELOCITY: push u's drift to the EXTRAPOLATED point exp_{E[u]}(μ) (the free line at the
+        # query time, not the centroid) back onto the sphere and inner-product it with the
+        # candidate's STATIC embedding. No μ_v — the candidate side samples no walks. ⟨q_u, E_v⟩
+        # asks whether v sits where u's neighbourhood is HEADING (extrapolation, not average).
+        # coef_velocity init 0 ⇒ no-op at init; the head starts as the centroid-identity baseline.
+        q_u = self._expmap(eu, mu_line)                          # [B,d]   extrapolated source pos
+        velocity = (q_u.unsqueeze(1) * ev).sum(-1)              # [B,C]   ⟨q_u, E_v⟩
 
         logit = (self.coef_identity * q_ident
-                 + self.coef_reach * reach)
+                 + self.coef_velocity * velocity)
 
         return logit
