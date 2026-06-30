@@ -31,8 +31,8 @@ real non-seed positions, signed time s = (timestamps − cutoffs)/T_train, recen
 line fit, score γ·⟨q̂, E[v]⟩.
 """
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import geoopt
 import numpy as np
@@ -46,7 +46,7 @@ from .link_pred_head import VelocityHead
 from .model import EmbeddingTable
 from .negatives import UniformNegativeSampler
 from .utils import make_lr_lambda
-from .walk_tokens import build_query_walk_tokens
+from .walk_tokens import build_query_walk_tokens_multi
 from .walks import WalkGenerator
 
 
@@ -69,10 +69,15 @@ class TrainerConfig:
 
     # Walks (BACKWARD only, undirected). QUERY-side only: source u → μ_u tokens. The candidate
     # side samples no walks (reach compares against v's static embedding).
-    num_walks_per_node_query_side: int = 5
+    #
+    # query_walk_configs: one or more (num_walks, start_bias, walk_bias) sampling configs. Each is
+    # sampled per query and their per-query walk bags are concatenated along K into one token bag
+    # (all share max_walk_len_query_side so the bags are L-compatible). A single config reproduces
+    # the prior behaviour; multiple configs diversify the μ-fit sample (e.g. an ExponentialWeight
+    # bag + an ExponentialWeightInverseDegree bag). Total walks/node = Σ num_walks over configs.
+    query_walk_configs: List[Tuple[int, str, str]] = field(
+        default_factory=lambda: [(5, "ExponentialWeight", "ExponentialWeight")])
     max_walk_len_query_side: int = 5
-    walk_bias_query_side: str = "ExponentialWeight"
-    start_bias_query_side: str = "ExponentialWeight"
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
     # Optimisation.
@@ -107,12 +112,15 @@ class Trainer:
             t_train=float(config.t_train),
         ).to(self.device)
 
-        # One generator, configured QUERY-side; only the source side samples walks.
+        # One generator, configured QUERY-side; only the source side samples walks. The biases /
+        # num_walks are overridden per-config at sample time (see _score), so the constructor just
+        # seeds sensible defaults from the first config.
+        _nw0, _sb0, _wb0 = config.query_walk_configs[0]
         self.walk_gen = WalkGenerator(
             use_gpu=config.use_gpu_tempest,
-            walk_bias=config.walk_bias_query_side,
-            start_bias=config.start_bias_query_side,
-            num_walks_per_node=config.num_walks_per_node_query_side,
+            walk_bias=_wb0,
+            start_bias=_sb0,
+            num_walks_per_node=_nw0,
             max_walk_len=config.max_walk_len_query_side,
             max_time_capacity=config.max_time_capacity,
         )
@@ -170,12 +178,10 @@ class Trainer:
 
         # --- SOURCE side: per-query (u_i, t_i) → K cutoff=t_i walks → token-stream CSR.
         # (src_csr also carries the per-query neighbour CSR for future co-reach signals.) ---
-        src_csr = build_query_walk_tokens(
+        src_csr = build_query_walk_tokens_multi(
             self.walk_gen, device, src_t, t_query_t,
             max_walk_len=self.config.max_walk_len_query_side,
-            num_walks_per_node=self.config.num_walks_per_node_query_side,
-            start_bias=self.config.start_bias_query_side,
-            walk_bias=self.config.walk_bias_query_side)
+            configs=self.config.query_walk_configs)
 
         return self.link_head(
             self.embedding_table.E.weight,   # the whole table; head indexes E_u / E_v / tokens

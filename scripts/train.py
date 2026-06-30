@@ -27,7 +27,7 @@ import argparse
 import pathlib
 import sys
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 # Allow direct invocation (`python scripts/train.py ...`) by putting
 # the project root on sys.path. `python -m scripts.train ...` works
@@ -45,6 +45,53 @@ from tempest_walks.evaluator import Evaluator
 from tempest_walks.negatives import TGBNegativeSampler
 from tempest_walks.trainer import Trainer, TrainerConfig
 from tempest_walks.utils import compute_max_time_capacity, seed_all
+
+
+def resolve_query_walk_configs(
+    start_bias: str, walk_bias: str, num_walks: str,
+) -> List[Tuple[int, str, str]]:
+    """Turn the comma-separated query-side walk args into aligned (num_walks, start_bias, walk_bias)
+    sampling configs.
+
+    Pairing rule (generalizable to any N): n_configs = max(#start, #walk). A length-1 bias side is
+    reused for every config; if both sides have length > 1 they must match length and are zipped
+    pairwise (NOT a cartesian product). num_walks is one value (used for every config) or exactly
+    n_configs values (per config). See the --walk-bias-query-side help.
+    """
+    def split(s: str) -> List[str]:
+        return [tok.strip() for tok in s.split(",") if tok.strip()]
+
+    starts, walks = split(start_bias), split(walk_bias)
+    if not starts or not walks:
+        raise ValueError("--start-bias-query-side and --walk-bias-query-side must be non-empty.")
+
+    n = max(len(starts), len(walks))
+
+    def broadcast(vals: List[str], flag: str) -> List[str]:
+        if len(vals) == 1:
+            return vals * n
+        if len(vals) == n:
+            return vals
+        raise ValueError(
+            f"{flag} has {len(vals)} entries; expected 1 (reused) or {n} (to match the other "
+            f"bias side). Multi-vs-multi sides must have equal length (zipped pairwise).")
+
+    starts, walks = broadcast(starts, "--start-bias-query-side"), broadcast(walks, "--walk-bias-query-side")
+
+    nw_toks = split(num_walks)
+    try:
+        nws = [int(tok) for tok in nw_toks]
+    except ValueError as exc:
+        raise ValueError(f"--num-walks-per-node-query-side must be integers, got '{num_walks}'.") from exc
+    if not nws or any(k <= 0 for k in nws):
+        raise ValueError(f"--num-walks-per-node-query-side must be positive integers, got '{num_walks}'.")
+    if len(nws) == 1:
+        nws = nws * n
+    elif len(nws) != n:
+        raise ValueError(
+            f"--num-walks-per-node-query-side has {len(nws)} entries; expected 1 or n_configs={n}.")
+
+    return [(nws[i], starts[i], walks[i]) for i in range(n)]
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,15 +131,25 @@ def parse_args() -> argparse.Namespace:
 
     # Walks (BACKWARD only, undirected). Decoupled QUERY-side (source u → μ) and
     # CANDIDATE-side (v → connectors for the cross channel); same Tempest graph.
-    p.add_argument("--num-walks-per-node-query-side", default=5, type=int,
-                   help="K walks per source u (build μ).")
+    p.add_argument("--num-walks-per-node-query-side", default="5", type=str,
+                   help="K walks per source u (build μ), per sampling config. A single value "
+                        "(e.g. '5') is used for EVERY config (total = K x n_configs); a comma-"
+                        "separated list (e.g. '5,7') sets K per config and must have length 1 or "
+                        "n_configs.")
     p.add_argument("--max-walk-len-query-side", default=5, type=int,
-                   help="L, max walk length for the query-side walks. (Sweep on wiki: "
+                   help="L, max walk length for the query-side walks; a SINGLE value shared by all "
+                        "sampling configs (so their walk bags concatenate along K). (Sweep on wiki: "
                         "shorter is better — 20→5 gave +0.006 test, monotone, more stable.)")
     p.add_argument("--walk-bias-query-side", default="ExponentialWeight", type=str,
-                   help="Per-hop edge bias for the query-side backward walks.")
+                   help="Per-hop edge bias(es) for the query-side backward walks; one bias or a "
+                        "comma-separated list. With --start-bias-query-side this defines "
+                        "n_configs = max(#walk, #start) sampling configs: a length-1 side is reused "
+                        "for all configs, otherwise both sides must match length and are zipped "
+                        "pairwise (NOT a cartesian product). Each config's walks are concatenated "
+                        "into the source token bag.")
     p.add_argument("--start-bias-query-side", default="ExponentialWeight", type=str,
-                   help="Initial-edge bias for the query-side backward walks.")
+                   help="Initial-edge bias(es) for the query-side backward walks; one bias or a "
+                        "comma-separated list (see --walk-bias-query-side for the pairing rule).")
 
     # The link head (LinkPredHead) has no architecture knobs beyond
     # max_walk_len, which is set from --link-pred-max-walk-len.
@@ -286,10 +343,12 @@ def main() -> Dict[str, Any]:
         tau_link=args.tau_link,
         K_train=args.k_train,
 
-        num_walks_per_node_query_side=args.num_walks_per_node_query_side,
+        query_walk_configs=resolve_query_walk_configs(
+            args.start_bias_query_side,
+            args.walk_bias_query_side,
+            args.num_walks_per_node_query_side,
+        ),
         max_walk_len_query_side=args.max_walk_len_query_side,
-        walk_bias_query_side=args.walk_bias_query_side,
-        start_bias_query_side=args.start_bias_query_side,
         max_time_capacity=compute_max_time_capacity(
             args.tempest_batch_window_multiplier,
             args.batch_size,
