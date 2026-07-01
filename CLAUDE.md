@@ -1278,3 +1278,63 @@ falsified" conclusion, which was an artifact of comparing two differently-built 
 rather than this clean single-variable A/B.
 
 Logs: `logs/velocity/strat_velocity_*.log`, `logs/master/strat_point_*.log`.
+
+---
+
+## Walk-length win + pair-feature falsification (2026-07-01 overnight)
+
+Velocity head, tgbl-wiki, per-query causal substrate. Two findings.
+
+### ★ THE WIN: max_walk_len 5→3 (3-seed confirmed, +0.0026 test)
+
+The earlier best-config note claimed "len stays 5 (longer HURTS)" — but that campaign only
+tested len ∈ {5, 10, 20}, **never below 5**. It does. Full sweep (velocity head, seed 42,
+test MRR): **len5 0.8032 < len4 0.8039 < len2 0.8048 < LEN3 0.8063 (peak)**. len=3 is the
+optimum — shorter walks keep μ near u's immediate neighbourhood; longer walks diffuse and add
+noise; len=2 has too few tokens for the line-fit.
+
+**mwl=3 = +0.0026 test / +0.0038 val over mwl=5, and it is 3-SEED CONFIRMED** (this project's
+noise rule):
+
+| seed | mwl3 test | mwl5 test | Δtest | Δval |
+|---|---|---|---|---|
+| 42 | 0.8063 | 0.8032 | +0.0031 | +0.0036 |
+| 43 | 0.8064 | 0.8040 | +0.0024 | +0.0036 |
+| 44 | 0.8063 | 0.8041 | +0.0022 | +0.0041 |
+
+mwl3 test 0.8063/0.8064/0.8063 — near-zero variance; every seed positive, outside noise. This
+is the new wiki best config (`best_configs.sh` updated: `--max-walk-len-query-side 3`).
+d_emb: 256 stays best — **d_emb 512 OVERFITS** (matched val, −0.0014 test, peaked ep13 vs 22).
+
+### Pair-recurrence terms don't help THIS head (but the claim is narrow — read the scope)
+
+Three candidate-aware pair channels added to the velocity head (all init-0, additive, wiki):
+- **#1 exact-count** (learned reach_head + Time2Vec, ~300 params): −0.0010 test
+- **#2 geometric soft-witness** ((1/τ)logsumexp_p τ·⟨Ê_v,Ê_p⟩, 2 params): −0.0034 test
+- **#3 minimal exact-count** (coef·log1p(Σexp(−λ·age)[node==v]), 2 params): −0.0041 test
+
+**All lose, identical pathology:** lead ep1–6, peak ~ep6, then COLLAPSE below baseline while the
+baseline climbs smoothly to ep16 (violates the smooth-curve rule). #3(minimal) worse than
+#1(full) ⇒ not capacity — the recurrence signal is a **harmful redundant shortcut**: the
+identity-centroid ALREADY saturates "does u reach v" (repeat-pair 0.897), so an explicit
+recurrence channel just accelerates convergence to a worse minimum.
+
+**SCOPE — this is NOT "pair features never help":**
+1. **Head-specific.** On the OLD point head (no centroid recurrence detector) the same
+   reach_count HELPED +0.006–0.008. Pair-recurrence helps a head MISSING the signal, not one
+   that has it. The finding is about redundancy.
+2. **Wrong slice, never stratified.** The gap to TPNet lives on the **new-pair** slice (~13%,
+   no u–v history) — recurrence fires 0 there and cannot help it; that slice needs
+   **co-reachability** (shared 2-hop). My 3 channels were whole-bag; I never stratified to see
+   if their co-reach component helped new-pairs while the repeat-slice redundancy sank the
+   aggregate (stratify runs hung).
+3. **Untested regimes:** review (drift — recurrence irrelevant, structural untested; too big for
+   the laptop), and non-additive forms (gating/reranking).
+
+**Honest read:** recurrence pair signal is dead on the velocity head / wiki. The one LIVE thread
+is a **hop-resolved / slice-gated co-reachability** term measured **on the new-pair slice
+specifically** — the clean untested next test. If that's empty too, wiki recurrence is
+saturated and the specialization's venue is review, not more wiki pair features.
+
+Branch `experiment/overnight-pair-features` (commits c07b34d #1, f271282 #2, 0619c5c #3);
+full trace in `logs/OVERNIGHT_PAIR_FEATURES.md`.
