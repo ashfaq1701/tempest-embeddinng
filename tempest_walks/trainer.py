@@ -42,8 +42,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
-from .link_pred_head import VelocityHead
-from .model import EmbeddingTable
+from .model import VelocityHead
 from .negatives import UniformNegativeSampler
 from .utils import make_lr_lambda
 from .walk_tokens import build_query_walk_tokens
@@ -99,10 +98,9 @@ class Trainer:
         self.device = device or torch.device(
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
-        self.embedding_table = EmbeddingTable(
-            num_nodes=config.num_nodes, d_emb=config.d_emb,
-        ).to(self.device)
-        self.link_head = VelocityHead(
+        # Single module owning the sphere node embeddings AND the velocity head.
+        self.model = VelocityHead(
+            num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             t_train=float(config.t_train),
         ).to(self.device)
@@ -120,7 +118,7 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        params = list(self.embedding_table.parameters()) + list(self.link_head.parameters())
+        params = list(self.model.parameters())
         self.opt = geoopt.optim.RiemannianAdam(
             params, lr=config.lr, weight_decay=config.weight_decay, stabilize=10)
 
@@ -177,10 +175,9 @@ class Trainer:
             start_bias=self.config.start_bias_query_side,
             walk_bias=self.config.walk_bias_query_side)
 
-        return self.link_head(
-            self.embedding_table.E.weight,   # the whole table; head indexes E_u / E_v / tokens
+        return self.model(
             src_tokens,                      # raw source walk tokens (self-contained: seeds+cutoffs)
-            cand_t)                          # candidate node ids
+            cand_t)                          # candidate node ids; the head owns E internally
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
@@ -230,8 +227,7 @@ class Trainer:
 
     def _eval(self, evaluator: Evaluator, batches: Iterable[Batch],
               recorder: Any = None) -> float:
-        self.embedding_table.eval()
-        self.link_head.eval()
+        self.model.eval()
         total, n = 0.0, 0
         with torch.no_grad():
             for batch in batches:
@@ -286,13 +282,11 @@ class Trainer:
 
     def _snapshot(self) -> Dict[str, Any]:
         return {
-            "embedding_table": self._cpu_state_dict(self.embedding_table),
-            "link_head": self._cpu_state_dict(self.link_head),
+            "model": self._cpu_state_dict(self.model),
         }
 
     def _restore(self, snap: Dict[str, Any]) -> None:
-        self.embedding_table.load_state_dict(snap["embedding_table"])
-        self.link_head.load_state_dict(snap["link_head"])
+        self.model.load_state_dict(snap["model"])
 
     # ──────────────────────────────────────────────────────────────────
     # Train loop
@@ -320,8 +314,7 @@ class Trainer:
 
         for ep in range(1, n_epochs + 1):
             self.walk_gen.reset()
-            self.embedding_table.train()
-            self.link_head.train()
+            self.model.train()
 
             t0 = time.time()
             link_sum, n_batches = 0.0, 0

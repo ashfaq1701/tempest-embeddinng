@@ -321,11 +321,11 @@ def main() -> Dict[str, Any]:
     trainer = Trainer(config=config, device=device)
 
     print("\n=== Parameter counts ===")
-    n_E = sum(p.numel() for p in trainer.embedding_table.parameters())
-    n_H = sum(p.numel() for p in trainer.link_head.parameters())
-    print(f"  embedding_table: {n_E:>12,}")
-    print(f"  link_head:       {n_H:>12,}")
-    print(f"  TOTAL trainable: {n_E + n_H:>12,}")
+    n_total = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
+    n_E = trainer.model.E.weight.numel()
+    print(f"  model.E:         {n_E:>12,}")
+    print(f"  head params:     {n_total - n_E:>12,}")
+    print(f"  TOTAL trainable: {n_total:>12,}")
 
     # ─── Train ─────────────────────────────────────────────────────
     print("\n=== Training ===")
@@ -351,7 +351,7 @@ def main() -> Dict[str, Any]:
         meta = {
             "dataset": args.dataset, "seed": args.seed, "d_emb": args.d_emb,
             "batch_size": args.batch_size, "eval_batch_size": args.eval_batch_size,
-            "head": type(trainer.link_head).__name__,
+            "head": type(trainer.model).__name__,
             "best_epoch": result["stopped_at_epoch"],
             "best_val": result["best_val_mrr"], "best_test": result["best_test_mrr"],
         }
@@ -372,7 +372,7 @@ def main() -> Dict[str, Any]:
         )
         np.save(
             emb_path,
-            trainer.embedding_table.E.weight.detach().cpu().numpy(),
+            trainer.model.E.weight.detach().cpu().numpy(),
         )
         print(f"  embedding_table:   saved to {emb_path}")
 
