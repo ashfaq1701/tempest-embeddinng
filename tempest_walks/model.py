@@ -42,6 +42,51 @@ import torch.nn.functional as F
 from .walk_tokens import WalkTokens, flatten_and_exclude_seed
 
 
+class SphereManifold:
+    """Unit-sphere geometry, behind a 5-method contract so the head is manifold-agnostic.
+
+    The head does ALL of its scoring in the tangent space (centroid, WLS line, ellipse, heading);
+    the only geometry it touches is this contract:
+
+        manifold        the geoopt manifold for E's ManifoldParameter (RiemannianAdam retraction)
+        proj(x)         map an arbitrary vector onto the manifold (feasible-init + pre-score projection)
+        logmap(p, x)    Log_p(x): tangent vector at p pointing to x
+        expmap(p, δ)    Exp_p(δ): move off p along tangent δ, back onto the manifold
+        similarity(a,b) natural "closeness" of two on-manifold points, HIGHER = closer
+
+    To swap geometry, provide another class with these five members. `similarity` is the one
+    semantic hook: the sphere returns the inner product ⟨a,b⟩ (= cosine, since points are unit),
+    whereas a distance manifold (Poincaré/Lorentz/Euclidean) would return −dist(a,b). The bodies
+    below are the exact primitives the head used inline — this refactor changes call sites only,
+    not numerics.
+    """
+    eps = 1e-6
+
+    def __init__(self):
+        self.manifold = geoopt.Sphere()
+
+    def proj(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(x, dim=-1)
+
+    def logmap(self, p: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        c = (p * x).sum(-1, keepdim=True).clamp(-1 + self.eps, 1 - self.eps)
+        theta = torch.arccos(c)
+        orth = x - c * p
+        return theta * orth / orth.norm(dim=-1, keepdim=True).clamp_min(self.eps)
+
+    def expmap(self, p: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+        """exp_p(δ) = cos‖δ‖·p + sin‖δ‖·δ/‖δ‖ ∈ S^{d-1}. δ = μ is a sum of Log_p's (all ⊥ p),
+        so the result is unit-norm; ‖δ‖ capped to the injectivity radius (<π); δ→0 ⇒ exp_p(δ)=p
+        (a cold node drifts nowhere). Final proj is a numeric belt."""
+        norm = delta.norm(dim=-1, keepdim=True)                     # ‖μ‖ = drift angle
+        theta = norm.clamp(max=math.pi - self.eps)
+        coef = torch.sin(theta) / norm.clamp_min(self.eps)         # → 0 as norm→0 (q→p)
+        return self.proj(torch.cos(theta) * p + coef * delta)
+
+    def similarity(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return (a * b).sum(-1)
+
+
 class VelocityHead(nn.Module):
     """Sphere node embeddings + one-sided centroid/velocity drift head, in a single module."""
 
@@ -51,15 +96,18 @@ class VelocityHead(nn.Module):
         self.d_emb = d_emb
         self.eps = 1e-6
 
+        # --- geometry: all manifold ops go through this (swap the class to swap the space) --------
+        self.geom = SphereManifold()
+
         # --- node embeddings: the head OWNS the table (unit sphere, link-trained) ----------------
         self.E = nn.Embedding(num_nodes, d_emb)
         nn.init.normal_(self.E.weight, mean=0.0, std=1.0 / math.sqrt(d_emb))
-        # Feasible init: project every row onto the sphere (RiemannianAdam assumes the parameter
+        # Feasible init: project every row onto the manifold (RiemannianAdam assumes the parameter
         # starts on the manifold).
         with torch.no_grad():
             w = self.E.weight.data
             w = w / w.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-        self.E.weight = geoopt.ManifoldParameter(w, manifold=geoopt.Sphere())
+        self.E.weight = geoopt.ManifoldParameter(w, manifold=self.geom.manifold)
 
         # --- head parameters (Euclidean) ---------------------------------------------------------
         # Shared μ recency λ (softmax, scale-invariant), init λ ≈ C/t_train so λ·age~O(1).
@@ -77,26 +125,8 @@ class VelocityHead(nn.Module):
         self.coef_velocity = nn.Parameter(torch.zeros(1))
 
     # ──────────────────────────────────────────────────────────────────
-    # Geometry primitives (shape-agnostic over leading axes)
+    # Tangent-space scoring primitives (manifold-agnostic; geometry lives in self.geom)
     # ──────────────────────────────────────────────────────────────────
-
-    def _logmap(self, p: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        c = (p * x).sum(-1, keepdim=True).clamp(-1 + self.eps, 1 - self.eps)
-        theta = torch.arccos(c)
-        orth = x - c * p
-        return theta * orth / orth.norm(dim=-1, keepdim=True).clamp_min(self.eps)
-
-    def _expmap(self, p: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
-        """exp_p(δ) = cos‖δ‖·p + sin‖δ‖·δ/‖δ‖ ∈ S^{d-1}. δ = μ is a sum of Log_p's (all ⊥ p),
-        so the result is unit-norm; ‖δ‖ capped to the injectivity radius (<π); δ→0 ⇒ exp_p(δ)=p
-        (a cold node drifts nowhere). Final normalize is a numeric belt. Sends u's tangent
-        displacement back ONTO the sphere so q_u = exp_{E[u]}(μ_u) lives on the SAME manifold as
-        the candidate's unit E[v] and ⟨q_u, E[v]⟩ is a plain inner product."""
-        norm = delta.norm(dim=-1, keepdim=True)                     # ‖μ‖ = drift angle
-        theta = norm.clamp(max=math.pi - self.eps)
-        coef = torch.sin(theta) / norm.clamp_min(self.eps)         # → 0 as norm→0 (q→p)
-        q = torch.cos(theta) * p + coef * delta
-        return F.normalize(q, dim=-1)
 
     def _ellipse_dist_sq(self, delta: torch.Tensor, r: torch.Tensor,
                          a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -132,9 +162,9 @@ class VelocityHead(nn.Module):
         μ is SCALE-INVARIANT in s (b·s̄ is unit-free), so raw ages give the same line as any time
         unit. Count-free: a node recurring k times is k tokens, summed automatically. Cold (all
         masked) → w = 0 → v̄ = μ = 0 (exact)."""
-        base = F.normalize(base_emb, dim=-1)
-        ew = F.normalize(F.embedding(ids.clamp_min(0), self.E.weight), dim=-1)   # [...,U,d]
-        g = self._logmap(base.unsqueeze(-2), ew)                           # [...,U,d]
+        base = self.geom.proj(base_emb)
+        ew = self.geom.proj(F.embedding(ids.clamp_min(0), self.E.weight))       # [...,U,d]
+        g = self.geom.logmap(base.unsqueeze(-2), ew)                       # [...,U,d]
         lam = F.softplus(self.log_lambda)
         ell = (-lam * ages).masked_fill(~nmask, float("-inf"))            # [...,U]
         w = torch.nan_to_num(torch.softmax(ell, dim=-1), nan=0.0)         # [...,U]  Σ = 1 (0 if cold)
@@ -157,7 +187,7 @@ class VelocityHead(nn.Module):
                   r: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
                   alpha: torch.Tensor) -> torch.Tensor:
         """−α·ellipse( Log_frame(probe) − μ ; r ). All [...,d] (caller broadcasts) -> [...]."""
-        nu = self._logmap(frame, probe)                                  # [...,d]
+        nu = self.geom.logmap(frame, probe)                              # [...,d]
         dist = self._ellipse_dist_sq(nu - mu, r, a, b).clamp_min(self.eps).sqrt()
         return -alpha * dist
 
@@ -179,8 +209,8 @@ class VelocityHead(nn.Module):
         d = self.d_emb
         E_u = F.embedding(src_tokens.seeds, e_weight)            # [B, d]
         E_v = F.embedding(cand_ids, e_weight)                    # [B, C, d]
-        eu = F.normalize(E_u, dim=-1)                             # [B, d]
-        ev = F.normalize(E_v, dim=-1)                             # [B, C, d]
+        eu = self.geom.proj(E_u)                                  # [B, d]
+        ev = self.geom.proj(E_v)                                  # [B, C, d]
         a = F.softplus(self.log_a)
         b = F.softplus(self.log_b)
         alpha = self.alpha.clamp_min(1e-3)
@@ -206,8 +236,8 @@ class VelocityHead(nn.Module):
         # candidate's STATIC embedding. No μ_v — the candidate side samples no walks. ⟨q_u, E_v⟩
         # asks whether v sits where u's neighbourhood is HEADING (extrapolation, not average).
         # coef_velocity init 0 ⇒ no-op at init; the head starts as the centroid-identity baseline.
-        q_u = self._expmap(eu, mu_line)                          # [B,d]   extrapolated source pos
-        velocity = (q_u.unsqueeze(1) * ev).sum(-1)              # [B,C]   ⟨q_u, E_v⟩
+        q_u = self.geom.expmap(eu, mu_line)                      # [B,d]   extrapolated source pos
+        velocity = self.geom.similarity(q_u.unsqueeze(1), ev)   # [B,C]   ⟨q_u, E_v⟩
 
         logit = (self.coef_identity * q_ident
                  + self.coef_velocity * velocity)
