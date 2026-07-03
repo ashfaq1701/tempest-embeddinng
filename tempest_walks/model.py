@@ -2,7 +2,7 @@
 
 Builds a recency-weighted line through the source's walk-token trajectory in the tangent space at
 E[u] and scores each candidate against it. Two channels:
-    identity  = -distance_weight * || Log_u(E[v]) - neighbourhood_centroid ||
+    identity  = -distance_weight * ellipse( Log_u(E[v]) - neighbourhood_centroid ; drift_heading )
     velocity  = similarity( exp_u(extrapolated_offset), E[v] )
     logit     = coef_identity * identity + coef_velocity * velocity
 coef_velocity inits to 0, so the head starts as the pure centroid-identity baseline and velocity
@@ -62,6 +62,8 @@ class VelocityHead(nn.Module):
         self.log_recency_lambda = nn.Parameter(
             torch.tensor([math.log(math.expm1(recency_lambda_init))], dtype=torch.float32))
         self.distance_weight = nn.Parameter(torch.tensor(10.0))
+        self.log_axis_along = nn.Parameter(torch.zeros(1))       # ellipse stretch along the drift heading
+        self.log_axis_perp = nn.Parameter(torch.zeros(1))        # ... and perpendicular (along == perp -> isotropic)
         self.coef_identity = nn.Parameter(torch.ones(1))
         self.coef_velocity = nn.Parameter(torch.zeros(1))         # earns weight from 0
 
@@ -89,10 +91,26 @@ class VelocityHead(nn.Module):
         extrapolated_offset = neighbourhood_centroid - slope * mean_signed_time.unsqueeze(-1)
         return neighbourhood_centroid, extrapolated_offset
 
+    _HEADING_GATE_KNEE = 0.05
+
+    def _drift_heading(self, centroid: torch.Tensor) -> torch.Tensor:
+        """Gated unit heading of the centroid offset. g(||c||) = ||c||^2 / (||c||^2 + knee^2) fades
+        the frame to 0 (isotropic) when the drift is weak/cold and to the unit heading when strong."""
+        norm = centroid.norm(dim=-1, keepdim=True)
+        gate = (norm * norm) / (norm * norm + self._HEADING_GATE_KNEE ** 2)
+        return gate * centroid / norm.clamp_min(self.eps)
+
     def _identity_score(self, source: torch.Tensor, candidate: torch.Tensor,
-                        prediction_offset: torch.Tensor, distance_weight: torch.Tensor) -> torch.Tensor:
+                        prediction_offset: torch.Tensor, heading: torch.Tensor,
+                        along_scale: torch.Tensor, perp_scale: torch.Tensor,
+                        distance_weight: torch.Tensor) -> torch.Tensor:
+        """Anisotropic tangent distance to the centroid prediction: an ellipse oriented by `heading`,
+        stretched `along_scale` along the drift direction and `perp_scale` perpendicular to it
+        (along_scale == perp_scale -> plain isotropic distance)."""
         gap = self.geom.log_map(source, candidate) - prediction_offset
-        distance = (gap * gap).sum(-1).clamp_min(self.eps).sqrt()
+        along_sq = (gap * heading).sum(-1).pow(2)
+        perp_sq = ((gap * gap).sum(-1) - along_sq).clamp_min(0.0)
+        distance = (along_scale * along_sq + perp_scale * perp_sq).clamp_min(self.eps).sqrt()
         return -distance_weight * distance
 
     def forward(self, src_tokens: WalkTokens, cand_ids: torch.Tensor) -> torch.Tensor:
@@ -103,14 +121,19 @@ class VelocityHead(nn.Module):
         source = self.geom.project(F.embedding(src_tokens.seeds, e_weight))       # [B, d]
         candidate = self.geom.project(F.embedding(cand_ids, e_weight))            # [B, C, d]
         distance_weight = self.distance_weight.clamp_min(1e-3)
+        along_scale = F.softplus(self.log_axis_along)
+        perp_scale = F.softplus(self.log_axis_perp)
 
         token_ids, token_mask, token_ages = flatten_and_exclude_seed(src_tokens)
         neighbourhood_centroid, extrapolated_offset = self._centroid_and_extrapolation(
             source, token_ids, token_mask, token_ages.to(source.dtype))           # [B, d], [B, d]
 
+        heading = self._drift_heading(neighbourhood_centroid)                    # [B, d]
         source_bc = source.unsqueeze(1).expand(batch, num_cand, d)
         centroid_bc = neighbourhood_centroid.unsqueeze(1).expand(batch, num_cand, d)
-        identity_score = self._identity_score(source_bc, candidate, centroid_bc, distance_weight)
+        heading_bc = heading.unsqueeze(1).expand(batch, num_cand, d)
+        identity_score = self._identity_score(
+            source_bc, candidate, centroid_bc, heading_bc, along_scale, perp_scale, distance_weight)
 
         drifted_source_point = self.geom.exp_map(source, extrapolated_offset)     # [B, d]
         velocity_score = self.geom.similarity(drifted_source_point.unsqueeze(1), candidate)
