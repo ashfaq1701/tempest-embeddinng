@@ -1,12 +1,11 @@
-"""Velocity link head — sphere node embeddings + one-sided drift scoring, in one module.
+"""Link head — sphere node embeddings + a single neighbourhood similarity channel, in one module.
 
-Builds a recency-weighted line through the source's walk-token trajectory in the tangent space at
-E[u] and scores each candidate against it. Two channels:
-    identity  = -distance_weight * || Log_u(E[v]) - neighbourhood_centroid ||
-    velocity  = similarity( exp_u(extrapolated_offset), E[v] )
-    logit     = coef_identity * identity + coef_velocity * velocity
-coef_velocity inits to 0, so the head starts as the pure centroid-identity baseline and velocity
-earns weight. The head owns self.E (link-trained on the sphere); geometry goes through self.geom.
+    logit = coef_neighbourhood * similarity(P[u], E[v])            is v near u's neighbourhood?
+
+where P[u] = exp_u(mu_u) is the source pushed off E[u] toward mu_u, the recency-weighted centroid
+of u's walk-token offsets in the tangent space at E[u]. No direct identity, no extrapolation / no
+slope — just the plain neighbourhood centroid scored against each candidate. The head owns self.E
+(link-trained on the sphere); geometry goes through self.geom.
 """
 import math
 
@@ -61,58 +60,31 @@ class VelocityHead(nn.Module):
         recency_lambda_init = 10.0 / max(float(t_train), 1.0)      # lambda * age ~ O(1)
         self.log_recency_lambda = nn.Parameter(
             torch.tensor([math.log(math.expm1(recency_lambda_init))], dtype=torch.float32))
-        self.distance_weight = nn.Parameter(torch.tensor(10.0))
-        self.coef_identity = nn.Parameter(torch.ones(1))
-        self.coef_velocity = nn.Parameter(torch.zeros(1))         # earns weight from 0
+        self.coef_neighbourhood = nn.Parameter(torch.ones(1))    # learnable logit scale
 
-    def _centroid_and_extrapolation(self, source_emb: torch.Tensor, token_ids: torch.Tensor,
-                                    token_mask: torch.Tensor, token_ages: torch.Tensor):
-        """Returns (neighbourhood_centroid, extrapolated_offset): the recency centroid of the
-        source's token offsets, and the recency-weighted least-squares line evaluated at the query
-        time (signed_time = 0). Both [...,d]. Degenerate time -> slope 0 -> the two coincide."""
-        source = self.geom.project(source_emb)
+    def _neighbourhood_centroid(self, source: torch.Tensor, token_ids: torch.Tensor,
+                                token_mask: torch.Tensor, token_ages: torch.Tensor) -> torch.Tensor:
+        """mu_u = Sum_p softmax_p(-lambda*age_p) * Log_source(E[token_p]) — the recency-weighted
+        centroid of the source's token offsets, in the tangent space at the source. [...,d].
+        Cold (all masked) -> 0."""
         token_emb = self.geom.project(F.embedding(token_ids.clamp_min(0), self.E.weight))
         token_offset = self.geom.log_map(source.unsqueeze(-2), token_emb)
-
         recency_lambda = F.softplus(self.log_recency_lambda)
         weight_logits = (-recency_lambda * token_ages).masked_fill(~token_mask, float("-inf"))
         weight = torch.nan_to_num(torch.softmax(weight_logits, dim=-1), nan=0.0)
-
-        neighbourhood_centroid = (weight.unsqueeze(-1) * token_offset).sum(dim=-2)
-
-        signed_time = -token_ages.to(token_offset.dtype)
-        mean_signed_time = (weight * signed_time).sum(dim=-1)
-        time_dev = signed_time - mean_signed_time.unsqueeze(-1)
-        time_var = (weight * time_dev * time_dev).sum(dim=-1)
-        time_offset_cov = (weight.unsqueeze(-1) * time_dev.unsqueeze(-1) * token_offset).sum(dim=-2)
-        slope = time_offset_cov / time_var.clamp_min(self.eps).unsqueeze(-1)
-        extrapolated_offset = neighbourhood_centroid - slope * mean_signed_time.unsqueeze(-1)
-        return neighbourhood_centroid, extrapolated_offset
-
-    def _identity_score(self, source: torch.Tensor, candidate: torch.Tensor,
-                        prediction_offset: torch.Tensor, distance_weight: torch.Tensor) -> torch.Tensor:
-        gap = self.geom.log_map(source, candidate) - prediction_offset
-        distance = (gap * gap).sum(-1).clamp_min(self.eps).sqrt()
-        return -distance_weight * distance
+        return (weight.unsqueeze(-1) * token_offset).sum(dim=-2)
 
     def forward(self, src_tokens: WalkTokens, cand_ids: torch.Tensor) -> torch.Tensor:
         e_weight = self.E.weight
-        batch, num_cand = cand_ids.shape[0], cand_ids.shape[1]
-        d = self.d_emb
 
-        source = self.geom.project(F.embedding(src_tokens.seeds, e_weight))       # [B, d]
-        candidate = self.geom.project(F.embedding(cand_ids, e_weight))            # [B, C, d]
-        distance_weight = self.distance_weight.clamp_min(1e-3)
+        source = self.geom.project(F.embedding(src_tokens.seeds, e_weight))       # E[u]  [B, d]
+        candidate = self.geom.project(F.embedding(cand_ids, e_weight))            # E[v]  [B, C, d]
 
+        # neighbourhood: P[u] vs E[v], where P[u] = exp_u(mu_u) is the recency centroid on the sphere
         token_ids, token_mask, token_ages = flatten_and_exclude_seed(src_tokens)
-        neighbourhood_centroid, extrapolated_offset = self._centroid_and_extrapolation(
-            source, token_ids, token_mask, token_ages.to(source.dtype))           # [B, d], [B, d]
+        mu_u = self._neighbourhood_centroid(
+            source, token_ids, token_mask, token_ages.to(source.dtype))           # [B, d] tangent
+        p_u = self.geom.exp_map(source, mu_u)                                     # P[u]  [B, d] sphere
+        neighbourhood_score = self.geom.similarity(p_u.unsqueeze(1), candidate)   # [B, C]
 
-        source_bc = source.unsqueeze(1).expand(batch, num_cand, d)
-        centroid_bc = neighbourhood_centroid.unsqueeze(1).expand(batch, num_cand, d)
-        identity_score = self._identity_score(source_bc, candidate, centroid_bc, distance_weight)
-
-        drifted_source_point = self.geom.exp_map(source, extrapolated_offset)     # [B, d]
-        velocity_score = self.geom.similarity(drifted_source_point.unsqueeze(1), candidate)
-
-        return self.coef_identity * identity_score + self.coef_velocity * velocity_score
+        return self.coef_neighbourhood * neighbourhood_score
