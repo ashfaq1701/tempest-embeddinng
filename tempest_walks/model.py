@@ -18,7 +18,7 @@ The candidate side samples NO walks — there is no μ_v. q_u is u's trajectory 
 inner product with the unit E[v] asks "how close is v to where u's neighbourhood is HEADING?".
 The score is identity + velocity:
 
-  identity = −α·ellipse( Log_{E[u]}(E_v) − v̄ ; r(v̄) )          is v in u's region?         [B,C]
+  identity = −α·‖ Log_{E[u]}(E_v) − v̄ ‖                        is v in u's region?         [B,C]
   velocity = ⟨ exp_{E[u]}(μ), E_v ⟩                            does u's drift extrapolate to v?  [B,C]
   logit = coef_identity·identity + coef_velocity·velocity
 
@@ -45,7 +45,7 @@ from .walk_tokens import WalkTokens, flatten_and_exclude_seed
 class SphereManifold:
     """Unit-sphere geometry, behind a 5-method contract so the head is manifold-agnostic.
 
-    The head does ALL of its scoring in the tangent space (centroid, WLS line, ellipse, heading);
+    The head does ALL of its scoring in the tangent space (centroid, WLS line, isotropic distance);
     the only geometry it touches is this contract:
 
         manifold        the geoopt manifold for E's ManifoldParameter (RiemannianAdam retraction)
@@ -115,33 +115,12 @@ class VelocityHead(nn.Module):
         self.log_lambda = nn.Parameter(
             torch.tensor([math.log(math.expm1(lam0))], dtype=torch.float32))
         self.alpha = nn.Parameter(torch.tensor(10.0))     # shared distance weight
-        self.log_a = nn.Parameter(torch.zeros(1))         # anisotropic ellipse (a,b ≥ 0)
-        self.log_b = nn.Parameter(torch.zeros(1))
 
         # --- geometric mix coefficients ----------------------------------------
         # identity is the proven baseline (init 1); velocity earns weight (init 0).
         self.coef_identity = nn.Parameter(torch.ones(1))
         # VELOCITY — ⟨exp_{E[u]}(μ_line), E_v⟩: does u's drift EXTRAPOLATION reach v? coef init 0.
         self.coef_velocity = nn.Parameter(torch.zeros(1))
-
-    # ──────────────────────────────────────────────────────────────────
-    # Tangent-space scoring primitives (manifold-agnostic; geometry lives in self.geom)
-    # ──────────────────────────────────────────────────────────────────
-
-    def _ellipse_dist_sq(self, delta: torch.Tensor, r: torch.Tensor,
-                         a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """Ellipse distance² a‖δ∥‖²+b‖δ⊥‖² in the heading frame r. delta [...,d];
-           r broadcastable to delta (caller unsqueezes the U axis where needed) -> [...]."""
-        dpar2 = (delta * r).sum(-1).pow(2)
-        dperp2 = ((delta * delta).sum(-1) - dpar2).clamp_min(0.0)
-        return a * dpar2 + b * dperp2
-
-    def _heading(self, mu: torch.Tensor) -> torch.Tensor:
-        """Gated heading r = g(‖μ‖)·μ/‖μ‖, g=‖μ‖²/(‖μ‖²+m0²) → 0 cold (isotropic), 1 warm."""
-        mu_norm = mu.norm(dim=-1, keepdim=True)
-        m0 = 0.05
-        gate = (mu_norm * mu_norm) / (mu_norm * mu_norm + m0 * m0)
-        return gate * mu / mu_norm.clamp_min(self.eps)
 
     # ──────────────────────────────────────────────────────────────────
     # μ — recency center of mass over a token bag (frame-agnostic)
@@ -184,11 +163,12 @@ class VelocityHead(nn.Module):
     # ──────────────────────────────────────────────────────────────────
 
     def _identity(self, frame: torch.Tensor, probe: torch.Tensor, mu: torch.Tensor,
-                  r: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
                   alpha: torch.Tensor) -> torch.Tensor:
-        """−α·ellipse( Log_frame(probe) − μ ; r ). All [...,d] (caller broadcasts) -> [...]."""
+        """−α·‖ Log_frame(probe) − μ ‖ — ISOTROPIC tangent distance to the centroid prediction.
+        All [...,d] (caller broadcasts) -> [...]."""
         nu = self.geom.logmap(frame, probe)                              # [...,d]
-        dist = self._ellipse_dist_sq(nu - mu, r, a, b).clamp_min(self.eps).sqrt()
+        delta = nu - mu
+        dist = (delta * delta).sum(-1).clamp_min(self.eps).sqrt()
         return -alpha * dist
 
     # ──────────────────────────────────────────────────────────────────
@@ -211,8 +191,6 @@ class VelocityHead(nn.Module):
         E_v = F.embedding(cand_ids, e_weight)                    # [B, C, d]
         eu = self.geom.proj(E_u)                                  # [B, d]
         ev = self.geom.proj(E_v)                                  # [B, C, d]
-        a = F.softplus(self.log_a)
-        b = F.softplus(self.log_b)
         alpha = self.alpha.clamp_min(1e-3)
 
         # --- predictions: centroid v̄ (identity) + line extrapolation μ (velocity) ---
@@ -223,13 +201,11 @@ class VelocityHead(nn.Module):
         ids, nmask, ages = flatten_and_exclude_seed(src_tokens)       # [B, T] each
         vbar, mu_line = self._centroid_and_line(
             E_u, ids, nmask, ages.to(eu.dtype))                      # [B,d], [B,d]
-        r_u = self._heading(vbar)                                 # [B,d]   identity frame = centroid heading
         eu_bc = eu.unsqueeze(1).expand(B, C, d)                   # [B,C,d]
         vbar_bc = vbar.unsqueeze(1).expand(B, C, d)
-        r_u_bc = r_u.unsqueeze(1).expand(B, C, d)
 
-        # --- identity: is v in u's region? ellipse to the CENTROID v̄ (proven baseline) ---
-        q_ident = self._identity(eu_bc, ev, vbar_bc, r_u_bc, a, b, alpha)   # [B,C]
+        # --- identity: is v in u's region? ISOTROPIC distance to the CENTROID v̄ ---
+        q_ident = self._identity(eu_bc, ev, vbar_bc, alpha)      # [B,C]
 
         # --- VELOCITY: push u's drift to the EXTRAPOLATED point exp_{E[u]}(μ) (the free line at the
         # query time, not the centroid) back onto the sphere and inner-product it with the
