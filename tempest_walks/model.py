@@ -3,7 +3,7 @@
     logit = similarity(P[u], E[v])                                 is v near u's neighbourhood?
 
 where P[u] = exp_u(mu_u) is the source pushed off E[u] toward mu_u. mu_u is produced by
-NeighborhoodProjection: a deep, learnable pooling of the source's walk-token offsets (in the tangent
+NeighborhoodProjection: a deep, learnable pooling of the source's walk-token tangents (in the tangent
 space at E[u]) together with a TPNet Time2Vec encoding of each token's age. It is candidate-
 independent — mu_u depends only on u, so P[u] is computed once and scored against every candidate by
 a plain inner product, exactly as before. The head owns self.E (link-trained on the sphere);
@@ -84,18 +84,18 @@ class TimeEncoder(nn.Module):
 
 
 class NeighborhoodProjection(nn.Module):
-    """Single attention-pooling of a source's walk-token offsets into one tangent vector mu_u.
+    """Single attention-pooling of a source's walk-token tangents into one tangent vector mu_u.
 
     A source-conditioned query attends over the tokens; the attention scores ARE the pooling weights,
-    and mu_u is the weighted centroid of the RAW tangent offsets:
+    and mu_u is the weighted centroid of the RAW token tangents:
 
         q_u  = W_q(E[u])                                  [B, d_a]
         k_p  = W_k([ Log_{E[u]}(E[token_p]) ; Time2Vec(age_p) ])   [B, T, d_a]
         w_p  = softmax_p( (q_u . k_p) / sqrt(d_a) )       [B, T]   (padding masked out)
-        mu_u = Sum_p w_p * offset_p                        [B, d_emb]
+        mu_u = Sum_p w_p * token_tangent_p                 [B, d_emb]
 
-    The value is the offset itself, so mu_u stays a genuine weighted centroid (in the span of u's
-    neighbour offsets) — a strict, learnable generalisation of the fixed softmax(-lambda*age)
+    The value is the token tangent itself, so mu_u stays a genuine weighted centroid (in the span of
+    u's neighbour tangents) — a strict, learnable generalisation of the fixed softmax(-lambda*age)
     weighting. Candidate-independent (never sees E[v]); cold rows (no token) -> mu_u = 0.
     """
 
@@ -109,13 +109,14 @@ class NeighborhoodProjection(nn.Module):
         self.w_k = nn.Linear(d_emb + t2v_dim, d_a)             # per-token key: content + time
         self.attn_dropout = nn.Dropout(dropout)
 
-    def forward(self, source: torch.Tensor, offsets: torch.Tensor,
+    def forward(self, source: torch.Tensor, token_tangents: torch.Tensor,
                 ages: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """source [B,d_emb] (E[u]); offsets [B,T,d_emb] (tangent at E[u]); ages [B,T]; mask [B,T]
-        bool (True = real token). Returns mu_u [B,d_emb] tangent at E[u]; cold rows (no token) -> 0."""
+        """source [B,d_emb] (E[u]); token_tangents [B,T,d_emb] (Log_{E[u]}(E[token]), tangent at
+        E[u]); ages [B,T]; mask [B,T] bool (True = real token). Returns mu_u [B,d_emb] tangent at
+        E[u]; cold rows (no token) -> 0."""
         # TPNet scales delta-times by log(Δt + 1) before the time encoder.
         t2v = self.time_encoder(torch.log1p(ages.clamp_min(0.0)))             # [B,T,t2v_dim]
-        keys = self.w_k(torch.cat([offsets, t2v], dim=-1))                    # [B,T,d_a]
+        keys = self.w_k(torch.cat([token_tangents, t2v], dim=-1))            # [B,T,d_a]
         query = self.w_q(source)                                             # [B,d_a]
 
         scores = (query.unsqueeze(1) * keys).sum(-1) * self.scale            # [B,T]
@@ -123,7 +124,7 @@ class NeighborhoodProjection(nn.Module):
         weights = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)   # cold row -> all 0
         weights = self.attn_dropout(weights)
 
-        return (weights.unsqueeze(-1) * offsets).sum(dim=-2)                  # [B,d_emb]
+        return (weights.unsqueeze(-1) * token_tangents).sum(dim=-2)          # [B,d_emb]
 
 
 class LinkPredHead(nn.Module):
@@ -151,12 +152,12 @@ class LinkPredHead(nn.Module):
         candidate = self.geom.project(F.embedding(cand_ids, e_weight))            # E[v]  [B, C, d]
 
         # neighbourhood: P[u] vs E[v], where P[u] = exp_u(mu_u) and mu_u is the deep projection of
-        # u's walk-token offsets (tangent at E[u]) + their Time2Vec ages.
+        # u's walk-token tangents (tangent at E[u]) + their Time2Vec ages.
         token_ids, token_mask, token_ages = flatten_and_exclude_seed(src_tokens)
         token_emb = self.geom.project(F.embedding(token_ids.clamp_min(0), e_weight))  # [B, T, d]
-        token_offset = self.geom.log_map(source.unsqueeze(-2), token_emb)            # [B, T, d] tangent
+        token_tangent = self.geom.log_map(source.unsqueeze(-2), token_emb)           # [B, T, d] tangent
         mu_u = self.neighbourhood(
-            source, token_offset, token_ages.to(source.dtype), token_mask)           # [B, d] tangent
+            source, token_tangent, token_ages.to(source.dtype), token_mask)          # [B, d] tangent
         p_u = self.geom.exp_map(source, mu_u)                                        # P[u]  [B, d] sphere
         neighbourhood_score = self.geom.similarity(p_u.unsqueeze(1), candidate)      # [B, C]
 
