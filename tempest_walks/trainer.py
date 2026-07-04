@@ -72,6 +72,8 @@ class TrainerConfig:
     max_walk_len_query_side: int = 5
     walk_bias_query_side: str = "ExponentialWeight"
     start_bias_query_side: str = "ExponentialWeight"
+    t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
+    t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
     # Optimisation.
@@ -113,6 +115,8 @@ class Trainer:
             num_walks_per_node=config.num_walks_per_node_query_side,
             max_walk_len=config.max_walk_len_query_side,
             max_time_capacity=config.max_time_capacity,
+            temporal_node2vec_p=config.t2nv_p,
+            temporal_node2vec_q=config.t2nv_q,
         )
         self.neg_sampler_train = UniformNegativeSampler(
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,

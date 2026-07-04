@@ -48,11 +48,23 @@ class WalkGenerator:
         max_walk_len: int = 20,
         timescale_bound: int = 300,
         max_time_capacity: int = -1,
+        temporal_node2vec_p: float = 4.0,
+        temporal_node2vec_q: float = 0.25,
     ):
+        # Only build the node2vec adjacency structures when a node2vec bias is
+        # actually requested (they cost extra memory/build time otherwise). p/q
+        # are the return / in-out params; at the embedding's timescale_bound they
+        # are a live diversity knob (p=4, q=0.25 = most diverse backward walks —
+        # low q/p pushes the walk away from returning). They are inert for
+        # non-node2vec biases, so passing them through is harmless.
+        enable_n2v = "TemporalNode2Vec" in (walk_bias, start_bias)
         self.tempest = Tempest(
             is_directed=False,
             use_gpu=use_gpu,
             enable_weight_computation=True,
+            enable_temporal_node2vec=enable_n2v,
+            temporal_node2vec_p=temporal_node2vec_p,
+            temporal_node2vec_q=temporal_node2vec_q,
             timescale_bound=timescale_bound,
             max_time_capacity=max_time_capacity,
             shuffle_walk_order=False,

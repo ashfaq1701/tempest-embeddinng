@@ -93,6 +93,12 @@ def parse_args() -> argparse.Namespace:
                    help="Per-hop edge bias for the query-side backward walks.")
     p.add_argument("--start-bias-query-side", default="ExponentialWeight", type=str,
                    help="Initial-edge bias for the query-side backward walks.")
+    p.add_argument("--t2nv-p", default=4.0, type=float,
+                   help="node2vec return param p (only used when a query-side bias is "
+                        "TemporalNode2Vec). Higher p => less immediate backtrack.")
+    p.add_argument("--t2nv-q", default=0.25, type=float,
+                   help="node2vec in-out param q (TemporalNode2Vec bias only). Lower q/p => "
+                        "more outward exploration; p=4,q=0.25 = most diverse backward walks.")
 
     # The link head (LinkPredHead) has no architecture knobs beyond
     # max_walk_len, which is set from --link-pred-max-walk-len.
@@ -290,6 +296,8 @@ def main() -> Dict[str, Any]:
         max_walk_len_query_side=args.max_walk_len_query_side,
         walk_bias_query_side=args.walk_bias_query_side,
         start_bias_query_side=args.start_bias_query_side,
+        t2nv_p=args.t2nv_p,
+        t2nv_q=args.t2nv_q,
         max_time_capacity=compute_max_time_capacity(
             args.tempest_batch_window_multiplier,
             args.batch_size,
