@@ -7,7 +7,7 @@ ordering (training):
   3. candidates = [pos | negs]                       — [B, 1+K_train]
   4. logits = score(src, candidates)                 — for each query (u_i, t_i) sample K
        backward walks with cutoff = t_i (→ μ_u), pack to tokens, score with
-       VelocityHead (identity + velocity-line). Candidate side samples no walks (static E[v]).
+       LinkPredHead (identity + velocity-line). Candidate side samples no walks (static E[v]).
   5. L = cross_entropy(logits / tau_link, target=0)  — Bruch 2019, upper-bounds 1-MRR
   6. one backward + single optimizer step
 
@@ -25,7 +25,7 @@ by a single RiemannianAdam.
 TOKEN PREP — the source side (u → μ_u) goes through `walk_tokens.build_query_walk_tokens`:
 walks are generated PER QUERY (no dedup — each row's (node, t) needs its own cutoff) and returned
 in the RAW per-walk WalkTokens layout ([Q, K, L] nodes / nodes_mask / node-aligned timestamps,
-seeds + cutoffs). This RAW layout is the SHARED walk contract for every head; VelocityHead
+seeds + cutoffs). This RAW layout is the SHARED walk contract for every head; LinkPredHead
 flattens it to a [Q, K*L] token bag and masks padding + the seed node u via
 `walk_tokens.flatten_and_exclude_seed`, then builds μ_u with a per-row softmax (ages =
 cutoffs − t_edge) and scores identity + velocity against E[v].
@@ -42,7 +42,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch
 from .evaluator import Evaluator
-from .model import VelocityHead
+from .model import LinkPredHead
 from .negatives import UniformNegativeSampler
 from .utils import make_lr_lambda
 from .walk_tokens import build_query_walk_tokens
@@ -99,7 +99,7 @@ class Trainer:
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
         # Single module owning the sphere node embeddings AND the velocity head.
-        self.model = VelocityHead(
+        self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             t_train=float(config.t_train),

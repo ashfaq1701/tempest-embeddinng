@@ -43,7 +43,7 @@ class SphereManifold:
         return (a * b).sum(-1)
 
 
-class VelocityHead(nn.Module):
+class LinkPredHead(nn.Module):
     def __init__(self, num_nodes: int, d_emb: int, t_train: float = 1.0):
         super().__init__()
         self.num_nodes = num_nodes
