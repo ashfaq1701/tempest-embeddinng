@@ -1,6 +1,6 @@
 """Tempest walk sampler wrapper.
 
-One ``TemporalRandomWalk`` instance holds the streaming temporal graph. The
+One ``Tempest`` instance holds the streaming temporal graph. The
 link head samples K BACKWARD walks per node (graphs treated as undirected);
 the seed sits at row position ``lens-1``, the chronologically oldest
 predecessor at position 0, padding = -1. Rows ``[i*K, (i+1)*K)`` are seed i's
@@ -13,7 +13,7 @@ from typing import NamedTuple, Optional
 
 import numpy as np
 import torch
-from temporal_random_walk import TemporalRandomWalk
+from tempest import Tempest
 
 
 class WalkData(NamedTuple):
@@ -49,7 +49,7 @@ class WalkGenerator:
         timescale_bound: int = 300,
         max_time_capacity: int = -1,
     ):
-        self.trw = TemporalRandomWalk(
+        self.tempest = Tempest(
             is_directed=False,
             use_gpu=use_gpu,
             enable_weight_computation=True,
@@ -64,12 +64,12 @@ class WalkGenerator:
 
     def reset(self) -> None:
         """Drop all ingested edges. Call at the start of each epoch."""
-        self.trw.clear()
+        self.tempest.clear()
 
     def add_edges(self, src: np.ndarray, tgt: np.ndarray, ts: np.ndarray,
                   edge_feat: Optional[np.ndarray] = None) -> None:
         """Ingest a batch of edges. STRICT-CAUSAL: call AFTER scoring."""
-        self.trw.add_multiple_edges(src, tgt, ts, edge_features=edge_feat)
+        self.tempest.add_multiple_edges(src, tgt, ts, edge_features=edge_feat)
 
     def walks_for_nodes(self, seeds: np.ndarray, max_walk_len: Optional[int] = None,
                         num_walks_per_node: Optional[int] = None,
@@ -100,7 +100,7 @@ class WalkGenerator:
                 raise ValueError(
                     "cutoff_times must have the same length as seeds "
                     f"({cutoff_arr.shape[0]} vs {seed_arr.shape[0]})")
-        nodes, ts, lens, ef = self.trw.get_random_walks_and_times_for_nodes(
+        nodes, ts, lens, ef = self.tempest.get_random_walks_and_times_for_nodes(
             seed_nodes=seed_arr,
             max_walk_len=mwl,
             walk_bias=wb,
