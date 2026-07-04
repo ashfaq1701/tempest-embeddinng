@@ -109,7 +109,6 @@ class Trainer:
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
-            t_train=float(config.t_train),
             proj_dim=int(config.proj_dim),
             proj_dropout=float(config.proj_dropout),
             t2v_dim=int(config.t2v_dim),

@@ -127,7 +127,7 @@ class NeighborhoodProjection(nn.Module):
 
 
 class LinkPredHead(nn.Module):
-    def __init__(self, num_nodes: int, d_emb: int, t_train: float = 1.0,
+    def __init__(self, num_nodes: int, d_emb: int,
                  proj_dim: int = 128, proj_dropout: float = 0.0, t2v_dim: int = 100):
         super().__init__()
         self.num_nodes = num_nodes
