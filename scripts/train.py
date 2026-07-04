@@ -61,6 +61,14 @@ def parse_args() -> argparse.Namespace:
     # Model.
     p.add_argument("--d-emb", default=128, type=int)
 
+    # NeighborhoodProjection — attention pooling of the source's walk-token offsets into mu_u.
+    p.add_argument("--proj-dim", default=128, type=int,
+                   help="Attention (query/key) dim d_a for the neighbourhood pooling.")
+    p.add_argument("--proj-dropout", default=0.0, type=float,
+                   help="Dropout on the attention weights.")
+    p.add_argument("--t2v-dim", default=100, type=int,
+                   help="Time2Vec output dim (TPNet default 100).")
+
     # Link loss / head.
     p.add_argument(
         "--tau-link", default=1.0, type=float,
@@ -288,6 +296,10 @@ def main() -> Dict[str, Any]:
         t_train=float(stats.T_train),
 
         d_emb=args.d_emb,
+
+        proj_dim=args.proj_dim,
+        proj_dropout=args.proj_dropout,
+        t2v_dim=args.t2v_dim,
 
         tau_link=args.tau_link,
         K_train=args.k_train,

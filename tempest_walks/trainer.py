@@ -62,6 +62,11 @@ class TrainerConfig:
     # Model.
     d_emb: int = 128
 
+    # NeighborhoodProjection (attention pooling of the source's walk-token offsets -> mu_u).
+    proj_dim: int = 128       # attention (query/key) dim d_a
+    proj_dropout: float = 0.0 # dropout on the attention weights
+    t2v_dim: int = 100        # Time2Vec output dim (TPNet default)
+
     # Link loss / head.
     tau_link: float = 1.0       # softmax-CE temperature
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
@@ -105,6 +110,9 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             t_train=float(config.t_train),
+            proj_dim=int(config.proj_dim),
+            proj_dropout=float(config.proj_dropout),
+            t2v_dim=int(config.t2v_dim),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.
