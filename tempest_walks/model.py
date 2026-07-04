@@ -1,6 +1,6 @@
 """Link head — sphere node embeddings + a single neighbourhood similarity channel, in one module.
 
-    logit = coef_neighbourhood * similarity(P[u], E[v])            is v near u's neighbourhood?
+    logit = similarity(P[u], E[v])                                 is v near u's neighbourhood?
 
 where P[u] = exp_u(mu_u) is the source pushed off E[u] toward mu_u, the recency-weighted centroid
 of u's walk-token offsets in the tangent space at E[u]. No direct identity, no extrapolation / no
@@ -60,7 +60,6 @@ class LinkPredHead(nn.Module):
         recency_lambda_init = 10.0 / max(float(t_train), 1.0)      # lambda * age ~ O(1)
         self.log_recency_lambda = nn.Parameter(
             torch.tensor([math.log(math.expm1(recency_lambda_init))], dtype=torch.float32))
-        self.coef_neighbourhood = nn.Parameter(torch.ones(1))    # learnable logit scale
 
     def _neighbourhood_centroid(self, source: torch.Tensor, token_ids: torch.Tensor,
                                 token_mask: torch.Tensor, token_ages: torch.Tensor) -> torch.Tensor:
@@ -87,4 +86,4 @@ class LinkPredHead(nn.Module):
         p_u = self.geom.exp_map(source, mu_u)                                     # P[u]  [B, d] sphere
         neighbourhood_score = self.geom.similarity(p_u.unsqueeze(1), candidate)   # [B, C]
 
-        return self.coef_neighbourhood * neighbourhood_score
+        return neighbourhood_score
