@@ -129,7 +129,8 @@ class NeighborhoodProjection(nn.Module):
 
 class LinkPredHead(nn.Module):
     def __init__(self, num_nodes: int, d_emb: int,
-                 proj_dim: int = 128, proj_dropout: float = 0.0, t2v_dim: int = 100):
+                 proj_dim: int = 128, proj_dropout: float = 0.0, t2v_dim: int = 100,
+                 score_combine: str = "mean", score_blend: bool = False):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_emb = d_emb
@@ -144,6 +145,30 @@ class LinkPredHead(nn.Module):
 
         self.neighbourhood = NeighborhoodProjection(
             d_emb=d_emb, d_a=proj_dim, dropout=proj_dropout, t2v_dim=t2v_dim)
+
+        # How the two directional cosines s_uv, s_vu combine into the cross term:
+        #   mean    -> 1/2 (s_uv + s_vu)          (OR-ish: one direction can compensate the other)
+        #   min     -> min(s_uv, s_vu)            (hard AND: only as good as the weaker direction)
+        #   softmin -> -1/beta logsumexp(-beta·s) (soft AND; learnable beta interpolates mean<->min)
+        # All three are in [-1, 1]. score_blend then mixes the cross term with <P_u, P_v> (a NEW
+        # comparison of the two projected points) via a learned coef, init 0.5.
+        self.score_combine = score_combine
+        self.score_blend = score_blend
+        if score_combine == "softmin":
+            self.log_beta = nn.Parameter(torch.tensor(math.log(math.expm1(4.0))))   # beta ~ 4 at init
+        if score_blend:
+            self.blend_theta = nn.Parameter(torch.zeros(1))                          # coef = sigmoid -> 0.5
+
+    def _combine(self, s_uv: torch.Tensor, s_vu: torch.Tensor) -> torch.Tensor:
+        if self.score_combine == "mean":
+            return 0.5 * (s_uv + s_vu)
+        if self.score_combine == "min":
+            return torch.minimum(s_uv, s_vu)
+        if self.score_combine == "softmin":
+            beta = F.softplus(self.log_beta)
+            stacked = torch.stack([s_uv, s_vu], dim=-1)                               # [..., 2]
+            return -torch.logsumexp(-beta * stacked, dim=-1) / beta
+        raise ValueError(f"unknown score_combine: {self.score_combine}")
 
     def _project(self, tokens: WalkTokens):
         """Project one bag of N queries. Returns (p, e_seed): p [N, d] = exp_{E[seed]}(mu) on the
@@ -161,8 +186,9 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Dual-sided symmetric scoring. src_tokens: B source queries (seeds = u). cand_tokens: B*C
-        candidate queries (seeds = v), row-major over [B, C]. Returns logits [B, C] =
-        1/2 (<P[u], E[v]> + <P[v], E[u]>)."""
+        candidate queries (seeds = v), row-major over [B, C]. Returns logits [B, C]: the combined
+        cross term (mean / min / softmin of <P[u],E[v]> and <P[v],E[u]>), optionally blended with
+        <P[u], P[v]>."""
         b = src_tokens.seeds.shape[0]
         p_u, e_u = self._project(src_tokens)                       # [B, d],  [B, d]
         p_v, e_v = self._project(cand_tokens)                      # [B*C, d], [B*C, d]
@@ -172,4 +198,10 @@ class LinkPredHead(nn.Module):
 
         s_uv = self.geom.similarity(p_u.unsqueeze(1), e_v)         # <P[u], E[v]>  [B, C]
         s_vu = self.geom.similarity(p_v, e_u.unsqueeze(1))         # <P[v], E[u]>  [B, C]
-        return 0.5 * (s_uv + s_vu)
+        cross = self._combine(s_uv, s_vu)                          # [B, C] in [-1, 1]
+
+        if self.score_blend:
+            coef = torch.sigmoid(self.blend_theta)                             # scalar in (0, 1)
+            p_uv = self.geom.similarity(p_u.unsqueeze(1), p_v)                 # <P[u], P[v]>  [B, C]
+            return coef * cross + (1.0 - coef) * p_uv
+        return cross

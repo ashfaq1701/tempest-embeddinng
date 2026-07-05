@@ -66,6 +66,8 @@ class TrainerConfig:
     proj_dim: int = 128       # attention (query/key) dim d_a
     proj_dropout: float = 0.0 # dropout on the attention weights
     t2v_dim: int = 100        # Time2Vec output dim (TPNet default)
+    score_combine: str = "mean"   # how s_uv, s_vu combine: mean | min | softmin
+    score_blend: bool = False     # blend the cross term with <P_u, P_v> via a learned coef
 
     # Link loss / head.
     tau_link: float = 1.0       # softmax-CE temperature
@@ -112,6 +114,8 @@ class Trainer:
             proj_dim=int(config.proj_dim),
             proj_dropout=float(config.proj_dropout),
             t2v_dim=int(config.t2v_dim),
+            score_combine=str(config.score_combine),
+            score_blend=bool(config.score_blend),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.

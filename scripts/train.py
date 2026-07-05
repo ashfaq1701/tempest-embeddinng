@@ -68,6 +68,11 @@ def parse_args() -> argparse.Namespace:
                    help="Dropout on the attention weights.")
     p.add_argument("--t2v-dim", default=100, type=int,
                    help="Time2Vec output dim (TPNet default 100).")
+    p.add_argument("--score-combine", default="mean", choices=["mean", "min", "softmin"],
+                   help="How s_uv, s_vu combine: mean=1/2(sum), min=hard AND, softmin=soft AND "
+                        "(learnable beta).")
+    p.add_argument("--score-blend", action="store_true",
+                   help="Blend the cross term with <P_u, P_v> via a learned coef (init 0.5).")
 
     # Link loss / head.
     p.add_argument(
@@ -300,6 +305,8 @@ def main() -> Dict[str, Any]:
         proj_dim=args.proj_dim,
         proj_dropout=args.proj_dropout,
         t2v_dim=args.t2v_dim,
+        score_combine=args.score_combine,
+        score_blend=args.score_blend,
 
         tau_link=args.tau_link,
         K_train=args.k_train,
