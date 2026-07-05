@@ -71,16 +71,12 @@ class TrainerConfig:
     tau_link: float = 1.0       # softmax-CE temperature
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
 
-    # Walks (BACKWARD only, undirected). Dual-sided: SOURCE u → μ_u tokens and CANDIDATE v → μ_v
-    # tokens, each with its own walk config (candidate side is B*C walks/step, so tune it down).
-    num_walks_per_node_query_side: int = 5
-    max_walk_len_query_side: int = 5
-    walk_bias_query_side: str = "ExponentialWeight"
-    start_bias_query_side: str = "ExponentialWeight"
-    num_walks_per_node_candidate_side: int = 5
-    max_walk_len_candidate_side: int = 5
-    walk_bias_candidate_side: str = "ExponentialWeight"
-    start_bias_candidate_side: str = "ExponentialWeight"
+    # Walks (BACKWARD only, undirected). ONE unified config for both the source (u → μ_u) and the
+    # candidate (v → μ_v) walk bags — the dual-sided head samples both sides with the same settings.
+    num_walks_per_node: int = 5
+    max_walk_len: int = 5
+    walk_bias: str = "ExponentialWeight"
+    start_bias: str = "ExponentialWeight"
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
@@ -121,10 +117,10 @@ class Trainer:
         # One generator, configured QUERY-side; only the source side samples walks.
         self.walk_gen = WalkGenerator(
             use_gpu=config.use_gpu_tempest,
-            walk_bias=config.walk_bias_query_side,
-            start_bias=config.start_bias_query_side,
-            num_walks_per_node=config.num_walks_per_node_query_side,
-            max_walk_len=config.max_walk_len_query_side,
+            walk_bias=config.walk_bias,
+            start_bias=config.start_bias,
+            num_walks_per_node=config.num_walks_per_node,
+            max_walk_len=config.max_walk_len,
             max_time_capacity=config.max_time_capacity,
             temporal_node2vec_p=config.t2nv_p,
             temporal_node2vec_q=config.t2nv_q,
@@ -185,10 +181,10 @@ class Trainer:
         # --- SOURCE side: per-query (u_i, t_i) → K cutoff=t_i backward walks → raw [B,K,L] bag. ---
         src_tokens = build_query_walk_tokens(
             self.walk_gen, device, src_t, t_query_t,
-            max_walk_len=self.config.max_walk_len_query_side,
-            num_walks_per_node=self.config.num_walks_per_node_query_side,
-            start_bias=self.config.start_bias_query_side,
-            walk_bias=self.config.walk_bias_query_side)
+            max_walk_len=self.config.max_walk_len,
+            num_walks_per_node=self.config.num_walks_per_node,
+            start_bias=self.config.start_bias,
+            walk_bias=self.config.walk_bias)
 
         # --- CANDIDATE side (symmetric): each candidate v in row i walked with cutoff = t_i.
         # Flatten [B, C] → [B*C] seeds (row-major); the head reshapes μ_v back to [B, C]. ---
@@ -196,10 +192,10 @@ class Trainer:
         cand_cutoffs = t_query_t.unsqueeze(1).expand(b, c).reshape(b * c)
         cand_tokens = build_query_walk_tokens(
             self.walk_gen, device, cand_flat, cand_cutoffs,
-            max_walk_len=self.config.max_walk_len_candidate_side,
-            num_walks_per_node=self.config.num_walks_per_node_candidate_side,
-            start_bias=self.config.start_bias_candidate_side,
-            walk_bias=self.config.walk_bias_candidate_side)
+            max_walk_len=self.config.max_walk_len,
+            num_walks_per_node=self.config.num_walks_per_node,
+            start_bias=self.config.start_bias,
+            walk_bias=self.config.walk_bias)
 
         return self.model(src_tokens, cand_tokens)   # both self-contained walk bags; head owns E
 

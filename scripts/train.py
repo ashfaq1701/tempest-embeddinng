@@ -90,29 +90,19 @@ def parse_args() -> argparse.Namespace:
         help="If >0, eval on only the first N official val/test edges (prefix; "
              "keeps TGB pre-generated negatives valid).")
 
-    # Walks (BACKWARD only, undirected). Decoupled QUERY-side (source u → μ) and
-    # CANDIDATE-side (v → connectors for the cross channel); same Tempest graph.
-    p.add_argument("--num-walks-per-node-query-side", default=5, type=int,
-                   help="K walks per source u (build μ).")
-    p.add_argument("--max-walk-len-query-side", default=5, type=int,
-                   help="L, max walk length for the query-side walks. (Sweep on wiki: "
-                        "shorter is better — 20→5 gave +0.006 test, monotone, more stable.)")
-    p.add_argument("--walk-bias-query-side", default="ExponentialWeight", type=str,
-                   help="Per-hop edge bias for the query-side backward walks.")
-    p.add_argument("--start-bias-query-side", default="ExponentialWeight", type=str,
-                   help="Initial-edge bias for the query-side backward walks.")
-    # CANDIDATE-side (v → μ_v tokens for the symmetric dual-sided score). Independent from the
-    # query side: this side samples B*C walks/step, so tune it DOWN (fewer/shorter) vs the source.
-    p.add_argument("--num-walks-per-node-candidate-side", default=5, type=int,
-                   help="K walks per candidate v (build μ_v). Cost scales with B*C — keep small.")
-    p.add_argument("--max-walk-len-candidate-side", default=5, type=int,
-                   help="L, max walk length for the candidate-side walks.")
-    p.add_argument("--walk-bias-candidate-side", default="ExponentialWeight", type=str,
-                   help="Per-hop edge bias for the candidate-side backward walks.")
-    p.add_argument("--start-bias-candidate-side", default="ExponentialWeight", type=str,
-                   help="Initial-edge bias for the candidate-side backward walks.")
+    # Walks (BACKWARD only, undirected). ONE unified config: both the source (u → μ_u) and the
+    # candidate (v → μ_v) walk bags of the dual-sided head are sampled with these settings.
+    p.add_argument("--num-walks-per-node", default=5, type=int,
+                   help="K walks per node (source u and candidate v alike).")
+    p.add_argument("--max-walk-len", default=5, type=int,
+                   help="L, max walk length. (Sweep on wiki: shorter is better — 20→5 gave "
+                        "+0.006 test, monotone, more stable.)")
+    p.add_argument("--walk-bias", default="ExponentialWeight", type=str,
+                   help="Per-hop edge bias for the backward walks.")
+    p.add_argument("--start-bias", default="ExponentialWeight", type=str,
+                   help="Initial-edge bias for the backward walks.")
     p.add_argument("--t2nv-p", default=4.0, type=float,
-                   help="node2vec return param p (only used when a query-side bias is "
+                   help="node2vec return param p (only used when the walk bias is "
                         "TemporalNode2Vec). Higher p => less immediate backtrack.")
     p.add_argument("--t2nv-q", default=0.25, type=float,
                    help="node2vec in-out param q (TemporalNode2Vec bias only). Lower q/p => "
@@ -314,14 +304,10 @@ def main() -> Dict[str, Any]:
         tau_link=args.tau_link,
         K_train=args.k_train,
 
-        num_walks_per_node_query_side=args.num_walks_per_node_query_side,
-        max_walk_len_query_side=args.max_walk_len_query_side,
-        walk_bias_query_side=args.walk_bias_query_side,
-        start_bias_query_side=args.start_bias_query_side,
-        num_walks_per_node_candidate_side=args.num_walks_per_node_candidate_side,
-        max_walk_len_candidate_side=args.max_walk_len_candidate_side,
-        walk_bias_candidate_side=args.walk_bias_candidate_side,
-        start_bias_candidate_side=args.start_bias_candidate_side,
+        num_walks_per_node=args.num_walks_per_node,
+        max_walk_len=args.max_walk_len,
+        walk_bias=args.walk_bias,
+        start_bias=args.start_bias,
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
         max_time_capacity=compute_max_time_capacity(
