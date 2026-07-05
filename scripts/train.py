@@ -101,6 +101,16 @@ def parse_args() -> argparse.Namespace:
                    help="Per-hop edge bias for the query-side backward walks.")
     p.add_argument("--start-bias-query-side", default="ExponentialWeight", type=str,
                    help="Initial-edge bias for the query-side backward walks.")
+    # CANDIDATE-side (v → μ_v tokens for the symmetric dual-sided score). Independent from the
+    # query side: this side samples B*C walks/step, so tune it DOWN (fewer/shorter) vs the source.
+    p.add_argument("--num-walks-per-node-candidate-side", default=5, type=int,
+                   help="K walks per candidate v (build μ_v). Cost scales with B*C — keep small.")
+    p.add_argument("--max-walk-len-candidate-side", default=5, type=int,
+                   help="L, max walk length for the candidate-side walks.")
+    p.add_argument("--walk-bias-candidate-side", default="ExponentialWeight", type=str,
+                   help="Per-hop edge bias for the candidate-side backward walks.")
+    p.add_argument("--start-bias-candidate-side", default="ExponentialWeight", type=str,
+                   help="Initial-edge bias for the candidate-side backward walks.")
     p.add_argument("--t2nv-p", default=4.0, type=float,
                    help="node2vec return param p (only used when a query-side bias is "
                         "TemporalNode2Vec). Higher p => less immediate backtrack.")
@@ -308,6 +318,10 @@ def main() -> Dict[str, Any]:
         max_walk_len_query_side=args.max_walk_len_query_side,
         walk_bias_query_side=args.walk_bias_query_side,
         start_bias_query_side=args.start_bias_query_side,
+        num_walks_per_node_candidate_side=args.num_walks_per_node_candidate_side,
+        max_walk_len_candidate_side=args.max_walk_len_candidate_side,
+        walk_bias_candidate_side=args.walk_bias_candidate_side,
+        start_bias_candidate_side=args.start_bias_candidate_side,
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
         max_time_capacity=compute_max_time_capacity(
