@@ -167,18 +167,14 @@ class Trainer:
                t_query_t: torch.Tensor) -> torch.Tensor:
         """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> logits [B, C].
 
-        DUAL-SIDED per-query walks: the SOURCE side samples K backward walks for each query (u_i, t_i)
+        ONE-SIDED per-query walks: the SOURCE side samples K backward walks for each query (u_i, t_i)
         with cutoff = t_i, so every token has t_edge < t_i (strict causal past of that query). The
-        CANDIDATE side symmetrically samples K walks for every candidate v in row i, ALSO with
-        cutoff = t_i, so v's tokens are the same strict causal past — the two bags share one walk
-        config. `build_query_walk_tokens` returns a self-contained raw WalkTokens per side; the head
-        builds μ_u and μ_v via one shared NeighborhoodProjection and scores symmetrically. Strict
+        candidate side samples NO walks — each v enters only through its static embedding E[v]. Strict
         causality comes from the per-query cutoff, NOT from ingestion order, so the batch may already
         be in Tempest."""
         device = self.device
-        b, c = cand_t.shape
 
-        # --- SOURCE side: per-query (u_i, t_i) → K cutoff=t_i backward walks → raw [B,K,L] bag. ---
+        # SOURCE side: per-query (u_i, t_i) → K cutoff=t_i backward walks → raw [B,K,L] token bag.
         src_tokens = build_query_walk_tokens(
             self.walk_gen, device, src_t, t_query_t,
             max_walk_len=self.config.max_walk_len,
@@ -186,18 +182,7 @@ class Trainer:
             start_bias=self.config.start_bias,
             walk_bias=self.config.walk_bias)
 
-        # --- CANDIDATE side (symmetric): each candidate v in row i walked with cutoff = t_i.
-        # Flatten [B, C] → [B*C] seeds (row-major); the head reshapes μ_v back to [B, C]. ---
-        cand_flat = cand_t.reshape(b * c)
-        cand_cutoffs = t_query_t.unsqueeze(1).expand(b, c).reshape(b * c)
-        cand_tokens = build_query_walk_tokens(
-            self.walk_gen, device, cand_flat, cand_cutoffs,
-            max_walk_len=self.config.max_walk_len,
-            num_walks_per_node=self.config.num_walks_per_node,
-            start_bias=self.config.start_bias,
-            walk_bias=self.config.walk_bias)
-
-        return self.model(src_tokens, cand_tokens)   # both self-contained walk bags; head owns E
+        return self.model(src_tokens, cand_t)   # cand_t = candidate node ids; head owns E
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step

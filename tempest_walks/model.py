@@ -1,13 +1,16 @@
 """Link head — sphere node embeddings + a deep neighbourhood-projection channel, in one module.
 
-    logit = <P[u], P[v]>                               do u's and v's neighbourhood-shifted
-                                                       points coincide?
+    logit = <P[u], E[v]>                               is v near u's neighbourhood?
 
-where P[x] = exp_{E[x]}(mu_x) pushes node x off E[x] toward mu_x — the deep pooling of x's own
-walk-token tangents (in the tangent space at E[x]) + a TPNet Time2Vec of each token's age, produced
-by a SINGLE shared NeighborhoodProjection. Both the source u and every candidate v go through the
-same projection from their own walk bag, and the score compares the two projected points directly
-(dual-sided). The head owns self.E (link-trained on the sphere); geometry goes through self.geom.
+where P[u] = exp_{E[u]}(mu_u) pushes the source off E[u] toward mu_u — the deep pooling of u's
+walk-token tangents (in the tangent space at E[u]) + a TPNet Time2Vec of each token's age, produced
+by NeighborhoodProjection. One-sided: only u is walked/projected; each candidate v enters through
+its static embedding E[v]. The head owns self.E (link-trained on the sphere); geometry goes through
+self.geom.
+
+(The dual-sided variant — walk every candidate too and score <P[u], P[v]> — was falsified on wiki:
+at matched walks it lost to one-sided at ~8x the cost. It lives one `git revert` away; see the
+"Important: revert this commit to bring back dual side walks" commit.)
 """
 import math
 
@@ -147,8 +150,7 @@ class LinkPredHead(nn.Module):
 
     def _project(self, tokens: WalkTokens):
         """Project one bag of N queries. Returns (p, e_seed): p [N, d] = exp_{E[seed]}(mu) on the
-        sphere (seed pushed toward its walk-token centroid), e_seed [N, d] = E[seed] on the sphere.
-        Same NeighborhoodProjection is used for the source and candidate sides."""
+        sphere (seed pushed toward its walk-token centroid), e_seed [N, d] = E[seed] on the sphere."""
         e_weight = self.E.weight
         e_seed = self.geom.project(F.embedding(tokens.seeds, e_weight))               # E[x]  [N, d]
 
@@ -159,14 +161,9 @@ class LinkPredHead(nn.Module):
             e_seed, token_tangent, token_ages.to(e_seed.dtype), token_mask)          # [N, d] tangent
         return self.geom.exp_map(e_seed, mu), e_seed                                 # P[x], E[x]
 
-    def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Dual-sided scoring by the two projected points. src_tokens: B source queries (seeds = u).
-        cand_tokens: B*C candidate queries (seeds = v), row-major over [B, C]. Returns logits [B, C] =
-        <P[u], P[v]> — do u's and v's neighbourhood-shifted points coincide?"""
-        b = src_tokens.seeds.shape[0]
-        p_u, _ = self._project(src_tokens)                         # P[u]  [B, d]
-        p_v, _ = self._project(cand_tokens)                        # P[v]  [B*C, d]
-        c = p_v.shape[0] // b
-        p_v = p_v.view(b, c, -1)                                   # [B, C, d]
-
-        return self.geom.similarity(p_u.unsqueeze(1), p_v)         # <P[u], P[v]>  [B, C]
+    def forward(self, src_tokens: WalkTokens, cand_ids: torch.Tensor) -> torch.Tensor:
+        """One-sided scoring. src_tokens: B source queries (seeds = u); cand_ids [B, C] candidate
+        node ids. Returns logits [B, C] = <P[u], E[v]> — is v near u's neighbourhood?"""
+        p_u, _ = self._project(src_tokens)                                    # P[u]  [B, d]
+        candidate = self.geom.project(F.embedding(cand_ids, self.E.weight))   # E[v]  [B, C, d]
+        return self.geom.similarity(p_u.unsqueeze(1), candidate)              # <P[u], E[v]>  [B, C]
