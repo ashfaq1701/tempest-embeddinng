@@ -1,13 +1,13 @@
 """Link head — sphere node embeddings + a deep neighbourhood-projection channel, in one module.
 
-    logit = 1/2 [ <P[u], E[v]> + <P[v], E[u]> ]        symmetric: is v near u's neighbourhood
-                                                       AND u near v's neighbourhood?
+    logit = <P[u], P[v]>                               do u's and v's neighbourhood-shifted
+                                                       points coincide?
 
 where P[x] = exp_{E[x]}(mu_x) pushes node x off E[x] toward mu_x — the deep pooling of x's own
 walk-token tangents (in the tangent space at E[x]) + a TPNet Time2Vec of each token's age, produced
 by a SINGLE shared NeighborhoodProjection. Both the source u and every candidate v go through the
-same projection from their own walk bag, and the score is symmetric (dual-sided). The head owns
-self.E (link-trained on the sphere); geometry goes through self.geom.
+same projection from their own walk bag, and the score compares the two projected points directly
+(dual-sided). The head owns self.E (link-trained on the sphere); geometry goes through self.geom.
 """
 import math
 
@@ -160,16 +160,13 @@ class LinkPredHead(nn.Module):
         return self.geom.exp_map(e_seed, mu), e_seed                                 # P[x], E[x]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Dual-sided symmetric scoring. src_tokens: B source queries (seeds = u). cand_tokens: B*C
-        candidate queries (seeds = v), row-major over [B, C]. Returns logits [B, C] =
-        1/2 (<P[u], E[v]> + <P[v], E[u]>)."""
+        """Dual-sided scoring by the two projected points. src_tokens: B source queries (seeds = u).
+        cand_tokens: B*C candidate queries (seeds = v), row-major over [B, C]. Returns logits [B, C] =
+        <P[u], P[v]> — do u's and v's neighbourhood-shifted points coincide?"""
         b = src_tokens.seeds.shape[0]
-        p_u, e_u = self._project(src_tokens)                       # [B, d],  [B, d]
-        p_v, e_v = self._project(cand_tokens)                      # [B*C, d], [B*C, d]
+        p_u, _ = self._project(src_tokens)                         # P[u]  [B, d]
+        p_v, _ = self._project(cand_tokens)                        # P[v]  [B*C, d]
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, -1)                                   # [B, C, d]
-        e_v = e_v.view(b, c, -1)                                   # [B, C, d]
 
-        s_uv = self.geom.similarity(p_u.unsqueeze(1), e_v)         # <P[u], E[v]>  [B, C]
-        s_vu = self.geom.similarity(p_v, e_u.unsqueeze(1))         # <P[v], E[u]>  [B, C]
-        return 0.5 * (s_uv + s_vu)
+        return self.geom.similarity(p_u.unsqueeze(1), p_v)         # <P[u], P[v]>  [B, C]
