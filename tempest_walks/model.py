@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .walk_tokens import WalkTokens, flatten_and_exclude_seed
+from .walk_tokens import WalkTokens, flatten_tokens
 
 
 class SphereManifold:
@@ -154,7 +154,8 @@ class LinkPredHead(nn.Module):
         e_weight = self.E.weight
         e_seed = self.geom.project(F.embedding(tokens.seeds, e_weight))               # E[x]  [N, d]
 
-        token_ids, token_mask, token_ages = flatten_and_exclude_seed(tokens)
+        token_ids, token_mask, token_ages = flatten_tokens(
+            tokens, exclude_seed_positions=True, exclude_seed_tokens=True)
         token_emb = self.geom.project(F.embedding(token_ids.clamp_min(0), e_weight))  # [N, T, d]
         token_tangent = self.geom.log_map(e_seed.unsqueeze(-2), token_emb)           # [N, T, d] tangent
         mu = self.neighbourhood(

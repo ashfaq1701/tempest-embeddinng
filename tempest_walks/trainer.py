@@ -27,7 +27,7 @@ walks are generated PER QUERY (no dedup — each row's (node, t) needs its own c
 in the RAW per-walk WalkTokens layout ([Q, K, L] nodes / nodes_mask / node-aligned timestamps,
 seeds + cutoffs). This RAW layout is the SHARED walk contract for every head; LinkPredHead
 flattens it to a [Q, K*L] token bag and masks padding + the seed node u via
-`walk_tokens.flatten_and_exclude_seed`, then builds μ_u with a per-row softmax (ages =
+`walk_tokens.flatten_tokens`, then builds μ_u with a per-row softmax (ages =
 cutoffs − t_edge) and scores identity + velocity against E[v].
 """
 import time

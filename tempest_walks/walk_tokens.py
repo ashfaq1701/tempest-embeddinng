@@ -20,7 +20,7 @@ returns them in their RAW per-walk layout — no packing, no dedup, no seed/orig
 
 This RAW layout is the SHARED walk contract for every head (point / velocity / …): the trainer
 samples a query's backward walks into it (`build_query_walk_tokens`) and each head turns it into
-the flat token bag its μ needs via `flatten_and_exclude_seed` — so the sampling pipeline is
+the flat token bag its μ needs via `flatten_tokens` — so the sampling pipeline is
 identical across heads and only the scoring model differs.
 
 Requires shuffle_walk_order=False at the Tempest constructor so a query's K walk rows are
@@ -102,20 +102,38 @@ def build_query_walk_tokens(
     return WalkTokens(seeds_t, nodes, nodes_mask, timestamps, cutoffs_t)
 
 
-def flatten_and_exclude_seed(tokens: WalkTokens):
-    """Collapse the raw [Q, K, L] walks into one flat [Q, K*L] token bag for the μ softmax.
+def flatten_tokens(
+    tokens: WalkTokens,
+    exclude_seed_positions: bool = True,
+    exclude_seed_tokens: bool = True,
+):
+    """Collapse the raw [Q, K, L] walks into one flat [Q, K*L] token bag for the μ pooling.
 
-    Masks out (a) padding (nodes == -1) and (b) EVERY occurrence of the seed node u — both its slot
-    at the walk end and any earlier recurrence, since Log_{E[u]}(E[u]) = 0 would pull μ toward the
-    origin and let u witness itself. Returns:
-        ids   [Q, T]  int64  token node ids (−1 in masked slots; clamp before embedding)
-        mask  [Q, T]  bool   True on kept (real, non-seed) tokens
-        ages  [Q, T]  int64  cutoff − t_edge (≥ 0), meaningful only where mask is True
+    Padding (nodes == -1) is ALWAYS masked. Two flags control whether the seed node u is also
+    masked out of the bag. Empirically, excluding the seed lifts wiki MRR substantially: E[u] as a
+    token self-anchors P[u] toward u itself (a recurrence shortcut that overfits), so removing it
+    frees μ to describe u's neighbourhood rather than u.
+
+      exclude_seed_tokens (default True) — TAKES PRECEDENCE. When True, mask EVERY occurrence of
+          the seed node u: its walk-origin slot AND any mid-walk recurrence (ids == seed).
+      exclude_seed_positions (default True) — checked ONLY when exclude_seed_tokens is False. When
+          True, mask ONLY the seed's walk-origin slot — the position where the seed sits at the walk
+          end, identified by timestamp == cutoff (age 0). Mid-walk recurrences of u are KEPT.
+      both False — no seed filtering; the seed is kept everywhere (padding-only mask).
+
+    Returns:
+        ids   [Q, T]  int64  token node ids (−1 in padding/masked slots; clamp before embedding)
+        mask  [Q, T]  bool   True on kept tokens
+        ages  [Q, T]  int64  cutoff − t_edge (≥ 0; the seed slot's t = cutoff so its age = 0)
     with T = K*L. The per-walk (K) structure is intentionally flattened away — every head consumes
     one flat token bag; the raw [Q, K, L] shape exists only to share the walk-sampling pipeline."""
     q = tokens.nodes.shape[0]
     ids = tokens.nodes.reshape(q, -1)                                       # [Q, T]
-    is_seed = ids == tokens.seeds.view(q, 1)
-    mask = tokens.nodes_mask.reshape(q, -1) & ~is_seed                      # [Q, T]
-    ages = (tokens.cutoffs.view(q, 1) - tokens.timestamps.reshape(q, -1)).clamp_min(0)
+    ts = tokens.timestamps.reshape(q, -1)                                   # [Q, T]
+    mask = tokens.nodes_mask.reshape(q, -1)                                 # [Q, T]  padding
+    ages = (tokens.cutoffs.view(q, 1) - ts).clamp_min(0)
+    if exclude_seed_tokens:                                                 # every occurrence of node u
+        mask = mask & (ids != tokens.seeds.view(q, 1))
+    elif exclude_seed_positions:                                            # only the walk-origin slot (age 0)
+        mask = mask & (ts != tokens.cutoffs.view(q, 1))
     return ids, mask, ages
