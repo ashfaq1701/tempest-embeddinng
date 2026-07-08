@@ -81,15 +81,20 @@ class TrainerConfig:
     t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
-    # Optimisation — per-group cosine decay to lr_min over num_epochs (no warmup, no weight decay).
-    # TWO LR GROUPS (ported from feature/poincare-head-3): the sphere manifold embedding E (a
-    # geoopt.ManifoldParameter) vs all other (Euclidean) head params, each decaying independently
-    # from its own peak to its own floor. E keeps master's proven 1e-3 (dropping it to 1e-4 starved
-    # E's learning — link loss froze, val capped ~0.80); the Euclidean head takes a higher 1e-2.
+    # Optimisation — per-group cosine decay to lr_min over num_epochs (no warmup). TWO LR GROUPS
+    # (ported from feature/poincare-head-3): the sphere manifold embedding E (a geoopt.ManifoldParameter)
+    # vs all other (Euclidean) head params, each decaying independently from its own peak to its own
+    # floor. E keeps master's proven 1e-3 (dropping it to 1e-4 starved E's learning); head takes 1e-2.
     lr_manifold: float = 1e-3
     lr_min_manifold: float = 1e-7
     lr_model: float = 1e-2
     lr_min_model: float = 1e-7
+    # Per-group weight decay (RiemannianAdam group["weight_decay"]). Restored after an A/B showed the
+    # old single-optimizer pipeline (wd 1e-4 on all params) reached ~0.828/0.803 at d128/w10/l10 while
+    # the no-wd two-LR pipeline capped ~0.825/0.797 — the test-gap>val-gap signature of a lost
+    # regulariser. Applied SEPARATELY per group so E and the head can be tuned independently.
+    weight_decay_manifold: float = 1e-4
+    weight_decay_model: float = 1e-4
 
     # Run control.
     num_epochs: int = 50
@@ -138,10 +143,12 @@ class Trainer:
             (manifold_params if isinstance(p, geoopt.ManifoldParameter) else model_params).append(p)
         groups, self._group_lr = [], []   # self._group_lr: (peak, floor) per group, in opt order
         if manifold_params:
-            groups.append({"params": manifold_params, "lr": config.lr_manifold})
+            groups.append({"params": manifold_params, "lr": config.lr_manifold,
+                           "weight_decay": float(config.weight_decay_manifold)})
             self._group_lr.append((float(config.lr_manifold), float(config.lr_min_manifold)))
         if model_params:
-            groups.append({"params": model_params, "lr": config.lr_model})
+            groups.append({"params": model_params, "lr": config.lr_model,
+                           "weight_decay": float(config.weight_decay_model)})
             self._group_lr.append((float(config.lr_model), float(config.lr_min_model)))
         self.opt = geoopt.optim.RiemannianAdam(groups, stabilize=10)
 

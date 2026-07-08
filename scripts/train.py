@@ -124,18 +124,24 @@ def parse_args() -> argparse.Namespace:
              "the raw window depends on the dataset's calendar density.",
     )
 
-    # Optimisation — RiemannianAdam, per-group cosine decay to lr-min over --num-epochs (no warmup,
-    # no weight decay). Two groups: the sphere embedding E (a geoopt.ManifoldParameter, gentle LR) vs
-    # all other (Euclidean) head params.
+    # Optimisation — RiemannianAdam, per-group cosine decay to lr-min over --num-epochs (no warmup).
+    # Two groups: the sphere embedding E (a geoopt.ManifoldParameter, gentle LR) vs all other
+    # (Euclidean) head params. Per-group weight decay (see --weight-decay-*).
     p.add_argument("--lr-manifold", default=1e-3, type=float,
                    help="Peak LR for the sphere manifold embedding E (master's proven 1e-3; "
                         "lower starves E — link loss freezes, val caps ~0.80).")
     p.add_argument("--lr-min-manifold", default=1e-7, type=float,
                    help="Cosine-decay floor for the manifold group.")
+    p.add_argument("--weight-decay-manifold", default=1e-4, type=float,
+                   help="Weight decay for the sphere manifold group E (per-group, RiemannianAdam).")
+
     p.add_argument("--lr-model", default=1e-2, type=float,
                    help="Peak LR for all other (Euclidean) params — attention/projection/coeffs.")
     p.add_argument("--lr-min-model", default=1e-7, type=float,
                    help="Cosine-decay floor for the model group.")
+    p.add_argument("--weight-decay-model", default=1e-4, type=float,
+                   help="Weight decay for the Euclidean model group (attention/projection/coeffs).")
+
     p.add_argument(
         "--batch-size", default=200, type=int,
         help="Train batch size. Under the per-query ranking link "
@@ -310,6 +316,8 @@ def main() -> Dict[str, Any]:
         lr_min_manifold=args.lr_min_manifold,
         lr_model=args.lr_model,
         lr_min_model=args.lr_min_model,
+        weight_decay_manifold=args.weight_decay_manifold,
+        weight_decay_model=args.weight_decay_model,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 
