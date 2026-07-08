@@ -158,6 +158,10 @@ def parse_args() -> argparse.Namespace:
              "wiki needs --eval-batch-size 25-50 explicitly.",
     )
     p.add_argument("--num-epochs", default=50, type=int)
+    p.add_argument("--decay-horizon-epochs", default=50, type=int,
+                   help="LR cosine-decay horizon in epochs (shared by both LR groups), SEPARATE from "
+                        "--num-epochs: LR reaches lr-min at this horizon, so a shorter --num-epochs "
+                        "stays near peak. Lets you vary epoch count without rescaling the schedule.")
     p.add_argument("--early-stop-patience", default=0, type=int)
 
     # System.
@@ -319,6 +323,7 @@ def main() -> Dict[str, Any]:
         weight_decay_manifold=args.weight_decay_manifold,
         weight_decay_model=args.weight_decay_model,
         num_epochs=args.num_epochs,
+        decay_horizon_epochs=args.decay_horizon_epochs,
         early_stop_patience=args.early_stop_patience,
 
         seed=args.seed,

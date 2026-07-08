@@ -98,6 +98,10 @@ class TrainerConfig:
 
     # Run control.
     num_epochs: int = 50
+    # LR-decay horizon in epochs — SEPARATE from num_epochs, ONE value shared by BOTH LR groups. The
+    # per-group cosine reaches each group's lr_min at decay_horizon_epochs, so num_epochs < horizon
+    # keeps LR near peak (freedom to run any epoch count without rescaling the schedule).
+    decay_horizon_epochs: int = 50
     early_stop_patience: int = 0
 
     # System.
@@ -162,7 +166,7 @@ class Trainer:
     def _setup_lr_scheduler(self, batches_per_epoch: int) -> None:
         # Independent cosine decay per param group (each to its own floor) over the whole run
         # (horizon = num_epochs); no warmup. LambdaLR takes one lambda per group.
-        decay_steps = self.config.num_epochs * max(batches_per_epoch, 1)
+        decay_steps = self.config.decay_horizon_epochs * max(batches_per_epoch, 1)
         lambdas = []
         for pg, (peak, floor) in zip(self.opt.param_groups, self._group_lr):
             pg["lr"] = peak
@@ -174,7 +178,7 @@ class Trainer:
         groups = " ".join(f"{peak:.1e}->{floor:.1e}" for peak, floor in self._group_lr)
         print(
             f"  LR schedule (cosine, per-group [manifold model]): {groups}; "
-            f"decay_horizon={decay_steps} ({self.config.num_epochs}ep x {batches_per_epoch} batches)"
+            f"decay_horizon={decay_steps} ({self.config.decay_horizon_epochs}ep x {batches_per_epoch} batches)"
         )
 
     # ──────────────────────────────────────────────────────────────────
