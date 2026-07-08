@@ -84,10 +84,11 @@ class TrainerConfig:
     # Optimisation — per-group cosine decay to lr_min over num_epochs (no warmup, no weight decay).
     # TWO LR GROUPS (ported from feature/poincare-head-3): the sphere manifold embedding E (a
     # geoopt.ManifoldParameter) vs all other (Euclidean) head params, each decaying independently
-    # from its own peak to its own floor. Lets E take a gentler LR than the head.
-    lr_manifold: float = 1e-4
+    # from its own peak to its own floor. E keeps master's proven 1e-3 (dropping it to 1e-4 starved
+    # E's learning — link loss froze, val capped ~0.80); the Euclidean head takes a higher 1e-2.
+    lr_manifold: float = 1e-3
     lr_min_manifold: float = 1e-7
-    lr_model: float = 1e-3
+    lr_model: float = 1e-2
     lr_min_model: float = 1e-7
 
     # Run control.
