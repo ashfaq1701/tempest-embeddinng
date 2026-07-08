@@ -81,13 +81,14 @@ class TrainerConfig:
     t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
-    # Optimisation.
-    lr: float = 1e-3
-    lr_min: float = 1e-5
-    weight_decay: float = 1e-4
-    warmup_fraction: float = 0.05
-    warmup_steps_cap: int = 500
-    decay_horizon_epochs: int = 50
+    # Optimisation — per-group cosine decay to lr_min over num_epochs (no warmup, no weight decay).
+    # TWO LR GROUPS (ported from feature/poincare-head-3): the sphere manifold embedding E (a
+    # geoopt.ManifoldParameter) vs all other (Euclidean) head params, each decaying independently
+    # from its own peak to its own floor. Lets E take a gentler LR than the head.
+    lr_manifold: float = 1e-4
+    lr_min_manifold: float = 1e-7
+    lr_model: float = 1e-3
+    lr_min_model: float = 1e-7
 
     # Run control.
     num_epochs: int = 50
@@ -129,9 +130,19 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        params = list(self.model.parameters())
-        self.opt = geoopt.optim.RiemannianAdam(
-            params, lr=config.lr, weight_decay=config.weight_decay, stabilize=10)
+        # Two LR groups: the sphere manifold params (E, a geoopt.ManifoldParameter) vs all other
+        # Euclidean params. Each group gets its own peak LR + cosine floor (see _setup_lr_scheduler).
+        manifold_params, model_params = [], []
+        for p in self.model.parameters():
+            (manifold_params if isinstance(p, geoopt.ManifoldParameter) else model_params).append(p)
+        groups, self._group_lr = [], []   # self._group_lr: (peak, floor) per group, in opt order
+        if manifold_params:
+            groups.append({"params": manifold_params, "lr": config.lr_manifold})
+            self._group_lr.append((float(config.lr_manifold), float(config.lr_min_manifold)))
+        if model_params:
+            groups.append({"params": model_params, "lr": config.lr_model})
+            self._group_lr.append((float(config.lr_model), float(config.lr_min_model)))
+        self.opt = geoopt.optim.RiemannianAdam(groups, stabilize=10)
 
         self.sched: Optional[LambdaLR] = None
         self._global_step = 0
@@ -141,22 +152,21 @@ class Trainer:
     # ──────────────────────────────────────────────────────────────────
 
     def _setup_lr_scheduler(self, batches_per_epoch: int) -> None:
-        decay_steps = self.config.decay_horizon_epochs * max(batches_per_epoch, 1)
-        warmup_steps = max(1, min(
-            int(self.config.warmup_fraction * decay_steps), self.config.warmup_steps_cap))
-        peak = float(self.config.lr)
-        floor = float(self.config.lr_min)
-        for pg in self.opt.param_groups:
+        # Independent cosine decay per param group (each to its own floor) over the whole run
+        # (horizon = num_epochs); no warmup. LambdaLR takes one lambda per group.
+        decay_steps = self.config.num_epochs * max(batches_per_epoch, 1)
+        lambdas = []
+        for pg, (peak, floor) in zip(self.opt.param_groups, self._group_lr):
             pg["lr"] = peak
             pg["initial_lr"] = peak
-        ratio = floor / peak if peak > 0 else 0.0
-        self.sched = LambdaLR(
-            self.opt, lr_lambda=make_lr_lambda(warmup_steps, decay_steps, ratio))
+            ratio = floor / peak if peak > 0 else 0.0
+            lambdas.append(make_lr_lambda(decay_steps, ratio))
+        self.sched = LambdaLR(self.opt, lr_lambda=lambdas)
         self._global_step = 0
+        groups = " ".join(f"{peak:.1e}->{floor:.1e}" for peak, floor in self._group_lr)
         print(
-            f"  LR schedule (warmup+cosine): peak={peak:.2e} floor={floor:.2e}; "
-            f"warmup={warmup_steps} decay_horizon={decay_steps} "
-            f"({self.config.decay_horizon_epochs}ep x {batches_per_epoch} batches)"
+            f"  LR schedule (cosine, per-group [manifold model]): {groups}; "
+            f"decay_horizon={decay_steps} ({self.config.num_epochs}ep x {batches_per_epoch} batches)"
         )
 
     # ──────────────────────────────────────────────────────────────────
@@ -332,7 +342,7 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
-                f"lr={self.opt.param_groups[0]['lr']:.2e}  "
+                f"lr={'/'.join('%.1e' % pg['lr'] for pg in self.opt.param_groups)}  "
                 f"train {train_dt:.1f}s"
             )
 

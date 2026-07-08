@@ -12,10 +12,11 @@ Hyperparameters exposed at CLI (and their grouping):
   Walks:          --{num-walks-per-node,max-walk-len,walk-bias,start-bias}-
                   {query,candidate}-side, --tempest-batch-window-multiplier
                   (backward-only, undirected; query=source→μ, candidate=v→connectors)
-  Optimisation:   --lr, --lr-min, --warmup-fraction,
-                  --warmup-steps-cap, --decay-horizon-epochs, --weight-decay,
+  Optimisation:   --lr-manifold, --lr-min-manifold, --lr-model, --lr-min-model,
                   --batch-size, --eval-batch-size, --num-epochs,
                   --early-stop-patience
+                  (two LR groups: sphere E vs Euclidean head; per-group cosine
+                  decay to lr-min over --num-epochs)
   System:         --seed, --use-gpu, --use-gpu-tempest
   Analysis:       --stratify (post-train per-slice test-MRR stratification)
 
@@ -123,29 +124,17 @@ def parse_args() -> argparse.Namespace:
              "the raw window depends on the dataset's calendar density.",
     )
 
-    # Optimisation. Single RiemannianAdam over {E (sphere), GRU, scale}.
-    p.add_argument(
-        "--lr", default=1e-3, type=float, help="Peak LR (RiemannianAdam).",
-    )
-    p.add_argument(
-        "--lr-min", default=1e-5, type=float,
-        help="Cosine-decay LR floor (~peak/1000).",
-    )
-    p.add_argument(
-        "--warmup-fraction", default=0.05, type=float,
-        help="Warmup as fraction of decay horizon steps.",
-    )
-    p.add_argument(
-        "--warmup-steps-cap", default=500, type=int,
-        help="Maximum warmup steps regardless of fraction.",
-    )
-    p.add_argument(
-        "--decay-horizon-epochs", default=50, type=int,
-        help="Target epoch count for cosine decay to reach lr-min. "
-             "SEPARATE from --num-epochs — short runs stay near peak; "
-             "full decay is hit only at num_epochs = horizon.",
-    )
-    p.add_argument("--weight-decay", default=1e-4, type=float)
+    # Optimisation — RiemannianAdam, per-group cosine decay to lr-min over --num-epochs (no warmup,
+    # no weight decay). Two groups: the sphere embedding E (a geoopt.ManifoldParameter, gentle LR) vs
+    # all other (Euclidean) head params.
+    p.add_argument("--lr-manifold", default=1e-4, type=float,
+                   help="Peak LR for the sphere manifold embedding E.")
+    p.add_argument("--lr-min-manifold", default=1e-7, type=float,
+                   help="Cosine-decay floor for the manifold group.")
+    p.add_argument("--lr-model", default=1e-3, type=float,
+                   help="Peak LR for all other (Euclidean) params — attention/projection/coeffs.")
+    p.add_argument("--lr-min-model", default=1e-7, type=float,
+                   help="Cosine-decay floor for the model group.")
     p.add_argument(
         "--batch-size", default=200, type=int,
         help="Train batch size. Under the per-query ranking link "
@@ -316,12 +305,10 @@ def main() -> Dict[str, Any]:
             stats.mean_inter_arrival,
         ),
 
-        lr=args.lr,
-        lr_min=args.lr_min,
-        warmup_fraction=args.warmup_fraction,
-        warmup_steps_cap=args.warmup_steps_cap,
-        decay_horizon_epochs=args.decay_horizon_epochs,
-        weight_decay=args.weight_decay,
+        lr_manifold=args.lr_manifold,
+        lr_min_manifold=args.lr_min_manifold,
+        lr_model=args.lr_model,
+        lr_min_model=args.lr_min_model,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 

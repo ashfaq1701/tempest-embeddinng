@@ -8,9 +8,9 @@ Contents:
   Determinism:
     - seed_all(seed)              — seed Python/numpy/torch RNGs.
   LR schedule:
-    - make_lr_lambda(warmup_steps, decay_steps, lr_min_ratio)
+    - make_lr_lambda(decay_steps, lr_min_ratio)
                                   — closure for LambdaLR that does
-                                    linear warmup then cosine decay
+                                    cosine decay (no warmup)
                                     to lr_min_ratio.
   Tempest configuration:
     - compute_max_time_capacity(multiplier, batch_size, mean_inter_arrival)
@@ -58,35 +58,18 @@ def seed_all(seed: int) -> None:
 
 
 def make_lr_lambda(
-    warmup_steps: int,
     decay_steps: int,
     lr_min_ratio: float,
 ) -> Callable[[int], float]:
-    """Build a LambdaLR lambda for linear warmup + cosine decay.
-
-    Shape:
-      step 0..warmup_steps    linear ramp from 0 (at step 0) to 1.0
-      step warmup..decay      cosine from 1.0 to lr_min_ratio
-      step > decay_steps      stay at lr_min_ratio
-
-    lr_min_ratio is lr_min / peak_lr. The lambda returns a scale
-    factor that LambdaLR multiplies by the optimizer's initial_lr.
-    """
+    """Build a LambdaLR lambda for cosine decay from 1.0 (step 0) to lr_min_ratio (step decay_steps),
+    then flat at lr_min_ratio. lr_min_ratio = lr_min / peak_lr; the lambda scales the optimizer's
+    initial_lr. No warmup — a value test on the poincare-head-3 winner found warmup added nothing."""
 
     def lr_lambda(step: int) -> float:
         # step is 0-indexed (PyTorch LambdaLR convention).
-        if step < warmup_steps:
-            return float(step + 1) / float(warmup_steps)
-
-        decay_progress = step - warmup_steps
-        decay_total = decay_steps - warmup_steps
-        if decay_total <= 0:
+        if decay_steps <= 0:
             return lr_min_ratio
-
-        progress = float(decay_progress) / float(decay_total)
-        if progress >= 1.0:
-            return lr_min_ratio
-
+        progress = min(1.0, float(step) / float(decay_steps))
         cos_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
         return lr_min_ratio + (1.0 - lr_min_ratio) * cos_factor
 
