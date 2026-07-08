@@ -8,7 +8,7 @@ ordering (training):
   4. logits = score(src, candidates)                 — for each query (u_i, t_i) sample K
        backward walks with cutoff = t_i (→ μ_u), pack to tokens, score with
        LinkPredHead (identity + velocity-line). Candidate side samples no walks (static E[v]).
-  5. L = cross_entropy(logits / tau_link, target=0)  — Bruch 2019, upper-bounds 1-MRR
+  5. L = cross_entropy(logits, target=0)             — Bruch 2019, upper-bounds 1-MRR
   6. one backward + single optimizer step
 
 Why ingest-first is valid (and == TPNet): a walk for (u, t) with cutoff = t traverses only
@@ -68,7 +68,6 @@ class TrainerConfig:
     t2v_dim: int = 100        # Time2Vec output dim (TPNet default)
 
     # Link loss / head.
-    tau_link: float = 1.0       # softmax-CE temperature
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
 
     # Walks (BACKWARD only, undirected). ONE unified config for both the source (u → μ_u) and the
@@ -101,7 +100,7 @@ class TrainerConfig:
     # LR-decay horizon in epochs — SEPARATE from num_epochs, ONE value shared by BOTH LR groups. The
     # per-group cosine reaches each group's lr_min at decay_horizon_epochs, so num_epochs < horizon
     # keeps LR near peak (freedom to run any epoch count without rescaling the schedule).
-    decay_horizon_epochs: int = 50
+    decay_horizon_epochs: int = 30
     early_stop_patience: int = 0
 
     # System.
@@ -234,7 +233,7 @@ class Trainer:
 
         logits = self._score(src_t, cand_t, t_query_t)                 # [B, 1+K]
         target = torch.zeros(B, dtype=torch.long, device=device)
-        loss = F.cross_entropy(logits / self.config.tau_link, target)
+        loss = F.cross_entropy(logits, target)
 
         self.opt.zero_grad(set_to_none=True)
         loss.backward()

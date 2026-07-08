@@ -8,7 +8,7 @@ repeatedly with different CLI args.
 Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root
   Model:          --d-emb
-  Link/head:      --tau-link, --k-train
+  Link/head:      --k-train
   Walks:          --{num-walks-per-node,max-walk-len,walk-bias,start-bias}-
                   {query,candidate}-side, --tempest-batch-window-multiplier
                   (backward-only, undirected; query=source→μ, candidate=v→connectors)
@@ -71,10 +71,6 @@ def parse_args() -> argparse.Namespace:
                    help="Time2Vec output dim (TPNet default 100).")
 
     # Link loss / head.
-    p.add_argument(
-        "--tau-link", default=1.0, type=float,
-        help="Link-prediction softmax-CE temperature (per-query ranking loss).",
-    )
     p.add_argument(
         "--k-train", type=int, default=100,
         help="Per-query training negatives. The head sees [B, 1+K_train] "
@@ -158,7 +154,7 @@ def parse_args() -> argparse.Namespace:
              "wiki needs --eval-batch-size 25-50 explicitly.",
     )
     p.add_argument("--num-epochs", default=50, type=int)
-    p.add_argument("--decay-horizon-epochs", default=50, type=int,
+    p.add_argument("--decay-horizon-epochs", default=30, type=int,
                    help="LR cosine-decay horizon in epochs (shared by both LR groups), SEPARATE from "
                         "--num-epochs: LR reaches lr-min at this horizon, so a shorter --num-epochs "
                         "stays near peak. Lets you vary epoch count without rescaling the schedule.")
@@ -301,7 +297,6 @@ def main() -> Dict[str, Any]:
         proj_dropout=args.proj_dropout,
         t2v_dim=args.t2v_dim,
 
-        tau_link=args.tau_link,
         K_train=args.k_train,
 
         num_walks_per_node=args.num_walks_per_node,
