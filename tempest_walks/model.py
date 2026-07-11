@@ -102,7 +102,7 @@ class NeighborhoodProjection(nn.Module):
     weighting. Candidate-independent (never sees E[v]); cold rows (no token) -> mu_u = 0.
     """
 
-    def __init__(self, d_emb: int, d_a: int = 128, dropout: float = 0.0, t2v_dim: int = 100):
+    def __init__(self, d_emb: int, d_a: int = 128, dropout: float = 0.0, t2v_dim: int = 16):
         super().__init__()
         self.d_emb = d_emb
         self.scale = 1.0 / math.sqrt(d_a)
@@ -132,7 +132,7 @@ class NeighborhoodProjection(nn.Module):
 
 class LinkPredHead(nn.Module):
     def __init__(self, num_nodes: int, d_emb: int,
-                 proj_dim: int = 128, proj_dropout: float = 0.0, t2v_dim: int = 100):
+                 proj_dim: int = 128, proj_dropout: float = 0.0, t2v_dim: int = 16):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_emb = d_emb

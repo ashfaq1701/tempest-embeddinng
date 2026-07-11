@@ -64,7 +64,7 @@ class TrainerConfig:
 
     # NeighborhoodProjection (attention pooling of the source's walk-token offsets -> mu_u).
     proj_dim: int = 128       # attention (query/key) dim d_a
-    t2v_dim: int = 100        # Time2Vec output dim (TPNet default)
+    t2v_dim: int = 16         # Time2Vec output dim (16 ties dim100 on wiki: 0.8287/0.8040 vs 0.8289/0.8046)
 
     # Link loss / head.
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])

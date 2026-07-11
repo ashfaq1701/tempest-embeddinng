@@ -63,8 +63,8 @@ def parse_args() -> argparse.Namespace:
     # NeighborhoodProjection — attention pooling of the source's walk-token offsets into mu_u.
     p.add_argument("--proj-dim", default=128, type=int,
                    help="Attention (query/key) dim d_a for the neighbourhood pooling.")
-    p.add_argument("--t2v-dim", default=100, type=int,
-                   help="Time2Vec output dim (TPNet default 100).")
+    p.add_argument("--t2v-dim", default=16, type=int,
+                   help="Time2Vec output dim (16 ties dim 100 on wiki; TPNet default was 100).")
 
     # Link loss / head.
     p.add_argument(
