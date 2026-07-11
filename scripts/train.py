@@ -13,10 +13,8 @@ Hyperparameters exposed at CLI (and their grouping):
                   {query,candidate}-side, --tempest-batch-window-multiplier
                   (backward-only, undirected; query=source→μ, candidate=v→connectors)
   Optimisation:   --lr-manifold, --lr-min-manifold, --lr-model, --lr-min-model,
-                  --batch-size, --eval-batch-size, --num-epochs,
-                  --early-stop-patience
-                  (two LR groups: sphere E vs Euclidean head; per-group cosine
-                  decay to lr-min over --num-epochs)
+                  --batch-size, --eval-batch-size, --num-epochs, --early-stop-patience
+                  (per-group cosine decay to lr-min over --num-epochs)
   System:         --seed, --use-gpu, --use-gpu-tempest
   Analysis:       --stratify (post-train per-slice test-MRR stratification)
 
@@ -65,8 +63,6 @@ def parse_args() -> argparse.Namespace:
     # NeighborhoodProjection — attention pooling of the source's walk-token offsets into mu_u.
     p.add_argument("--proj-dim", default=128, type=int,
                    help="Attention (query/key) dim d_a for the neighbourhood pooling.")
-    p.add_argument("--proj-dropout", default=0.0, type=float,
-                   help="Dropout on the attention weights.")
     p.add_argument("--t2v-dim", default=100, type=int,
                    help="Time2Vec output dim (TPNet default 100).")
 
@@ -87,10 +83,10 @@ def parse_args() -> argparse.Namespace:
         help="If >0, eval on only the first N official val/test edges (prefix; "
              "keeps TGB pre-generated negatives valid).")
 
-    # Walks (BACKWARD only, undirected). ONE unified config: both the source (u → μ_u) and the
-    # candidate (v → μ_v) walk bags of the dual-sided head are sampled with these settings.
+    # Walks (BACKWARD only, undirected) for the source side (u → μ_u). One-sided head: only the
+    # source is walked; each candidate v enters through its static embedding E[v].
     p.add_argument("--num-walks-per-node", default=5, type=int,
-                   help="K walks per node (source u and candidate v alike).")
+                   help="K walks per source node u.")
     p.add_argument("--max-walk-len", default=5, type=int,
                    help="L, max walk length. (Sweep on wiki: shorter is better — 20→5 gave "
                         "+0.006 test, monotone, more stable.)")
@@ -120,24 +116,17 @@ def parse_args() -> argparse.Namespace:
              "the raw window depends on the dataset's calendar density.",
     )
 
-    # Optimisation — RiemannianAdam, per-group cosine decay to lr-min over --num-epochs (no warmup).
-    # Two groups: the sphere embedding E (a geoopt.ManifoldParameter, gentle LR) vs all other
-    # (Euclidean) head params. Per-group weight decay (see --weight-decay-*).
+    # Optimisation — RiemannianAdam, per-group cosine decay to lr-min over --num-epochs. Two groups:
+    # the manifold embedding E (gentle LR) vs all other params. The sphere head wants 1e-3 (the
+    # Poincaré variant on feature/poincare-geodesic-rand uses 1e-4 — the one intended cross-branch diff).
     p.add_argument("--lr-manifold", default=1e-3, type=float,
-                   help="Peak LR for the sphere manifold embedding E (master's proven 1e-3; "
-                        "lower starves E — link loss freezes, val caps ~0.80).")
+                   help="Peak LR for the manifold embedding E (sphere default 1e-3).")
     p.add_argument("--lr-min-manifold", default=1e-7, type=float,
                    help="Cosine-decay floor for the manifold group.")
-    p.add_argument("--weight-decay-manifold", default=1e-4, type=float,
-                   help="Weight decay for the sphere manifold group E (per-group, RiemannianAdam).")
-
-    p.add_argument("--lr-model", default=1e-2, type=float,
+    p.add_argument("--lr-model", default=1e-3, type=float,
                    help="Peak LR for all other (Euclidean) params — attention/projection/coeffs.")
     p.add_argument("--lr-min-model", default=1e-7, type=float,
                    help="Cosine-decay floor for the model group.")
-    p.add_argument("--weight-decay-model", default=1e-4, type=float,
-                   help="Weight decay for the Euclidean model group (attention/projection/coeffs).")
-
     p.add_argument(
         "--batch-size", default=200, type=int,
         help="Train batch size. Under the per-query ranking link "
@@ -153,12 +142,12 @@ def parse_args() -> argparse.Namespace:
              "coin/comment ~2000+. Default 200 fits review/coin/comment; "
              "wiki needs --eval-batch-size 25-50 explicitly.",
     )
-    p.add_argument("--num-epochs", default=50, type=int)
+    p.add_argument("--num-epochs", default=25, type=int)
     p.add_argument("--decay-horizon-epochs", default=30, type=int,
                    help="LR cosine-decay horizon in epochs (shared by both LR groups), SEPARATE from "
                         "--num-epochs: LR reaches lr-min at this horizon, so a shorter --num-epochs "
-                        "stays near peak. Lets you vary epoch count without rescaling the schedule.")
-    p.add_argument("--early-stop-patience", default=0, type=int)
+                        "stays near peak (freedom to run any epoch count without rescaling the LR).")
+    p.add_argument("--early-stop-patience", default=10, type=int)
 
     # System.
     p.add_argument("--seed", default=42, type=int)
@@ -294,7 +283,6 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
 
         proj_dim=args.proj_dim,
-        proj_dropout=args.proj_dropout,
         t2v_dim=args.t2v_dim,
 
         K_train=args.k_train,
@@ -315,8 +303,6 @@ def main() -> Dict[str, Any]:
         lr_min_manifold=args.lr_min_manifold,
         lr_model=args.lr_model,
         lr_min_model=args.lr_min_model,
-        weight_decay_manifold=args.weight_decay_manifold,
-        weight_decay_model=args.weight_decay_model,
         num_epochs=args.num_epochs,
         decay_horizon_epochs=args.decay_horizon_epochs,
         early_stop_patience=args.early_stop_patience,

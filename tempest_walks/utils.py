@@ -10,8 +10,7 @@ Contents:
   LR schedule:
     - make_lr_lambda(decay_steps, lr_min_ratio)
                                   — closure for LambdaLR that does
-                                    cosine decay (no warmup)
-                                    to lr_min_ratio.
+                                    cosine decay to lr_min_ratio.
   Tempest configuration:
     - compute_max_time_capacity(multiplier, batch_size, mean_inter_arrival)
                                   — translate a dataset-agnostic
@@ -63,7 +62,7 @@ def make_lr_lambda(
 ) -> Callable[[int], float]:
     """Build a LambdaLR lambda for cosine decay from 1.0 (step 0) to lr_min_ratio (step decay_steps),
     then flat at lr_min_ratio. lr_min_ratio = lr_min / peak_lr; the lambda scales the optimizer's
-    initial_lr. No warmup — a value test on the poincare-head-3 winner found warmup added nothing."""
+    initial_lr. No warmup — a value test on the winner found warmup added nothing (marginally hurt)."""
 
     def lr_lambda(step: int) -> float:
         # step is 0-indexed (PyTorch LambdaLR convention).

@@ -64,14 +64,13 @@ class TrainerConfig:
 
     # NeighborhoodProjection (attention pooling of the source's walk-token offsets -> mu_u).
     proj_dim: int = 128       # attention (query/key) dim d_a
-    proj_dropout: float = 0.0 # dropout on the attention weights
     t2v_dim: int = 100        # Time2Vec output dim (TPNet default)
 
     # Link loss / head.
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
 
-    # Walks (BACKWARD only, undirected). ONE unified config for both the source (u → μ_u) and the
-    # candidate (v → μ_v) walk bags — the dual-sided head samples both sides with the same settings.
+    # Walks (BACKWARD only, undirected) for the source side (u → μ_u); the one-sided head samples
+    # walks only for the source, each candidate v enters through its static embedding E[v].
     num_walks_per_node: int = 5
     max_walk_len: int = 5
     walk_bias: str = "ExponentialWeight"
@@ -80,28 +79,26 @@ class TrainerConfig:
     t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
-    # Optimisation — per-group cosine decay to lr_min over num_epochs (no warmup). TWO LR GROUPS
-    # (ported from feature/poincare-head-3): the sphere manifold embedding E (a geoopt.ManifoldParameter)
-    # vs all other (Euclidean) head params, each decaying independently from its own peak to its own
-    # floor. E keeps master's proven 1e-3 (dropping it to 1e-4 starved E's learning); head takes 1e-2.
+    # Optimisation — cosine decay to lr_min over num_epochs (no warmup, no weight decay: a value test
+    # on the winner found both added nothing). TWO LR GROUPS: the ball manifold embedding E and all
+    # other (Euclidean) params — attention / projection / any coeffs — decay independently. The
+    # manifold keeps the gentle LR the winner needs; the model head can take a higher LR since it isn't
+    # on the ball. NOTE: the SPHERE head (this branch's model.py) wants lr_manifold 1e-3; the Poincaré
+    # variant (feature/poincare-geodesic-rand) uses 1e-4 — this is the one intended cross-branch diff.
     lr_manifold: float = 1e-3
     lr_min_manifold: float = 1e-7
-    lr_model: float = 1e-2
+    lr_model: float = 1e-3
     lr_min_model: float = 1e-7
-    # Per-group weight decay (RiemannianAdam group["weight_decay"]). Restored after an A/B showed the
-    # old single-optimizer pipeline (wd 1e-4 on all params) reached ~0.828/0.803 at d128/w10/l10 while
-    # the no-wd two-LR pipeline capped ~0.825/0.797 — the test-gap>val-gap signature of a lost
-    # regulariser. Applied SEPARATELY per group so E and the head can be tuned independently.
-    weight_decay_manifold: float = 1e-4
-    weight_decay_model: float = 1e-4
 
     # Run control.
-    num_epochs: int = 50
+    num_epochs: int = 25
     # LR-decay horizon in epochs — SEPARATE from num_epochs, ONE value shared by BOTH LR groups. The
     # per-group cosine reaches each group's lr_min at decay_horizon_epochs, so num_epochs < horizon
-    # keeps LR near peak (freedom to run any epoch count without rescaling the schedule).
+    # keeps LR near peak (freedom to run any epoch count without rescaling the schedule). NOTE: the
+    # ball head's cliff-free "freeze-at-peak" was tuned with horizon == num_epochs == 25 (fast decay);
+    # default 50 with num_epochs 25 leaves LR ~half-decayed at stop — set horizon 25 to reproduce it.
     decay_horizon_epochs: int = 30
-    early_stop_patience: int = 0
+    early_stop_patience: int = 10
 
     # System.
     seed: int = 42
@@ -120,7 +117,6 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             proj_dim=int(config.proj_dim),
-            proj_dropout=float(config.proj_dropout),
             t2v_dim=int(config.t2v_dim),
         ).to(self.device)
 
@@ -139,19 +135,17 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # Two LR groups: the sphere manifold params (E, a geoopt.ManifoldParameter) vs all other
+        # Two LR groups: the ball manifold params (E, a geoopt.ManifoldParameter) vs all other
         # Euclidean params. Each group gets its own peak LR + cosine floor (see _setup_lr_scheduler).
         manifold_params, model_params = [], []
         for p in self.model.parameters():
             (manifold_params if isinstance(p, geoopt.ManifoldParameter) else model_params).append(p)
         groups, self._group_lr = [], []   # self._group_lr: (peak, floor) per group, in opt order
         if manifold_params:
-            groups.append({"params": manifold_params, "lr": config.lr_manifold,
-                           "weight_decay": float(config.weight_decay_manifold)})
+            groups.append({"params": manifold_params, "lr": config.lr_manifold})
             self._group_lr.append((float(config.lr_manifold), float(config.lr_min_manifold)))
         if model_params:
-            groups.append({"params": model_params, "lr": config.lr_model,
-                           "weight_decay": float(config.weight_decay_model)})
+            groups.append({"params": model_params, "lr": config.lr_model})
             self._group_lr.append((float(config.lr_model), float(config.lr_min_model)))
         self.opt = geoopt.optim.RiemannianAdam(groups, stabilize=10)
 
@@ -159,7 +153,7 @@ class Trainer:
         self._global_step = 0
 
     # ──────────────────────────────────────────────────────────────────
-    # LR schedule (warmup + cosine)
+    # LR schedule (cosine)
     # ──────────────────────────────────────────────────────────────────
 
     def _setup_lr_scheduler(self, batches_per_epoch: int) -> None:

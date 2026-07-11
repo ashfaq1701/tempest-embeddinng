@@ -22,6 +22,6 @@ cd "$(dirname "$0")"
   --batch-size 200 --eval-batch-size 20 \
   --num-epochs 50 --early-stop-patience 5 \
   --seed 42 \
-  --lr 1e-3 --lr-min 1e-5 --decay-horizon-epochs 50 \
+  --lr 5e-3 --lr-min 5e-6 \
   --tempest-batch-window-multiplier -1.0 \
   --use-gpu --use-gpu-tempest
