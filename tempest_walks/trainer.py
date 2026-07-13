@@ -121,6 +121,7 @@ class Trainer:
             d_emb=int(config.d_emb),
             proj_dim=int(config.proj_dim),
             t2v_dim=int(config.t2v_dim),
+            max_walk_len=int(config.max_walk_len),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.

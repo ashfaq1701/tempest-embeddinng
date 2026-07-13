@@ -102,7 +102,8 @@ class NeighborhoodProjection(nn.Module):
     weighting. Candidate-independent (never sees E[v]); cold rows (no token) -> mu_u = 0.
     """
 
-    def __init__(self, d_emb: int, d_a: int = 128, dropout: float = 0.0, t2v_dim: int = 16):
+    def __init__(self, d_emb: int, d_a: int = 128, dropout: float = 0.0, t2v_dim: int = 16,
+                 max_walk_len: int = 5):
         super().__init__()
         self.d_emb = d_emb
         self.scale = 1.0 / math.sqrt(d_a)
@@ -110,16 +111,20 @@ class NeighborhoodProjection(nn.Module):
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
         self.w_q = nn.Linear(d_emb, d_a)                       # source query
         self.w_k = nn.Linear(d_emb + t2v_dim, d_a)             # per-token key: content + time
+        # Learned hop-position embedding (pos in [0..max_walk_len]; 0 = padding, 1 = seed, 2.. =
+        # predecessors). Added to the KEY (feeds the attention scores), NOT the pooled tangent values.
+        self.pos_emb = nn.Embedding(max_walk_len + 1, d_a)
         self.attn_dropout = nn.Dropout(dropout)
 
     def forward(self, source: torch.Tensor, token_tangents: torch.Tensor,
-                ages: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+                ages: torch.Tensor, mask: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """source [B,d_emb] (E[u]); token_tangents [B,T,d_emb] (Log_{E[u]}(E[token]), tangent at
-        E[u]); ages [B,T]; mask [B,T] bool (True = real token). Returns mu_u [B,d_emb] tangent at
-        E[u]; cold rows (no token) -> 0."""
+        E[u]); ages [B,T]; mask [B,T] bool (True = real token); positions [B,T] int hop-from-seed
+        (1=seed, 0=pad). Returns mu_u [B,d_emb] tangent at E[u]; cold rows (no token) -> 0."""
         # TPNet scales delta-times by log(Δt + 1) before the time encoder.
         t2v = self.time_encoder(torch.log1p(ages.clamp_min(0.0)))             # [B,T,t2v_dim]
         keys = self.w_k(torch.cat([token_tangents, t2v], dim=-1))            # [B,T,d_a]
+        keys = keys + self.pos_emb(positions)                               # + learned hop-position PE
         query = self.w_q(source)                                             # [B,d_a]
 
         scores = (query.unsqueeze(1) * keys).sum(-1) * self.scale            # [B,T]
@@ -132,7 +137,8 @@ class NeighborhoodProjection(nn.Module):
 
 class LinkPredHead(nn.Module):
     def __init__(self, num_nodes: int, d_emb: int,
-                 proj_dim: int = 128, proj_dropout: float = 0.0, t2v_dim: int = 16):
+                 proj_dim: int = 128, proj_dropout: float = 0.0, t2v_dim: int = 16,
+                 max_walk_len: int = 5):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_emb = d_emb
@@ -146,7 +152,8 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(unit_rows, manifold=self.geom.manifold)
 
         self.neighbourhood = NeighborhoodProjection(
-            d_emb=d_emb, d_a=proj_dim, dropout=proj_dropout, t2v_dim=t2v_dim)
+            d_emb=d_emb, d_a=proj_dim, dropout=proj_dropout, t2v_dim=t2v_dim,
+            max_walk_len=max_walk_len)
 
     def _project(self, tokens: WalkTokens):
         """Project one bag of N queries. Returns (p, e_seed): p [N, d] = exp_{E[seed]}(mu) on the
@@ -154,12 +161,12 @@ class LinkPredHead(nn.Module):
         e_weight = self.E.weight
         e_seed = self.geom.project(F.embedding(tokens.seeds, e_weight))               # E[x]  [N, d]
 
-        token_ids, token_mask, token_ages = flatten_tokens(
+        token_ids, token_mask, token_ages, token_pos = flatten_tokens(
             tokens, exclude_seed_positions=True, exclude_seed_tokens=True)
         token_emb = self.geom.project(F.embedding(token_ids.clamp_min(0), e_weight))  # [N, T, d]
         token_tangent = self.geom.log_map(e_seed.unsqueeze(-2), token_emb)           # [N, T, d] tangent
         mu = self.neighbourhood(
-            e_seed, token_tangent, token_ages.to(e_seed.dtype), token_mask)          # [N, d] tangent
+            e_seed, token_tangent, token_ages.to(e_seed.dtype), token_mask, token_pos)  # [N, d] tangent
         return self.geom.exp_map(e_seed, mu), e_seed                                 # P[x], E[x]
 
     def forward(self, src_tokens: WalkTokens, cand_ids: torch.Tensor) -> torch.Tensor:

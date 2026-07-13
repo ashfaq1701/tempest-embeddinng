@@ -125,15 +125,23 @@ def flatten_tokens(
         ids   [Q, T]  int64  token node ids (−1 in padding/masked slots; clamp before embedding)
         mask  [Q, T]  bool   True on kept tokens
         ages  [Q, T]  int64  cutoff − t_edge (≥ 0; the seed slot's t = cutoff so its age = 0)
+        pos   [Q, T]  int64  within-walk HOP position from the seed: 1 = seed (walk end), 2 = its
+                             immediate predecessor, …, lens = oldest node; 0 on padding. Backward
+                             walks are stored oldest→seed, so pos = lens − array_index.
     with T = K*L. The per-walk (K) structure is intentionally flattened away — every head consumes
     one flat token bag; the raw [Q, K, L] shape exists only to share the walk-sampling pipeline."""
     q = tokens.nodes.shape[0]
+    L = tokens.nodes.shape[2]
     ids = tokens.nodes.reshape(q, -1)                                       # [Q, T]
     ts = tokens.timestamps.reshape(q, -1)                                   # [Q, T]
     mask = tokens.nodes_mask.reshape(q, -1)                                 # [Q, T]  padding
     ages = (tokens.cutoffs.view(q, 1) - ts).clamp_min(0)
+    # Hop position from the seed: seed (last real slot, index lens-1) = 1, oldest (index 0) = lens.
+    lens = tokens.nodes_mask.sum(dim=-1, keepdim=True)                      # [Q, K, 1] real length
+    arange = torch.arange(L, device=tokens.nodes.device).view(1, 1, L)
+    pos = (lens - arange).clamp_min(0).reshape(q, -1)                       # [Q, T]  pad → 0
     if exclude_seed_tokens:                                                 # every occurrence of node u
         mask = mask & (ids != tokens.seeds.view(q, 1))
     elif exclude_seed_positions:                                            # only the walk-origin slot (age 0)
         mask = mask & (ts != tokens.cutoffs.view(q, 1))
-    return ids, mask, ages
+    return ids, mask, ages, pos
