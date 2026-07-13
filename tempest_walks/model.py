@@ -102,7 +102,7 @@ class NeighborhoodProjection(nn.Module):
     weighting. Candidate-independent (never sees E[v]); cold rows (no token) -> mu_u = 0.
     """
 
-    def __init__(self, d_emb: int, d_a: int = 128, dropout: float = 0.0, t2v_dim: int = 16,
+    def __init__(self, d_emb: int, d_a: int = 128, t2v_dim: int = 16,
                  max_walk_len: int = 5):
         super().__init__()
         self.d_emb = d_emb
@@ -114,7 +114,6 @@ class NeighborhoodProjection(nn.Module):
         # Learned hop-position embedding (pos in [0..max_walk_len]; 0 = padding, 1 = seed, 2.. =
         # predecessors). Added to the KEY (feeds the attention scores), NOT the pooled tangent values.
         self.pos_emb = nn.Embedding(max_walk_len + 1, d_a)
-        self.attn_dropout = nn.Dropout(dropout)
 
     def forward(self, source: torch.Tensor, token_tangents: torch.Tensor,
                 ages: torch.Tensor, mask: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -130,14 +129,13 @@ class NeighborhoodProjection(nn.Module):
         scores = (query.unsqueeze(1) * keys).sum(-1) * self.scale            # [B,T]
         scores = scores.masked_fill(~mask, float("-inf"))
         weights = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)   # cold row -> all 0
-        weights = self.attn_dropout(weights)
 
         return (weights.unsqueeze(-1) * token_tangents).sum(dim=-2)          # [B,d_emb]
 
 
 class LinkPredHead(nn.Module):
     def __init__(self, num_nodes: int, d_emb: int,
-                 proj_dim: int = 128, proj_dropout: float = 0.0, t2v_dim: int = 16,
+                 proj_dim: int = 128, t2v_dim: int = 16,
                  max_walk_len: int = 5):
         super().__init__()
         self.num_nodes = num_nodes
@@ -152,8 +150,7 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(unit_rows, manifold=self.geom.manifold)
 
         self.neighbourhood = NeighborhoodProjection(
-            d_emb=d_emb, d_a=proj_dim, dropout=proj_dropout, t2v_dim=t2v_dim,
-            max_walk_len=max_walk_len)
+            d_emb=d_emb, d_a=proj_dim, t2v_dim=t2v_dim, max_walk_len=max_walk_len)
 
     def _project(self, tokens: WalkTokens):
         """Project one bag of N queries. Returns (p, e_seed): p [N, d] = exp_{E[seed]}(mu) on the
