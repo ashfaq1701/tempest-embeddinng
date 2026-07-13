@@ -5,11 +5,7 @@ architecture below replaces the prior alignment+uniformity design
 (preserved on `backup/important-walk-embedding`) with a single
 InfoNCE contrastive loss + a separate BCE link head.
 
-> **`best_configs.sh` — the per-dataset best-config registry. KEEP IT UPDATED.**
-> It holds the single best-performing training command for each TGB dataset
-> (with the val/test it produced). Whenever you find a config that beats the
-> current best for a dataset, update that dataset's command in `best_configs.sh`
-> in the same change.
+> **Walk length: use `max_walk_len 5`.**
 
 > **ALWAYS launch training runs with `PYTHONUNBUFFERED=1` (and prefer `python -u`).**
 > When stdout is redirected to a log file Python block-buffers it, so epoch
@@ -1159,7 +1155,7 @@ Reference baseline for the velocity-head work. Head: `GeometricPointHead` REACH
 `num_walks_per_node_query_side 10`, `max_walk_len_query_side 5`, `k_train 100`,
 `batch_size 200`, `eval_batch_size 20`, `lr 1e-3`, `num_epochs 50`,
 `early_stop_patience 5`. Ran on the post-neighbour-bag-removal `walk_tokens` (token
-bag only). Registered best in `best_configs.sh` is `0.8280 / 0.8062 @ ep22`; this
+bag only). A prior best-config run landed `0.8280 / 0.8062 @ ep22`; this
 run landed lower and peaked earlier (walk-sampler nondeterminism — μ tokens are
 verified identical, so it is not the neighbour-bag removal).
 
@@ -1303,8 +1299,9 @@ not a gate, just what was recorded at the time):
 | 43 | 0.8064 | 0.8040 | +0.0024 | +0.0036 |
 | 44 | 0.8063 | 0.8041 | +0.0022 | +0.0041 |
 
-mwl3 test 0.8063/0.8064/0.8063 — near-zero variance; every seed positive, outside noise. This
-is the new wiki best config (`best_configs.sh` updated: `--max-walk-len-query-side 3`).
+mwl3 test 0.8063/0.8064/0.8063 — near-zero variance; every seed positive, outside noise, on the
+velocity head. (SUPERSEDED: we now standardise on `max_walk_len 5` — see the walk-length note at
+the top. The mwl3 optimum was velocity-head-specific and did not carry forward.)
 d_emb: 256 stays best — **d_emb 512 OVERFITS** (matched val, −0.0014 test, peaked ep13 vs 22).
 
 ### Pair-recurrence terms don't help THIS head (but the claim is narrow — read the scope)
