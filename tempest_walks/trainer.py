@@ -71,7 +71,7 @@ class TrainerConfig:
 
     # Walks (BACKWARD only, undirected) for the source side (u → μ_u); the one-sided head samples
     # walks only for the source, each candidate v enters through its static embedding E[v].
-    num_walks_per_node: int = 5
+    num_walks_per_node: int = 10
     max_walk_len: int = 5
     walk_bias: str = "ExponentialWeight"
     start_bias: str = "ExponentialWeight"

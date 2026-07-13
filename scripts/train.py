@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
 
     # Walks (BACKWARD only, undirected) for the source side (u → μ_u). One-sided head: only the
     # source is walked; each candidate v enters through its static embedding E[v].
-    p.add_argument("--num-walks-per-node", default=5, type=int,
+    p.add_argument("--num-walks-per-node", default=10, type=int,
                    help="K walks per source node u.")
     p.add_argument("--max-walk-len", default=5, type=int,
                    help="L, max walk length. (Sweep on wiki: shorter is better — 20→5 gave "
