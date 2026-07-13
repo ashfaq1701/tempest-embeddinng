@@ -159,7 +159,7 @@ class LinkPredHead(nn.Module):
         e_seed = self.geom.project(F.embedding(tokens.seeds, e_weight))               # E[x]  [N, d]
 
         token_ids, token_mask, token_ages, token_pos = flatten_tokens(
-            tokens, exclude_seed_positions=True, exclude_seed_tokens=True)
+            tokens, exclude_seed_positions=True, exclude_seed_tokens=False)
         token_emb = self.geom.project(F.embedding(token_ids.clamp_min(0), e_weight))  # [N, T, d]
         token_tangent = self.geom.log_map(e_seed.unsqueeze(-2), token_emb)           # [N, T, d] tangent
         mu = self.neighbourhood(
