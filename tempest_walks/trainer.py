@@ -44,6 +44,7 @@ from .data import Batch
 from .evaluator import Evaluator
 from .model import LinkPredHead
 from .negatives import UniformNegativeSampler
+from .probes import CommunityProbe
 from .utils import make_lr_lambda
 from .walk_tokens import build_query_walk_tokens
 from .walks import WalkGenerator
@@ -329,8 +330,18 @@ class Trainer:
         n_epochs = self.config.num_epochs
         patience = self.config.early_stop_patience
 
-        batches_per_epoch = sum(1 for _ in train_batches_factory())
+        # One pass over the train batches: count them AND collect the full edge set (for the
+        # community probe's fixed Louvain graph — built once).
+        src_all, dst_all, batches_per_epoch = [], [], 0
+        for b in train_batches_factory():
+            src_all.append(np.asarray(b.src))
+            dst_all.append(np.asarray(b.tgt))
+            batches_per_epoch += 1
         self._setup_lr_scheduler(batches_per_epoch)
+        self.comm_probe = CommunityProbe(
+            np.concatenate(src_all), np.concatenate(dst_all), self.config.num_nodes)
+        print(f"  CommunityProbe: {self.comm_probe.n_comms} Louvain communities "
+              f"(Q={self.comm_probe.q:.3f}); random-neighbour null purity={self.comm_probe.null:.3f}")
 
         best_val, best_test, best_epoch = -1.0, -1.0, -1
         best_snap: Optional[Dict[str, Any]] = None
@@ -356,6 +367,8 @@ class Trainer:
                 f"lr={'/'.join('%.1e' % pg['lr'] for pg in self.opt.param_groups)}  "
                 f"train {train_dt:.1f}s"
             )
+            cp = self.comm_probe.measure(self.model.E.weight.detach())     # community-formation probe
+            line += f"  commP={cp:.3f}(x{cp / max(self.comm_probe.null, 1e-9):.1f})"
 
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()
