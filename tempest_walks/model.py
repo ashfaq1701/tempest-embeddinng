@@ -25,15 +25,13 @@ from .walk_tokens import WalkTokens, flatten_tokens
 
 class SphereManifold:
     """Unit-sphere geometry behind a manifold-agnostic contract (swap the class to swap the space):
-    manifold, project, log_map, exp_map, similarity. similarity is HIGHER = closer (inner product =
-    cosine on the sphere; a distance manifold would return -dist)."""
+    manifold, log_map, exp_map, similarity. similarity is HIGHER = closer (inner product =
+    cosine on the sphere; a distance manifold would return -dist). (E is kept on-sphere by
+    RiemannianAdam, so no read-time re-projection is needed.)"""
     eps = 1e-6
 
     def __init__(self):
         self.manifold = geoopt.Sphere()
-
-    def project(self, x: torch.Tensor) -> torch.Tensor:
-        return F.normalize(x, dim=-1)
 
     def log_map(self, base: torch.Tensor, point: torch.Tensor) -> torch.Tensor:
         cos_angle = (base * point).sum(-1, keepdim=True).clamp(-1 + self.eps, 1 - self.eps)
@@ -43,7 +41,7 @@ class SphereManifold:
     def exp_map(self, base: torch.Tensor, tangent: torch.Tensor) -> torch.Tensor:
         norm = tangent.norm(dim=-1, keepdim=True)
         angle = norm.clamp(max=math.pi - self.eps)
-        return self.project(torch.cos(angle) * base + torch.sin(angle) / norm.clamp_min(self.eps) * tangent)
+        return torch.cos(angle) * base + torch.sin(angle) / norm.clamp_min(self.eps) * tangent
 
     def similarity(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return (a * b).sum(-1)
@@ -156,11 +154,11 @@ class LinkPredHead(nn.Module):
         """Project one bag of N queries. Returns (p, e_seed): p [N, d] = exp_{E[seed]}(mu) on the
         sphere (seed pushed toward its walk-token centroid), e_seed [N, d] = E[seed] on the sphere."""
         e_weight = self.E.weight
-        e_seed = self.geom.project(F.embedding(tokens.seeds, e_weight))               # E[x]  [N, d]
+        e_seed = F.embedding(tokens.seeds, e_weight)                                  # E[x]  [N, d] (E is on-sphere)
 
         token_ids, token_mask, token_ages, token_pos = flatten_tokens(
             tokens, exclude_seed_positions=True, exclude_seed_tokens=False)
-        token_emb = self.geom.project(F.embedding(token_ids.clamp_min(0), e_weight))  # [N, T, d]
+        token_emb = F.embedding(token_ids.clamp_min(0), e_weight)                     # [N, T, d]
         token_tangent = self.geom.log_map(e_seed.unsqueeze(-2), token_emb)           # [N, T, d] tangent
         mu = self.neighbourhood(
             e_seed, token_tangent, token_ages.to(e_seed.dtype), token_mask, token_pos)  # [N, d] tangent
@@ -170,5 +168,5 @@ class LinkPredHead(nn.Module):
         """One-sided scoring. src_tokens: B source queries (seeds = u); cand_ids [B, C] candidate
         node ids. Returns logits [B, C] = <P[u], E[v]> — is v near u's neighbourhood?"""
         p_u, _ = self._project(src_tokens)                                    # P[u]  [B, d]
-        candidate = self.geom.project(F.embedding(cand_ids, self.E.weight))   # E[v]  [B, C, d]
+        candidate = F.embedding(cand_ids, self.E.weight)                      # E[v]  [B, C, d] (E on-sphere)
         return self.geom.similarity(p_u.unsqueeze(1), candidate)              # <P[u], E[v]>  [B, C]
