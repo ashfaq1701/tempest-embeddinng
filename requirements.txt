@@ -82,6 +82,6 @@ py-tgb>=2.2.0
 # 2.x defaults CoW off and loads fine. Keep pandas <3 until TGB is
 # pandas-3.0-ready (do NOT install pandas 3.x in the env).
 pandas>=2,<3
-tempest-rw>=1.0.1
+tempest-rw>=1.0.2
 prodigyopt>=1.1
 geoopt>=0.5.0
