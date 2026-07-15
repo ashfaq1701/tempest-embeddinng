@@ -75,7 +75,7 @@ def test_shapes_nodes_mask_cutoffs():
     wt, wd = _build(seeds, cutoffs, k=k, mwl=mwl)
     q, length = len(seeds), int(wd.nodes.shape[1])
 
-    for name, t in (("nodes", wt.nodes), ("nodes_mask", wt.nodes_mask), ("timestamps", wt.timestamps)):
+    for name, t in (("nodes", wt.nodes), ("nodes_mask", wt.nodes_mask), ("ages", wt.ages)):
         assert t.shape == (q, k, length), f"{name} shape {tuple(t.shape)}"
     assert wt.cutoffs.shape == (q,) and wt.seeds.shape == (q,)
     assert torch.equal(wt.cutoffs, cutoffs), "cutoffs must round-trip"
@@ -83,37 +83,36 @@ def test_shapes_nodes_mask_cutoffs():
     assert torch.equal(wt.nodes, wd.nodes.to(torch.int64).reshape(q, k, length)), \
         "nodes must equal the raw walk output reshaped to [Q, K, L]"
     assert torch.equal(wt.nodes_mask, wt.nodes != -1), "nodes_mask must be (nodes != -1)"
-    print(f"\n[shapes] nodes/mask/timestamps {tuple(wt.nodes.shape)}, cutoffs {tuple(wt.cutoffs.shape)} OK")
+    print(f"\n[shapes] nodes/mask/ages {tuple(wt.nodes.shape)}, cutoffs {tuple(wt.cutoffs.shape)} OK")
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 2. node-aligned timestamps: seed=cutoff, no sentinel, mask shared, causal
+# 2. node-aligned ages: seed=0, edges>=1, padding=-1, mask shared, causal
 # ──────────────────────────────────────────────────────────────────────────
-def test_timestamps_node_aligned_seed_is_cutoff():
+def test_ages_node_aligned_seed_is_zero():
     k, mwl = 8, 8
     seeds = torch.tensor([2, 4, 6, 8], dtype=torch.long)
     cutoffs = torch.tensor([12_000, 25_000, 40_000, 50_000], dtype=torch.long)
     wt, wd = _build(seeds, cutoffs, k=k, mwl=mwl, gseed=4)
     q, length = len(seeds), int(wd.nodes.shape[1])
 
-    # No sentinel survives, and it equals Tempest's timestamps with sentinel -> cutoff.
-    assert not bool((wt.timestamps == _TS_SENTINEL).any()), "sentinel must be replaced"
+    # ages == cutoff - (raw edge time, sentinel->cutoff), with padding -> -1.
     raw = wd.timestamps.to(torch.int64).reshape(q, k, length)
-    expect = torch.where(raw == _TS_SENTINEL, cutoffs.view(q, 1, 1), raw)
-    assert torch.equal(wt.timestamps, expect), "timestamps must be raw with sentinel->cutoff"
+    edge_ts = torch.where(raw == _TS_SENTINEL, cutoffs.view(q, 1, 1), raw)
+    expect = torch.where(wt.nodes_mask, cutoffs.view(q, 1, 1) - edge_ts, torch.full_like(raw, -1))
+    assert torch.equal(wt.ages, expect), "ages must be cutoff - edge_time (seed 0), padding -1"
 
-    # The mask is shared: a real time iff a real node.
-    assert torch.equal(wt.timestamps != -1, wt.nodes_mask), "timestamps != -1 must match nodes_mask"
+    # The mask is shared: a real age iff a real node (padding age == -1).
+    assert torch.equal(wt.ages != -1, wt.nodes_mask), "ages != -1 must match nodes_mask"
 
-    # Seed slot == cutoff; every other real time strictly < cutoff.
+    # Seed slot age == 0; every other real age strictly >= 1 (cutoff is exclusive).
     seed_idx = _last_real_index(wt.nodes_mask).unsqueeze(-1)               # [Q, K, 1]
     is_seed = torch.zeros_like(wt.nodes_mask)
     is_seed.scatter_(-1, seed_idx, wt.nodes_mask.any(-1, keepdim=True))    # only for non-empty walks
-    cut = cutoffs.view(q, 1, 1).expand_as(wt.timestamps)
-    assert bool((wt.timestamps[is_seed] == cut[is_seed]).all()), "seed time must == cutoff"
+    assert bool((wt.ages[is_seed] == 0).all()), "seed age must == 0"
     non_seed = wt.nodes_mask & ~is_seed
-    assert bool((wt.timestamps[non_seed] < cut[non_seed]).all()), "non-seed times must be < cutoff"
-    print("\n[timestamps] node-aligned, seed==cutoff, edges<cutoff, mask shared OK")
+    assert bool((wt.ages[non_seed] >= 1).all()), "non-seed ages must be >= 1"
+    print("\n[ages] node-aligned, seed==0, edges>=1, mask shared OK")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -126,12 +125,11 @@ def test_seed_is_last_real_node():
     wt, _ = _build(seeds, cutoffs, k=k, mwl=mwl, gseed=1)
     seed_idx = _last_real_index(wt.nodes_mask)                             # [Q, K]
     last_node = torch.gather(wt.nodes, -1, seed_idx.unsqueeze(-1)).squeeze(-1)        # [Q, K]
-    last_time = torch.gather(wt.timestamps, -1, seed_idx.unsqueeze(-1)).squeeze(-1)   # [Q, K]
+    last_age = torch.gather(wt.ages, -1, seed_idx.unsqueeze(-1)).squeeze(-1)          # [Q, K]
     assert torch.equal(last_node, seeds.view(-1, 1).expand_as(last_node)), \
         "the last real node of every walk must be that query's seed"
-    assert torch.equal(last_time, cutoffs.view(-1, 1).expand_as(last_time)), \
-        "the seed (last node) must carry time == cutoff"
-    print("\n[seed] last real node == query seed, time == cutoff OK")
+    assert bool((last_age == 0).all()), "the seed (last node) must carry age == 0"
+    print("\n[seed] last real node == query seed, age == 0 OK")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -150,7 +148,7 @@ def test_empty_walks_when_no_predecessors():
     for q in (0, 1):
         assert not bool(wt.nodes_mask[q].any()), f"query {q}: expected all-False mask"
         assert bool((wt.nodes[q] == -1).all()), f"query {q}: expected all-padding nodes"
-        assert bool((wt.timestamps[q] == -1).all()), f"query {q}: expected all-padding timestamps"
+        assert bool((wt.ages[q] == -1).all()), f"query {q}: expected all-padding ages"
     print("\n[empty] cutoff-excluded + isolated queries → fully empty walks (seeds kept) OK")
 
 
@@ -158,16 +156,16 @@ def test_empty_walks_when_no_predecessors():
 # 5. flatten_tokens — flat [Q, K*L] bag; padding always masked + seed-filter flags
 # ──────────────────────────────────────────────────────────────────────────
 def _synthetic_tokens():
-    """One query, K=2 walks, L=4. Seed u=5, cutoff t=100.
-    Walk1 nodes [7,5,3,5] ts [90,95,98,100]: pos1 = MID-WALK seed recurrence (ts95, age5),
-                                              pos3 = seed SLOT (ts==cutoff=100, age0).
-    Walk2 nodes [8,2,5,-1] ts [80,85,100,-1]: pos2 = seed SLOT (ts100), pos3 = PADDING.
+    """One query, K=2 walks, L=4. Seed u=5, cutoff t=100. Ages = cutoff - t_edge (seed slot 0, pad -1).
+    Walk1 nodes [7,5,3,5] ages [10,5,2,0]: pos1 = MID-WALK seed recurrence (age5),
+                                           pos3 = seed SLOT (age0).
+    Walk2 nodes [8,2,5,-1] ages [20,15,0,-1]: pos2 = seed SLOT (age0), pos3 = PADDING.
     Flat order is walk1's 4 positions then walk2's -> indices 0..7."""
     from tempest_walks.walk_tokens import WalkTokens
     nodes = torch.tensor([[[7, 5, 3, 5], [8, 2, 5, -1]]], dtype=torch.long)
-    ts = torch.tensor([[[90, 95, 98, 100], [80, 85, 100, -1]]], dtype=torch.long)
+    ages = torch.tensor([[[10, 5, 2, 0], [20, 15, 0, -1]]], dtype=torch.long)
     return WalkTokens(seeds=torch.tensor([5], dtype=torch.long), nodes=nodes,
-                      nodes_mask=(nodes != -1), timestamps=ts,
+                      nodes_mask=(nodes != -1), ages=ages,
                       cutoffs=torch.tensor([100], dtype=torch.long))
 
 
@@ -235,7 +233,7 @@ def test_flatten_shapes_and_padding_realdata():
 
 if __name__ == "__main__":
     test_shapes_nodes_mask_cutoffs()
-    test_timestamps_node_aligned_seed_is_cutoff()
+    test_ages_node_aligned_seed_is_zero()
     test_seed_is_last_real_node()
     test_empty_walks_when_no_predecessors()
     test_flatten_exclude_seed_tokens_is_default()
