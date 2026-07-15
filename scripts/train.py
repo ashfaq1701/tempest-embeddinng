@@ -286,6 +286,7 @@ def main() -> Dict[str, Any]:
         t_train=float(stats.T_train),
 
         d_emb=args.d_emb,
+        d_ef=(int(train_sp.edge_feat.shape[1]) if train_sp.edge_feat is not None else 0),
 
         proj_dim=args.proj_dim,
         t2v_dim=args.t2v_dim,

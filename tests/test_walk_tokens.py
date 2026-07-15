@@ -173,7 +173,7 @@ def test_flatten_exclude_seed_tokens_is_default():
     """Default (exclude_seed_tokens=True): EVERY occurrence of node u masked (slot + recurrence)."""
     from tempest_walks.walk_tokens import flatten_tokens
     wt = _synthetic_tokens()
-    ids, mask, ages, _ = flatten_tokens(wt)                       # defaults True/True -> tokens wins
+    ids, mask, _ = flatten_tokens(wt)                             # defaults True/True -> tokens wins
     assert mask.int().tolist()[0] == [1, 0, 1, 0, 1, 1, 0, 0]  # pos1(rec),3,6 (node5) + pad7 removed
     assert not bool((ids[0][mask[0]] == 5).any()), "no seed token may survive under exclude_seed_tokens"
     print("\n[flatten] exclude_seed_tokens (default) removes all seed occurrences OK")
@@ -184,11 +184,12 @@ def test_flatten_exclude_seed_positions_only():
     mid-walk seed recurrences are KEPT (this is the whole slot-vs-token distinction)."""
     from tempest_walks.walk_tokens import flatten_tokens
     wt = _synthetic_tokens()
-    ids, mask, ages, _ = flatten_tokens(wt, exclude_seed_positions=True, exclude_seed_tokens=False)
-    assert mask.int().tolist()[0] == [1, 1, 1, 0, 1, 1, 0, 0]  # slots pos3,6 (ts==cutoff) removed; pos1 KEPT
+    ids, mask, _ = flatten_tokens(wt, exclude_seed_positions=True, exclude_seed_tokens=False)
+    assert mask.int().tolist()[0] == [1, 1, 1, 0, 1, 1, 0, 0]  # slots pos3,6 (age 0) removed; pos1 KEPT
     seed_kept = (ids[0][mask[0]] == 5)
     assert bool(seed_kept.any()), "mid-walk seed recurrence must be KEPT"
-    assert bool((ages[0][mask[0]][seed_kept] > 0).all()), "surviving seed token is a recurrence (age>0)"
+    ages_flat = wt.ages.reshape(1, -1)                            # ages read from the instance now
+    assert bool((ages_flat[0][mask[0]][seed_kept] > 0).all()), "surviving seed token is a recurrence (age>0)"
     print("\n[flatten] exclude_seed_positions keeps mid-walk recurrence, drops walk-origin slot OK")
 
 
@@ -196,7 +197,7 @@ def test_flatten_no_filtering_when_both_false():
     """both False: seed kept everywhere; only padding removed."""
     from tempest_walks.walk_tokens import flatten_tokens
     wt = _synthetic_tokens()
-    ids, mask, ages, _ = flatten_tokens(wt, exclude_seed_positions=False, exclude_seed_tokens=False)
+    ids, mask, _ = flatten_tokens(wt, exclude_seed_positions=False, exclude_seed_tokens=False)
     assert mask.int().tolist()[0] == [1, 1, 1, 1, 1, 1, 1, 0]  # only padding pos7 removed
     assert int(mask.sum()) == int(wt.nodes_mask.sum())
     print("\n[flatten] both flags False keeps the seed everywhere OK")
@@ -221,14 +222,49 @@ def test_flatten_shapes_and_padding_realdata():
     cutoffs = torch.tensor([20_000, 30_000, 40_000, 50_000], dtype=torch.long)
     wt, _ = _build(seeds, cutoffs, k=k, mwl=mwl, gseed=1)
     q = len(seeds)
-    ids, mask, ages, _ = flatten_tokens(wt)                       # default: exclude seed tokens
-    assert ids.shape == (q, k * mwl) and mask.shape == (q, k * mwl) and ages.shape == (q, k * mwl)
+    ids, mask, pos = flatten_tokens(wt)                           # default: exclude seed tokens
+    assert ids.shape == (q, k * mwl) and mask.shape == (q, k * mwl) and pos.shape == (q, k * mwl)
+    ages_flat = wt.ages.reshape(q, -1)                            # ages read from the instance now
     for i in range(q):
         kept = ids[i][mask[i]]
         assert bool((kept != -1).all()), f"padding leaked into kept tokens (q={i})"
         assert not bool((kept == seeds[i]).any()), f"default must EXCLUDE seed {int(seeds[i])} (q={i})"
-        assert bool((ages[i][mask[i]] >= 0).all()), f"kept token age must be >= 0 (q={i})"
+        assert bool((ages_flat[i][mask[i]] >= 0).all()), f"kept token age must be >= 0 (q={i})"
     print("\n[flatten] real-data: shapes OK, padding excluded, seed excluded (default) OK")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 6. edge features — [Q, K, L*d_ef], seed slot + padding zeroed
+# ──────────────────────────────────────────────────────────────────────────
+def test_edge_features_populated_and_seed_padding_zero():
+    """build_query_walk_tokens carries per-position edge features [Q, K, L*d_ef]; the seed slot
+    (age 0) and padding are forced to [0]*d_ef."""
+    from tempest_walks.walk_tokens import build_query_walk_tokens
+    rng = np.random.default_rng(3)
+    n_nodes, n_edges, d_ef = 8, 90, 4
+    src = rng.integers(0, n_nodes, n_edges).astype(np.int64)
+    tgt = rng.integers(0, n_nodes, n_edges).astype(np.int64)
+    tgt[src == tgt] = (tgt[src == tgt] + 1) % n_nodes
+    ts = np.sort(rng.choice(np.arange(1, 5000), n_edges, replace=False)).astype(np.int64)
+    ef = rng.standard_normal((n_edges, d_ef)).astype(np.float32) + 5.0   # nonzero so a zero is meaningful
+    wg = WalkGenerator(use_gpu=False, num_walks_per_node=4, max_walk_len=6)
+    wg.reset(); wg.add_edges(src, tgt, ts, ef)
+    seeds = torch.tensor([1, 3, 5], dtype=torch.long)
+    cutoffs = torch.full((3,), 5000, dtype=torch.long)
+    wt = build_query_walk_tokens(wg, torch.device("cpu"), seeds, cutoffs,
+                                 max_walk_len=6, num_walks_per_node=4)
+    q, k, L = wt.nodes.shape
+    assert wt.edge_features is not None, "edge_features not populated"
+    assert wt.edge_features.shape == (q, k, L * d_ef), \
+        f"edge_features should be [Q, K, L*d_ef], got {tuple(wt.edge_features.shape)}"
+
+    ef_pos = wt.edge_features.reshape(q, k, L, d_ef)              # unflatten to inspect per position
+    assert bool((ef_pos[~wt.nodes_mask] == 0).all()), "padding edge features must be zero"
+    seed_idx = _last_real_index(wt.nodes_mask)                    # [Q, K] last real slot = seed
+    seed_ef = torch.gather(ef_pos, 2, seed_idx[..., None, None].expand(q, k, 1, d_ef)).squeeze(2)
+    has_walk = wt.nodes_mask.any(-1)                              # only non-empty walks have a seed slot
+    assert bool((seed_ef[has_walk] == 0).all()), "seed-slot edge features must be zero"
+    print("\n[edge_features] shape [Q,K,L*d_ef], seed + padding zero OK")
 
 
 if __name__ == "__main__":
@@ -241,4 +277,5 @@ if __name__ == "__main__":
     test_flatten_no_filtering_when_both_false()
     test_flatten_tokens_takes_precedence_over_positions()
     test_flatten_shapes_and_padding_realdata()
+    test_edge_features_populated_and_seed_padding_zero()
     print("\nALL RAW WALK-TENSOR CHECKS PASSED")

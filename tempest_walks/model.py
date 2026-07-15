@@ -101,26 +101,29 @@ class NeighborhoodProjection(nn.Module):
     """
 
     def __init__(self, d_emb: int, d_a: int = 128, t2v_dim: int = 16,
-                 max_walk_len: int = 5):
+                 max_walk_len: int = 5, d_ef: int = 0):
         super().__init__()
         self.d_emb = d_emb
+        self.d_ef = d_ef
         self.scale = 1.0 / math.sqrt(d_a)
 
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
         self.w_q = nn.Linear(d_emb, d_a)                       # source query
-        self.w_k = nn.Linear(d_emb + t2v_dim, d_a)             # per-token key: content + time
+        self.w_k = nn.Linear(d_emb + t2v_dim + d_ef, d_a)      # per-token key: content + time + edge feats
         # Learned hop-position embedding (pos in [0..max_walk_len]; 0 = padding, 1 = seed, 2.. =
         # predecessors). Added to the KEY (feeds the attention scores), NOT the pooled tangent values.
         self.pos_emb = nn.Embedding(max_walk_len + 1, d_a)
 
     def forward(self, source: torch.Tensor, token_tangents: torch.Tensor,
-                ages: torch.Tensor, mask: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+                ages: torch.Tensor, mask: torch.Tensor, positions: torch.Tensor,
+                edge_features: torch.Tensor) -> torch.Tensor:
         """source [B,d_emb] (E[u]); token_tangents [B,T,d_emb] (Log_{E[u]}(E[token]), tangent at
         E[u]); ages [B,T]; mask [B,T] bool (True = real token); positions [B,T] int hop-from-seed
-        (1=seed, 0=pad). Returns mu_u [B,d_emb] tangent at E[u]; cold rows (no token) -> 0."""
+        (1=seed, 0=pad); edge_features [B,T,d_ef] per-token edge features (empty [B,T,0] when the
+        dataset has none). Returns mu_u [B,d_emb] tangent at E[u]; cold rows (no token) -> 0."""
         # TPNet scales delta-times by log(Δt + 1) before the time encoder.
         t2v = self.time_encoder(torch.log1p(ages.clamp_min(0.0)))             # [B,T,t2v_dim]
-        keys = self.w_k(torch.cat([token_tangents, t2v], dim=-1))            # [B,T,d_a]
+        keys = self.w_k(torch.cat([token_tangents, t2v, edge_features], dim=-1))   # [B,T,d_a] content+time+ef
         keys = keys + self.pos_emb(positions)                               # + learned hop-position PE
         query = self.w_q(source)                                             # [B,d_a]
 
@@ -134,10 +137,11 @@ class NeighborhoodProjection(nn.Module):
 class LinkPredHead(nn.Module):
     def __init__(self, num_nodes: int, d_emb: int,
                  proj_dim: int = 128, t2v_dim: int = 16,
-                 max_walk_len: int = 5):
+                 max_walk_len: int = 5, d_ef: int = 0):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_emb = d_emb
+        self.d_ef = d_ef
         self.eps = 1e-6
         self.geom = SphereManifold()
 
@@ -148,20 +152,32 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(unit_rows, manifold=self.geom.manifold)
 
         self.neighbourhood = NeighborhoodProjection(
-            d_emb=d_emb, d_a=proj_dim, t2v_dim=t2v_dim, max_walk_len=max_walk_len)
+            d_emb=d_emb, d_a=proj_dim, t2v_dim=t2v_dim, max_walk_len=max_walk_len, d_ef=d_ef)
+
+    def _token_edge_features(self, tokens: WalkTokens, q: int) -> torch.Tensor:
+        """Per-token edge features [Q, T, d_ef] aligned with the flattened token bag. tokens holds
+        edge_features as [Q, K, L*d_ef]; reshape to [Q, K*L, d_ef]. When the dataset has no edge
+        features (d_ef == 0) this is an empty [Q, T, 0] tensor (a no-op in the key concat)."""
+        _, k, length = tokens.nodes.shape
+        if tokens.edge_features is not None:
+            return tokens.edge_features.reshape(q, k, length, self.d_ef).reshape(q, k * length, self.d_ef)
+        return tokens.nodes.new_zeros((q, k * length, self.d_ef), dtype=torch.float32)
 
     def _project(self, tokens: WalkTokens):
         """Project one bag of N queries. Returns (p, e_seed): p [N, d] = exp_{E[seed]}(mu) on the
         sphere (seed pushed toward its walk-token centroid), e_seed [N, d] = E[seed] on the sphere."""
         e_weight = self.E.weight
         e_seed = F.embedding(tokens.seeds, e_weight)                                  # E[x]  [N, d] (E is on-sphere)
+        n = e_seed.shape[0]
 
-        token_ids, token_mask, token_ages, token_pos = flatten_tokens(
+        token_ids, token_mask, token_pos = flatten_tokens(
             tokens, exclude_seed_positions=True, exclude_seed_tokens=False)
+        token_ages = tokens.ages.reshape(n, -1).clamp_min(0)                          # ages read from the instance
+        token_ef = self._token_edge_features(tokens, n)                              # [N, T, d_ef]
         token_emb = F.embedding(token_ids.clamp_min(0), e_weight)                     # [N, T, d]
         token_tangent = self.geom.log_map(e_seed.unsqueeze(-2), token_emb)           # [N, T, d] tangent
         mu = self.neighbourhood(
-            e_seed, token_tangent, token_ages.to(e_seed.dtype), token_mask, token_pos)  # [N, d] tangent
+            e_seed, token_tangent, token_ages.to(e_seed.dtype), token_mask, token_pos, token_ef)  # [N, d]
         return self.geom.exp_map(e_seed, mu), e_seed                                 # P[x], E[x]
 
     def forward(self, src_tokens: WalkTokens, cand_ids: torch.Tensor) -> torch.Tensor:

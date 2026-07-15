@@ -38,18 +38,22 @@ _TS_SENTINEL = torch.iinfo(torch.int64).max
 class WalkTokens:
     """Raw per-query backward walks (see module docstring).
 
-        seeds       [Q]         int64  query/source node u (walk origin; present even when cold)
-        nodes       [Q, K, L]   int64  node ids; seed at the last real position, padding -1
-        nodes_mask  [Q, K, L]   bool   True on real walk positions
-        ages        [Q, K, L]   int64  node-aligned age = cutoff − t_edge; seed 0, edges ≥ 1, pad -1
-        cutoffs     [Q]         int64  per-query exclusive cutoff t
+        seeds         [Q]           int64  query/source node u (walk origin; present even when cold)
+        nodes         [Q, K, L]     int64  node ids; seed at the last real position, padding -1
+        nodes_mask    [Q, K, L]     bool   True on real walk positions
+        ages          [Q, K, L]     int64  node-aligned age = cutoff − t_edge; seed 0, edges ≥ 1, pad -1
+        cutoffs       [Q]           int64  per-query exclusive cutoff t
+        edge_features [Q, K, L*d_ef] float per-position edge features flattened over the L axis; the
+                                          seed position and padding carry [0]*d_ef. None if the dataset
+                                          has no edge features.
     """
 
-    seeds: torch.Tensor        # [Q]
-    nodes: torch.Tensor        # [Q, K, L]
-    nodes_mask: torch.Tensor   # [Q, K, L]
-    ages: torch.Tensor         # [Q, K, L]
-    cutoffs: torch.Tensor      # [Q]
+    seeds: torch.Tensor                        # [Q]
+    nodes: torch.Tensor                        # [Q, K, L]
+    nodes_mask: torch.Tensor                   # [Q, K, L]
+    ages: torch.Tensor                         # [Q, K, L]
+    cutoffs: torch.Tensor                      # [Q]
+    edge_features: Optional[torch.Tensor] = None   # [Q, K, L*d_ef]
 
 
 def build_query_walk_tokens(
@@ -99,7 +103,16 @@ def build_query_walk_tokens(
     ages = cutoffs_t.view(q, 1, 1) - edge_ts                                           # seed → 0, edges ≥ 1
     ages = torch.where(nodes_mask, ages, torch.full_like(ages, -1))                    # padding → -1
 
-    return WalkTokens(seeds_t, nodes, nodes_mask, ages, cutoffs_t)
+    # Per-position edge features → [Q, K, L*d_ef]. wd.edge_feats is [N*K, L, d_ef] node-aligned; the
+    # seed position (age 0) and padding are forced to [0]*d_ef so they carry no edge. None if absent.
+    edge_features = None
+    if wd.edge_feats is not None:
+        d_ef = int(wd.edge_feats.shape[-1])
+        ef = wd.edge_feats.to(device=device, dtype=torch.float32).reshape(q, k, length, d_ef)
+        real = (nodes_mask & (ages != 0)).unsqueeze(-1)                                # [Q, K, L, 1] non-seed, non-pad
+        edge_features = (ef * real).reshape(q, k, length * d_ef)                       # zero seed + padding
+
+    return WalkTokens(seeds_t, nodes, nodes_mask, ages, cutoffs_t, edge_features)
 
 
 def flatten_tokens(
@@ -121,10 +134,9 @@ def flatten_tokens(
           end, identified by timestamp == cutoff (age 0). Mid-walk recurrences of u are KEPT.
       both False — no seed filtering; the seed is kept everywhere (padding-only mask).
 
-    Returns:
+    Returns (ages are NOT returned — read them from the instance as tokens.ages, [Q, K, L]):
         ids   [Q, T]  int64  token node ids (−1 in padding/masked slots; clamp before embedding)
         mask  [Q, T]  bool   True on kept tokens
-        ages  [Q, T]  int64  cutoff − t_edge (≥ 0; the seed slot's t = cutoff so its age = 0)
         pos   [Q, T]  int64  within-walk HOP position from the seed: 1 = seed (walk end), 2 = its
                              immediate predecessor, …, lens = oldest node; 0 on padding. Backward
                              walks are stored oldest→seed, so pos = lens − array_index.
@@ -133,9 +145,7 @@ def flatten_tokens(
     q = tokens.nodes.shape[0]
     L = tokens.nodes.shape[2]
     ids = tokens.nodes.reshape(q, -1)                                       # [Q, T]
-    age_raw = tokens.ages.reshape(q, -1)                                    # [Q, T]  seed 0, edges ≥1, pad -1
     mask = tokens.nodes_mask.reshape(q, -1)                                 # [Q, T]  padding
-    ages = age_raw.clamp_min(0)                                             # [Q, T]  (pad -1 → 0, but masked)
     # Hop position from the seed: seed (last real slot, index lens-1) = 1, oldest (index 0) = lens.
     lens = tokens.nodes_mask.sum(dim=-1, keepdim=True)                      # [Q, K, 1] real length
     arange = torch.arange(L, device=tokens.nodes.device).view(1, 1, L)
@@ -143,5 +153,5 @@ def flatten_tokens(
     if exclude_seed_tokens:                                                 # every occurrence of node u
         mask = mask & (ids != tokens.seeds.view(q, 1))
     elif exclude_seed_positions:                                            # only the walk-origin slot (age 0)
-        mask = mask & (age_raw != 0)
-    return ids, mask, ages, pos
+        mask = mask & (tokens.ages.reshape(q, -1) != 0)
+    return ids, mask, pos

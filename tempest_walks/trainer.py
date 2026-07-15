@@ -62,6 +62,8 @@ class TrainerConfig:
 
     # Model.
     d_emb: int = 128
+    d_ef: int = 0             # per-edge-feature dim (0 = dataset has no edge features); fed into the
+                             # NeighborhoodProjection attention keys. Set from the loaded dataset.
 
     # NeighborhoodProjection (attention pooling of the source's walk-token offsets -> mu_u).
     proj_dim: int = 128       # attention (query/key) dim d_a
@@ -123,6 +125,7 @@ class Trainer:
             proj_dim=int(config.proj_dim),
             t2v_dim=int(config.t2v_dim),
             max_walk_len=int(config.max_walk_len),
+            d_ef=int(config.d_ef),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.
