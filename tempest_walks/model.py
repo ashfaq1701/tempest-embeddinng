@@ -169,7 +169,7 @@ class LinkPredHead(nn.Module):
         n = e_seed.shape[0]
 
         token_ids, token_mask, token_pos = flatten_tokens(
-            tokens, exclude_seed_positions=True, exclude_seed_tokens=False)
+            tokens, exclude_seed_positions=True)
         token_ages = tokens.ages.reshape(n, -1).clamp_min(0)                          # ages read from the instance
         token_ef = self._token_edge_features(tokens, n)                              # [N, T, d_ef]
         token_emb = F.embedding(token_ids.clamp_min(0), e_weight)                     # [N, T, d]

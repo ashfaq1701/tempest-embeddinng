@@ -118,21 +118,14 @@ def build_query_walk_tokens(
 def flatten_tokens(
     tokens: WalkTokens,
     exclude_seed_positions: bool = True,
-    exclude_seed_tokens: bool = True,
 ):
     """Collapse the raw [Q, K, L] walks into one flat [Q, K*L] token bag for the μ pooling.
 
-    Padding (nodes == -1) is ALWAYS masked. Two flags control whether the seed node u is also
-    masked out of the bag. Empirically, excluding the seed lifts wiki MRR substantially: E[u] as a
-    token self-anchors P[u] toward u itself (a recurrence shortcut that overfits), so removing it
-    frees μ to describe u's neighbourhood rather than u.
+    Padding (nodes == -1) is ALWAYS masked. One flag controls whether the seed's own slot is masked:
 
-      exclude_seed_tokens (default True) — TAKES PRECEDENCE. When True, mask EVERY occurrence of
-          the seed node u: its walk-origin slot AND any mid-walk recurrence (ids == seed).
-      exclude_seed_positions (default True) — checked ONLY when exclude_seed_tokens is False. When
-          True, mask ONLY the seed's walk-origin slot — the position where the seed sits at the walk
-          end, identified by timestamp == cutoff (age 0). Mid-walk recurrences of u are KEPT.
-      both False — no seed filtering; the seed is kept everywhere (padding-only mask).
+      exclude_seed_positions (default True) — mask the seed's walk-origin slot, the position where the
+          seed sits at the walk end, identified by timestamp == cutoff (age 0). Mid-walk recurrences of
+          u are KEPT. False — no seed filtering; the seed is kept everywhere (padding-only mask).
 
     Returns (ages are NOT returned — read them from the instance as tokens.ages, [Q, K, L]):
         ids   [Q, T]  int64  token node ids (−1 in padding/masked slots; clamp before embedding)
@@ -150,8 +143,6 @@ def flatten_tokens(
     lens = tokens.nodes_mask.sum(dim=-1, keepdim=True)                      # [Q, K, 1] real length
     arange = torch.arange(L, device=tokens.nodes.device).view(1, 1, L)
     pos = (lens - arange).clamp_min(0).reshape(q, -1)                       # [Q, T]  pad → 0
-    if exclude_seed_tokens:                                                 # every occurrence of node u
-        mask = mask & (ids != tokens.seeds.view(q, 1))
-    elif exclude_seed_positions:                                            # only the walk-origin slot (age 0)
+    if exclude_seed_positions:                                              # only the walk-origin slot (age 0)
         mask = mask & (tokens.ages.reshape(q, -1) != 0)
     return ids, mask, pos

@@ -169,22 +169,12 @@ def _synthetic_tokens():
                       cutoffs=torch.tensor([100], dtype=torch.long))
 
 
-def test_flatten_exclude_seed_tokens_is_default():
-    """Default (exclude_seed_tokens=True): EVERY occurrence of node u masked (slot + recurrence)."""
-    from tempest_walks.walk_tokens import flatten_tokens
-    wt = _synthetic_tokens()
-    ids, mask, _ = flatten_tokens(wt)                             # defaults True/True -> tokens wins
-    assert mask.int().tolist()[0] == [1, 0, 1, 0, 1, 1, 0, 0]  # pos1(rec),3,6 (node5) + pad7 removed
-    assert not bool((ids[0][mask[0]] == 5).any()), "no seed token may survive under exclude_seed_tokens"
-    print("\n[flatten] exclude_seed_tokens (default) removes all seed occurrences OK")
-
-
 def test_flatten_exclude_seed_positions_only():
-    """exclude_seed_tokens=False, exclude_seed_positions=True: only the walk-origin slot masked;
-    mid-walk seed recurrences are KEPT (this is the whole slot-vs-token distinction)."""
+    """exclude_seed_positions=True (default): only the walk-origin slot masked; mid-walk seed
+    recurrences are KEPT (this is the whole slot-vs-token distinction)."""
     from tempest_walks.walk_tokens import flatten_tokens
     wt = _synthetic_tokens()
-    ids, mask, _ = flatten_tokens(wt, exclude_seed_positions=True, exclude_seed_tokens=False)
+    ids, mask, _ = flatten_tokens(wt, exclude_seed_positions=True)
     assert mask.int().tolist()[0] == [1, 1, 1, 0, 1, 1, 0, 0]  # slots pos3,6 (age 0) removed; pos1 KEPT
     seed_kept = (ids[0][mask[0]] == 5)
     assert bool(seed_kept.any()), "mid-walk seed recurrence must be KEPT"
@@ -193,44 +183,33 @@ def test_flatten_exclude_seed_positions_only():
     print("\n[flatten] exclude_seed_positions keeps mid-walk recurrence, drops walk-origin slot OK")
 
 
-def test_flatten_no_filtering_when_both_false():
-    """both False: seed kept everywhere; only padding removed."""
+def test_flatten_no_filtering_when_positions_false():
+    """exclude_seed_positions=False: seed kept everywhere; only padding removed."""
     from tempest_walks.walk_tokens import flatten_tokens
     wt = _synthetic_tokens()
-    ids, mask, _ = flatten_tokens(wt, exclude_seed_positions=False, exclude_seed_tokens=False)
+    ids, mask, _ = flatten_tokens(wt, exclude_seed_positions=False)
     assert mask.int().tolist()[0] == [1, 1, 1, 1, 1, 1, 1, 0]  # only padding pos7 removed
     assert int(mask.sum()) == int(wt.nodes_mask.sum())
-    print("\n[flatten] both flags False keeps the seed everywhere OK")
-
-
-def test_flatten_tokens_takes_precedence_over_positions():
-    """exclude_seed_tokens=True dominates regardless of exclude_seed_positions."""
-    from tempest_walks.walk_tokens import flatten_tokens
-    wt = _synthetic_tokens()
-    m_pos_false = flatten_tokens(wt, exclude_seed_positions=False, exclude_seed_tokens=True)[1]
-    m_pos_true = flatten_tokens(wt, exclude_seed_positions=True, exclude_seed_tokens=True)[1]
-    assert bool((m_pos_false == m_pos_true).all()), "exclude_seed_tokens must ignore positions flag"
-    assert m_pos_true.int().tolist()[0] == [1, 0, 1, 0, 1, 1, 0, 0]
-    print("\n[flatten] exclude_seed_tokens precedence OK")
+    print("\n[flatten] exclude_seed_positions False keeps the seed everywhere OK")
 
 
 def test_flatten_shapes_and_padding_realdata():
-    """On live Tempest walks: shapes correct, padding never leaks, default excludes the seed."""
+    """On live Tempest walks: shapes correct, padding never leaks, default drops the seed's
+    walk-origin slot (age 0) so every kept token has age > 0."""
     from tempest_walks.walk_tokens import flatten_tokens
     k, mwl = 6, 8
     seeds = torch.tensor([2, 4, 6, 8], dtype=torch.long)
     cutoffs = torch.tensor([20_000, 30_000, 40_000, 50_000], dtype=torch.long)
     wt, _ = _build(seeds, cutoffs, k=k, mwl=mwl, gseed=1)
     q = len(seeds)
-    ids, mask, pos = flatten_tokens(wt)                           # default: exclude seed tokens
+    ids, mask, pos = flatten_tokens(wt)                           # default: exclude seed's walk-origin slot
     assert ids.shape == (q, k * mwl) and mask.shape == (q, k * mwl) and pos.shape == (q, k * mwl)
     ages_flat = wt.ages.reshape(q, -1)                            # ages read from the instance now
     for i in range(q):
         kept = ids[i][mask[i]]
         assert bool((kept != -1).all()), f"padding leaked into kept tokens (q={i})"
-        assert not bool((kept == seeds[i]).any()), f"default must EXCLUDE seed {int(seeds[i])} (q={i})"
-        assert bool((ages_flat[i][mask[i]] >= 0).all()), f"kept token age must be >= 0 (q={i})"
-    print("\n[flatten] real-data: shapes OK, padding excluded, seed excluded (default) OK")
+        assert bool((ages_flat[i][mask[i]] > 0).all()), f"walk-origin slot (age 0) must be excluded (q={i})"
+    print("\n[flatten] real-data: shapes OK, padding excluded, walk-origin slot excluded (default) OK")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -272,10 +251,8 @@ if __name__ == "__main__":
     test_ages_node_aligned_seed_is_zero()
     test_seed_is_last_real_node()
     test_empty_walks_when_no_predecessors()
-    test_flatten_exclude_seed_tokens_is_default()
     test_flatten_exclude_seed_positions_only()
-    test_flatten_no_filtering_when_both_false()
-    test_flatten_tokens_takes_precedence_over_positions()
+    test_flatten_no_filtering_when_positions_false()
     test_flatten_shapes_and_padding_realdata()
     test_edge_features_populated_and_seed_padding_zero()
     print("\nALL RAW WALK-TENSOR CHECKS PASSED")
