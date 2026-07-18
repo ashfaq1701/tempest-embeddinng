@@ -124,7 +124,6 @@ class Trainer:
             d_emb=int(config.d_emb),
             proj_dim=int(config.proj_dim),
             t2v_dim=int(config.t2v_dim),
-            max_walk_len=int(config.max_walk_len),
             d_ef=int(config.d_ef),
         ).to(self.device)
 
