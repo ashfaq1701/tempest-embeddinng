@@ -117,13 +117,15 @@ class NeighborhoodProjection(nn.Module):
         self.scale = 1.0 / math.sqrt(d_emb)
 
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        # Query + key are 2-layer GELU MLPs that project to d_emb (no separate attention dim d_a).
-        self.w_q = nn.Sequential(nn.Linear(d_emb, d_emb), nn.GELU(), nn.Linear(d_emb, d_emb))
+        # Query + key are SINGLE linear projections to d_emb (no separate attention dim d_a). A 2-layer
+        # projection (GELU MLP or low-rank linear, full or bottleneck) overfits on wiki — the depth, not
+        # the width, is the regression; a single linear ties the old Linear→d_a=128 (0.8312/0.8057).
+        self.w_q = nn.Linear(d_emb, d_emb)
         # per-token key: content + time + log-hop position (1 scalar) + edge feats. The hop position
         # enters as log1p(hop) inside the KEY (not an additive PE), so it can be learned/silenced;
         # length-agnostic (a scalar function of the hop, works for any walk length).
         k_in = d_emb + t2v_dim + 1 + d_ef
-        self.w_k = nn.Sequential(nn.Linear(k_in, d_emb), nn.GELU(), nn.Linear(d_emb, d_emb))
+        self.w_k = nn.Linear(k_in, d_emb)
 
     def forward(self, source: torch.Tensor, token_tangents: torch.Tensor,
                 ages: torch.Tensor, mask: torch.Tensor, positions: torch.Tensor,
