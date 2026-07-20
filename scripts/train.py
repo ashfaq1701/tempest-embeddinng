@@ -12,9 +12,9 @@ Hyperparameters exposed at CLI (and their grouping):
   Walks:          --{num-walks-per-node,max-walk-len,walk-bias,start-bias}-
                   {query,candidate}-side, --tempest-batch-window-multiplier
                   (backward-only, undirected; query=source→μ, candidate=v→connectors)
-  Optimisation:   --lr-manifold, --lr-min-manifold, --lr-model, --lr-min-model,
-                  --batch-size, --eval-batch-size, --num-epochs, --early-stop-patience
-                  (per-group cosine decay to lr-min over --num-epochs)
+  Optimisation:   --lr, --lr-min, --weight-decay, --batch-size, --eval-batch-size,
+                  --num-epochs, --early-stop-patience
+                  (single-group cosine decay to --lr-min over --decay-horizon-epochs)
   System:         --seed, --use-gpu, --use-gpu-tempest
   Analysis:       --stratify (post-train per-slice test-MRR stratification)
 
@@ -116,22 +116,14 @@ def parse_args() -> argparse.Namespace:
              "the raw window depends on the dataset's calendar density.",
     )
 
-    # Optimisation — RiemannianAdam, per-group cosine decay to lr-min over --num-epochs. Two groups:
-    # the manifold embedding E (gentle LR) vs all other params. The sphere head wants 1e-3 (the
-    # Poincaré variant on feature/poincare-geodesic-rand uses 1e-4 — the one intended cross-branch diff).
-    p.add_argument("--lr-manifold", default=1e-3, type=float,
-                   help="Peak LR for the manifold embedding E (sphere default 1e-3).")
-    p.add_argument("--lr-min-manifold", default=1e-7, type=float,
-                   help="Cosine-decay floor for the manifold group.")
-    p.add_argument("--weight-decay-manifold", default=1e-4, type=float,
-                   help="Weight decay for the manifold group E (per-group, RiemannianAdam). "
-                        "Load-bearing on the sphere head; the Poincaré variant runs 0.")
-    p.add_argument("--lr-model", default=1e-3, type=float,
-                   help="Peak LR for all other (Euclidean) params — attention/projection/coeffs.")
-    p.add_argument("--lr-min-model", default=1e-7, type=float,
-                   help="Cosine-decay floor for the model group.")
-    p.add_argument("--weight-decay-model", default=1e-4, type=float,
-                   help="Weight decay for the Euclidean model group (attention/projection/coeffs).")
+    # Optimisation — RiemannianAdam, single-group cosine decay to --lr-min over --decay-horizon-epochs.
+    # One group covers E (a geoopt.ManifoldParameter, Riemannian update) and all Euclidean params.
+    p.add_argument("--lr", default=1e-3, type=float,
+                   help="Peak LR (sphere default 1e-3).")
+    p.add_argument("--lr-min", default=1e-7, type=float,
+                   help="Cosine-decay floor.")
+    p.add_argument("--weight-decay", default=1e-4, type=float,
+                   help="Weight decay (RiemannianAdam). Load-bearing on the sphere head.")
     p.add_argument(
         "--batch-size", default=200, type=int,
         help="Train batch size. Under the per-query ranking link "
@@ -305,12 +297,9 @@ def main() -> Dict[str, Any]:
             stats.mean_inter_arrival,
         ),
 
-        lr_manifold=args.lr_manifold,
-        lr_min_manifold=args.lr_min_manifold,
-        lr_model=args.lr_model,
-        lr_min_model=args.lr_min_model,
-        weight_decay_manifold=args.weight_decay_manifold,
-        weight_decay_model=args.weight_decay_model,
+        lr=args.lr,
+        lr_min=args.lr_min,
+        weight_decay=args.weight_decay,
         num_epochs=args.num_epochs,
         decay_horizon_epochs=args.decay_horizon_epochs,
         early_stop_patience=args.early_stop_patience,

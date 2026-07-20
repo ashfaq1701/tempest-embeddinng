@@ -82,19 +82,14 @@ class TrainerConfig:
     t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
     max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
-    # Optimisation — cosine decay to lr_min over num_epochs (no warmup). TWO LR GROUPS: the manifold
-    # embedding E and all other (Euclidean) params — decay independently. NOTE: the SPHERE head (this
-    # branch's model.py) wants lr_manifold 1e-3; the Poincaré variant (feature/poincare-geodesic-rand)
-    # uses 1e-4 — the one intended cross-branch LR diff.
-    lr_manifold: float = 1e-3
-    lr_min_manifold: float = 1e-7
-    lr_model: float = 1e-3
-    lr_min_model: float = 1e-7
-    # Per-group weight decay (RiemannianAdam group["weight_decay"]). LOAD-BEARING on the sphere head:
+    # Optimisation — cosine decay to lr_min over decay_horizon_epochs (no warmup). ONE param group:
+    # RiemannianAdam applies the Riemannian update to E (a geoopt.ManifoldParameter) and standard Adam
+    # to the Euclidean params, all under the same LR. weight_decay is LOAD-BEARING on the sphere head:
     # an A/B showed wd 1e-4 reached ~0.828/0.803 while no-wd capped ~0.825/0.797 (the test-gap>val-gap
-    # signature of a lost regulariser). Master-only vs the Poincaré branch (which runs no weight decay).
-    weight_decay_manifold: float = 1e-4
-    weight_decay_model: float = 1e-4
+    # signature of a lost regulariser).
+    lr: float = 1e-3
+    lr_min: float = 1e-7
+    weight_decay: float = 1e-4
 
     # Run control.
     num_epochs: int = 25
@@ -142,21 +137,13 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # Two LR groups: the ball manifold params (E, a geoopt.ManifoldParameter) vs all other
-        # Euclidean params. Each group gets its own peak LR + cosine floor (see _setup_lr_scheduler).
-        manifold_params, model_params = [], []
-        for p in self.model.parameters():
-            (manifold_params if isinstance(p, geoopt.ManifoldParameter) else model_params).append(p)
-        groups, self._group_lr = [], []   # self._group_lr: (peak, floor) per group, in opt order
-        if manifold_params:
-            groups.append({"params": manifold_params, "lr": config.lr_manifold,
-                           "weight_decay": float(config.weight_decay_manifold)})
-            self._group_lr.append((float(config.lr_manifold), float(config.lr_min_manifold)))
-        if model_params:
-            groups.append({"params": model_params, "lr": config.lr_model,
-                           "weight_decay": float(config.weight_decay_model)})
-            self._group_lr.append((float(config.lr_model), float(config.lr_min_model)))
-        self.opt = geoopt.optim.RiemannianAdam(groups, stabilize=10)
+        # ONE param group: RiemannianAdam applies the Riemannian update to E (a geoopt.ManifoldParameter)
+        # and standard Adam to the Euclidean params, all under one LR + cosine floor.
+        self.opt = geoopt.optim.RiemannianAdam(
+            [{"params": list(self.model.parameters()),
+              "lr": float(config.lr), "weight_decay": float(config.weight_decay)}],
+            stabilize=10,
+        )
 
         self.sched: Optional[LambdaLR] = None
         self._global_step = 0
@@ -166,20 +153,17 @@ class Trainer:
     # ──────────────────────────────────────────────────────────────────
 
     def _setup_lr_scheduler(self, batches_per_epoch: int) -> None:
-        # Independent cosine decay per param group (each to its own floor) over the whole run
-        # (horizon = num_epochs); no warmup. LambdaLR takes one lambda per group.
+        # Cosine decay to lr_min over decay_horizon_epochs (no warmup); one lambda for the single group.
         decay_steps = self.config.decay_horizon_epochs * max(batches_per_epoch, 1)
-        lambdas = []
-        for pg, (peak, floor) in zip(self.opt.param_groups, self._group_lr):
-            pg["lr"] = peak
-            pg["initial_lr"] = peak
-            ratio = floor / peak if peak > 0 else 0.0
-            lambdas.append(make_lr_lambda(decay_steps, ratio))
-        self.sched = LambdaLR(self.opt, lr_lambda=lambdas)
+        peak, floor = float(self.config.lr), float(self.config.lr_min)
+        pg = self.opt.param_groups[0]
+        pg["lr"] = peak
+        pg["initial_lr"] = peak
+        ratio = floor / peak if peak > 0 else 0.0
+        self.sched = LambdaLR(self.opt, lr_lambda=make_lr_lambda(decay_steps, ratio))
         self._global_step = 0
-        groups = " ".join(f"{peak:.1e}->{floor:.1e}" for peak, floor in self._group_lr)
         print(
-            f"  LR schedule (cosine, per-group [manifold model]): {groups}; "
+            f"  LR schedule (cosine): {peak:.1e}->{floor:.1e}; "
             f"decay_horizon={decay_steps} ({self.config.decay_horizon_epochs}ep x {batches_per_epoch} batches)"
         )
 
@@ -366,7 +350,7 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
-                f"lr={'/'.join('%.1e' % pg['lr'] for pg in self.opt.param_groups)}  "
+                f"lr={self.opt.param_groups[0]['lr']:.1e}  "
                 f"train {train_dt:.1f}s"
             )
             cp = self.comm_probe.measure(self.model.E.weight.detach())     # community-formation probe
