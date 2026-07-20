@@ -353,7 +353,7 @@ ranked by leverage:
 
 ```
 # iter 6 / all-winners stack — the winning embedding-loss recipe.
-./.venv/bin/python scripts/train.py \
+./.venv/bin/python scripts/train_link_property_prediction.py \
   --dataset tgbl-wiki \
   --use-gpu --use-gpu-tempest \
   --seed 42 \

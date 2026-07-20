@@ -2,7 +2,7 @@
 
 Functions in this module have no module-level state and don't depend
 on any class instance. They are pulled here so trainer.py and
-scripts/train.py stay focused on orchestration, not boilerplate.
+scripts/train_link_property_prediction.py stay focused on orchestration, not boilerplate.
 
 Contents:
   Determinism:

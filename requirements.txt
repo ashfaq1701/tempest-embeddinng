@@ -47,7 +47,7 @@
 #     pip install -r requirements.txt
 #
 # Step 4 — verify (one-liner; must print True + your GPU name before
-# launching scripts/train.py with --use-gpu):
+# launching scripts/train_link_property_prediction.py with --use-gpu):
 #
 #     python -c "import torch; print(torch.__version__, torch.cuda.is_available(), \
 #                torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"

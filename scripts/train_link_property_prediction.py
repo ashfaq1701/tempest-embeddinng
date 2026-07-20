@@ -28,8 +28,8 @@ import sys
 import time
 from typing import Any, Dict
 
-# Allow direct invocation (`python scripts/train.py ...`) by putting
-# the project root on sys.path. `python -m scripts.train ...` works
+# Allow direct invocation (`python scripts/train_link_property_prediction.py ...`) by putting
+# the project root on sys.path. `python -m scripts.train_link_property_prediction ...` works
 # without this; the bootstrap is for the spec's first invocation form.
 _PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:

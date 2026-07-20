@@ -13,7 +13,7 @@ InfoNCE contrastive loss + a separate BCE link head.
 > looks dead (empty log) for many minutes even while healthy. Set
 > `PYTHONUNBUFFERED=1` so epoch lines stream as they print and the log can be
 > tailed live. Example:
-> `PYTHONUNBUFFERED=1 nohup .venv/bin/python -u scripts/train.py ... > run.log 2>&1 &`
+> `PYTHONUNBUFFERED=1 nohup .venv/bin/python -u scripts/train_link_property_prediction.py ... > run.log 2>&1 &`
 
 ---
 
