@@ -100,9 +100,9 @@ class NeighborhoodProjection(nn.Module):
     A source-conditioned query attends over the tokens; the attention scores ARE the pooling weights,
     and mu_u is the weighted centroid of the RAW token tangents:
 
-        q_u  = W_q(E[u])                                  [B, d_a]
-        k_p  = W_k([ Log_{E[u]}(E[token_p]) ; Time2Vec(age_p) ; log1p(hop_p) ])   [B, T, d_a]
-        w_p  = softmax_p( (q_u . k_p) / sqrt(d_a) )       [B, T]   (padding masked out)
+        q_u  = MLP_q(E[u])                                [B, d_emb]   (Linear → GELU → Linear)
+        k_p  = MLP_k([ Log_{E[u]}(E[token_p]) ; Time2Vec(age_p) ; log1p(hop_p) ])   [B, T, d_emb]
+        w_p  = softmax_p( (q_u . k_p) / sqrt(d_emb) )     [B, T]   (padding masked out)
         mu_u = Sum_p w_p * token_tangent_p                 [B, d_emb]
 
     The value is the token tangent itself, so mu_u stays a genuine weighted centroid (in the span of
@@ -110,18 +110,20 @@ class NeighborhoodProjection(nn.Module):
     weighting. Candidate-independent (never sees E[v]); cold rows (no token) -> mu_u = 0.
     """
 
-    def __init__(self, d_emb: int, d_a: int = 128, t2v_dim: int = 16, d_ef: int = 0):
+    def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0):
         super().__init__()
         self.d_emb = d_emb
         self.d_ef = d_ef
-        self.scale = 1.0 / math.sqrt(d_a)
+        self.scale = 1.0 / math.sqrt(d_emb)
 
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        self.w_q = nn.Linear(d_emb, d_a)                       # source query
+        # Query + key are 2-layer GELU MLPs that project to d_emb (no separate attention dim d_a).
+        self.w_q = nn.Sequential(nn.Linear(d_emb, d_emb), nn.GELU(), nn.Linear(d_emb, d_emb))
         # per-token key: content + time + log-hop position (1 scalar) + edge feats. The hop position
-        # enters as log1p(hop) inside the KEY (not an additive PE), so W_k learns its direction and can
-        # silence it; length-agnostic (a scalar function of the hop, works for any walk length).
-        self.w_k = nn.Linear(d_emb + t2v_dim + 1 + d_ef, d_a)
+        # enters as log1p(hop) inside the KEY (not an additive PE), so it can be learned/silenced;
+        # length-agnostic (a scalar function of the hop, works for any walk length).
+        k_in = d_emb + t2v_dim + 1 + d_ef
+        self.w_k = nn.Sequential(nn.Linear(k_in, d_emb), nn.GELU(), nn.Linear(d_emb, d_emb))
 
     def forward(self, source: torch.Tensor, token_tangents: torch.Tensor,
                 ages: torch.Tensor, mask: torch.Tensor, positions: torch.Tensor,
@@ -133,8 +135,8 @@ class NeighborhoodProjection(nn.Module):
         # TPNet scales delta-times by log(Δt + 1) before the time encoder.
         t2v = self.time_encoder(torch.log1p(ages.clamp_min(0.0)))             # [B,T,t2v_dim]
         log_hop = torch.log1p(positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)   # [B,T,1] log-hop position
-        keys = self.w_k(torch.cat([token_tangents, t2v, log_hop, edge_features], dim=-1))   # [B,T,d_a]
-        query = self.w_q(source)                                             # [B,d_a]
+        keys = self.w_k(torch.cat([token_tangents, t2v, log_hop, edge_features], dim=-1))   # [B,T,d_emb]
+        query = self.w_q(source)                                             # [B,d_emb]
 
         scores = (query.unsqueeze(1) * keys).sum(-1) * self.scale            # [B,T]
         scores = scores.masked_fill(~mask, float("-inf"))
@@ -145,7 +147,7 @@ class NeighborhoodProjection(nn.Module):
 
 class LinkPredHead(nn.Module):
     def __init__(self, num_nodes: int, d_emb: int,
-                 proj_dim: int = 128, t2v_dim: int = 16, d_ef: int = 0):
+                 t2v_dim: int = 16, d_ef: int = 0):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_emb = d_emb
@@ -160,7 +162,7 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(unit_rows, manifold=self.geom.manifold)
 
         self.neighbourhood = NeighborhoodProjection(
-            d_emb=d_emb, d_a=proj_dim, t2v_dim=t2v_dim, d_ef=d_ef)
+            d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef)
 
     def _token_edge_features(self, tokens: WalkTokens, q: int) -> torch.Tensor:
         """Per-token edge features [Q, T, d_ef] aligned with the flattened token bag. tokens holds

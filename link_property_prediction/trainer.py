@@ -68,7 +68,6 @@ class TrainerConfig:
                              # NeighborhoodProjection attention keys. Set from the loaded dataset.
 
     # NeighborhoodProjection (attention pooling of the source's walk-token offsets -> mu_u).
-    proj_dim: int = 128       # attention (query/key) dim d_a
     t2v_dim: int = 16         # Time2Vec output dim (16 ties dim100 on wiki: 0.8287/0.8040 vs 0.8289/0.8046)
 
     # Link loss / head.
@@ -118,7 +117,6 @@ class Trainer:
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
-            proj_dim=int(config.proj_dim),
             t2v_dim=int(config.t2v_dim),
             d_ef=int(config.d_ef),
         ).to(self.device)

@@ -63,8 +63,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--d-emb", default=128, type=int)
 
     # NeighborhoodProjection — attention pooling of the source's walk-token offsets into mu_u.
-    p.add_argument("--proj-dim", default=128, type=int,
-                   help="Attention (query/key) dim d_a for the neighbourhood pooling.")
+    # (Query/key MLPs project to d_emb — no separate attention dim.)
     p.add_argument("--t2v-dim", default=16, type=int,
                    help="Time2Vec output dim (16 ties dim 100 on wiki; TPNet default was 100).")
 
@@ -268,7 +267,6 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
         d_ef=(int(train_sp.edge_feat.shape[1]) if train_sp.edge_feat is not None else 0),
 
-        proj_dim=args.proj_dim,
         t2v_dim=args.t2v_dim,
 
         K_train=args.k_train,
