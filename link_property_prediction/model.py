@@ -176,8 +176,8 @@ class LinkPredHead(nn.Module):
         return tokens.nodes.new_zeros((q, k * length, self.d_ef), dtype=torch.float32)
 
     def _project(self, tokens: WalkTokens):
-        """Project one bag of N queries. Returns (p, e_seed): p [N, d] = exp_{E[seed]}(mu) on the
-        sphere (seed pushed toward its walk-token centroid), e_seed [N, d] = E[seed] on the sphere."""
+        """Project one bag of N queries. Returns p [N, d] = exp_{E[seed]}(mu) on the sphere (seed
+        pushed toward its walk-token centroid)."""
         e_weight = self.E.weight
         e_seed = F.embedding(tokens.seeds, e_weight)                                  # E[x]  [N, d] (E is on-sphere)
         n = e_seed.shape[0]
@@ -190,11 +190,11 @@ class LinkPredHead(nn.Module):
         token_tangent = self.geom.log_map(e_seed.unsqueeze(-2), token_emb)           # [N, T, d] tangent
         mu = self.neighbourhood(
             e_seed, token_tangent, token_ages.to(e_seed.dtype), token_mask, token_pos, token_ef)  # [N, d]
-        return self.geom.exp_map(e_seed, mu), e_seed                                 # P[x], E[x]
+        return self.geom.exp_map(e_seed, mu)                                         # P[x]  [N, d]
 
     def forward(self, src_tokens: WalkTokens, cand_ids: torch.Tensor) -> torch.Tensor:
         """One-sided scoring. src_tokens: B source queries (seeds = u); cand_ids [B, C] candidate
         node ids. Returns logits [B, C] = <P[u], E[v]> — is v near u's neighbourhood?"""
-        p_u, _ = self._project(src_tokens)                                    # P[u]  [B, d]
+        p_u = self._project(src_tokens)                                       # P[u]  [B, d]
         candidate = F.embedding(cand_ids, self.E.weight)                      # E[v]  [B, C, d] (E on-sphere)
         return self.geom.similarity(p_u.unsqueeze(1), candidate)              # <P[u], E[v]>  [B, C]
