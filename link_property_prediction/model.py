@@ -25,23 +25,33 @@ from .walk_tokens import WalkTokens, flatten_tokens
 
 class SphereManifold:
     """Unit-sphere geometry behind a manifold-agnostic contract (swap the class to swap the space):
-    manifold, log_map, exp_map, similarity. similarity is HIGHER = closer (inner product =
-    cosine on the sphere; a distance manifold would return -dist). (E is kept on-sphere by
-    RiemannianAdam, so no read-time re-projection is needed.)"""
-    eps = 1e-6
+    manifold, log_map, exp_map, similarity. similarity is HIGHER = closer (inner product = cosine).
+    E is kept on-sphere by RiemannianAdam, so no read-time re-projection is needed.
+
+    Both maps are exact-formula, clamp-free in the smooth region:
+    - log_map uses atan2(‖perp‖, cos) for the angle — accurate to ~1e-9 at small angles (arccos of
+      a clamped cosine has a ~1.4e-3 angle floor in fp32 AND amplifies gradients by floor/θ for
+      near-coincident pairs); the only guard left is the direction denominator, which is reached
+      only at the two theory-degenerate points (coincident: tangent ~1e-7 noise, harmless;
+      antipodal: norm π, direction undefined by theory, returned as noise by convention).
+    - exp_map is the exact formula for ALL tangent norms: cos²+sin² keeps it on-sphere identically,
+      and norms > π wrap past the antipode (the true exponential, smooth gradients everywhere —
+      no clamp, hence no flat-gradient trap). sinc makes tangent = 0 a LIVE exact no-op
+      (P = base bit-exactly, Jacobian = I). Bounding ‖mu‖ is model policy, not manifold policy:
+      if a head wants locality, it caps its own tangent before calling exp."""
 
     def __init__(self):
         self.manifold = geoopt.Sphere()
 
     def log_map(self, base: torch.Tensor, point: torch.Tensor) -> torch.Tensor:
-        cos_angle = (base * point).sum(-1, keepdim=True).clamp(-1 + self.eps, 1 - self.eps)
+        cos_angle = (base * point).sum(-1, keepdim=True)
         perp = point - cos_angle * base
-        return torch.arccos(cos_angle) * perp / perp.norm(dim=-1, keepdim=True).clamp_min(self.eps)
+        perp_norm = perp.norm(dim=-1, keepdim=True)
+        return torch.atan2(perp_norm, cos_angle) * perp / perp_norm.clamp_min(1e-12)
 
     def exp_map(self, base: torch.Tensor, tangent: torch.Tensor) -> torch.Tensor:
-        norm = tangent.norm(dim=-1, keepdim=True)
-        angle = norm.clamp(max=math.pi - self.eps)
-        return torch.cos(angle) * base + torch.sin(angle) / norm.clamp_min(self.eps) * tangent
+        angle = tangent.norm(dim=-1, keepdim=True)
+        return torch.cos(angle) * base + torch.sinc(angle / math.pi) * tangent
 
     def similarity(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return (a * b).sum(-1)
