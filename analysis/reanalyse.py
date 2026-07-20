@@ -33,7 +33,7 @@ def main():
     out_dir = pathlib.Path(sys.argv[2])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    from tempest_walks.data import load_tgb
+    from link_property_prediction.data import load_tgb
 
     E = np.load(emb_path).astype(np.float32)
     print(f"E shape: {E.shape}   path: {emb_path}")

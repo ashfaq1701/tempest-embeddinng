@@ -237,7 +237,7 @@ def score_split_proj(P, E, src, tgt, neg_list):
 
 
 def main():
-    from tempest_walks.data import load_tgb
+    from link_property_prediction.data import load_tgb
     E = np.load(EMB_PATH).astype(np.float32)
     loaded = load_tgb("tgbl-wiki", root=str(ROOT / "datasets"))
     loaded.dataset.load_val_ns()

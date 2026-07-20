@@ -285,7 +285,7 @@ a block of entries) of that Gram, and the MLP learns which combinations matter.
 
 Everything we build has to come from one call:
 `trw.get_random_walks_and_times_for_nodes(...)` (wrapped in
-`tempest_walks/walks.py::walks_for_nodes`). It returns four arrays — **walk
+`link_property_prediction/walks.py::walks_for_nodes`). It returns four arrays — **walk
 nodes, timestamps, walk lengths, and edge features** — which the wrapper packs
 into `WalkData`. Shapes/dtypes are pinned by `tests/test_walk_contract.py` and the
 verified contract in `CLAUDE.md`. `N` = #seeds, `K` = walks/seed, `L` =

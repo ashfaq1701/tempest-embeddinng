@@ -99,7 +99,7 @@ def mrr_under_score(E, src, tgt, neg_dst_list,
 
 
 def main():
-    from tempest_walks.data import load_tgb
+    from link_property_prediction.data import load_tgb
     E = np.load(EMB_PATH).astype(np.float32)
     print(f"E shape: {E.shape}")
     loaded = load_tgb("tgbl-wiki", root=str(ROOT / "datasets"))

@@ -208,7 +208,7 @@ protocol and is NOT what the 0.84 number is.**
 
 ### 4b. The TGB eval, audited against ours
 
-| aspect | TPNet (`evaluate_models_utils.py`) | Ours (`tempest_walks`) | identical? |
+| aspect | TPNet (`evaluate_models_utils.py`) | Ours (`link_property_prediction`) | identical? |
 |---|---|---|---|
 | negatives | `dataset.negative_sampler.query_batch(src,dst,ts,split_mode)` → ~999 dst negs, fixed per positive | same call (`TGBNegativeSampler.query_batch`) | ✓ **same negatives** (deterministic ns set) |
 | metric | official TGB `Evaluator.eval({y_pred_pos, y_pred_neg, eval_metric})` → MRR | same `Evaluator` + dataset `eval_metric` | ✓ identical |

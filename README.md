@@ -10,7 +10,7 @@ The pre-rewrite design and its development history (35 lessons across
 ## Layout
 
 ```
-tempest_walks/
+link_property_prediction/
   data.py        TGB loader + Batch dataclass + batcher
   evaluator.py   TGB Evaluator wrapper (architecture-agnostic)
   negatives.py   Uniform / Historical (Vitter R) / TGB samplers

@@ -32,7 +32,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 
 def load_splits():
-    from tempest_walks.data import load_tgb
+    from link_property_prediction.data import load_tgb
     return load_tgb("tgbl-wiki", root=str(ROOT / "datasets"))
 
 

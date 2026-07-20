@@ -18,7 +18,7 @@ Contents:
                                     raw-timestamp `max_time_capacity`
                                     Tempest expects.
 
-Dataset-derived constants now live in `tempest_walks/data_stats.py`
+Dataset-derived constants now live in `link_property_prediction/data_stats.py`
 (TrainStats bundle).
 """
 

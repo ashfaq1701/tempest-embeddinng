@@ -1,4 +1,4 @@
-"""Correctness tests for the raw per-query walk tensors (tempest_walks/walk_tokens.py).
+"""Correctness tests for the raw per-query walk tensors (link_property_prediction/walk_tokens.py).
 
 `build_query_walk_tokens` runs K backward walks per QUERY — a (seed node, cutoff time) pair —
 and returns the RAW walks: nodes [Q, K, L], nodes_mask [Q, K, L], node-aligned timestamps
@@ -16,8 +16,8 @@ and returns the RAW walks: nodes [Q, K, L], nodes_mask [Q, K, L], node-aligned t
 import numpy as np
 import torch
 
-from tempest_walks.walk_tokens import _TS_SENTINEL, build_query_walk_tokens
-from tempest_walks.walks import WalkGenerator
+from link_property_prediction.walk_tokens import _TS_SENTINEL, build_query_walk_tokens
+from link_property_prediction.walks import WalkGenerator
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -161,7 +161,7 @@ def _synthetic_tokens():
                                            pos3 = seed SLOT (age0).
     Walk2 nodes [8,2,5,-1] ages [20,15,0,-1]: pos2 = seed SLOT (age0), pos3 = PADDING.
     Flat order is walk1's 4 positions then walk2's -> indices 0..7."""
-    from tempest_walks.walk_tokens import WalkTokens
+    from link_property_prediction.walk_tokens import WalkTokens
     nodes = torch.tensor([[[7, 5, 3, 5], [8, 2, 5, -1]]], dtype=torch.long)
     ages = torch.tensor([[[10, 5, 2, 0], [20, 15, 0, -1]]], dtype=torch.long)
     return WalkTokens(seeds=torch.tensor([5], dtype=torch.long), nodes=nodes,
@@ -172,7 +172,7 @@ def _synthetic_tokens():
 def test_flatten_exclude_seed_positions_only():
     """exclude_seed_positions=True (default): only the walk-origin slot masked; mid-walk seed
     recurrences are KEPT (this is the whole slot-vs-token distinction)."""
-    from tempest_walks.walk_tokens import flatten_tokens
+    from link_property_prediction.walk_tokens import flatten_tokens
     wt = _synthetic_tokens()
     ids, mask, _ = flatten_tokens(wt, exclude_seed_positions=True)
     assert mask.int().tolist()[0] == [1, 1, 1, 0, 1, 1, 0, 0]  # slots pos3,6 (age 0) removed; pos1 KEPT
@@ -185,7 +185,7 @@ def test_flatten_exclude_seed_positions_only():
 
 def test_flatten_no_filtering_when_positions_false():
     """exclude_seed_positions=False: seed kept everywhere; only padding removed."""
-    from tempest_walks.walk_tokens import flatten_tokens
+    from link_property_prediction.walk_tokens import flatten_tokens
     wt = _synthetic_tokens()
     ids, mask, _ = flatten_tokens(wt, exclude_seed_positions=False)
     assert mask.int().tolist()[0] == [1, 1, 1, 1, 1, 1, 1, 0]  # only padding pos7 removed
@@ -196,7 +196,7 @@ def test_flatten_no_filtering_when_positions_false():
 def test_flatten_shapes_and_padding_realdata():
     """On live Tempest walks: shapes correct, padding never leaks, default drops the seed's
     walk-origin slot (age 0) so every kept token has age > 0."""
-    from tempest_walks.walk_tokens import flatten_tokens
+    from link_property_prediction.walk_tokens import flatten_tokens
     k, mwl = 6, 8
     seeds = torch.tensor([2, 4, 6, 8], dtype=torch.long)
     cutoffs = torch.tensor([20_000, 30_000, 40_000, 50_000], dtype=torch.long)
@@ -218,7 +218,7 @@ def test_flatten_shapes_and_padding_realdata():
 def test_edge_features_populated_and_seed_padding_zero():
     """build_query_walk_tokens carries per-position edge features [Q, K, L*d_ef]; the seed slot
     (age 0) and padding are forced to [0]*d_ef."""
-    from tempest_walks.walk_tokens import build_query_walk_tokens
+    from link_property_prediction.walk_tokens import build_query_walk_tokens
     rng = np.random.default_rng(3)
     n_nodes, n_edges, d_ef = 8, 90, 4
     src = rng.integers(0, n_nodes, n_edges).astype(np.int64)

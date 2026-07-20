@@ -20,7 +20,7 @@ from collections import OrderedDict
 import numpy as np
 import torch
 
-from tempest_walks.pair_store import PairRecencyStore
+from link_property_prediction.pair_store import PairRecencyStore
 
 # Published leaderboard refs, by dataset — only used to print a "gap" line.
 LEADERBOARD_REF = {

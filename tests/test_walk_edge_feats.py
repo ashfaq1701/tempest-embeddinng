@@ -13,7 +13,7 @@ caught exactly rather than statistically.
 import numpy as np
 import torch
 
-from tempest_walks.walks import WalkGenerator
+from link_property_prediction.walks import WalkGenerator
 
 
 def _synthetic_graph(n_nodes=8, n_edges=60, seed=0):

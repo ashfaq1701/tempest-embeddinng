@@ -40,7 +40,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 
 def main():
-    from tempest_walks.data import load_tgb
+    from link_property_prediction.data import load_tgb
     E = np.load(EMB_PATH).astype(np.float32)
     loaded = load_tgb("tgbl-wiki", root=str(ROOT / "datasets"))
 

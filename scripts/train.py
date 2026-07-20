@@ -38,12 +38,12 @@ if str(_PROJECT_ROOT) not in sys.path:
 import numpy as np
 import torch
 
-from tempest_walks.data import Loaded, create_batches, load_tgb
-from tempest_walks.data_stats import compute_train_stats
-from tempest_walks.evaluator import Evaluator
-from tempest_walks.negatives import TGBNegativeSampler
-from tempest_walks.trainer import Trainer, TrainerConfig
-from tempest_walks.utils import compute_max_time_capacity, seed_all
+from link_property_prediction.data import Loaded, create_batches, load_tgb
+from link_property_prediction.data_stats import compute_train_stats
+from link_property_prediction.evaluator import Evaluator
+from link_property_prediction.negatives import TGBNegativeSampler
+from link_property_prediction.trainer import Trainer, TrainerConfig
+from link_property_prediction.utils import compute_max_time_capacity, seed_all
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,7 +109,7 @@ def parse_args() -> argparse.Namespace:
              "mean batch's time-span. The effective max_time_capacity "
              "passed to Tempest is "
              "round(multiplier * batch_size * mean_inter_arrival) — see "
-             "tempest_walks/utils.py:compute_max_time_capacity. -1.0 "
+             "link_property_prediction/utils.py:compute_max_time_capacity. -1.0 "
              "(default) is the unbounded sentinel: Tempest retains all "
              "ingested edges until walk_gen.reset() at the epoch "
              "boundary. The multiplier interface is dataset-agnostic; "
@@ -346,7 +346,7 @@ def main() -> Dict[str, Any]:
 
     # Optional: stratify the best-val model's test MRR to localize the gap.
     if args.stratify:
-        from tempest_walks.stratify import run_stratification
+        from link_property_prediction.stratify import run_stratification
         meta = {
             "dataset": args.dataset, "seed": args.seed, "d_emb": args.d_emb,
             "batch_size": args.batch_size, "eval_batch_size": args.eval_batch_size,

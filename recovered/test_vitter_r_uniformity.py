@@ -19,7 +19,7 @@ Run:
 
 import numpy as np
 
-from tempest_walks.negatives import HistoricalNegativeSampler
+from link_property_prediction.negatives import HistoricalNegativeSampler
 
 
 def test_vitter_r_uniformity():

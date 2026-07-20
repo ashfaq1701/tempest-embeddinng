@@ -34,7 +34,7 @@ def load_active_node_set():
     """Nodes that actually appear in the TGB wiki training split.
     Inactive rows of E never received gradient and bias the geometry
     summaries if included naively."""
-    from tempest_walks.data import load_tgb
+    from link_property_prediction.data import load_tgb
     loaded = load_tgb("tgbl-wiki", root=str(ROOT / "datasets"))
     train = loaded.train
     active = np.unique(np.concatenate([train.sources, train.destinations]))

@@ -6,7 +6,7 @@ torch_geometric.TemporalDataLoader / TPNet's DataLoader-over-indices).
 """
 import numpy as np
 
-from tempest_walks.data import SplitData, create_batches
+from link_property_prediction.data import SplitData, create_batches
 
 
 def _split(n, ts=None, with_ef=False):

@@ -35,7 +35,7 @@ _PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from tempest_walks.data import load_tgb
+from link_property_prediction.data import load_tgb
 
 
 # ─── CLI ────────────────────────────────────────────────────────────────

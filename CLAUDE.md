@@ -89,7 +89,7 @@ sets, the training objective now directly targets the eval metric.
 
 #### Alignment (InfoNCE)
 
-`tempest_walks/losses.py` — `alignment_loss(...)`
+`link_property_prediction/losses.py` — `alignment_loss(...)`
 
 For each seed `s_i` with positive contexts `{n_p^+ : p ∈ [0, lens_i − 2]}`
 (positions of walk i, with the seed itself at position `lens_i − 1`):
@@ -158,7 +158,7 @@ Defaults: `tau_link = 1.0` (pending sweep), `K_train = 100`.
 
 ### Trainer
 
-`tempest_walks/trainer.py` — strict-causal per-batch ordering:
+`link_property_prediction/trainer.py` — strict-causal per-batch ordering:
 
 1. `walks = walk_gen.walks_for_nodes(seeds)`  — pre-ingest
 2. `L_align = alignment_loss(...)`             — InfoNCE scalar
@@ -177,7 +177,7 @@ ranking gradients to `link_head` only.
 
 ### Model components
 
-`tempest_walks/model.py`:
+`link_property_prediction/model.py`:
 
 - `EmbeddingTable`     single `nn.Embedding(num_nodes, d_emb)`.
 - `ProjectionHead`     conditional architecture (E-only or
@@ -752,7 +752,7 @@ and 3-seed confirmation is not required.)
 ### 0. Initial v2 head design (2026-06-04 → 2026-06-05)
 
 The bilinear+pair-MLP `LinkHead` was replaced by a walk-mediated
-similarity head (`tempest_walks/link_pred_head_v2.py`), motivated
+similarity head (`link_property_prediction/link_pred_head_v2.py`), motivated
 by analysis/REPORT.md §9. Per (u, t, v_candidate):
 
 1. Sample K walks for u (forward or backward, configurable).

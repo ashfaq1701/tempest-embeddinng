@@ -52,7 +52,7 @@ def _rank_pos(sp: float, sn: np.ndarray) -> float:
 
 
 def main():
-    from tempest_walks.data import load_tgb
+    from link_property_prediction.data import load_tgb
     from temporal_random_walk import TemporalRandomWalk
 
     E = np.load(EMB_PATH).astype(np.float32)
