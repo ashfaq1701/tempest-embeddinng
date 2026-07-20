@@ -100,9 +100,9 @@ class NeighborhoodProjection(nn.Module):
     A source-conditioned query attends over the tokens; the attention scores ARE the pooling weights,
     and mu_u is the weighted centroid of the RAW token tangents:
 
-        q_u  = MLP_q(E[u])                                [B, d_emb]   (Linear → GELU → Linear)
-        k_p  = MLP_k([ Log_{E[u]}(E[token_p]) ; Time2Vec(age_p) ; log1p(hop_p) ])   [B, T, d_emb]
-        w_p  = softmax_p( (q_u . k_p) / sqrt(d_emb) )     [B, T]   (padding masked out)
+        q_u  = W_q(E[u])                                  [B, d_a]     (d_a = d_emb // 2)
+        k_p  = W_k([ Log_{E[u]}(E[token_p]) ; Time2Vec(age_p) ; log1p(hop_p) ])   [B, T, d_a]
+        w_p  = softmax_p( (q_u . k_p) / sqrt(d_a) )       [B, T]   (padding masked out)
         mu_u = Sum_p w_p * token_tangent_p                 [B, d_emb]
 
     The value is the token tangent itself, so mu_u stays a genuine weighted centroid (in the span of
@@ -114,18 +114,18 @@ class NeighborhoodProjection(nn.Module):
         super().__init__()
         self.d_emb = d_emb
         self.d_ef = d_ef
-        self.scale = 1.0 / math.sqrt(d_emb)
+        d_a = d_emb // 2                     # attention (query/key) dim, derived from d_emb
+        self.scale = 1.0 / math.sqrt(d_a)
 
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        # Query + key are SINGLE linear projections to d_emb (no separate attention dim d_a). A 2-layer
-        # projection (GELU MLP or low-rank linear, full or bottleneck) overfits on wiki — the depth, not
-        # the width, is the regression; a single linear ties the old Linear→d_a=128 (0.8312/0.8057).
-        self.w_q = nn.Linear(d_emb, d_emb)
+        # Query + key are SINGLE linear projections to d_a (a 2-layer projection overfits on wiki —
+        # depth is the regression, not width).
+        self.w_q = nn.Linear(d_emb, d_a)
         # per-token key: content + time + log-hop position (1 scalar) + edge feats. The hop position
         # enters as log1p(hop) inside the KEY (not an additive PE), so it can be learned/silenced;
         # length-agnostic (a scalar function of the hop, works for any walk length).
         k_in = d_emb + t2v_dim + 1 + d_ef
-        self.w_k = nn.Linear(k_in, d_emb)
+        self.w_k = nn.Linear(k_in, d_a)
 
     def forward(self, source: torch.Tensor, token_tangents: torch.Tensor,
                 ages: torch.Tensor, mask: torch.Tensor, positions: torch.Tensor,
