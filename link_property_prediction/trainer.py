@@ -1,23 +1,25 @@
 """Per-query-causal training + eval loop — link-supervised geometric walk head (REACH).
 
-Causality is now enforced PER QUERY by Tempest's cutoff, not by ingestion order. Per-batch
-ordering (training):
-  1. walk_gen.add_edges(batch)                        — ingest the batch's true edges FIRST
-  2. neg = neg_sampler.sample(batch)                 — [B, K_train] uniform negs
-  3. candidates = [pos | negs]                       — [B, 1+K_train]
-  4. logits = score(src, candidates)                 — for each query (u_i, t_i) sample K
+Causality is enforced PER QUERY by Tempest's cutoff, not by ingestion order. The FULL graph
+(train + val + test) is ingested into Tempest ONCE up front (`ingest_full_graph`, a single
+`add_edges` call); there is no per-epoch reset and no per-batch ingestion. Per-batch ordering
+(training):
+  1. neg = neg_sampler.sample(batch)                 — [B, K_train] uniform negs
+  2. candidates = [pos | negs]                       — [B, 1+K_train]
+  3. logits = score(src, candidates)                 — for each query (u_i, t_i) sample K
        backward walks with cutoff = t_i (→ μ_u), pack to tokens, score with
        LinkPredHead (identity + velocity-line). Candidate side samples no walks (static E[v]).
-  5. L = cross_entropy(logits, target=0)             — Bruch 2019, upper-bounds 1-MRR
-  6. one backward + single optimizer step
+  4. L = cross_entropy(logits, target=0)             — Bruch 2019, upper-bounds 1-MRR
+  5. one backward + single optimizer step
 
-Why ingest-first is valid (and == TPNet): a walk for (u, t) with cutoff = t traverses only
-edges with t_edge < t (EXCLUSIVE), so the target edge at t — and any simultaneous/future
-batch edge — is never seen, while same-batch-earlier edges (t' < t) legitimately are. This is
-exactly TPNet's prebuilt-time-index queried strictly-before-t per edge, and it removes the
-batch-size coupling of the old "walk the pre-ingest snapshot" scheme (which hid same-batch-
-earlier edges). The stores have no per-query cutoff, so they keep a pre-batch snapshot
-(updated last) — their strictly-causal form.
+Why one full graph is valid (and == TPNet): a walk for (u, t) with cutoff = t traverses only
+edges with t_edge < t (EXCLUSIVE), so the target edge at t — and any simultaneous/future edge —
+is never seen. Because the TGB splits are chronological (train < val < test), a TRAIN query at
+time t sees only edges before t: every val/test edge is later and the cutoff excludes it, so
+training is causally identical to having ingested train-only. VAL sees train + earlier val; TEST
+sees everything before t. This is exactly TPNet's prebuilt-time-index queried strictly-before-t
+per edge. The analysis-only stores (stratify) have no cutoff, so they are seeded explicitly over
+the causal-past splits.
 
 E (on the unit sphere) and the head are trained together by L (no alignment, no detach)
 by a single RiemannianAdam.
@@ -40,7 +42,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 
-from .data import Batch
+from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import LinkPredHead
 from .negatives import UniformNegativeSampler
@@ -80,7 +82,6 @@ class TrainerConfig:
     start_bias: str = "ExponentialWeight"
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
-    max_time_capacity: int = -1   # Tempest sliding-window eviction; -1 = unbounded
 
     # Optimisation — cosine decay to lr_min over decay_horizon_epochs (no warmup). ONE param group:
     # RiemannianAdam applies the Riemannian update to E (a geoopt.ManifoldParameter) and standard Adam
@@ -129,7 +130,6 @@ class Trainer:
             start_bias=config.start_bias,
             num_walks_per_node=config.num_walks_per_node,
             max_walk_len=config.max_walk_len,
-            max_time_capacity=config.max_time_capacity,
             temporal_node2vec_p=config.t2nv_p,
             temporal_node2vec_q=config.t2nv_q,
         )
@@ -168,6 +168,22 @@ class Trainer:
         )
 
     # ──────────────────────────────────────────────────────────────────
+    # Full-graph ingestion (once, up front)
+    # ──────────────────────────────────────────────────────────────────
+
+    def ingest_full_graph(self, src: np.ndarray, tgt: np.ndarray, ts: np.ndarray,
+                          edge_feat: Optional[np.ndarray] = None) -> None:
+        """Ingest the ENTIRE graph (all splits, concatenated) into Tempest in ONE add_edges call.
+        The per-query cutoff (t_edge < t_query, EXCLUSIVE) then enforces causality: a train query at
+        t sees only edges before t — every val/test edge is chronologically later (TGB splits are
+        causal: train < val < test), so the cutoff excludes it; val sees train + earlier val; test
+        sees everything before t. Call once before train()/eval; there is no per-epoch reset and no
+        per-batch ingestion. Capacity is unbounded — the whole timeline must stay resident."""
+        self.walk_gen.add_edges(src, tgt, ts, edge_feat)
+        print(f"  Ingested full graph into Tempest: {len(src):,} edges "
+              f"(once; per-query cutoff enforces causality)")
+
+    # ──────────────────────────────────────────────────────────────────
     # Scoring — shared by train + eval
     # ──────────────────────────────────────────────────────────────────
 
@@ -200,16 +216,9 @@ class Trainer:
         device = self.device
         B = len(batch.src)
 
-        # Ingest the batch's true edges into Tempest BEFORE scoring. This is causally
-        # valid — and exactly TPNet's protocol (prebuilt time-sorted index queried
-        # strictly-before-t per edge) — because every per-query walk is bounded by
-        # cutoff = t_query (EXCLUSIVE): the walk for (u, t) only traverses edges with
-        # t_edge < t, so the target edge at t (and any simultaneous/future batch edge) is
-        # never visible, while same-batch-earlier edges (t' < t) legitimately are. The
-        # stores below have NO cutoff mechanism, so they stay strictly causal the only way
-        # they can — a pre-batch snapshot, updated AFTER scoring.
-        self.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
-
+        # No ingestion here: the full graph is already in Tempest (ingest_full_graph, once).
+        # Each query (u, t) walks with cutoff = t (EXCLUSIVE), so it only traverses edges with
+        # t_edge < t — every val/test edge is chronologically later and is never seen.
         _, neg_tgt = self.neg_sampler_train.sample(batch)              # [B, K_train]
         src_t = torch.from_numpy(batch.src.astype(np.int64)).to(device)
         cand_np = np.concatenate(
@@ -248,11 +257,9 @@ class Trainer:
                 if recorder is not None:
                     recorder.before_batch(batch)
 
-                # Ingest into Tempest BEFORE scoring — the per-query cutoff keeps every
-                # walk causal (t_edge < t_query), so eval edges in the index never leak.
-                self.walk_gen.add_edges(
-                    batch.src, batch.tgt, batch.ts, batch.edge_feat)
-
+                # No ingestion: the full graph (incl. val/test) is already in Tempest. The
+                # per-query cutoff keeps every walk causal (t_edge < t_query), so future eval
+                # edges in the index never leak.
                 if B == 0:
                     if recorder is not None:
                         recorder.after_batch(batch)
@@ -308,11 +315,19 @@ class Trainer:
     def train(
         self,
         train_batches_factory,
+        full_graph: SplitData,
         val_evaluator: Optional[Evaluator] = None,
         val_batches_factory=None,
         test_evaluator: Optional[Evaluator] = None,
         test_batches_factory=None,
     ) -> Dict[str, Any]:
+        # Ingest the FULL graph (train + val + test) into Tempest ONCE, up front. Per-query cutoffs
+        # then keep every walk causal (TGB splits are chronological: train < val < test), so there is
+        # no per-epoch reset and no per-batch ingestion.
+        self.ingest_full_graph(
+            full_graph.sources, full_graph.destinations,
+            full_graph.timestamps, full_graph.edge_feat)
+
         n_epochs = self.config.num_epochs
         patience = self.config.early_stop_patience
 
@@ -336,7 +351,6 @@ class Trainer:
         per_epoch_test: List[float] = []
 
         for ep in range(1, n_epochs + 1):
-            self.walk_gen.reset()
             self.model.train()
 
             t0 = time.time()

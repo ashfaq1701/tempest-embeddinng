@@ -6,8 +6,10 @@ the seed sits at row position ``lens-1``, the chronologically oldest
 predecessor at position 0, padding = -1. Rows ``[i*K, (i+1)*K)`` are seed i's
 K walks (``shuffle_walk_order=False`` pins this grouping).
 
-Ordering contract: ``reset()`` per epoch, ``walks_for_nodes()`` at scoring
-(pre-ingest state), ``add_edges()`` AFTER scoring (strict-causal).
+Ingestion: the FULL graph (all splits) is ingested ONCE via ``add_edges``; there is no
+per-epoch reset and no incremental per-batch ingestion. Causality is enforced per query by
+``walks_for_nodes(..., cutoff_times=t)`` — a walk for (u, t) traverses only edges with
+t_edge < t (exclusive), so future edges in the index never leak.
 """
 from typing import NamedTuple, Optional
 
@@ -74,13 +76,10 @@ class WalkGenerator:
         self.num_walks_per_node = int(num_walks_per_node)
         self.max_walk_len = int(max_walk_len)
 
-    def reset(self) -> None:
-        """Drop all ingested edges. Call at the start of each epoch."""
-        self.tempest.clear()
-
     def add_edges(self, src: np.ndarray, tgt: np.ndarray, ts: np.ndarray,
                   edge_feat: Optional[np.ndarray] = None) -> None:
-        """Ingest a batch of edges. STRICT-CAUSAL: call AFTER scoring."""
+        """Ingest edges into Tempest. Used for the one-shot full-graph ingest; causality is
+        per-query via the cutoff, so ingestion order does not matter (Tempest indexes by time)."""
         self.tempest.add_multiple_edges(src, tgt, ts, edge_features=edge_feat)
 
     def walks_for_nodes(self, seeds: np.ndarray, max_walk_len: Optional[int] = None,

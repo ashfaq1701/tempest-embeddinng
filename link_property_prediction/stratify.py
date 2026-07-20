@@ -220,22 +220,22 @@ seed {meta['seed']}, d_emb {meta['d_emb']}, train bs {meta['batch_size']}
 # ──────────────────────────────────────────────────────────────────────────
 def run_stratification(trainer, train_f, val_f, test_eval, test_f,
                        num_nodes, meta, out_dir="logs/stratify"):
-    """Re-seed the trainer's causal stores over train+val, then run the stratified
+    """Seed the recorder's analysis stores over train+val, then run the stratified
     strict-causal test eval and write tables. Returns (strata, headroom).
 
-    Call AFTER `trainer.train(...)` (which restores best-val weights). Assumes the
-    trainer exposes `walk_gen` and the `_eval(evaluator, batches, recorder=...)` hook.
-    (The recorder keeps its OWN dedicated PairRecencyStore for the new-pair/repeat-pair
-    analysis; the model has no staleness/pair stores.)
+    Call AFTER `trainer.train(...)` (which restores best-val weights). Tempest already holds the
+    full graph (ingested once up front), so this does NOT touch walk_gen — it only seeds the
+    recorder's OWN dedicated PairRecencyStore/degree counters (separate from Tempest) for the
+    new-pair/repeat-pair analysis; the per-query cutoff keeps the test walks causal.
     """
     print("\n=== Re-seeding train+val, then stratified test eval ===")
-    trainer.walk_gen.reset()
-
+    # Tempest already holds the FULL graph (ingested once in the training script); no re-ingest.
+    # Only the recorder's OWN analysis stores (separate from Tempest) need seeding over the
+    # causal-past splits — the per-query cutoff keeps the test walks causal against the full index.
     rec = TestStratRecorder(num_nodes)
     rec.reset()
     for fac in (train_f, val_f):
         for batch in fac():
-            trainer.walk_gen.add_edges(batch.src, batch.tgt, batch.ts, batch.edge_feat)
             rec.after_batch(batch)
 
     test_mrr = trainer._eval(test_eval, test_f(), recorder=rec)

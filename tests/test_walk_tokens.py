@@ -52,7 +52,7 @@ def _build(seeds, cutoffs, k=6, mwl=8, gseed=0):
     src, tgt, ts = _synthetic_graph(seed=gseed)
     wg = WalkGenerator(use_gpu=False, num_walks_per_node=k, max_walk_len=mwl,
                        walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
-    wg.reset(); wg.add_edges(src, tgt, ts, None)
+    wg.add_edges(src, tgt, ts, None)
     wt, wd = _run_with_capture(
         wg, seeds, cutoffs, max_walk_len=mwl, num_walks_per_node=k,
         walk_bias="ExponentialWeight", start_bias="ExponentialWeight")
@@ -138,7 +138,7 @@ def test_seed_is_last_real_node():
 def test_empty_walks_when_no_predecessors():
     src, tgt, ts = _synthetic_graph(n_nodes=6, n_edges=40, seed=2)
     wg = WalkGenerator(use_gpu=False, num_walks_per_node=4, max_walk_len=6)
-    wg.reset(); wg.add_edges(src, tgt, ts, None)
+    wg.add_edges(src, tgt, ts, None)
     t_min = int(ts.min())
     seeds = torch.tensor([int(src[0]), 999], dtype=torch.long)          # cutoff-excluded, isolated
     cutoffs = torch.tensor([t_min, 50_000], dtype=torch.long)
@@ -227,7 +227,7 @@ def test_edge_features_populated_and_seed_padding_zero():
     ts = np.sort(rng.choice(np.arange(1, 5000), n_edges, replace=False)).astype(np.int64)
     ef = rng.standard_normal((n_edges, d_ef)).astype(np.float32) + 5.0   # nonzero so a zero is meaningful
     wg = WalkGenerator(use_gpu=False, num_walks_per_node=4, max_walk_len=6)
-    wg.reset(); wg.add_edges(src, tgt, ts, ef)
+    wg.add_edges(src, tgt, ts, ef)
     seeds = torch.tensor([1, 3, 5], dtype=torch.long)
     cutoffs = torch.full((3,), 5000, dtype=torch.long)
     wt = build_query_walk_tokens(wg, torch.device("cpu"), seeds, cutoffs,

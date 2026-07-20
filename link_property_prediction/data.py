@@ -92,6 +92,17 @@ def load_tgb(name: str, root: str = "datasets") -> Loaded:
     )
 
 
+def concat_splits(*splits: SplitData) -> SplitData:
+    """Concatenate splits into ONE SplitData — the full graph as a single set of arrays, for a
+    one-shot Tempest ingest. edge_feat is concatenated only when every split has it (else None)."""
+    src = np.concatenate([s.sources for s in splits])
+    dst = np.concatenate([s.destinations for s in splits])
+    ts = np.concatenate([s.timestamps for s in splits])
+    efs = [s.edge_feat for s in splits]
+    ef = np.concatenate(efs) if all(e is not None for e in efs) else None
+    return SplitData(sources=src, destinations=dst, timestamps=ts, edge_feat=ef)
+
+
 def create_batches(split: SplitData, batch_size: int) -> Iterator[Batch]:
     """TGB-identical fixed-size chronological batches (train AND eval).
 

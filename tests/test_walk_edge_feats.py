@@ -31,7 +31,6 @@ def _synthetic_graph(n_nodes=8, n_edges=60, seed=0):
 def test_edge_feats_present_and_aligned():
     src, tgt, ts, ef = _synthetic_graph()
     wg = WalkGenerator(use_gpu=False, num_walks_per_node=4, max_walk_len=8)
-    wg.reset()
     wg.add_edges(src, tgt, ts, ef)
     wd = wg.walks_for_nodes(np.array([1, 3, 5, 7], dtype=np.int64))
 
@@ -66,7 +65,7 @@ def test_edge_feats_seed_and_padding_are_zero():
     context mask (positions < lens-1) selects exactly the real edge rows."""
     src, tgt, ts, ef = _synthetic_graph()
     wg = WalkGenerator(use_gpu=False, num_walks_per_node=4, max_walk_len=8)
-    wg.reset(); wg.add_edges(src, tgt, ts, ef)
+    wg.add_edges(src, tgt, ts, ef)
     wd = wg.walks_for_nodes(np.array([1, 3, 5, 7], dtype=np.int64))
 
     NK, L = wd.nodes.shape
@@ -86,7 +85,7 @@ def test_edge_feats_none_when_dataset_has_none():
     """No edge features ingested -> WalkData.edge_feats is None (not a crash)."""
     src, tgt, ts, _ = _synthetic_graph()
     wg = WalkGenerator(use_gpu=False, num_walks_per_node=3, max_walk_len=6)
-    wg.reset(); wg.add_edges(src, tgt, ts, None)          # no edge features
+    wg.add_edges(src, tgt, ts, None)          # no edge features
     wd = wg.walks_for_nodes(np.array([2, 4], dtype=np.int64))
     assert wd.edge_feats is None, "edge_feats should be None when none were ingested"
     print("\n[none] edge_feats is None when dataset has no edge features")

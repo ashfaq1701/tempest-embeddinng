@@ -11,12 +11,6 @@ Contents:
     - make_lr_lambda(decay_steps, lr_min_ratio)
                                   — closure for LambdaLR that does
                                     cosine decay to lr_min_ratio.
-  Tempest configuration:
-    - compute_max_time_capacity(multiplier, batch_size, mean_inter_arrival)
-                                  — translate a dataset-agnostic
-                                    "batch-window multiplier" into the
-                                    raw-timestamp `max_time_capacity`
-                                    Tempest expects.
 
 Dataset-derived constants now live in `link_property_prediction/data_stats.py`
 (TrainStats bundle).
@@ -73,38 +67,3 @@ def make_lr_lambda(
         return lr_min_ratio + (1.0 - lr_min_ratio) * cos_factor
 
     return lr_lambda
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Tempest configuration
-# ──────────────────────────────────────────────────────────────────────
-
-
-def compute_max_time_capacity(
-    multiplier: float,
-    batch_size: int,
-    mean_inter_arrival: float,
-) -> int:
-    """Translate a batch-window multiplier into Tempest's max_time_capacity.
-
-    Tempest's `max_time_capacity` is a raw-timestamp-unit window that
-    determines how far back its sliding-window eviction reaches: any
-    ingested edge with `ts < (latest - max_time_capacity)` is dropped
-    on the next add. Working directly in raw timestamp units means the
-    right cap depends on the dataset's calendar density — a value that
-    holds 3 batches' worth of edges on tgbl-wiki (mean inter-arrival
-    17.4 s) holds vastly different numbers on tgbl-review or tgbl-coin.
-
-    The multiplier interface is dataset-agnostic: it says "keep enough
-    Tempest state for `multiplier` average batches' worth of edge
-    timeline". The conversion is:
-
-        max_time_capacity = round(multiplier * batch_size * mean_inter_arrival)
-
-    `multiplier == -1` is the sentinel for "unbounded" and is passed
-    straight through (keep all ingested edges until walk_gen.reset()
-    at epoch boundary).
-    """
-    if multiplier == -1:
-        return -1
-    return int(round(multiplier * batch_size * mean_inter_arrival))

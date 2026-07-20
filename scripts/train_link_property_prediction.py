@@ -9,17 +9,19 @@ Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root
   Model:          --d-emb
   Link/head:      --k-train
-  Walks:          --{num-walks-per-node,max-walk-len,walk-bias,start-bias}-
-                  {query,candidate}-side, --tempest-batch-window-multiplier
-                  (backward-only, undirected; query=source→μ, candidate=v→connectors)
+  Walks:          --num-walks-per-node, --max-walk-len, --walk-bias, --start-bias
+                  (backward-only, undirected; source u → μ_u; candidate v via static E[v])
   Optimisation:   --lr, --lr-min, --weight-decay, --batch-size, --eval-batch-size,
                   --num-epochs, --early-stop-patience
                   (single-group cosine decay to --lr-min over --decay-horizon-epochs)
   System:         --seed, --use-gpu, --use-gpu-tempest
   Analysis:       --stratify (post-train per-slice test-MRR stratification)
 
-Derived from the dataset (not exposed): num_nodes, dst_pool, and
-mean_inter_arrival (TrainStats) for the Tempest sliding-window cap.
+Derived from the dataset (not exposed): num_nodes, dst_pool, and the
+train-split span (TrainStats) for the μ recency-λ init.
+
+The full graph (train + val + test) is ingested into Tempest ONCE before
+training; per-query cutoffs keep every walk causal (see Trainer.ingest_full_graph).
 """
 
 import argparse
@@ -38,12 +40,12 @@ if str(_PROJECT_ROOT) not in sys.path:
 import numpy as np
 import torch
 
-from link_property_prediction.data import Loaded, create_batches, load_tgb
+from link_property_prediction.data import Loaded, concat_splits, create_batches, load_tgb
 from link_property_prediction.data_stats import compute_train_stats
 from link_property_prediction.evaluator import Evaluator
 from link_property_prediction.negatives import TGBNegativeSampler
 from link_property_prediction.trainer import Trainer, TrainerConfig
-from link_property_prediction.utils import compute_max_time_capacity, seed_all
+from link_property_prediction.utils import seed_all
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,20 +103,6 @@ def parse_args() -> argparse.Namespace:
                    help="node2vec in-out param q (TemporalNode2Vec bias only). Lower q/p => "
                         "more outward exploration; p=4,q=0.25 = most diverse backward walks.")
 
-    # The link head (LinkPredHead) has no architecture knobs beyond
-    # max_walk_len, which is set from --link-pred-max-walk-len.
-    p.add_argument(
-        "--tempest-batch-window-multiplier", default=-1.0, type=float,
-        help="Tempest sliding-window cap expressed as a multiple of the "
-             "mean batch's time-span. The effective max_time_capacity "
-             "passed to Tempest is "
-             "round(multiplier * batch_size * mean_inter_arrival) — see "
-             "link_property_prediction/utils.py:compute_max_time_capacity. -1.0 "
-             "(default) is the unbounded sentinel: Tempest retains all "
-             "ingested edges until walk_gen.reset() at the epoch "
-             "boundary. The multiplier interface is dataset-agnostic; "
-             "the raw window depends on the dataset's calendar density.",
-    )
 
     # Optimisation — RiemannianAdam, single-group cosine decay to --lr-min over --decay-horizon-epochs.
     # One group covers E (a geoopt.ManifoldParameter, Riemannian update) and all Euclidean params.
@@ -291,12 +279,6 @@ def main() -> Dict[str, Any]:
         start_bias=args.start_bias,
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
-        max_time_capacity=compute_max_time_capacity(
-            args.tempest_batch_window_multiplier,
-            args.batch_size,
-            stats.mean_inter_arrival,
-        ),
-
         lr=args.lr,
         lr_min=args.lr_min,
         weight_decay=args.weight_decay,
@@ -330,6 +312,7 @@ def main() -> Dict[str, Any]:
     print("\n=== Training ===")
     result = trainer.train(
         train_batches_factory=train_batches_factory,
+        full_graph=concat_splits(train_sp, val_sp, test_sp),
         val_evaluator=val_eval,
         val_batches_factory=val_batches_factory,
         test_evaluator=test_eval,
