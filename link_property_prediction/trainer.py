@@ -67,6 +67,12 @@ class TrainerConfig:
     node_feat: Optional[np.ndarray] = None   # [num_nodes, d_nf] static node-feature table (None if absent).
     t2v_dim: int = 16         # Time2Vec output dim for the per-token age feature.
 
+    # Walk-neighbourhood encoder (per-token embed → residual FFN blocks → attention pool).
+    enc_dim: int = 64         # encoder embedding width (output dim of the per-token encoder).
+    n_layers: int = 2         # number of pre-norm residual FFN blocks (depth).
+    expansion: int = 2        # FFN inner-width multiplier (enc_dim → expansion*enc_dim → enc_dim).
+    dropout: float = 0.1      # dropout inside each residual FFN (TPNet tunes this 0.0-0.5 per dataset).
+
     # Link loss / head.
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
 
@@ -109,6 +115,10 @@ class Trainer:
             t2v_dim=int(config.t2v_dim),
             d_ef=int(config.d_ef),
             d_nf=int(config.d_nf),
+            enc_dim=int(config.enc_dim),
+            n_layers=int(config.n_layers),
+            expansion=int(config.expansion),
+            dropout=float(config.dropout),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.

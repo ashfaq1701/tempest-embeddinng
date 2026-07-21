@@ -96,6 +96,6 @@ def test_head_consumes_node_features():
     assert logits.shape == (2, 2)
     assert torch.isfinite(logits).all()
     logits.sum().backward()
-    # token_mlp input = node_enc((n_hops+1)*d_emb) ‖ t2v ‖ log_hop(1) ‖ d_ef(0) ‖ d_nf — so d_nf is in it.
+    # encoder input = node_enc((n_hops+1)*d_emb) ‖ t2v ‖ log_hop(1) ‖ d_ef(0) ‖ d_nf — so d_nf is in it.
     d_code = (n_hops + 1) * d_emb
-    assert head.encoder.token_mlp[1].in_features == d_code + t2v_dim + 1 + 0 + d_nf
+    assert head.encoder.input_proj.in_features == d_code + t2v_dim + 1 + 0 + d_nf

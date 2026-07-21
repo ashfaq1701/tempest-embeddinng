@@ -67,6 +67,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--t2v-dim", default=16, type=int,
                    help="Time2Vec output dim for the per-token age feature.")
 
+    # Walk-neighbourhood encoder (per-token embed → residual FFN blocks → attention pool).
+    p.add_argument("--enc-dim", default=64, type=int,
+                   help="Encoder embedding width (output dim of the per-token encoder).")
+    p.add_argument("--n-layers", default=2, type=int,
+                   help="Number of pre-norm residual FFN blocks (encoder depth).")
+    p.add_argument("--expansion", default=2, type=int,
+                   help="FFN inner-width multiplier (enc_dim → expansion*enc_dim → enc_dim).")
+    p.add_argument("--dropout", default=0.1, type=float,
+                   help="Dropout inside each residual FFN (TPNet tunes this 0.0-0.5 per dataset).")
+
     # Link loss / head.
     p.add_argument(
         "--k-train", type=int, default=100,
@@ -253,6 +263,11 @@ def main() -> Dict[str, Any]:
         node_feat=loaded.node_feat,
 
         t2v_dim=args.t2v_dim,
+
+        enc_dim=args.enc_dim,
+        n_layers=args.n_layers,
+        expansion=args.expansion,
+        dropout=args.dropout,
 
         K_train=args.k_train,
 
