@@ -79,9 +79,10 @@ class TrainerConfig:
     t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
 
     # Optimisation — plain AdamW at a constant LR (no scheduler / decay / warmup). The stateless head is
-    # tiny (~few hundred params) and trains smoothly at a flat LR; weight_decay is the only regulariser.
+    # tiny (~few hundred params) and trains smoothly at a flat LR. weight_decay defaults to 0 (matching
+    # TPNet; GraphMixer uses 1e-6) — the old 1e-4 was tuned for the geometric head, not this one.
     lr: float = 1e-3
-    weight_decay: float = 1e-4
+    weight_decay: float = 0.0
 
     # Run control.
     num_epochs: int = 25

@@ -106,8 +106,8 @@ def parse_args() -> argparse.Namespace:
     # Optimisation — plain AdamW at a constant LR (no scheduler / decay / warmup), like GraphMixer/TPNet.
     p.add_argument("--lr", default=1e-3, type=float,
                    help="Constant learning rate (no decay). GraphMixer/TPNet both use 1e-4.")
-    p.add_argument("--weight-decay", default=1e-4, type=float,
-                   help="AdamW weight decay (GraphMixer 1e-6, TPNet 0.0).")
+    p.add_argument("--weight-decay", default=0.0, type=float,
+                   help="AdamW weight decay (default 0.0, matching TPNet; GraphMixer uses 1e-6).")
     p.add_argument(
         "--batch-size", default=200, type=int,
         help="Train batch size. Under the per-query ranking link "
