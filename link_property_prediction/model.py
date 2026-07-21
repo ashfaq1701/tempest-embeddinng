@@ -4,10 +4,10 @@ No learned node-embedding table, no manifold. A pair (u, v) is scored purely fro
 MULTI-HOP temporal walks (the differentiator vs GraphMixer/TPNet's 1-hop neighbours), turned into
 structural signal by a batch-local, anonymized `NodeEncoding` and pooled by a light attention head:
 
-    logit(u, v) = MLP( <x_u, x_v>, <x_u, h_v>, <h_u, x_v>, <h_u, h_v> )
+    logit(u, v) = MLP( ⟨seed_u, seed_v⟩, ⟨seed_u, nbhd_v⟩, ⟨nbhd_u, seed_v⟩, ⟨nbhd_u, nbhd_v⟩ )
 
-where x_x = the node's own structural code (seed row of NodeEncoding) and h_x = a recency/structure-
-weighted aggregation of x's walk neighbourhood (WalkNeighborhoodEncoder). Both bags (source +
+where seed_x = the node's own structural code (seed row of NodeEncoding) and nbhd_x = a recency/
+structure-weighted aggregation of x's walk neighbourhood (WalkNeighborhoodEncoder). Both bags (source +
 candidate) are JOINTLY encoded so they share one batch-local graph and one random basis.
 
 THE BASIS CONSTRAINT (load-bearing): NodeEncoding draws a fresh random X0 each batch, so a node's
@@ -148,27 +148,30 @@ class TimeEncoder(nn.Module):
 
 
 class WalkNeighborhoodEncoder(nn.Module):
-    """Pool a query's walk-token bag into (x, h): x = the seed's OWN structural code, h = a
-    recency/structure-weighted aggregation of its NEIGHBOURHOOD tokens (the seed's own walk-origin slot
-    is excluded, so h is genuinely the neighbourhood, not a self-copy).
+    """Pool a query's walk-token bag into (seed_code, nbhd_code): seed_code = the query node's OWN
+    structural code; nbhd_code = a recency/structure-weighted aggregation of its NEIGHBOURHOOD tokens
+    (the seed's own walk-origin slot is excluded, so nbhd_code is genuinely the neighbourhood, not a
+    self-copy).
 
     Single seed-query attention. The attention logit combines a structural co-reachability term
     cos(seed_code, token_code) — the ONLY way node codes may enter, since their basis is random per
-    batch — with a NONLINEAR (2-layer GELU MLP) score over the stable per-token features
-    [Time2Vec(age) ‖ log1p(hop) ‖ ef]. The nonlinearity on the stable features was a clean +0.007
-    test win on wiki over a plain linear logit (sweep 2026-07-21); it does NOT overfit because it acts
-    on stable features / attention weighting, not on the random codes or scorer capacity (both of which
-    overfit). The pooled value is the token code itself, so h stays in the (same-batch) code subspace
-    and can be consumed by inner products downstream. All four requested token signals are present: the
-    code via the structural score + pooled value, and time/hop/ef via the logit.
+    batch — with a NONLINEAR (2-layer GELU MLP) score over each token's time features
+    [Time2Vec(age) ‖ log1p(hop) ‖ edge_feats]. Those time features are basis-independent (consistent
+    across batches), so a learned layer on them is legitimate. The nonlinearity was a clean +0.007 test
+    win on wiki over a plain linear logit (sweep 2026-07-21); it does NOT overfit because it acts on the
+    time features / attention weighting, not on the random codes or scorer capacity (both of which
+    overfit). The pooled value is the token code itself, so nbhd_code stays in the (same-batch) code
+    subspace and can be consumed by inner products downstream. All four requested token signals are
+    present: the code via the co-reachability term + pooled value, and time/hop/edge via the logit.
     """
 
     def __init__(self, t2v_dim: int, d_ef: int):
         super().__init__()
         self.d_ef = d_ef
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        self.struct_scale = nn.Parameter(torch.tensor(1.0))          # weight on the co-reachability score
-        self.logit_bias = nn.Sequential(                            # V7: nonlinear (deeper) attention logit
+        # Attention logit = coreach_weight * (seed–token co-reachability) + attn_bias_mlp(token time feats).
+        self.coreach_weight = nn.Parameter(torch.tensor(1.0))        # scalar weight on the co-reachability term
+        self.attn_bias_mlp = nn.Sequential(                         # nonlinear bias from each token's time/hop/edge feats
             nn.Linear(t2v_dim + 1 + d_ef, 16), nn.GELU(), nn.Linear(16, 1))
 
     def _token_edge_features(self, tokens: WalkTokens, q: int, t: int) -> torch.Tensor:
@@ -182,26 +185,31 @@ class WalkNeighborhoodEncoder(nn.Module):
     def forward(self, assoc: torch.Tensor, node_enc: torch.Tensor,
                 tokens: WalkTokens) -> tuple:
         """assoc/node_enc from a (joint) NodeEncoding forward; tokens = one bag of Q queries.
-        Returns (x, h), each [Q, De]. Cold queries (no neighbourhood token) get h = 0."""
+        Returns (seed_code, nbhd_code), each [Q, De]: seed_code = the query node's own structural code;
+        nbhd_code = the attention-pooled code of its walk neighbourhood. Cold queries (no neighbourhood
+        token) get nbhd_code = 0."""
         q = tokens.nodes.shape[0]
-        x = NodeEncoding.gather(assoc, node_enc, tokens.seeds)              # [Q, De]  seed's own code
+        seed_code = NodeEncoding.gather(assoc, node_enc, tokens.seeds)     # [Q, De]  the query node's own code
 
-        ids, mask, pos = flatten_tokens(tokens, exclude_seed_positions=True)   # [Q, T] each
-        t = ids.shape[1]
-        tok_code = NodeEncoding.gather(assoc, node_enc, ids)               # [Q, T, De]
-        ages = tokens.ages.reshape(q, t).clamp_min(0)                      # [Q, T]
+        # Flatten the query's walk bag to one [Q, T] token list (padding + the seed's own slot masked out).
+        token_ids, token_mask, token_hop = flatten_tokens(tokens, exclude_seed_positions=True)   # [Q, T] each
+        num_tokens = token_ids.shape[1]
+        token_code = NodeEncoding.gather(assoc, node_enc, token_ids)       # [Q, T, De]  each token's structural code
+        token_age = tokens.ages.reshape(q, num_tokens).clamp_min(0)        # [Q, T]      cutoff − t_edge
 
-        t2v = self.time_encoder(torch.log1p(ages.to(node_enc.dtype)))     # [Q, T, t2v]
-        log_hop = torch.log1p(pos.clamp_min(0).to(node_enc.dtype)).unsqueeze(-1)   # [Q, T, 1]
-        ef = self._token_edge_features(tokens, q, t)                      # [Q, T, d_ef]
-        stable = torch.cat([t2v, log_hop, ef], dim=-1)                    # [Q, T, t2v+1+d_ef]
+        # Per-token time/position/edge features (basis-independent — the only inputs to a learned layer).
+        age_enc = self.time_encoder(torch.log1p(token_age.to(node_enc.dtype)))            # [Q, T, t2v]
+        hop_enc = torch.log1p(token_hop.clamp_min(0).to(node_enc.dtype)).unsqueeze(-1)    # [Q, T, 1]
+        edge_feats = self._token_edge_features(tokens, q, num_tokens)                     # [Q, T, d_ef]
+        token_time_feats = torch.cat([age_enc, hop_enc, edge_feats], dim=-1)             # [Q, T, t2v+1+d_ef]
 
-        struct = (x.unsqueeze(1) * tok_code).sum(-1)                      # [Q, T]  cos co-reachability
-        logit = self.struct_scale * struct + self.logit_bias(stable).squeeze(-1)   # [Q, T]
-        logit = logit.masked_fill(~mask, float("-inf"))
-        weights = torch.nan_to_num(torch.softmax(logit, dim=-1), nan=0.0)  # cold row → all 0
-        h = (weights.unsqueeze(-1) * tok_code).sum(dim=1)                 # [Q, De]
-        return x, h
+        # Attention weight per token = seed↔token co-reachability + a learned bias from its time features.
+        coreach = (seed_code.unsqueeze(1) * token_code).sum(-1)                          # [Q, T] seed·token (cosine)
+        attn_logit = self.coreach_weight * coreach + self.attn_bias_mlp(token_time_feats).squeeze(-1)   # [Q, T]
+        attn_logit = attn_logit.masked_fill(~token_mask, float("-inf"))
+        attn_weight = torch.nan_to_num(torch.softmax(attn_logit, dim=-1), nan=0.0)       # cold row → all 0
+        nbhd_code = (attn_weight.unsqueeze(-1) * token_code).sum(dim=1)                  # [Q, De] pooled neighbourhood
+        return seed_code, nbhd_code
 
 
 class StatelessLinkHead(nn.Module):
@@ -221,8 +229,9 @@ class StatelessLinkHead(nn.Module):
             num_nodes=num_nodes, dim=d_emb, n_hops=n_hops, recency_lambda=recency_lambda)
         self.encoder = WalkNeighborhoodEncoder(t2v_dim=t2v_dim, d_ef=d_ef)
 
-        # Pairwise scorer: a small MLP over the four basis-invariant inner products of (x, h). The inner
-        # products are scalars (basis-invariant), so a learned MLP on them is legitimate.
+        # Pairwise scorer: a small MLP over the four basis-invariant inner products between u's and v's
+        # (seed_code, nbhd_code). The inner products are scalars (basis-invariant), so a learned MLP on
+        # them is legitimate.
         self.scorer = nn.Sequential(
             nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1))
 
@@ -241,19 +250,20 @@ class StatelessLinkHead(nn.Module):
         assoc, node_enc = self.node_encoding(src_tokens, cand_tokens)     # joint encode both bags
         node_enc = self._normalize_blocks(node_enc)
 
-        x_u, h_u = self.encoder(assoc, node_enc, src_tokens)             # [B, De]
-        x_v, h_v = self.encoder(assoc, node_enc, cand_tokens)           # [B*C, De]
+        seed_u, nbhd_u = self.encoder(assoc, node_enc, src_tokens)       # source: [B, De] each
+        seed_v, nbhd_v = self.encoder(assoc, node_enc, cand_tokens)     # candidates: [B*C, De] each
 
-        b, de = x_u.shape
-        x_v = x_v.reshape(b, -1, de)                                     # [B, C, De]
-        h_v = h_v.reshape(b, -1, de)                                     # [B, C, De]
-        x_u = x_u.unsqueeze(1)                                           # [B, 1, De]
-        h_u = h_u.unsqueeze(1)                                           # [B, 1, De]
+        b, de = seed_u.shape
+        seed_v = seed_v.reshape(b, -1, de)                               # [B, C, De]
+        nbhd_v = nbhd_v.reshape(b, -1, de)                               # [B, C, De]
+        seed_u = seed_u.unsqueeze(1)                                     # [B, 1, De]
+        nbhd_u = nbhd_u.unsqueeze(1)                                     # [B, 1, De]
 
-        feats = torch.stack([
-            (x_u * x_v).sum(-1),                                         # <x_u, x_v>  u–v co-reachability
-            (x_u * h_v).sum(-1),                                         # <x_u, h_v>
-            (h_u * x_v).sum(-1),                                         # <h_u, x_v>  is v in u's neighbourhood
-            (h_u * h_v).sum(-1),                                         # <h_u, h_v>  neighbourhood overlap
+        # Four basis-invariant inner products between u's and v's (seed, neighbourhood) codes.
+        pair_inner_products = torch.stack([
+            (seed_u * seed_v).sum(-1),                                   # ⟨seed_u, seed_v⟩  u–v co-reachability
+            (seed_u * nbhd_v).sum(-1),                                   # ⟨seed_u, nbhd_v⟩  is u in v's neighbourhood
+            (nbhd_u * seed_v).sum(-1),                                   # ⟨nbhd_u, seed_v⟩  is v in u's neighbourhood
+            (nbhd_u * nbhd_v).sum(-1),                                   # ⟨nbhd_u, nbhd_v⟩  neighbourhood overlap
         ], dim=-1)                                                       # [B, C, 4]
-        return self.scorer(feats).squeeze(-1)                           # [B, C]
+        return self.scorer(pair_inner_products).squeeze(-1)            # [B, C]
