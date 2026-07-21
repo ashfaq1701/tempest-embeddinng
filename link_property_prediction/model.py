@@ -109,6 +109,17 @@ class NodeEncoding(nn.Module):
         row 0 (garbage) and must be masked out by the caller via the tokens' mask."""
         return node_enc[assoc[ids.clamp_min(0)].clamp_min(0)]
 
+    def normalize_blocks(self, node_enc: torch.Tensor) -> torch.Tensor:
+        """Per-HOP-block L2 normalisation — a SCORING-side transform kept out of forward() so forward
+        stays the exact, testable raw diffusion. Raw block magnitudes shrink with diffusion depth (each
+        hop is a mean-of-means), so an inner product over the concatenated code would be dominated by
+        hop-0 (exact identity) and the deeper co-reachability hops would be numerically drowned out.
+        Making each dim-block unit-norm turns every hop's ⟨block_i, block_j⟩ into a cosine in [-1, 1],
+        so all hops enter downstream inner products on equal footing. [U, (n_hops+1)*dim] → same shape."""
+        u = node_enc.shape[0]
+        blocks = F.normalize(node_enc.view(u, self.n_hops + 1, self.dim), dim=-1)
+        return blocks.reshape(u, (self.n_hops + 1) * self.dim)
+
 
 class TimeEncoder(nn.Module):
     """Time2Vec time encoding, ported verbatim from TPNet (TGB_TPNet/models/modules.py)."""
@@ -220,9 +231,6 @@ class StatelessLinkHead(nn.Module):
                  t2v_dim: int = 16, d_ef: int = 0, recency_lambda: float = 0.0):
         super().__init__()
         self.num_nodes = num_nodes
-        self.d_emb = d_emb
-        self.n_hops = n_hops
-        self.n_blocks = n_hops + 1
         self.d_ef = d_ef
 
         self.node_encoding = NodeEncoding(
@@ -235,20 +243,11 @@ class StatelessLinkHead(nn.Module):
         self.scorer = nn.Sequential(
             nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1))
 
-    def _normalize_blocks(self, node_enc: torch.Tensor) -> torch.Tensor:
-        """Per-HOP-block L2 normalisation so every hop's co-reachability enters the inner product on
-        equal footing (raw block magnitudes shrink with diffusion depth; without this the largest block
-        would dominate every cosine). [U, n_blocks*dim] → same shape, each dim-block unit-norm."""
-        u = node_enc.shape[0]
-        blocks = node_enc.view(u, self.n_blocks, self.d_emb)
-        blocks = F.normalize(blocks, dim=-1)
-        return blocks.reshape(u, self.n_blocks * self.d_emb)
-
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate queries (seeds = v)
         in query-major order, each walked with its query's cutoff. Returns logits [B, C]."""
         assoc, node_enc = self.node_encoding(src_tokens, cand_tokens)     # joint encode both bags
-        node_enc = self._normalize_blocks(node_enc)
+        node_enc = self.node_encoding.normalize_blocks(node_enc)          # per-hop-block L2 (scoring-side)
 
         seed_u, nbhd_u = self.encoder(assoc, node_enc, src_tokens)       # source: [B, De] each
         seed_v, nbhd_v = self.encoder(assoc, node_enc, cand_tokens)     # candidates: [B*C, De] each
