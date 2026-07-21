@@ -64,6 +64,10 @@ def parse_args() -> argparse.Namespace:
                    help="NodeEncoding random-feature width per hop-block (JL basis dim).")
     p.add_argument("--n-hops", default=3, type=int,
                    help="Diffusion depth: node_enc = [X0, ÂX0, …, Âⁿ X0], width (n_hops+1)*d_emb.")
+    p.add_argument("--fixed-basis", action="store_true",
+                   help="Give each node id a PERMANENT random fingerprint (drawn once) instead of a fresh "
+                        "anonymized draw per batch. Stable across batches → MLP-usable, captures recurrence; "
+                        "costs a [num_nodes, d_emb] buffer. Default off (fresh/anonymized).")
     p.add_argument("--t2v-dim", default=16, type=int,
                    help="Time2Vec output dim for the per-token age feature.")
 
@@ -251,6 +255,7 @@ def main() -> Dict[str, Any]:
         d_ef=(int(train_sp.edge_feat.shape[1]) if train_sp.edge_feat is not None else 0),
         d_nf=(int(loaded.node_feat.shape[1]) if loaded.node_feat is not None else 0),
         node_feat=loaded.node_feat,
+        fixed_basis=args.fixed_basis,
 
         t2v_dim=args.t2v_dim,
 
