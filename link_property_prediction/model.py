@@ -3,11 +3,12 @@
 No learned node-embedding table, no manifold. A pair (u, v) is scored purely from Tempest's
 MULTI-HOP temporal walks (the differentiator vs GraphMixer/TPNet's 1-hop neighbours):
 
-    logit(u, v) = MLP( ⟨seed_u, seed_v⟩, ⟨seed_u, nbhd_v⟩, ⟨nbhd_u, seed_v⟩, ⟨nbhd_u, nbhd_v⟩ )
+    logit(u, v) = MergeLayer( [seed_u ‖ nbhd_u ‖ seed_v ‖ nbhd_v]  ‖  the four ⟨·,·⟩ inner products )
 
 where seed_x / nbhd_x are the node's own / neighbourhood-pooled LEARNED embeddings from
-WalkNeighborhoodEncoder. Both bags (source + candidate) are jointly encoded so they share one
-batch-local graph.
+WalkNeighborhoodEncoder, and the scorer is a pre-norm MLP over both sides' embeddings concatenated
+(TPNet's decoder) plus the four inner products (the affinity prior). Both bags (source + candidate)
+are jointly encoded so they share one batch-local graph.
 
 FIXED BASIS: NodeEncoding uses a PERMANENT per-node-id random fingerprint (drawn once), so a node's
 coordinates are stable across batches. Unlike the anonymized fresh-basis variant (where the basis
@@ -279,30 +280,39 @@ class StatelessLinkHead(nn.Module):
             d_code=(n_hops + 1) * d_emb, t2v_dim=t2v_dim, d_ef=d_ef, d_nf=d_nf,
             enc_dim=enc_dim, n_layers=n_layers, expansion=expansion, dropout=dropout)
 
-        # Pairwise scorer: a small MLP over the four inner products between u's and v's learned
-        # (seed, neighbourhood) embeddings. (Refined in the scorer step; kept simple here.)
+        # MergeLayer scorer (TPNet-style, adapted): a pre-norm MLP over the CONCAT of u's and v's learned
+        # (seed, neighbourhood) embeddings, PLUS the four inner products. The concat gives expressiveness;
+        # the inner products give the affinity/co-reachability prior for free (we keep seed/nbhd separate,
+        # so unlike TPNet's single fused embedding the pairwise signal isn't pre-baked). LayerNorm+dropout
+        # harmonise the mixed-scale inputs and regularise.
+        scorer_in = 4 * enc_dim + 4                                      # [seed_u‖nbhd_u‖seed_v‖nbhd_v] + 4 ⟨·,·⟩
         self.scorer = nn.Sequential(
-            nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1))
+            nn.LayerNorm(scorer_in),
+            nn.Linear(scorer_in, enc_dim), nn.GELU(), nn.Dropout(dropout), nn.Linear(enc_dim, 1))
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate queries (seeds = v)
         in query-major order, each walked with its query's cutoff. Returns logits [B, C]."""
         assoc, node_enc = self.node_encoding(src_tokens, cand_tokens)     # joint encode both bags
 
-        seed_u, nbhd_u = self.encoder(assoc, node_enc, src_tokens)       # source: [B, d_h] each
-        seed_v, nbhd_v = self.encoder(assoc, node_enc, cand_tokens)     # candidates: [B*C, d_h] each
+        seed_u, nbhd_u = self.encoder(assoc, node_enc, src_tokens)       # source: [B, enc_dim] each
+        seed_v, nbhd_v = self.encoder(assoc, node_enc, cand_tokens)     # candidates: [B*C, enc_dim] each
 
-        b, dh = seed_u.shape
-        seed_v = seed_v.reshape(b, -1, dh)                               # [B, C, d_h]
-        nbhd_v = nbhd_v.reshape(b, -1, dh)                               # [B, C, d_h]
-        seed_u = seed_u.unsqueeze(1)                                     # [B, 1, d_h]
-        nbhd_u = nbhd_u.unsqueeze(1)                                     # [B, 1, d_h]
+        b, e = seed_u.shape
+        c = seed_v.shape[0] // b
+        seed_v = seed_v.reshape(b, c, e)                                 # [B, C, enc_dim]
+        nbhd_v = nbhd_v.reshape(b, c, e)                                 # [B, C, enc_dim]
+        seed_u = seed_u.unsqueeze(1).expand(b, c, e)                     # [B, C, enc_dim]
+        nbhd_u = nbhd_u.unsqueeze(1).expand(b, c, e)                     # [B, C, enc_dim]
 
         # Four inner products between u's and v's learned (seed, neighbourhood) embeddings.
-        pair_inner_products = torch.stack([
+        inner_products = torch.stack([
             (seed_u * seed_v).sum(-1),                                   # ⟨seed_u, seed_v⟩  u–v affinity
             (seed_u * nbhd_v).sum(-1),                                   # ⟨seed_u, nbhd_v⟩  is u in v's neighbourhood
             (nbhd_u * seed_v).sum(-1),                                   # ⟨nbhd_u, seed_v⟩  is v in u's neighbourhood
             (nbhd_u * nbhd_v).sum(-1),                                   # ⟨nbhd_u, nbhd_v⟩  neighbourhood overlap
         ], dim=-1)                                                       # [B, C, 4]
-        return self.scorer(pair_inner_products).squeeze(-1)            # [B, C]
+
+        # MergeLayer: concat both sides' embeddings + the inner products → MLP → scalar.
+        feats = torch.cat([seed_u, nbhd_u, seed_v, nbhd_v, inner_products], dim=-1)   # [B, C, 4*enc_dim+4]
+        return self.scorer(feats).squeeze(-1)                          # [B, C]
