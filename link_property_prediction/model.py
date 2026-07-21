@@ -164,16 +164,18 @@ class WalkNeighborhoodEncoder(nn.Module):
     (the seed's own walk-origin slot is excluded, so nbhd_code is genuinely the neighbourhood, not a
     self-copy).
 
-    Single seed-query attention. The attention logit combines a structural co-reachability term
-    cos(seed_code, token_code) — the ONLY way node codes may enter, since their basis is random per
-    batch — with a NONLINEAR (2-layer GELU MLP) score over each token's time features
-    [Time2Vec(age) ‖ log1p(hop) ‖ edge_feats]. Those time features are basis-independent (consistent
-    across batches), so a learned layer on them is legitimate. The nonlinearity was a clean +0.007 test
-    win on wiki over a plain linear logit (sweep 2026-07-21); it does NOT overfit because it acts on the
-    time features / attention weighting, not on the random codes or scorer capacity (both of which
-    overfit). The pooled value is the token code itself, so nbhd_code stays in the (same-batch) code
-    subspace and can be consumed by inner products downstream. All four requested token signals are
-    present: the code via the co-reachability term + pooled value, and time/hop/edge via the logit.
+    Single seed-query attention, logit = a sum of query·key block dot products + a learned time bias:
+      - QUERY = [seed_code, seed_nf];  KEY = [token_code, token_nf, Time2Vec(age), log1p(hop), edge].
+      - ⟨seed_code, token_code⟩ — structural co-reachability; the ONLY way the random-basis codes may
+        enter (a learned W_q/W_k on them can't learn beyond a scalar×coreach), so it's a RAW dot.
+      - ⟨seed_nf, token_nf⟩ — node-feature affinity (cosine), present only when the dataset has node
+        features; weighted by nf_weight (init 0 → earns in). Uses the seed's OWN node feature.
+      - the token-only time features have no seed counterpart, so they enter through a NONLINEAR
+        (2-layer GELU MLP) learned bias — the query's learned time preference. The nonlinearity was a
+        clean +0.007 test win on wiki over a linear logit (sweep 2026-07-21) and does NOT overfit (it
+        acts on basis-independent features / attention weighting, not on the random codes or the scorer).
+    The pooled value is the token code itself, so nbhd_code stays in the (same-batch) code subspace and
+    can be consumed by inner products downstream.
     """
 
     def __init__(self, t2v_dim: int, d_ef: int, d_nf: int = 0):
@@ -181,10 +183,15 @@ class WalkNeighborhoodEncoder(nn.Module):
         self.d_ef = d_ef
         self.d_nf = d_nf
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        # Attention logit = coreach_weight * (seed–token co-reachability) + attn_bias_mlp(token feats).
-        self.coreach_weight = nn.Parameter(torch.tensor(1.0))        # scalar weight on the co-reachability term
-        self.attn_bias_mlp = nn.Sequential(                         # nonlinear bias from each token's time/hop/edge/node feats
-            nn.Linear(t2v_dim + 1 + d_ef + d_nf, 16), nn.GELU(), nn.Linear(16, 1))
+        # Attention logit (seed=query attends its neighbourhood tokens=keys) is a sum of query·key block
+        # dot products plus a learned time bias:
+        #   coreach_weight·⟨seed_code, token_code⟩   (structural co-reachability; the codes' only legal use)
+        # + nf_weight·⟨seed_nf, token_nf⟩            (node-feature affinity; only when the dataset has them)
+        # + attn_bias_mlp([t2v, hop, ef])            (token-only time features → the query's learned bias)
+        self.coreach_weight = nn.Parameter(torch.tensor(1.0))       # weight on the co-reachability term
+        self.nf_weight = nn.Parameter(torch.tensor(0.0))           # weight on the node-feature affinity (earns in from 0)
+        self.attn_bias_mlp = nn.Sequential(                        # nonlinear bias from each token's time/hop/edge feats
+            nn.Linear(t2v_dim + 1 + d_ef, 16), nn.GELU(), nn.Linear(16, 1))
 
     def _token_edge_features(self, tokens: WalkTokens, q: int, t: int) -> torch.Tensor:
         """Per-token edge features [Q, T, d_ef] aligned with the flattened bag; empty [Q,T,0] if absent."""
@@ -216,18 +223,22 @@ class WalkNeighborhoodEncoder(nn.Module):
         token_code = NodeEncoding.gather(assoc, node_enc, token_ids)       # [Q, T, De]  each token's structural code
         token_age = tokens.ages.reshape(q, num_tokens).clamp_min(0)        # [Q, T]      cutoff − t_edge
 
-        # Per-token time/position/edge/node features (basis-independent — the only inputs to a learned
-        # layer). Node features are the token node's STATIC dataset attributes (present iff the dataset
-        # has them), letting the attention weight neighbourhood tokens by node type.
+        # Token-only time features (basis-independent) → the query's learned attention bias.
         age_enc = self.time_encoder(torch.log1p(token_age.to(node_enc.dtype)))            # [Q, T, t2v]
         hop_enc = torch.log1p(token_hop.clamp_min(0).to(node_enc.dtype)).unsqueeze(-1)    # [Q, T, 1]
         edge_feats = self._token_edge_features(tokens, q, num_tokens)                     # [Q, T, d_ef]
-        node_feats = self._token_node_features(tokens, q, num_tokens)                     # [Q, T, d_nf]
-        token_feats = torch.cat([age_enc, hop_enc, edge_feats, node_feats], dim=-1)      # [Q, T, t2v+1+d_ef+d_nf]
+        token_time_feats = torch.cat([age_enc, hop_enc, edge_feats], dim=-1)             # [Q, T, t2v+1+d_ef]
 
-        # Attention weight per token = seed↔token co-reachability + a learned bias from its time features.
-        coreach = (seed_code.unsqueeze(1) * token_code).sum(-1)                          # [Q, T] seed·token (cosine)
-        attn_logit = self.coreach_weight * coreach + self.attn_bias_mlp(token_feats).squeeze(-1)   # [Q, T]
+        # Attention logit = weighted query·key block dots + the learned time bias.
+        coreach = (seed_code.unsqueeze(1) * token_code).sum(-1)                          # [Q, T] ⟨seed_code, token_code⟩
+        attn_logit = self.coreach_weight * coreach + self.attn_bias_mlp(token_time_feats).squeeze(-1)   # [Q, T]
+
+        # Node-feature affinity ⟨seed_nf, token_nf⟩ (cosine) — only when the dataset carries node features.
+        if tokens.seed_node_features is not None:
+            seed_nf = F.normalize(tokens.seed_node_features, dim=-1)                     # [Q, d_nf]     (query nf)
+            token_nf = F.normalize(self._token_node_features(tokens, q, num_tokens), dim=-1)   # [Q, T, d_nf] (key nf)
+            attn_logit = attn_logit + self.nf_weight * (seed_nf.unsqueeze(1) * token_nf).sum(-1)  # [Q, T]
+
         attn_logit = attn_logit.masked_fill(~token_mask, float("-inf"))
         attn_weight = torch.nan_to_num(torch.softmax(attn_logit, dim=-1), nan=0.0)       # cold row → all 0
         nbhd_code = (attn_weight.unsqueeze(-1) * token_code).sum(dim=1)                  # [Q, De] pooled neighbourhood

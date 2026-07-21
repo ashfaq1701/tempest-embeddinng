@@ -61,16 +61,29 @@ def test_node_features_match_independent_gather():
     assert mask.sum() > 0 and np.abs(got[mask]).sum() > 0
 
 
+def test_seed_node_features_match_gather():
+    """WalkTokens.seed_node_features [Q, d_nf] is the query seed's own node-feature row."""
+    rng = np.random.default_rng(2)
+    d_nf = 5
+    node_feat = rng.standard_normal((NUM_NODES, d_nf)).astype(np.float32)
+    seeds = rng.choice(NUM_NODES, 6, replace=False)
+    tok = _bag(_walk_gen(), seeds, node_feat)
+    assert tok.seed_node_features.shape == (len(seeds), d_nf)
+    assert np.allclose(tok.seed_node_features.numpy(), node_feat[seeds], atol=1e-6)
+
+
 def test_none_when_no_node_feat():
-    """No node_feat table → WalkTokens.node_features is None (nothing attached)."""
+    """No node_feat table → both node-feature fields are None (nothing attached)."""
     wg = _walk_gen()
     tok = _bag(wg, np.array([0, 1, 2]), node_feat=None)
     assert tok.node_features is None
+    assert tok.seed_node_features is None
 
 
 def test_head_consumes_node_features():
     """StatelessLinkHead(d_nf>0) runs on bags carrying node features and produces finite, differentiable
-    logits; the attention-bias MLP's first layer widens by exactly d_nf."""
+    logits. Node features enter as the ⟨seed_nf, token_nf⟩ affinity (weighted by nf_weight), NOT through
+    the time-bias MLP — so the MLP width is unchanged and nf_weight receives gradient."""
     rng = np.random.default_rng(1)
     d_nf = 4
     node_feat = rng.standard_normal((NUM_NODES, d_nf)).astype(np.float32)
@@ -83,5 +96,7 @@ def test_head_consumes_node_features():
     assert logits.shape == (2, 2)
     assert torch.isfinite(logits).all()
     logits.sum().backward()
-    # d_nf actually entered the model: attn_bias_mlp input width == t2v(16) + hop(1) + d_ef(0) + d_nf(4).
-    assert head.encoder.attn_bias_mlp[0].in_features == 16 + 1 + 0 + d_nf
+    # node features stay OUT of the time-bias MLP (input width == t2v(16) + hop(1) + d_ef(0)); they enter
+    # via the affinity term, so nf_weight must have received a gradient.
+    assert head.encoder.attn_bias_mlp[0].in_features == 16 + 1 + 0
+    assert head.encoder.nf_weight.grad is not None and head.encoder.nf_weight.grad.abs().item() >= 0.0
