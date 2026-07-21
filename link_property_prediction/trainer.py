@@ -63,6 +63,9 @@ class TrainerConfig:
     n_hops: int = 3           # diffusion depth: node_enc = [X0, ÂX0, …, Âⁿ X0], width (n_hops+1)*d_emb.
     d_ef: int = 0             # per-edge-feature dim (0 = dataset has no edge features); enters the
                              # attention logit as a stable per-token feature. Set from the loaded dataset.
+    d_nf: int = 0             # per-node-feature dim (0 = dataset has no node features); enters the
+                             # attention logit as a stable per-token feature. Set from the loaded dataset.
+    node_feat: Optional[np.ndarray] = None   # [num_nodes, d_nf] static node-feature table (None if absent).
     t2v_dim: int = 16         # Time2Vec output dim for the per-token age feature.
 
     # Link loss / head.
@@ -113,6 +116,7 @@ class Trainer:
             n_hops=int(config.n_hops),
             t2v_dim=int(config.t2v_dim),
             d_ef=int(config.d_ef),
+            d_nf=int(config.d_nf),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.
@@ -194,7 +198,8 @@ class Trainer:
             max_walk_len=self.config.max_walk_len,
             num_walks_per_node=self.config.num_walks_per_node,
             start_bias=self.config.start_bias,
-            walk_bias=self.config.walk_bias)
+            walk_bias=self.config.walk_bias,
+            node_feat=self.config.node_feat)
 
         # CANDIDATE side: walk every candidate v with its query's cutoff t_i. Flatten [B,C] → [B*C]
         # query-major; each candidate inherits its query's cutoff so its walk is causal.
@@ -206,7 +211,8 @@ class Trainer:
             max_walk_len=self.config.max_walk_len,
             num_walks_per_node=self.config.num_walks_per_node,
             start_bias=self.config.start_bias,
-            walk_bias=self.config.walk_bias)
+            walk_bias=self.config.walk_bias,
+            node_feat=self.config.node_feat)
 
         return self.model(src_tokens, cand_tokens)
 

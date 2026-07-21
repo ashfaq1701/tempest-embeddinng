@@ -176,21 +176,29 @@ class WalkNeighborhoodEncoder(nn.Module):
     present: the code via the co-reachability term + pooled value, and time/hop/edge via the logit.
     """
 
-    def __init__(self, t2v_dim: int, d_ef: int):
+    def __init__(self, t2v_dim: int, d_ef: int, d_nf: int = 0):
         super().__init__()
         self.d_ef = d_ef
+        self.d_nf = d_nf
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        # Attention logit = coreach_weight * (seed–token co-reachability) + attn_bias_mlp(token time feats).
+        # Attention logit = coreach_weight * (seed–token co-reachability) + attn_bias_mlp(token feats).
         self.coreach_weight = nn.Parameter(torch.tensor(1.0))        # scalar weight on the co-reachability term
-        self.attn_bias_mlp = nn.Sequential(                         # nonlinear bias from each token's time/hop/edge feats
-            nn.Linear(t2v_dim + 1 + d_ef, 16), nn.GELU(), nn.Linear(16, 1))
+        self.attn_bias_mlp = nn.Sequential(                         # nonlinear bias from each token's time/hop/edge/node feats
+            nn.Linear(t2v_dim + 1 + d_ef + d_nf, 16), nn.GELU(), nn.Linear(16, 1))
 
     def _token_edge_features(self, tokens: WalkTokens, q: int, t: int) -> torch.Tensor:
-        """Per-token edge features [Q, T, d_ef] aligned with the flattened bag ([Q, K, L*d_ef] →
-        [Q, K*L, d_ef]); an empty [Q, T, 0] tensor when the dataset has no edge features."""
+        """Per-token edge features [Q, T, d_ef] aligned with the flattened bag; empty [Q,T,0] if absent."""
         if tokens.edge_features is not None:
             _, k, length = tokens.nodes.shape
             return tokens.edge_features.reshape(q, k, length, self.d_ef).reshape(q, t, self.d_ef)
+        return tokens.nodes.new_zeros((q, t, 0), dtype=torch.float32)
+
+    def _token_node_features(self, tokens: WalkTokens, q: int, t: int) -> torch.Tensor:
+        """Per-token static node features [Q, T, d_nf] aligned with the flattened bag; empty [Q,T,0]
+        when the dataset has no node features."""
+        if tokens.node_features is not None:
+            _, k, length = tokens.nodes.shape
+            return tokens.node_features.reshape(q, k, length, self.d_nf).reshape(q, t, self.d_nf)
         return tokens.nodes.new_zeros((q, t, 0), dtype=torch.float32)
 
     def forward(self, assoc: torch.Tensor, node_enc: torch.Tensor,
@@ -208,15 +216,18 @@ class WalkNeighborhoodEncoder(nn.Module):
         token_code = NodeEncoding.gather(assoc, node_enc, token_ids)       # [Q, T, De]  each token's structural code
         token_age = tokens.ages.reshape(q, num_tokens).clamp_min(0)        # [Q, T]      cutoff − t_edge
 
-        # Per-token time/position/edge features (basis-independent — the only inputs to a learned layer).
+        # Per-token time/position/edge/node features (basis-independent — the only inputs to a learned
+        # layer). Node features are the token node's STATIC dataset attributes (present iff the dataset
+        # has them), letting the attention weight neighbourhood tokens by node type.
         age_enc = self.time_encoder(torch.log1p(token_age.to(node_enc.dtype)))            # [Q, T, t2v]
         hop_enc = torch.log1p(token_hop.clamp_min(0).to(node_enc.dtype)).unsqueeze(-1)    # [Q, T, 1]
         edge_feats = self._token_edge_features(tokens, q, num_tokens)                     # [Q, T, d_ef]
-        token_time_feats = torch.cat([age_enc, hop_enc, edge_feats], dim=-1)             # [Q, T, t2v+1+d_ef]
+        node_feats = self._token_node_features(tokens, q, num_tokens)                     # [Q, T, d_nf]
+        token_feats = torch.cat([age_enc, hop_enc, edge_feats, node_feats], dim=-1)      # [Q, T, t2v+1+d_ef+d_nf]
 
         # Attention weight per token = seed↔token co-reachability + a learned bias from its time features.
         coreach = (seed_code.unsqueeze(1) * token_code).sum(-1)                          # [Q, T] seed·token (cosine)
-        attn_logit = self.coreach_weight * coreach + self.attn_bias_mlp(token_time_feats).squeeze(-1)   # [Q, T]
+        attn_logit = self.coreach_weight * coreach + self.attn_bias_mlp(token_feats).squeeze(-1)   # [Q, T]
         attn_logit = attn_logit.masked_fill(~token_mask, float("-inf"))
         attn_weight = torch.nan_to_num(torch.softmax(attn_logit, dim=-1), nan=0.0)       # cold row → all 0
         nbhd_code = (attn_weight.unsqueeze(-1) * token_code).sum(dim=1)                  # [Q, De] pooled neighbourhood
@@ -228,14 +239,15 @@ class StatelessLinkHead(nn.Module):
     the walk-neighbourhood encoder, and a tiny pairwise scorer over basis-invariant inner products."""
 
     def __init__(self, num_nodes: int, d_emb: int, n_hops: int = 3,
-                 t2v_dim: int = 16, d_ef: int = 0, recency_lambda: float = 0.0):
+                 t2v_dim: int = 16, d_ef: int = 0, d_nf: int = 0, recency_lambda: float = 0.0):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_ef = d_ef
+        self.d_nf = d_nf
 
         self.node_encoding = NodeEncoding(
             num_nodes=num_nodes, dim=d_emb, n_hops=n_hops, recency_lambda=recency_lambda)
-        self.encoder = WalkNeighborhoodEncoder(t2v_dim=t2v_dim, d_ef=d_ef)
+        self.encoder = WalkNeighborhoodEncoder(t2v_dim=t2v_dim, d_ef=d_ef, d_nf=d_nf)
 
         # Pairwise scorer: a small MLP over the four basis-invariant inner products between u's and v's
         # (seed_code, nbhd_code). The inner products are scalars (basis-invariant), so a learned MLP on

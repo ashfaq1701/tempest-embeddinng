@@ -46,6 +46,11 @@ class WalkTokens:
         edge_features [Q, K, L*d_ef] float per-position edge features flattened over the L axis; the
                                           seed position and padding carry [0]*d_ef. None if the dataset
                                           has no edge features.
+        node_features [Q, K, L*d_nf] float per-token STATIC node features (looked up by node id from the
+                                          dataset's node_feat table), flattened over the L axis; padding
+                                          carries [0]*d_nf but the seed slot keeps its real feature (a
+                                          node feature is valid for the seed). None when the dataset has
+                                          no node features.
     """
 
     seeds: torch.Tensor                        # [Q]
@@ -54,6 +59,7 @@ class WalkTokens:
     ages: torch.Tensor                         # [Q, K, L]
     cutoffs: torch.Tensor                      # [Q]
     edge_features: Optional[torch.Tensor] = None   # [Q, K, L*d_ef]
+    node_features: Optional[torch.Tensor] = None   # [Q, K, L*d_nf]
 
 
 def build_query_walk_tokens(
@@ -66,8 +72,12 @@ def build_query_walk_tokens(
     num_walks_per_node: int,
     start_bias: Optional[str] = None,
     walk_bias: Optional[str] = None,
+    node_feat: Optional[np.ndarray] = None,
 ) -> WalkTokens:
-    """Per-query backward walks → raw [Q, K, L] nodes + mask + node-aligned timestamps (see WalkTokens)."""
+    """Per-query backward walks → raw [Q, K, L] nodes + mask + node-aligned timestamps (see WalkTokens).
+
+    node_feat: optional [num_nodes, d_nf] static node-feature table. When given, each token gets its
+    node's feature vector attached as WalkTokens.node_features [Q, K, L*d_nf] (padding zeroed)."""
     seeds_t = query_seeds.detach().to(device=device, dtype=torch.long)        # [Q]
     cutoffs_t = query_cutoffs.detach().to(device=device, dtype=torch.long)    # [Q]
     q = int(seeds_t.shape[0])
@@ -112,7 +122,17 @@ def build_query_walk_tokens(
         real = (nodes_mask & (ages != 0)).unsqueeze(-1)                                # [Q, K, L, 1] non-seed, non-pad
         edge_features = (ef * real).reshape(q, k, length * d_ef)                       # zero seed + padding
 
-    return WalkTokens(seeds_t, nodes, nodes_mask, ages, cutoffs_t, edge_features)
+    # Per-token STATIC node features → [Q, K, L*d_nf]. Look up each token node's row from node_feat;
+    # gather only the needed rows on CPU (the seeds/cutoffs already round-tripped through numpy), then
+    # move to device. Padding (node id -1) is zeroed; the seed slot KEEPS its real feature.
+    node_features = None
+    if node_feat is not None:
+        d_nf = int(node_feat.shape[1])
+        idx = nodes.clamp_min(0).cpu().numpy()                                         # [Q, K, L] (pad → row 0)
+        nf = torch.from_numpy(node_feat[idx]).to(device=device, dtype=torch.float32)   # [Q, K, L, d_nf]
+        node_features = (nf * nodes_mask.unsqueeze(-1)).reshape(q, k, length * d_nf)   # zero padding
+
+    return WalkTokens(seeds_t, nodes, nodes_mask, ages, cutoffs_t, edge_features, node_features)
 
 
 def flatten_tokens(
