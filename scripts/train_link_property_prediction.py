@@ -59,13 +59,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tgb-root", default="datasets", type=str)
 
 
-    # Model.
-    p.add_argument("--d-emb", default=128, type=int)
-
-    # NeighborhoodProjection — attention pooling of the source's walk-token offsets into mu_u.
-    # (Query/key MLPs project to d_emb — no separate attention dim.)
+    # Model — stateless NodeEncoding + walk-neighbourhood attention head.
+    p.add_argument("--d-emb", default=128, type=int,
+                   help="NodeEncoding random-feature width per hop-block (JL basis dim).")
+    p.add_argument("--n-hops", default=3, type=int,
+                   help="Diffusion depth: node_enc = [X0, ÂX0, …, Âⁿ X0], width (n_hops+1)*d_emb.")
     p.add_argument("--t2v-dim", default=16, type=int,
-                   help="Time2Vec output dim (16 ties dim 100 on wiki; TPNet default was 100).")
+                   help="Time2Vec output dim for the per-token age feature.")
 
     # Link loss / head.
     p.add_argument(
@@ -103,14 +103,13 @@ def parse_args() -> argparse.Namespace:
                         "more outward exploration; p=4,q=0.25 = most diverse backward walks.")
 
 
-    # Optimisation — RiemannianAdam, single-group cosine decay to --lr-min over --decay-horizon-epochs.
-    # One group covers E (a geoopt.ManifoldParameter, Riemannian update) and all Euclidean params.
+    # Optimisation — AdamW, single-group cosine decay to --lr-min over --decay-horizon-epochs.
     p.add_argument("--lr", default=1e-3, type=float,
-                   help="Peak LR (sphere default 1e-3).")
+                   help="Peak LR.")
     p.add_argument("--lr-min", default=1e-7, type=float,
                    help="Cosine-decay floor.")
     p.add_argument("--weight-decay", default=1e-4, type=float,
-                   help="Weight decay (RiemannianAdam). Load-bearing on the sphere head.")
+                   help="AdamW weight decay.")
     p.add_argument(
         "--batch-size", default=200, type=int,
         help="Train batch size. Under the per-query ranking link "
@@ -156,17 +155,6 @@ def parse_args() -> argparse.Namespace:
              "MRR is lost. Writes logs/stratify/<dataset>_seed<seed>_strata.{md,json}. "
              "Re-seeds the trainer's causal stores over train+val first; training is "
              "untouched. Off by default.",
-    )
-    p.add_argument(
-        "--export-best-embedding-table",
-        action="store_true",
-        help="After training, dump the best-val-restored embedding-table "
-             "weights to logs/embeddings/<dataset>_seed<seed>_demb<d_emb>"
-             "_ep<stopped_at_epoch>.npy. Raw float32 [num_nodes, d_emb] "
-             "array; node ids follow TGB's contiguous integer ordering. "
-             "NOTE: rows are now UNIT-NORM (sphere-constrained E) — analyse "
-             "by direction (cosine), not magnitude. "
-             "Off by default.",
     )
 
     return p.parse_args()
@@ -265,6 +253,7 @@ def main() -> Dict[str, Any]:
         t_train=float(stats.T_train),
 
         d_emb=args.d_emb,
+        n_hops=args.n_hops,
         d_ef=(int(train_sp.edge_feat.shape[1]) if train_sp.edge_feat is not None else 0),
 
         t2v_dim=args.t2v_dim,
@@ -301,10 +290,7 @@ def main() -> Dict[str, Any]:
 
     print("\n=== Parameter counts ===")
     n_total = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
-    n_E = trainer.model.E.weight.numel()
-    print(f"  model.E:         {n_E:>12,}")
-    print(f"  head params:     {n_total - n_E:>12,}")
-    print(f"  TOTAL trainable: {n_total:>12,}")
+    print(f"  TOTAL trainable: {n_total:>12,}  (stateless: no learned node-embedding table)")
 
     # ─── Train ─────────────────────────────────────────────────────
     print("\n=== Training ===")
@@ -338,23 +324,6 @@ def main() -> Dict[str, Any]:
         run_stratification(
             trainer, train_batches_factory, val_batches_factory,
             test_eval, test_batches_factory, num_nodes, meta)
-
-    # Optional: dump best-val-restored embedding table for downstream
-    # analysis. Raw [num_nodes, d_emb] float32 array; node ids follow
-    # TGB's contiguous integer ordering. Gated by --export-best-
-    # embedding-table; off by default to keep runs side-effect-free.
-    if args.export_best_embedding_table:
-        emb_dir = pathlib.Path("logs/embeddings")
-        emb_dir.mkdir(parents=True, exist_ok=True)
-        emb_path = emb_dir / (
-            f"{args.dataset}_seed{args.seed}_demb{args.d_emb}"
-            f"_ep{result['stopped_at_epoch']}.npy"
-        )
-        np.save(
-            emb_path,
-            trainer.model.E.weight.detach().cpu().numpy(),
-        )
-        print(f"  embedding_table:   saved to {emb_path}")
 
     return result
 

@@ -1,21 +1,24 @@
-"""Link head — sphere node embeddings + a deep neighbourhood-projection channel, in one module.
+"""Stateless, geometry-free temporal link head.
 
-    logit = <P[u], E[v]>                               is v near u's neighbourhood?
+No learned node-embedding table, no manifold. A pair (u, v) is scored purely from Tempest's
+MULTI-HOP temporal walks (the differentiator vs GraphMixer/TPNet's 1-hop neighbours), turned into
+structural signal by a batch-local, anonymized `NodeEncoding` and pooled by a light attention head:
 
-where P[u] = exp_{E[u]}(mu_u) pushes the source off E[u] toward mu_u — the deep pooling of u's
-walk-token tangents (in the tangent space at E[u]) + a TPNet Time2Vec of each token's age, produced
-by NeighborhoodProjection. One-sided: only u is walked/projected; each candidate v enters through
-its static embedding E[v]. The head owns self.E (link-trained on the sphere); geometry goes through
-self.geom.
+    logit(u, v) = MLP( <x_u, x_v>, <x_u, h_v>, <h_u, x_v>, <h_u, h_v> )
 
-(The dual-sided variant — walk every candidate too and score <P[u], P[v]> — was falsified on wiki:
-at matched walks it lost to one-sided at ~8x the cost. It lives one `git revert` away; see the
-"Important: revert this commit to bring back dual side walks" commit.)
+where x_x = the node's own structural code (seed row of NodeEncoding) and h_x = a recency/structure-
+weighted aggregation of x's walk neighbourhood (WalkNeighborhoodEncoder). Both bags (source +
+candidate) are JOINTLY encoded so they share one batch-local graph and one random basis.
+
+THE BASIS CONSTRAINT (load-bearing): NodeEncoding draws a fresh random X0 each batch, so a node's
+raw code lives in a random subspace that rotates batch-to-batch. Learned dense layers on raw codes
+would see random inputs and can't learn a stable function. Codes are therefore consumed ONLY through
+inner products — attention scores (cos(seed, token)) and the final pairwise dot products — which are
+invariant to the random basis. Time/hop/edge features (stable across batches) are the only inputs to
+learned linears; they drive the attention logits.
 """
-import math
 from typing import Optional
 
-import geoopt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -107,40 +110,6 @@ class NodeEncoding(nn.Module):
         return node_enc[assoc[ids.clamp_min(0)].clamp_min(0)]
 
 
-class SphereManifold:
-    """Unit-sphere geometry behind a manifold-agnostic contract (swap the class to swap the space):
-    manifold, log_map, exp_map, similarity. similarity is HIGHER = closer (inner product = cosine).
-    E is kept on-sphere by RiemannianAdam, so no read-time re-projection is needed.
-
-    Both maps are exact-formula, clamp-free in the smooth region:
-    - log_map uses atan2(‖perp‖, cos) for the angle — accurate to ~1e-9 at small angles (arccos of
-      a clamped cosine has a ~1.4e-3 angle floor in fp32 AND amplifies gradients by floor/θ for
-      near-coincident pairs); the only guard left is the direction denominator, which is reached
-      only at the two theory-degenerate points (coincident: tangent ~1e-7 noise, harmless;
-      antipodal: norm π, direction undefined by theory, returned as noise by convention).
-    - exp_map is the exact formula for ALL tangent norms: cos²+sin² keeps it on-sphere identically,
-      and norms > π wrap past the antipode (the true exponential, smooth gradients everywhere —
-      no clamp, hence no flat-gradient trap). sinc makes tangent = 0 a LIVE exact no-op
-      (P = base bit-exactly, Jacobian = I). Bounding ‖mu‖ is model policy, not manifold policy:
-      if a head wants locality, it caps its own tangent before calling exp."""
-
-    def __init__(self):
-        self.manifold = geoopt.Sphere()
-
-    def log_map(self, base: torch.Tensor, point: torch.Tensor) -> torch.Tensor:
-        cos_angle = (base * point).sum(-1, keepdim=True)
-        perp = point - cos_angle * base
-        perp_norm = perp.norm(dim=-1, keepdim=True)
-        return torch.atan2(perp_norm, cos_angle) * perp / perp_norm.clamp_min(1e-12)
-
-    def exp_map(self, base: torch.Tensor, tangent: torch.Tensor) -> torch.Tensor:
-        angle = tangent.norm(dim=-1, keepdim=True)
-        return torch.cos(angle) * base + torch.sinc(angle / math.pi) * tangent
-
-    def similarity(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return (a * b).sum(-1)
-
-
 class TimeEncoder(nn.Module):
     """Time2Vec time encoding, ported verbatim from TPNet (TGB_TPNet/models/modules.py)."""
 
@@ -178,112 +147,109 @@ class TimeEncoder(nn.Module):
         return output
 
 
-class NeighborhoodProjection(nn.Module):
-    """Single attention-pooling of a source's walk-token tangents into one tangent vector mu_u.
+class WalkNeighborhoodEncoder(nn.Module):
+    """Pool a query's walk-token bag into (x, h): x = the seed's OWN structural code, h = a
+    recency/structure-weighted aggregation of its NEIGHBOURHOOD tokens (the seed's own walk-origin slot
+    is excluded, so h is genuinely the neighbourhood, not a self-copy).
 
-    A source-conditioned query attends over the tokens; the attention scores ARE the pooling weights,
-    and mu_u is the weighted centroid of the RAW token tangents:
-
-        q_u  = W_q(E[u])                                  [B, d_a]     (d_a = d_emb // 2)
-        k_p  = W_k([ Log_{E[u]}(E[token_p]) ; Time2Vec(age_p) ; log1p(hop_p) ])   [B, T, d_a]
-        w_p  = softmax_p( (q_u . k_p) / sqrt(d_a) )       [B, T]   (padding masked out)
-        mu_u = Sum_p w_p * token_tangent_p                 [B, d_emb]
-
-    The value is the token tangent itself, so mu_u stays a genuine weighted centroid (in the span of
-    u's neighbour tangents) — a strict, learnable generalisation of the fixed softmax(-lambda*age)
-    weighting. Candidate-independent (never sees E[v]); cold rows (no token) -> mu_u = 0.
+    Single seed-query attention. The attention logit combines a structural co-reachability term
+    cos(seed_code, token_code) — the ONLY way node codes may enter, since their basis is random per
+    batch — with a learned linear over the stable per-token features [Time2Vec(age) ‖ log1p(hop) ‖ ef].
+    The pooled value is the token code itself, so h stays in the (same-batch) code subspace and can be
+    consumed by inner products downstream. All four requested token signals are present: the code via
+    the structural score + pooled value, and time/hop/ef via the logit.
     """
 
-    def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0):
+    def __init__(self, t2v_dim: int, d_ef: int):
         super().__init__()
-        self.d_emb = d_emb
         self.d_ef = d_ef
-        d_a = d_emb // 2                     # attention (query/key) dim, derived from d_emb
-        self.scale = 1.0 / math.sqrt(d_a)
-
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        # Query + key are SINGLE linear projections to d_a (a 2-layer projection overfits on wiki —
-        # depth is the regression, not width).
-        self.w_q = nn.Linear(d_emb, d_a)
-        # per-token key: content + time + log-hop position (1 scalar) + edge feats. The hop position
-        # enters as log1p(hop) inside the KEY (not an additive PE), so it can be learned/silenced;
-        # length-agnostic (a scalar function of the hop, works for any walk length).
-        k_in = d_emb + t2v_dim + 1 + d_ef
-        self.w_k = nn.Linear(k_in, d_a)
+        self.struct_scale = nn.Parameter(torch.tensor(1.0))          # weight on the co-reachability score
+        self.logit_bias = nn.Linear(t2v_dim + 1 + d_ef, 1)          # stable-feature attention bias → scalar
 
-    def forward(self, source: torch.Tensor, token_tangents: torch.Tensor,
-                ages: torch.Tensor, mask: torch.Tensor, positions: torch.Tensor,
-                edge_features: torch.Tensor) -> torch.Tensor:
-        """source [B,d_emb] (E[u]); token_tangents [B,T,d_emb] (Log_{E[u]}(E[token]), tangent at
-        E[u]); ages [B,T]; mask [B,T] bool (True = real token); positions [B,T] int hop-from-seed
-        (1=seed, 0=pad); edge_features [B,T,d_ef] per-token edge features (empty [B,T,0] when the
-        dataset has none). Returns mu_u [B,d_emb] tangent at E[u]; cold rows (no token) -> 0."""
-        # TPNet scales delta-times by log(Δt + 1) before the time encoder.
-        t2v = self.time_encoder(torch.log1p(ages.clamp_min(0.0)))             # [B,T,t2v_dim]
-        log_hop = torch.log1p(positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)   # [B,T,1] log-hop position
-        keys = self.w_k(torch.cat([token_tangents, t2v, log_hop, edge_features], dim=-1))   # [B,T,d_emb]
-        query = self.w_q(source)                                             # [B,d_emb]
+    def _token_edge_features(self, tokens: WalkTokens, q: int, t: int) -> torch.Tensor:
+        """Per-token edge features [Q, T, d_ef] aligned with the flattened bag ([Q, K, L*d_ef] →
+        [Q, K*L, d_ef]); an empty [Q, T, 0] tensor when the dataset has no edge features."""
+        if tokens.edge_features is not None:
+            _, k, length = tokens.nodes.shape
+            return tokens.edge_features.reshape(q, k, length, self.d_ef).reshape(q, t, self.d_ef)
+        return tokens.nodes.new_zeros((q, t, 0), dtype=torch.float32)
 
-        scores = (query.unsqueeze(1) * keys).sum(-1) * self.scale            # [B,T]
-        scores = scores.masked_fill(~mask, float("-inf"))
-        weights = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)   # cold row -> all 0
+    def forward(self, assoc: torch.Tensor, node_enc: torch.Tensor,
+                tokens: WalkTokens) -> tuple:
+        """assoc/node_enc from a (joint) NodeEncoding forward; tokens = one bag of Q queries.
+        Returns (x, h), each [Q, De]. Cold queries (no neighbourhood token) get h = 0."""
+        q = tokens.nodes.shape[0]
+        x = NodeEncoding.gather(assoc, node_enc, tokens.seeds)              # [Q, De]  seed's own code
 
-        return (weights.unsqueeze(-1) * token_tangents).sum(dim=-2)          # [B,d_emb]
+        ids, mask, pos = flatten_tokens(tokens, exclude_seed_positions=True)   # [Q, T] each
+        t = ids.shape[1]
+        tok_code = NodeEncoding.gather(assoc, node_enc, ids)               # [Q, T, De]
+        ages = tokens.ages.reshape(q, t).clamp_min(0)                      # [Q, T]
+
+        t2v = self.time_encoder(torch.log1p(ages.to(node_enc.dtype)))     # [Q, T, t2v]
+        log_hop = torch.log1p(pos.clamp_min(0).to(node_enc.dtype)).unsqueeze(-1)   # [Q, T, 1]
+        ef = self._token_edge_features(tokens, q, t)                      # [Q, T, d_ef]
+        stable = torch.cat([t2v, log_hop, ef], dim=-1)                    # [Q, T, t2v+1+d_ef]
+
+        struct = (x.unsqueeze(1) * tok_code).sum(-1)                      # [Q, T]  cos co-reachability
+        logit = self.struct_scale * struct + self.logit_bias(stable).squeeze(-1)   # [Q, T]
+        logit = logit.masked_fill(~mask, float("-inf"))
+        weights = torch.nan_to_num(torch.softmax(logit, dim=-1), nan=0.0)  # cold row → all 0
+        h = (weights.unsqueeze(-1) * tok_code).sum(dim=1)                 # [Q, De]
+        return x, h
 
 
-class LinkPredHead(nn.Module):
-    def __init__(self, num_nodes: int, d_emb: int,
-                 t2v_dim: int = 16, d_ef: int = 0):
+class StatelessLinkHead(nn.Module):
+    """Geometry-free, stateless link head (see module docstring). Owns the batch-local NodeEncoding,
+    the walk-neighbourhood encoder, and a tiny pairwise scorer over basis-invariant inner products."""
+
+    def __init__(self, num_nodes: int, d_emb: int, n_hops: int = 3,
+                 t2v_dim: int = 16, d_ef: int = 0, recency_lambda: float = 0.0):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_emb = d_emb
+        self.n_hops = n_hops
+        self.n_blocks = n_hops + 1
         self.d_ef = d_ef
-        self.eps = 1e-6
-        self.geom = SphereManifold()
 
-        self.E = nn.Embedding(num_nodes, d_emb)
-        nn.init.normal_(self.E.weight, mean=0.0, std=1.0 / math.sqrt(d_emb))
-        with torch.no_grad():
-            unit_rows = self.E.weight.data / self.E.weight.data.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-        self.E.weight = geoopt.ManifoldParameter(unit_rows, manifold=self.geom.manifold)
+        self.node_encoding = NodeEncoding(
+            num_nodes=num_nodes, dim=d_emb, n_hops=n_hops, recency_lambda=recency_lambda)
+        self.encoder = WalkNeighborhoodEncoder(t2v_dim=t2v_dim, d_ef=d_ef)
 
-        self.neighbourhood = NeighborhoodProjection(
-            d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef)
+        # Pairwise scorer: a small MLP over the four basis-invariant inner products of (x, h). The inner
+        # products are scalars (basis-invariant), so a learned MLP on them is legitimate.
+        self.scorer = nn.Sequential(
+            nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1))
 
-    def _token_edge_features(self, tokens: WalkTokens, q: int) -> torch.Tensor:
-        """Per-token edge features [Q, T, d_ef] aligned with the flattened token bag. tokens holds
-        edge_features as [Q, K, L*d_ef]; reshape to [Q, K*L, d_ef]. When the dataset has no edge
-        features (d_ef == 0) this is an empty [Q, T, 0] tensor (a no-op in the key concat)."""
-        _, k, length = tokens.nodes.shape
-        if tokens.edge_features is not None:
-            return tokens.edge_features.reshape(q, k, length, self.d_ef).reshape(q, k * length, self.d_ef)
-        return tokens.nodes.new_zeros((q, k * length, self.d_ef), dtype=torch.float32)
-
-    def _project(self, tokens: WalkTokens):
-        """Project one bag of N queries. Returns p [N, d] = exp_{E[seed]}(mu) on the sphere (seed
-        pushed toward its walk-token centroid)."""
-        e_weight = self.E.weight
-        e_seed = F.embedding(tokens.seeds, e_weight)                                  # E[x]  [N, d] (E is on-sphere)
-        n = e_seed.shape[0]
-
-        token_ids, token_mask, token_pos = flatten_tokens(
-            tokens, exclude_seed_positions=True)
-        token_ages = tokens.ages.reshape(n, -1).clamp_min(0)                          # ages read from the instance
-        token_ef = self._token_edge_features(tokens, n)                              # [N, T, d_ef]
-        token_emb = F.embedding(token_ids.clamp_min(0), e_weight)                     # [N, T, d]
-        token_tangent = self.geom.log_map(e_seed.unsqueeze(-2), token_emb)           # [N, T, d] tangent
-        mu = self.neighbourhood(
-            e_seed, token_tangent, token_ages.to(e_seed.dtype), token_mask, token_pos, token_ef)  # [N, d]
-        return self.geom.exp_map(e_seed, mu)                                         # P[x]  [N, d]
+    def _normalize_blocks(self, node_enc: torch.Tensor) -> torch.Tensor:
+        """Per-HOP-block L2 normalisation so every hop's co-reachability enters the inner product on
+        equal footing (raw block magnitudes shrink with diffusion depth; without this the largest block
+        would dominate every cosine). [U, n_blocks*dim] → same shape, each dim-block unit-norm."""
+        u = node_enc.shape[0]
+        blocks = node_enc.view(u, self.n_blocks, self.d_emb)
+        blocks = F.normalize(blocks, dim=-1)
+        return blocks.reshape(u, self.n_blocks * self.d_emb)
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Two-sided scoring (plumbing scaffold). src_tokens: B source queries (seeds = u). cand_tokens:
-        the B*C candidate queries (seeds = v) in query-major order, each walked with its query's cutoff.
-        Returns logits [B, C] = <P[u], P[v]>. NOTE: this geometric head is a throwaway — it is being
-        replaced by the stateless NodeEncoding model; only the two-bag (source + candidate) plumbing
-        matters here, so the actual logit value is irrelevant."""
-        p_u = self._project(src_tokens)                                       # P[u]  [B, d]
-        p_v = self._project(cand_tokens)                                      # P[v]  [B*C, d]
-        b, d = p_u.shape
-        p_v = p_v.reshape(b, -1, d)                                           # [B, C, d]
-        return self.geom.similarity(p_u.unsqueeze(1), p_v)                    # <P[u], P[v]>  [B, C]
+        """src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate queries (seeds = v)
+        in query-major order, each walked with its query's cutoff. Returns logits [B, C]."""
+        assoc, node_enc = self.node_encoding(src_tokens, cand_tokens)     # joint encode both bags
+        node_enc = self._normalize_blocks(node_enc)
+
+        x_u, h_u = self.encoder(assoc, node_enc, src_tokens)             # [B, De]
+        x_v, h_v = self.encoder(assoc, node_enc, cand_tokens)           # [B*C, De]
+
+        b, de = x_u.shape
+        x_v = x_v.reshape(b, -1, de)                                     # [B, C, De]
+        h_v = h_v.reshape(b, -1, de)                                     # [B, C, De]
+        x_u = x_u.unsqueeze(1)                                           # [B, 1, De]
+        h_u = h_u.unsqueeze(1)                                           # [B, 1, De]
+
+        feats = torch.stack([
+            (x_u * x_v).sum(-1),                                         # <x_u, x_v>  u–v co-reachability
+            (x_u * h_v).sum(-1),                                         # <x_u, h_v>
+            (h_u * x_v).sum(-1),                                         # <h_u, x_v>  is v in u's neighbourhood
+            (h_u * h_v).sum(-1),                                         # <h_u, h_v>  neighbourhood overlap
+        ], dim=-1)                                                       # [B, C, 4]
+        return self.scorer(feats).squeeze(-1)                           # [B, C]

@@ -1,4 +1,4 @@
-"""Per-query-causal training + eval loop — link-supervised geometric walk head (REACH).
+"""Per-query-causal training + eval loop — stateless, geometry-free walk head.
 
 Causality is enforced PER QUERY by Tempest's cutoff, not by ingestion order. The FULL graph
 (train + val + test) is ingested into Tempest ONCE up front (`ingest_full_graph`, a single
@@ -6,9 +6,9 @@ Causality is enforced PER QUERY by Tempest's cutoff, not by ingestion order. The
 (training):
   1. neg = neg_sampler.sample(batch)                 — [B, K_train] uniform negs
   2. candidates = [pos | negs]                       — [B, 1+K_train]
-  3. logits = score(src, candidates)                 — for each query (u_i, t_i) sample K
-       backward walks with cutoff = t_i (→ μ_u), pack to tokens, score with
-       LinkPredHead (identity + velocity-line). Candidate side samples no walks (static E[v]).
+  3. logits = score(src, candidates)                 — TWO-SIDED: sample K cutoff=t_i backward
+       walks for the source AND for every candidate, joint-encode both bags with the batch-local
+       NodeEncoding, pool each into (x, h) and score with StatelessLinkHead.
   4. L = cross_entropy(logits, target=0)             — Bruch 2019, upper-bounds 1-MRR
   5. one backward + single optimizer step
 
@@ -21,22 +21,19 @@ sees everything before t. This is exactly TPNet's prebuilt-time-index queried st
 per edge. The analysis-only stores (stratify) have no cutoff, so they are seeded explicitly over
 the causal-past splits.
 
-E (on the unit sphere) and the head are trained together by L (no alignment, no detach)
-by a single RiemannianAdam.
+There is NO learned node-embedding state — the head derives all structure from the walks via the
+batch-local, anonymized NodeEncoding — so only the head's few Euclidean params are trained (AdamW).
 
-TOKEN PREP — the source side (u → μ_u) goes through `walk_tokens.build_query_walk_tokens`:
-walks are generated PER QUERY (no dedup — each row's (node, t) needs its own cutoff) and returned
-in the RAW per-walk WalkTokens layout ([Q, K, L] nodes / nodes_mask / node-aligned timestamps,
-seeds + cutoffs). This RAW layout is the SHARED walk contract for every head; LinkPredHead
-flattens it to a [Q, K*L] token bag and masks padding + the seed node u via
-`walk_tokens.flatten_tokens`, then builds μ_u with a per-row softmax (ages =
-cutoffs − t_edge) and scores identity + velocity against E[v].
+TOKEN PREP — both sides go through `walk_tokens.build_query_walk_tokens`: walks are generated PER
+QUERY (no dedup — each row's (node, t) needs its own cutoff) and returned in the RAW per-walk
+WalkTokens layout ([Q, K, L] nodes / nodes_mask / node-aligned timestamps, seeds + cutoffs). The
+head jointly encodes the source + candidate bags and, per bag, flattens the walks to a [Q, K*L]
+token bag (`walk_tokens.flatten_tokens`) for the attention pooling.
 """
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
-import geoopt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -44,9 +41,8 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch, SplitData
 from .evaluator import Evaluator
-from .model import LinkPredHead
+from .model import StatelessLinkHead
 from .negatives import UniformNegativeSampler
-from .probes import CommunityProbe
 from .utils import make_lr_lambda
 from .walk_tokens import build_query_walk_tokens
 from .walks import WalkGenerator
@@ -62,13 +58,12 @@ class TrainerConfig:
     # Init only — never a per-step scaler.
     t_train: float = 1.0
 
-    # Model.
-    d_emb: int = 128
-    d_ef: int = 0             # per-edge-feature dim (0 = dataset has no edge features); fed into the
-                             # NeighborhoodProjection attention keys. Set from the loaded dataset.
-
-    # NeighborhoodProjection (attention pooling of the source's walk-token offsets -> mu_u).
-    t2v_dim: int = 16         # Time2Vec output dim (16 ties dim100 on wiki: 0.8287/0.8040 vs 0.8289/0.8046)
+    # Model — stateless NodeEncoding + walk-neighbourhood attention head.
+    d_emb: int = 128          # NodeEncoding random-feature width per hop-block (JL basis dim).
+    n_hops: int = 3           # diffusion depth: node_enc = [X0, ÂX0, …, Âⁿ X0], width (n_hops+1)*d_emb.
+    d_ef: int = 0             # per-edge-feature dim (0 = dataset has no edge features); enters the
+                             # attention logit as a stable per-token feature. Set from the loaded dataset.
+    t2v_dim: int = 16         # Time2Vec output dim for the per-token age feature.
 
     # Link loss / head.
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
@@ -82,11 +77,9 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
 
-    # Optimisation — cosine decay to lr_min over decay_horizon_epochs (no warmup). ONE param group:
-    # RiemannianAdam applies the Riemannian update to E (a geoopt.ManifoldParameter) and standard Adam
-    # to the Euclidean params, all under the same LR. weight_decay is LOAD-BEARING on the sphere head:
-    # an A/B showed wd 1e-4 reached ~0.828/0.803 while no-wd capped ~0.825/0.797 (the test-gap>val-gap
-    # signature of a lost regulariser).
+    # Optimisation — AdamW, single group, cosine decay to lr_min over decay_horizon_epochs (no warmup).
+    # No manifold params anymore (no learned E), so plain AdamW. weight_decay was load-bearing on the
+    # old sphere head; carried over as the default regulariser (re-validate on the stateless head).
     lr: float = 1e-3
     lr_min: float = 1e-7
     weight_decay: float = 1e-4
@@ -113,10 +106,11 @@ class Trainer:
         self.device = device or torch.device(
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
-        # Single module owning the sphere node embeddings AND the velocity head.
-        self.model = LinkPredHead(
+        # Stateless, geometry-free head: batch-local NodeEncoding + walk-neighbourhood attention.
+        self.model = StatelessLinkHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
+            n_hops=int(config.n_hops),
             t2v_dim=int(config.t2v_dim),
             d_ef=int(config.d_ef),
         ).to(self.device)
@@ -135,12 +129,10 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # ONE param group: RiemannianAdam applies the Riemannian update to E (a geoopt.ManifoldParameter)
-        # and standard Adam to the Euclidean params, all under one LR + cosine floor.
-        self.opt = geoopt.optim.RiemannianAdam(
-            [{"params": list(self.model.parameters()),
-              "lr": float(config.lr), "weight_decay": float(config.weight_decay)}],
-            stabilize=10,
+        # Plain AdamW over the head's (few) Euclidean params — one LR group + cosine floor.
+        self.opt = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=float(config.lr), weight_decay=float(config.weight_decay),
         )
 
         self.sched: Optional[LambdaLR] = None
@@ -341,18 +333,9 @@ class Trainer:
         n_epochs = self.config.num_epochs
         patience = self.config.early_stop_patience
 
-        # One pass over the train batches: count them AND collect the full edge set (for the
-        # community probe's fixed Louvain graph — built once).
-        src_all, dst_all, batches_per_epoch = [], [], 0
-        for b in train_batches_factory():
-            src_all.append(np.asarray(b.src))
-            dst_all.append(np.asarray(b.tgt))
-            batches_per_epoch += 1
+        # One pass over the train batches just to count them (LR schedule horizon).
+        batches_per_epoch = sum(1 for _ in train_batches_factory())
         self._setup_lr_scheduler(batches_per_epoch)
-        self.comm_probe = CommunityProbe(
-            np.concatenate(src_all), np.concatenate(dst_all), self.config.num_nodes)
-        print(f"  CommunityProbe: {self.comm_probe.n_comms} Louvain communities "
-              f"(Q={self.comm_probe.q:.3f}); random-neighbour null purity={self.comm_probe.null:.3f}")
 
         best_val, best_test, best_epoch = -1.0, -1.0, -1
         best_snap: Optional[Dict[str, Any]] = None
@@ -377,9 +360,6 @@ class Trainer:
                 f"lr={self.opt.param_groups[0]['lr']:.1e}  "
                 f"train {train_dt:.1f}s"
             )
-            cp = self.comm_probe.measure(self.model.E.weight.detach())     # community-formation probe
-            line += f"  commP={cp:.3f}(x{cp / max(self.comm_probe.null, 1e-9):.1f})"
-
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()
                 val_metric = self._eval(val_evaluator, val_batches_factory())
