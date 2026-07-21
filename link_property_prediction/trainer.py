@@ -37,13 +37,11 @@ from typing import Any, Dict, Iterable, List, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import StatelessLinkHead
 from .negatives import UniformNegativeSampler
-from .utils import make_lr_lambda
 from .walk_tokens import build_query_walk_tokens
 from .walks import WalkGenerator
 
@@ -80,21 +78,13 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
 
-    # Optimisation — AdamW, single group, cosine decay to lr_min over decay_horizon_epochs (no warmup).
-    # No manifold params anymore (no learned E), so plain AdamW. weight_decay was load-bearing on the
-    # old sphere head; carried over as the default regulariser (re-validate on the stateless head).
+    # Optimisation — plain AdamW at a constant LR (no scheduler / decay / warmup). The stateless head is
+    # tiny (~few hundred params) and trains smoothly at a flat LR; weight_decay is the only regulariser.
     lr: float = 1e-3
-    lr_min: float = 1e-7
     weight_decay: float = 1e-4
 
     # Run control.
     num_epochs: int = 25
-    # LR-decay horizon in epochs — SEPARATE from num_epochs, ONE value shared by BOTH LR groups. The
-    # per-group cosine reaches each group's lr_min at decay_horizon_epochs, so num_epochs < horizon
-    # keeps LR near peak (freedom to run any epoch count without rescaling the schedule). NOTE: the
-    # ball head's cliff-free "freeze-at-peak" was tuned with horizon == num_epochs == 25 (fast decay);
-    # default 50 with num_epochs 25 leaves LR ~half-decayed at stop — set horizon 25 to reproduce it.
-    decay_horizon_epochs: int = 30
     early_stop_patience: int = 10
 
     # System.
@@ -133,32 +123,11 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # Plain AdamW over the head's (few) Euclidean params — one LR group + cosine floor.
+        # Plain AdamW at a constant LR — no scheduler (like GraphMixer/TPNet, which both train temporal
+        # link prediction at a flat LR with no decay/warmup).
         self.opt = torch.optim.AdamW(
             self.model.parameters(),
             lr=float(config.lr), weight_decay=float(config.weight_decay),
-        )
-
-        self.sched: Optional[LambdaLR] = None
-        self._global_step = 0
-
-    # ──────────────────────────────────────────────────────────────────
-    # LR schedule (cosine)
-    # ──────────────────────────────────────────────────────────────────
-
-    def _setup_lr_scheduler(self, batches_per_epoch: int) -> None:
-        # Cosine decay to lr_min over decay_horizon_epochs (no warmup); one lambda for the single group.
-        decay_steps = self.config.decay_horizon_epochs * max(batches_per_epoch, 1)
-        peak, floor = float(self.config.lr), float(self.config.lr_min)
-        pg = self.opt.param_groups[0]
-        pg["lr"] = peak
-        pg["initial_lr"] = peak
-        ratio = floor / peak if peak > 0 else 0.0
-        self.sched = LambdaLR(self.opt, lr_lambda=make_lr_lambda(decay_steps, ratio))
-        self._global_step = 0
-        print(
-            f"  LR schedule (cosine): {peak:.1e}->{floor:.1e}; "
-            f"decay_horizon={decay_steps} ({self.config.decay_horizon_epochs}ep x {batches_per_epoch} batches)"
         )
 
     # ──────────────────────────────────────────────────────────────────
@@ -242,9 +211,6 @@ class Trainer:
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         self.opt.step()
-        if self.sched is not None:
-            self.sched.step()
-            self._global_step += 1
 
         return {
             "link": float(loss.detach()),
@@ -338,10 +304,6 @@ class Trainer:
 
         n_epochs = self.config.num_epochs
         patience = self.config.early_stop_patience
-
-        # One pass over the train batches just to count them (LR schedule horizon).
-        batches_per_epoch = sum(1 for _ in train_batches_factory())
-        self._setup_lr_scheduler(batches_per_epoch)
 
         best_val, best_test, best_epoch = -1.0, -1.0, -1
         best_snap: Optional[Dict[str, Any]] = None
