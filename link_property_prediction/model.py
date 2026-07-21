@@ -165,7 +165,8 @@ class WalkNeighborhoodEncoder(nn.Module):
         self.d_ef = d_ef
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
         self.struct_scale = nn.Parameter(torch.tensor(1.0))          # weight on the co-reachability score
-        self.logit_bias = nn.Linear(t2v_dim + 1 + d_ef, 1)          # stable-feature attention bias → scalar
+        self.logit_bias = nn.Sequential(                            # V7: nonlinear (deeper) attention logit
+            nn.Linear(t2v_dim + 1 + d_ef, 16), nn.GELU(), nn.Linear(16, 1))
 
     def _token_edge_features(self, tokens: WalkTokens, q: int, t: int) -> torch.Tensor:
         """Per-token edge features [Q, T, d_ef] aligned with the flattened bag ([Q, K, L*d_ef] →
