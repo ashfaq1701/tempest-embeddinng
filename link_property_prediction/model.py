@@ -2,20 +2,20 @@
 
 No learned node-embedding table, no manifold. A pair (u, v) is scored purely from Tempest's
 MULTI-HOP temporal walks (the differentiator vs GraphMixer/TPNet's 1-hop neighbours), turned into
-structural signal by a batch-local, anonymized `NodeEncoding` and pooled by a light attention head:
+structural signal by a batch-local `NodeEncoding` and pooled by a light attention head:
 
     logit(u, v) = MLP( ⟨seed_u, seed_v⟩, ⟨seed_u, nbhd_v⟩, ⟨nbhd_u, seed_v⟩, ⟨nbhd_u, nbhd_v⟩ )
 
 where seed_x = the node's own structural code (seed row of NodeEncoding) and nbhd_x = a recency/
 structure-weighted aggregation of x's walk neighbourhood (WalkNeighborhoodEncoder). Both bags (source +
-candidate) are JOINTLY encoded so they share one batch-local graph and one random basis.
+candidate) are jointly encoded so they share one batch-local graph.
 
-THE BASIS CONSTRAINT (load-bearing): NodeEncoding draws a fresh random X0 each batch, so a node's
-raw code lives in a random subspace that rotates batch-to-batch. Learned dense layers on raw codes
-would see random inputs and can't learn a stable function. Codes are therefore consumed ONLY through
-inner products — attention scores (cos(seed, token)) and the final pairwise dot products — which are
-invariant to the random basis. Time/hop/edge features (stable across batches) are the only inputs to
-learned linears; they drive the attention logits.
+FIXED BASIS: NodeEncoding uses a PERMANENT per-node-id random fingerprint (drawn once), so a node's
+coordinates are stable across batches. Unlike the anonymized fresh-basis variant (where the basis
+rotated each batch and codes were usable ONLY via inner products), the fixed basis lifts that
+constraint — the codes are now MLP-usable and carry cross-batch recurrence. The current head still
+consumes them via inner-product attention; an MLP consumer that exploits the stable coordinates is the
+next step on this branch.
 """
 from typing import Optional
 
@@ -35,12 +35,14 @@ class NodeEncoding(nn.Module):
 
         A        = batch-local recency-weighted (undirected) adjacency [U, U] from consecutive walk steps
         Â        = D^-1 A                                    (random-walk transition)
-        X0       = random Gaussian features [U, dim]         (JL basis; fresh each batch — anonymized)
+        X0       = per-id fixed fingerprints [U, dim]        (rows gathered from x0_table by global id)
         node_enc = [ X0 ; Â X0 ; Â² X0 ; … ; Âⁿ X0 ]         [U, (n_hops+1)·dim]
 
     By Johnson–Lindenstrauss, <Xk[i], Xk[j]> ≈ <Âᵏ[i,:], Âᵏ[j,:]> = the k-hop co-reachability of nodes
-    i and j — so the encoding carries multi-hop structure at fixed width, with no learned state and no
-    global node ids (identity-free / anonymized). Nodes that appear with no edges get [X0, 0, …, 0].
+    i and j — so the encoding carries multi-hop structure at fixed width with no learned state. The basis
+    is FIXED (one permanent random row per global node id, drawn once), so a node's coordinates are stable
+    across batches — usable by learned MLPs, and carrying cross-batch recurrence. Nodes that appear with
+    no edges get [X0, 0, …, 0].
 
     forward(tokens) -> (assoc, node_enc):
         assoc     [num_nodes] int64  global id -> local row in [0, U); -1 for nodes absent this batch.
@@ -49,13 +51,18 @@ class NodeEncoding(nn.Module):
     """
 
     def __init__(self, num_nodes: int, dim: int, n_hops: int,
-                 recency_lambda: float = 0.0, undirected: bool = True):
+                 recency_lambda: float = 0.0, undirected: bool = True, basis_seed: int = 0):
         super().__init__()
         self.num_nodes = num_nodes
         self.dim = dim
         self.n_hops = n_hops
         self.recency_lambda = recency_lambda
         self.undirected = undirected
+        # Permanent per-node-id random basis: one fixed row per node, drawn once (seeded). A node's code
+        # is therefore stable across batches — the coordinates mean the same thing every batch, so the
+        # codes are usable by learned MLPs and carry cross-batch recurrence. Non-learned buffer.
+        gen = torch.Generator().manual_seed(basis_seed)
+        self.register_buffer("x0_table", torch.randn(num_nodes, dim, generator=gen))
 
     def forward(self, tokens: WalkTokens, other: Optional[WalkTokens] = None):
         """Encode one bag, or JOINTLY encode two bags (e.g. source + candidate walks). When `other` is
@@ -86,8 +93,9 @@ class NodeEncoding(nn.Module):
             si, di = torch.cat([si, di]), torch.cat([di, si])
             w = torch.cat([w, w])
 
-        # 3. random base features, then multi-hop diffusion Â X over the (joint) batch-local graph.
-        x0 = torch.randn(u, self.dim, device=device)                                   # [U, dim] JL basis
+        # 3. base features — each present node's PERMANENT fingerprint (gathered by global id) — then
+        #    multi-hop diffusion Â X over the (joint) batch-local graph.
+        x0 = self.x0_table[present]                                                     # [U, dim] per-id fingerprint
         blocks = [x0]
         if si.numel() > 0:
             adj = torch.sparse_coo_tensor(torch.stack([si, di]), w, (u, u)).coalesce()  # [U,U] weighted

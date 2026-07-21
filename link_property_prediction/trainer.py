@@ -22,7 +22,8 @@ per edge. The analysis-only stores (stratify) have no cutoff, so they are seeded
 the causal-past splits.
 
 There is NO learned node-embedding state — the head derives all structure from the walks via the
-batch-local, anonymized NodeEncoding — so only the head's few Euclidean params are trained (AdamW).
+batch-local NodeEncoding (a fixed per-id random basis diffused over the walk graph) — so only the
+head's few Euclidean params are trained (AdamW).
 
 TOKEN PREP — both sides go through `walk_tokens.build_query_walk_tokens`: walks are generated PER
 QUERY (no dedup — each row's (node, t) needs its own cutoff) and returned in the RAW per-walk

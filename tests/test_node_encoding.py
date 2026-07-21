@@ -5,11 +5,14 @@ EVERY test runs on the real graph in tests/data/sample_data.csv, walked by real 
 the diffusion, built by explicit per-walk edge enumeration (a genuinely different implementation from
 the module's vectorized slicing) so shared-recipe bugs are caught.
 
+The basis is FIXED: one permanent random fingerprint per global node id (x0_table). Tests that need the
+JL EXPECTATION average over many re-seeded tables (the randomness is over the basis draw, not per batch).
+
 Properties verified against real bags:
   - exact diffusion  node_enc == [X0, ÂX0, …, ÂⁿX0]  (Â = D⁻¹A over the walk-induced graph),
   - recency weighting from the OLDER endpoint using real ages,
-  - co-reachability statistics  E[<Xk[i],Xk[j]>] = dim·<Âᵏ[i,:],Âᵏ[j,:]>  (JL),
-  - anonymization  (relabelling node ids leaves the structural inner-products unchanged),
+  - co-reachability statistics  E[<Xk[i],Xk[j]>] = dim·<Âᵏ[i,:],Âᵏ[j,:]>  (JL, over re-seeded bases),
+  - fixed basis: a node's code is keyed to its global id — stable across batches (identity-keyed),
   - joint two-bag encoding == diffusion over the UNION graph, incl. cross-bag co-reachability,
   - directed mode, shape/assoc/determinism, empty and seed-only (isolated) bags.
 """
@@ -157,11 +160,11 @@ def test_coreachability_statistics_hold():
     An = np.linalg.matrix_power(Ahat, n_hops)
     C = torch.from_numpy(An @ An.T).float()                     # true n-hop co-reachability Gram
 
-    enc = NodeEncoding(NUM_NODES, dim, n_hops, recency_lambda=0.0)
-    torch.manual_seed(0)
+    # Average over the RANDOM BASIS: a fresh fingerprint table each draw (fixed within a draw). The
+    # empirical Gram then estimates E over the basis of dim·<Âⁿ[i,:], Âⁿ[j,:]>.
     gram = torch.zeros(len(present), len(present))
-    for _ in range(draws):
-        _, ne = enc(bag)
+    for d in range(draws):
+        _, ne = NodeEncoding(NUM_NODES, dim, n_hops, recency_lambda=0.0, basis_seed=d)(bag)
         xk = ne[:, n_hops * dim:(n_hops + 1) * dim]
         gram += (xk @ xk.t()) / dim
     gram /= draws
@@ -172,39 +175,26 @@ def test_coreachability_statistics_hold():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ③ anonymization: relabelling node ids leaves structural inner-products unchanged
+# ③ fixed basis: a node's code is keyed to its GLOBAL id — stable across batches
 # ══════════════════════════════════════════════════════════════════════════════
-def test_anonymization_relabel_invariant():
+def test_fixed_basis_stable_across_batches():
+    """The same node in two DIFFERENT bags gets the SAME base fingerprint (block 0), equal to its
+    permanent x0_table row — i.e. keyed to identity, not to the batch (this is what makes the codes
+    MLP-usable / recurrence-aware). NB: relabelling ids WOULD change it — the fixed basis is deliberately
+    identity-keyed, not anonymized."""
     np.random.seed(4)
-    seeds = np.random.choice(NUM_NODES, 3, replace=False)
-    bag = real_bag(seeds, n_walks=5, max_len=4)
-    dim, n_hops, draws = 48, 2, 500
+    dim, n_hops = 32, 2
+    picks = np.random.choice(NUM_NODES, 8, replace=False)
+    enc = NodeEncoding(NUM_NODES, dim, n_hops)
+    a_assoc, a_enc = enc(real_bag(picks[:5], n_walks=5, max_len=4))
+    b_assoc, b_enc = enc(real_bag(picks[3:], n_walks=5, max_len=4))     # overlaps on picks[3:5] (both are seeds)
 
-    perm = torch.randperm(NUM_NODES)
-    nodes2 = torch.where(bag.nodes_mask, perm[bag.nodes.clamp_min(0)], bag.nodes)
-    bag2 = WalkTokens(seeds=perm[bag.seeds], nodes=nodes2, nodes_mask=bag.nodes_mask,
-                      ages=bag.ages, cutoffs=bag.cutoffs)
-
-    enc = NodeEncoding(NUM_NODES, dim, n_hops, recency_lambda=0.0)
-
-    def global_gram(b, seed):
-        torch.manual_seed(seed)
-        g = torch.zeros(NUM_NODES, NUM_NODES)
-        for _ in range(draws):
-            assoc, ne = enc(b)
-            xk = ne[:, n_hops * dim:(n_hops + 1) * dim]
-            present = (assoc >= 0).nonzero(as_tuple=True)[0]
-            local = assoc[present]
-            g[present[:, None], present[None, :]] += (xk[local] @ xk[local].t()) / dim
-        return g / draws
-
-    g1 = global_gram(bag, 0)
-    g2 = global_gram(bag2, 0)
-    # g2 is g1 with rows/cols permuted by `perm`; undo it and compare on the original present set.
-    present = (g1.abs().sum(1) > 0).nonzero(as_tuple=True)[0]
-    for a in present.tolist():
-        for b in present.tolist():
-            assert abs(g1[a, b].item() - g2[perm[a], perm[b]].item()) < 0.03
+    shared = ((a_assoc >= 0) & (b_assoc >= 0)).nonzero(as_tuple=True)[0]
+    assert shared.numel() > 0
+    for g in shared.tolist():
+        base_a, base_b = a_enc[a_assoc[g], :dim], b_enc[b_assoc[g], :dim]
+        assert torch.equal(base_a, base_b)                             # same id → same fingerprint across batches
+        assert torch.equal(base_a, enc.x0_table[g])                    # and it IS the permanent table row
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -235,11 +225,9 @@ def test_joint_cross_bag_coreachability():
     An = np.linalg.matrix_power(Ahat, n_hops)
     C = torch.from_numpy(An @ An.T).float()
 
-    enc = NodeEncoding(NUM_NODES, dim, n_hops, recency_lambda=0.0)
-    torch.manual_seed(0)
     gram = torch.zeros(len(present), len(present))
-    for _ in range(draws):
-        a, ne = enc(bag_a, bag_b)                               # JOINT
+    for d in range(draws):
+        a, ne = NodeEncoding(NUM_NODES, dim, n_hops, recency_lambda=0.0, basis_seed=d)(bag_a, bag_b)  # JOINT
         idx = a[torch.tensor(present)]
         xk = ne[idx][:, n_hops * dim:(n_hops + 1) * dim]
         gram += (xk @ xk.t()) / dim
