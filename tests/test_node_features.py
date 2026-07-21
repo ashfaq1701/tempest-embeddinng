@@ -82,21 +82,20 @@ def test_none_when_no_node_feat():
 
 def test_head_consumes_node_features():
     """StatelessLinkHead(d_nf>0) runs on bags carrying node features and produces finite, differentiable
-    logits. Node features enter as the ⟨seed_nf, token_nf⟩ affinity (weighted by nf_weight), NOT through
-    the time-bias MLP — so the MLP width is unchanged and nf_weight receives gradient."""
+    logits. Node features enter the per-token MLP as part of the token descriptor, so the MLP's input
+    width widens by exactly d_nf (both the per-token key nf and the seed's own nf go through it)."""
     rng = np.random.default_rng(1)
-    d_nf = 4
+    d_emb, n_hops, t2v_dim, d_nf = 16, 3, 16, 4
     node_feat = rng.standard_normal((NUM_NODES, d_nf)).astype(np.float32)
     wg = _walk_gen()
     src = _bag(wg, np.array([3, 4]), node_feat)
     cand = _bag(wg, np.array([5, 6, 7, 8]), node_feat)          # 2 queries × 2 candidates
 
-    head = StatelessLinkHead(NUM_NODES, d_emb=16, n_hops=3, t2v_dim=16, d_ef=0, d_nf=d_nf)
+    head = StatelessLinkHead(NUM_NODES, d_emb=d_emb, n_hops=n_hops, t2v_dim=t2v_dim, d_ef=0, d_nf=d_nf)
     logits = head(src, cand)
     assert logits.shape == (2, 2)
     assert torch.isfinite(logits).all()
     logits.sum().backward()
-    # node features stay OUT of the time-bias MLP (input width == t2v(16) + hop(1) + d_ef(0)); they enter
-    # via the affinity term, so nf_weight must have received a gradient.
-    assert head.encoder.attn_bias_mlp[0].in_features == 16 + 1 + 0
-    assert head.encoder.nf_weight.grad is not None and head.encoder.nf_weight.grad.abs().item() >= 0.0
+    # token_mlp input = node_enc((n_hops+1)*d_emb) ‖ t2v ‖ log_hop(1) ‖ d_ef(0) ‖ d_nf — so d_nf is in it.
+    d_code = (n_hops + 1) * d_emb
+    assert head.encoder.token_mlp[1].in_features == d_code + t2v_dim + 1 + 0 + d_nf
