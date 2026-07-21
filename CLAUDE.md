@@ -25,6 +25,12 @@ nonlinear GELU attention logit), 0.8636/0.8463, +0.007 test over the linear-logi
 overfit; capacity on the random CODES or the SCORER overfits ((h,h)-only loses, mean-pool drifts,
 pooled-stable-channel opens a −0.022 test gap, hop-resolved scorer ties, dropout inert).
 
+**FULL-WIKI VALIDATION (V7, non-subsampled, k-train=100, 2026-07-21):** val **0.8704** / test
+**0.8533** — and it was STILL IMPROVING at the 18-epoch cap (set its best on the last epoch; patience
+never triggered), so the true peak is higher — RUN MORE EPOCHS (≥30, longer `--decay-horizon-epochs`).
+This beats the old geometric head (~0.830/0.804) by ~+0.040 val / +0.049 test. ~9 min/epoch on the
+8 GB laptop (train ~183 s + 999-neg eval ~370 s); the server's bigger GPU should raise `--eval-batch-size`.
+
 **For the server run (review / coin / comment / flight — a DIFFERENT agent, more GPU):** run V7 as-is
 (`scripts/train_link_property_prediction.py`; knobs `--n-hops` default 3, `--d-emb`, `--t2v-dim`,
 `--k-train`). Full-wiki two-bag is ~10 min/epoch (candidate walking is C×). On COLD-START / new-pair-
