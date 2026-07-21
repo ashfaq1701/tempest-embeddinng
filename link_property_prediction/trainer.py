@@ -65,9 +65,6 @@ class TrainerConfig:
                              # attention logit as a stable per-token feature. Set from the loaded dataset.
     node_feat: Optional[np.ndarray] = None   # [num_nodes, d_nf] static node-feature table (None if absent).
     t2v_dim: int = 16         # Time2Vec output dim for the per-token age feature.
-    fixed_basis: bool = False # NodeEncoding base features: False = fresh anonymized draw per batch (inner-
-                             # product only); True = permanent per-id fingerprint (stable across batches,
-                             # MLP-usable, captures recurrence). See NodeEncoding.
 
     # Link loss / head.
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
@@ -111,7 +108,6 @@ class Trainer:
             t2v_dim=int(config.t2v_dim),
             d_ef=int(config.d_ef),
             d_nf=int(config.d_nf),
-            fixed_basis=bool(config.fixed_basis),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.

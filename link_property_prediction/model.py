@@ -49,28 +49,13 @@ class NodeEncoding(nn.Module):
     """
 
     def __init__(self, num_nodes: int, dim: int, n_hops: int,
-                 recency_lambda: float = 0.0, undirected: bool = True,
-                 fixed_basis: bool = False, basis_seed: int = 0):
+                 recency_lambda: float = 0.0, undirected: bool = True):
         super().__init__()
         self.num_nodes = num_nodes
         self.dim = dim
         self.n_hops = n_hops
         self.recency_lambda = recency_lambda
         self.undirected = undirected
-        # Base features. Fixed basis → a PERMANENT per-node-id random fingerprint, built once here as a
-        # (non-learned) buffer, so a node's code is stable across batches (MLP-usable, captures recurrence).
-        # Fresh basis → a new anonymized draw each batch (inner-product-only). The source is selected ONCE
-        # so forward() stays a single call, no per-batch branch.
-        if fixed_basis:
-            gen = torch.Generator().manual_seed(basis_seed)
-            self.register_buffer("x0_table", torch.randn(num_nodes, dim, generator=gen))
-        self._base_features = self._fixed_base if fixed_basis else self._fresh_base
-
-    def _fixed_base(self, present: torch.Tensor) -> torch.Tensor:
-        return self.x0_table[present]                                                   # [U, dim] permanent per-id row
-
-    def _fresh_base(self, present: torch.Tensor) -> torch.Tensor:
-        return torch.randn(present.numel(), self.dim, device=present.device)            # [U, dim] fresh draw
 
     def forward(self, tokens: WalkTokens, other: Optional[WalkTokens] = None):
         """Encode one bag, or JOINTLY encode two bags (e.g. source + candidate walks). When `other` is
@@ -101,8 +86,8 @@ class NodeEncoding(nn.Module):
             si, di = torch.cat([si, di]), torch.cat([di, si])
             w = torch.cat([w, w])
 
-        # 3. base features (fixed per-id fingerprint or fresh draw), then multi-hop diffusion Â X.
-        x0 = self._base_features(present)                                              # [U, dim]
+        # 3. random base features, then multi-hop diffusion Â X over the (joint) batch-local graph.
+        x0 = torch.randn(u, self.dim, device=device)                                   # [U, dim] JL basis
         blocks = [x0]
         if si.numel() > 0:
             adj = torch.sparse_coo_tensor(torch.stack([si, di]), w, (u, u)).coalesce()  # [U,U] weighted
@@ -265,16 +250,14 @@ class StatelessLinkHead(nn.Module):
     the walk-neighbourhood encoder, and a tiny pairwise scorer over basis-invariant inner products."""
 
     def __init__(self, num_nodes: int, d_emb: int, n_hops: int = 3,
-                 t2v_dim: int = 16, d_ef: int = 0, d_nf: int = 0, recency_lambda: float = 0.0,
-                 fixed_basis: bool = False):
+                 t2v_dim: int = 16, d_ef: int = 0, d_nf: int = 0, recency_lambda: float = 0.0):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_ef = d_ef
         self.d_nf = d_nf
 
         self.node_encoding = NodeEncoding(
-            num_nodes=num_nodes, dim=d_emb, n_hops=n_hops, recency_lambda=recency_lambda,
-            fixed_basis=fixed_basis)
+            num_nodes=num_nodes, dim=d_emb, n_hops=n_hops, recency_lambda=recency_lambda)
         self.encoder = WalkNeighborhoodEncoder(t2v_dim=t2v_dim, d_ef=d_ef, d_nf=d_nf)
 
         # Pairwise scorer: a small MLP over the four basis-invariant inner products between u's and v's
