@@ -189,11 +189,11 @@ class Trainer:
                t_query_t: torch.Tensor) -> torch.Tensor:
         """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> logits [B, C].
 
-        ONE-SIDED per-query walks: the SOURCE side samples K backward walks for each query (u_i, t_i)
-        with cutoff = t_i, so every token has t_edge < t_i (strict causal past of that query). The
-        candidate side samples NO walks — each v enters only through its static embedding E[v]. Strict
-        causality comes from the per-query cutoff, NOT from ingestion order, so the batch may already
-        be in Tempest."""
+        TWO-SIDED per-query walks: the SOURCE side samples K backward walks for each query (u_i, t_i)
+        with cutoff = t_i; the CANDIDATE side samples K backward walks for every candidate v_ij with the
+        SAME cutoff t_i (so both sides are causal as of the query time). Both bags flow to the head.
+        (Plumbing scaffold: the current geometric head is a placeholder — only the two-bag sampling
+        matters. Cost: the candidate side is C queries per positive, ~C× the source walks.)"""
         device = self.device
 
         # SOURCE side: per-query (u_i, t_i) → K cutoff=t_i backward walks → raw [B,K,L] token bag.
@@ -204,7 +204,19 @@ class Trainer:
             start_bias=self.config.start_bias,
             walk_bias=self.config.walk_bias)
 
-        return self.model(src_tokens, cand_t)   # cand_t = candidate node ids; head owns E
+        # CANDIDATE side: walk every candidate v with its query's cutoff t_i. Flatten [B,C] → [B*C]
+        # query-major; each candidate inherits its query's cutoff so its walk is causal.
+        b, c = cand_t.shape
+        cand_seeds = cand_t.reshape(-1)                                  # [B*C]
+        cand_cutoffs = t_query_t.unsqueeze(1).expand(b, c).reshape(-1)   # [B*C]
+        cand_tokens = build_query_walk_tokens(
+            self.walk_gen, device, cand_seeds, cand_cutoffs,
+            max_walk_len=self.config.max_walk_len,
+            num_walks_per_node=self.config.num_walks_per_node,
+            start_bias=self.config.start_bias,
+            walk_bias=self.config.walk_bias)
+
+        return self.model(src_tokens, cand_tokens)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step

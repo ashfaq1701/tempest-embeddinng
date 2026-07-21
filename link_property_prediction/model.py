@@ -276,9 +276,14 @@ class LinkPredHead(nn.Module):
             e_seed, token_tangent, token_ages.to(e_seed.dtype), token_mask, token_pos, token_ef)  # [N, d]
         return self.geom.exp_map(e_seed, mu)                                         # P[x]  [N, d]
 
-    def forward(self, src_tokens: WalkTokens, cand_ids: torch.Tensor) -> torch.Tensor:
-        """One-sided scoring. src_tokens: B source queries (seeds = u); cand_ids [B, C] candidate
-        node ids. Returns logits [B, C] = <P[u], E[v]> — is v near u's neighbourhood?"""
+    def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
+        """Two-sided scoring (plumbing scaffold). src_tokens: B source queries (seeds = u). cand_tokens:
+        the B*C candidate queries (seeds = v) in query-major order, each walked with its query's cutoff.
+        Returns logits [B, C] = <P[u], P[v]>. NOTE: this geometric head is a throwaway — it is being
+        replaced by the stateless NodeEncoding model; only the two-bag (source + candidate) plumbing
+        matters here, so the actual logit value is irrelevant."""
         p_u = self._project(src_tokens)                                       # P[u]  [B, d]
-        candidate = F.embedding(cand_ids, self.E.weight)                      # E[v]  [B, C, d] (E on-sphere)
-        return self.geom.similarity(p_u.unsqueeze(1), candidate)              # <P[u], E[v]>  [B, C]
+        p_v = self._project(cand_tokens)                                      # P[v]  [B*C, d]
+        b, d = p_u.shape
+        p_v = p_v.reshape(b, -1, d)                                           # [B, C, d]
+        return self.geom.similarity(p_u.unsqueeze(1), p_v)                    # <P[u], P[v]>  [B, C]
