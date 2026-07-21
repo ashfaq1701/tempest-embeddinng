@@ -13,6 +13,7 @@ at matched walks it lost to one-sided at ~8x the cost. It lives one `git revert`
 "Important: revert this commit to bring back dual side walks" commit.)
 """
 import math
+from typing import Optional
 
 import geoopt
 import numpy as np
@@ -21,6 +22,89 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .walk_tokens import WalkTokens, flatten_tokens
+
+
+class NodeEncoding(nn.Module):
+    """Stateless, batch-local node embedding — a drop-in replacement for a learned E table.
+
+    Per batch, builds the local walk graph from the WalkTokens, then encodes every node that appears
+    (walk nodes + query seeds) by a MULTI-HOP diffusion of random features over that graph:
+
+        A        = batch-local recency-weighted (undirected) adjacency [U, U] from consecutive walk steps
+        Â        = D^-1 A                                    (random-walk transition)
+        X0       = random Gaussian features [U, dim]         (JL basis; fresh each batch — anonymized)
+        node_enc = [ X0 ; Â X0 ; Â² X0 ; … ; Âⁿ X0 ]         [U, (n_hops+1)·dim]
+
+    By Johnson–Lindenstrauss, <Xk[i], Xk[j]> ≈ <Âᵏ[i,:], Âᵏ[j,:]> = the k-hop co-reachability of nodes
+    i and j — so the encoding carries multi-hop structure at fixed width, with no learned state and no
+    global node ids (identity-free / anonymized). Nodes that appear with no edges get [X0, 0, …, 0].
+
+    forward(tokens) -> (assoc, node_enc):
+        assoc     [num_nodes] int64  global id -> local row in [0, U); -1 for nodes absent this batch.
+        node_enc  [U, (n_hops+1)·dim] float  one fixed-width row per present node.
+    Use NodeEncoding.gather(assoc, node_enc, ids) to look up any id tensor (tokens / seeds / …).
+    """
+
+    def __init__(self, num_nodes: int, dim: int, n_hops: int,
+                 recency_lambda: float = 0.0, undirected: bool = True):
+        super().__init__()
+        self.num_nodes = num_nodes
+        self.dim = dim
+        self.n_hops = n_hops
+        self.recency_lambda = recency_lambda
+        self.undirected = undirected
+
+    def forward(self, tokens: WalkTokens, other: Optional[WalkTokens] = None):
+        """Encode one bag, or JOINTLY encode two bags (e.g. source + candidate walks). When `other` is
+        given, both bags share ONE batch-local graph, ONE random X0, and hence ONE comparable encoding
+        — necessary because encodings from separate forwards live in independent random subspaces
+        (⟨X¹,X²⟩≈0). Gather both sides' ids from the returned node_enc. Returns (assoc, node_enc)."""
+        bags = [tokens] if other is None else [tokens, other]
+        device = tokens.nodes.device
+
+        # 1. joint batch-local node set (all bags' walk nodes + seeds) + global→local map.
+        present = torch.unique(torch.cat(
+            [t.nodes[t.nodes_mask] for t in bags] + [t.seeds for t in bags]))           # [U] sorted global ids
+        u = int(present.numel())
+        assoc = tokens.nodes.new_full((self.num_nodes,), -1)                            # [num_nodes]
+        assoc[present] = torch.arange(u, device=device)
+
+        # 2. joint edges (l, l+1) from every bag. Ages are node-aligned to the OLDER endpoint l (walks
+        #    stored oldest→seed), so each edge's recency is read from the [..., :-1] slice.
+        si_list, di_list, w_list = [], [], []
+        for t in bags:
+            m = t.nodes_mask
+            em = m[..., :-1] & m[..., 1:]                                               # both endpoints real
+            si_list.append(assoc[t.nodes[..., :-1][em]])                               # local src
+            di_list.append(assoc[t.nodes[..., 1:][em]])                                # local dst
+            w_list.append(torch.exp(-self.recency_lambda * t.ages[..., :-1][em].to(torch.float32)))
+        si, di, w = torch.cat(si_list), torch.cat(di_list), torch.cat(w_list)
+        if self.undirected:
+            si, di = torch.cat([si, di]), torch.cat([di, si])
+            w = torch.cat([w, w])
+
+        # 3. random base features, then multi-hop diffusion Â X over the (joint) batch-local graph.
+        x0 = torch.randn(u, self.dim, device=device)                                   # [U, dim] JL basis
+        blocks = [x0]
+        if si.numel() > 0:
+            adj = torch.sparse_coo_tensor(torch.stack([si, di]), w, (u, u)).coalesce()  # [U,U] weighted
+            deg = torch.sparse.sum(adj, dim=1).to_dense()                               # [U] weighted degree
+            inv_deg = torch.where(deg > 0, deg.reciprocal(), torch.zeros_like(deg))     # exact 1/deg; 0 if isolated
+            xk = x0
+            for _ in range(self.n_hops):
+                xk = torch.sparse.mm(adj, xk) * inv_deg.unsqueeze(-1)                   # Â xk = D⁻¹A xk (k-hop)
+                blocks.append(xk)
+        else:
+            blocks += [torch.zeros_like(x0) for _ in range(self.n_hops)]               # no edges → 0 blocks
+
+        node_enc = torch.cat(blocks, dim=-1)                                           # [U, (n_hops+1)*dim]
+        return assoc, node_enc
+
+    @staticmethod
+    def gather(assoc: torch.Tensor, node_enc: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+        """Look up rows for any id tensor. ids [*] → [*, (n_hops+1)*dim]. Padding/absent ids (-1) map to
+        row 0 (garbage) and must be masked out by the caller via the tokens' mask."""
+        return node_enc[assoc[ids.clamp_min(0)].clamp_min(0)]
 
 
 class SphereManifold:
