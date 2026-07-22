@@ -90,6 +90,7 @@ class TrainerConfig:
     # TPNet; GraphMixer uses 1e-6) — the old 1e-4 was tuned for the geometric head, not this one.
     lr: float = 1e-3
     weight_decay: float = 0.0
+    optimizer: str = "adamw"  # "adamw" (flat --lr) or "prodigy" (LR-free D-adaptation, base lr=1.0; ignores --lr).
 
     # Run control.
     num_epochs: int = 25
@@ -135,12 +136,29 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # Plain AdamW at a constant LR — no scheduler (like GraphMixer/TPNet, which both train temporal
-        # link prediction at a flat LR with no decay/warmup).
-        self.opt = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=float(config.lr), weight_decay=float(config.weight_decay),
-        )
+        # Optimiser. Default = plain AdamW at a constant LR, no scheduler (like GraphMixer/TPNet, which both
+        # train temporal link prediction at a flat LR with no decay/warmup). Prodigy is the LR-free
+        # D-adaptation alternative (base lr=1.0; it estimates the step size online) — selectable on this
+        # branch to test whether the stateless head benefits from adaptive LR (Prodigy failed on the old
+        # geometric head; the stateless head is a different regime worth re-testing).
+        if config.optimizer == "prodigy":
+            from prodigyopt import Prodigy
+            self.opt = Prodigy(
+                self.model.parameters(),
+                lr=1.0, weight_decay=float(config.weight_decay),
+                safeguard_warmup=True, use_bias_correction=True,
+            )
+        else:
+            self.opt = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=float(config.lr), weight_decay=float(config.weight_decay),
+            )
+
+    def _effective_lr(self) -> float:
+        """The step size actually applied this epoch. Prodigy folds its online-estimated scale into the
+        param group's 'd'; AdamW has no 'd' so this is just the flat lr."""
+        g = self.opt.param_groups[0]
+        return float(g["lr"]) * float(g.get("d", 1.0))
 
     # ──────────────────────────────────────────────────────────────────
     # Full-graph ingestion (once, up front)
@@ -337,7 +355,7 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
-                f"lr={self.opt.param_groups[0]['lr']:.1e}  "
+                f"lr={self._effective_lr():.1e}  "
                 f"train {train_dt:.1f}s"
             )
             if val_evaluator is not None and val_batches_factory is not None:

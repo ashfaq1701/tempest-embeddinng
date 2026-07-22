@@ -117,7 +117,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", default=1e-3, type=float,
                    help="Constant learning rate (no decay). GraphMixer/TPNet both use 1e-4.")
     p.add_argument("--weight-decay", default=0.0, type=float,
-                   help="AdamW weight decay (default 0.0, matching TPNet; GraphMixer uses 1e-6).")
+                   help="Weight decay (default 0.0, matching TPNet; GraphMixer uses 1e-6). Applies to both optimisers.")
+    p.add_argument("--optimizer", default="adamw", choices=["adamw", "prodigy"],
+                   help="Optimiser: adamw (flat --lr) or prodigy (LR-free D-adaptation, base lr=1.0; ignores --lr).")
     p.add_argument(
         "--batch-size", default=200, type=int,
         help="Train batch size. Under the per-query ranking link "
@@ -279,6 +281,7 @@ def main() -> Dict[str, Any]:
         t2nv_q=args.t2nv_q,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        optimizer=args.optimizer,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 
