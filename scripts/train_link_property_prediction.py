@@ -84,19 +84,9 @@ def parse_args() -> argparse.Namespace:
              "candidates per query; positive at column 0.",
     )
 
-    # Chronological subsample (wiki-sized window on big datasets, e.g. review).
-    p.add_argument(
-        "--max-train-edges", default=0, type=int,
-        help="If >0, train on only the most-recent N train edges (fixed "
-             "chronological suffix) — a wiki-sized subsample of big datasets.")
-    p.add_argument(
-        "--max-eval-edges", default=0, type=int,
-        help="If >0, eval on only the first N official val/test edges (prefix; "
-             "keeps TGB pre-generated negatives valid).")
-
     # Walks (BACKWARD only, undirected) for the source side (u → μ_u). One-sided head: only the
     # source is walked; each candidate v enters through its static embedding E[v].
-    p.add_argument("--num-walks-per-node", default=10, type=int,
+    p.add_argument("--num-walks-per-node", default=5, type=int,
                    help="K walks per source node u.")
     p.add_argument("--max-walk-len", default=5, type=int,
                    help="L, max walk length. (Sweep on wiki: shorter is better — 20→5 gave "
@@ -114,12 +104,12 @@ def parse_args() -> argparse.Namespace:
 
 
     # Optimisation — plain AdamW at a constant LR (no scheduler / decay / warmup), like GraphMixer/TPNet.
-    p.add_argument("--lr", default=1e-3, type=float,
+    p.add_argument("--lr", default=1e-4, type=float,
                    help="Constant learning rate (no decay). GraphMixer/TPNet both use 1e-4.")
     p.add_argument("--weight-decay", default=0.0, type=float,
                    help="Weight decay (default 0.0, matching TPNet; GraphMixer uses 1e-6). Applies to both optimisers.")
-    p.add_argument("--optimizer", default="adamw", choices=["adamw", "prodigy"],
-                   help="Optimiser: adamw (flat --lr) or prodigy (LR-free D-adaptation, base lr=1.0; ignores --lr).")
+    p.add_argument("--optimizer", default="prodigy", choices=["adamw", "prodigy"],
+                   help="Optimiser: prodigy (LR-free D-adaptation, base lr=1.0; ignores --lr) or adamw (flat --lr).")
     p.add_argument(
         "--batch-size", default=200, type=int,
         help="Train batch size. Under the per-query ranking link "
@@ -136,7 +126,7 @@ def parse_args() -> argparse.Namespace:
              "wiki needs --eval-batch-size 25-50 explicitly.",
     )
     p.add_argument("--num-epochs", default=25, type=int)
-    p.add_argument("--early-stop-patience", default=10, type=int)
+    p.add_argument("--early-stop-patience", default=8, type=int)
 
     # System.
     p.add_argument("--seed", default=42, type=int)
@@ -192,22 +182,9 @@ def main() -> Dict[str, Any]:
     # Derived dataset constants.
     num_nodes = loaded.max_node_count
 
-    # Optional chronological subsample: recent suffix of train (so the graph the
-    # walks see stays causal), official prefix of val/test (keeps TGB's
-    # pre-generated negatives valid). Used to run a wiki-sized window on big
-    # datasets (e.g. review) that otherwise OOM an 8 GB GPU at full size.
-    def _trunc(split, n, tail):
-        if n <= 0 or n >= int(split.sources.shape[0]):
-            return split
-        sl = slice(-n, None) if tail else slice(0, n)
-        ef = split.edge_feat[sl] if split.edge_feat is not None else None
-        return split._replace(
-            sources=split.sources[sl], destinations=split.destinations[sl],
-            timestamps=split.timestamps[sl], edge_feat=ef)
-
-    train_sp = _trunc(loaded.train, args.max_train_edges, tail=True)
-    val_sp = _trunc(loaded.val, args.max_eval_edges, tail=False)
-    test_sp = _trunc(loaded.test, args.max_eval_edges, tail=False)
+    train_sp = loaded.train
+    val_sp = loaded.val
+    test_sp = loaded.test
 
     dst_pool = np.unique(train_sp.destinations).astype(np.int32)
     stats = compute_train_stats(train_sp.timestamps)
