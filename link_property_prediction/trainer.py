@@ -1,4 +1,4 @@
-"""Per-query-causal training + eval loop — link-supervised geometric walk head (REACH).
+"""Per-query-causal training + eval loop — stateless, geometry-free walk head.
 
 Causality is enforced PER QUERY by Tempest's cutoff, not by ingestion order. The FULL graph
 (train + val + test) is ingested into Tempest ONCE up front (`ingest_full_graph`, a single
@@ -6,9 +6,9 @@ Causality is enforced PER QUERY by Tempest's cutoff, not by ingestion order. The
 (training):
   1. neg = neg_sampler.sample(batch)                 — [B, K_train] uniform negs
   2. candidates = [pos | negs]                       — [B, 1+K_train]
-  3. logits = score(src, candidates)                 — for each query (u_i, t_i) sample K
-       backward walks with cutoff = t_i (→ μ_u), pack to tokens, score with
-       LinkPredHead (identity + velocity-line). Candidate side samples no walks (static E[v]).
+  3. logits = score(src, candidates)                 — TWO-SIDED: sample K cutoff=t_i backward
+       walks for the source AND for every candidate, joint-encode both bags with the batch-local
+       NodeEncoding, pool each into (x, h) and score with StatelessLinkHead.
   4. L = cross_entropy(logits, target=0)             — Bruch 2019, upper-bounds 1-MRR
   5. one backward + single optimizer step
 
@@ -21,33 +21,28 @@ sees everything before t. This is exactly TPNet's prebuilt-time-index queried st
 per edge. The analysis-only stores (stratify) have no cutoff, so they are seeded explicitly over
 the causal-past splits.
 
-E (on the unit sphere) and the head are trained together by L (no alignment, no detach)
-by a single RiemannianAdam.
+There is NO learned node-embedding state — the head derives all structure from the walks via the
+batch-local NodeEncoding (a fixed per-id random basis diffused over the walk graph) — so only the
+head's few Euclidean params are trained (AdamW).
 
-TOKEN PREP — the source side (u → μ_u) goes through `walk_tokens.build_query_walk_tokens`:
-walks are generated PER QUERY (no dedup — each row's (node, t) needs its own cutoff) and returned
-in the RAW per-walk WalkTokens layout ([Q, K, L] nodes / nodes_mask / node-aligned timestamps,
-seeds + cutoffs). This RAW layout is the SHARED walk contract for every head; LinkPredHead
-flattens it to a [Q, K*L] token bag and masks padding + the seed node u via
-`walk_tokens.flatten_tokens`, then builds μ_u with a per-row softmax (ages =
-cutoffs − t_edge) and scores identity + velocity against E[v].
+TOKEN PREP — both sides go through `walk_tokens.build_query_walk_tokens`: walks are generated PER
+QUERY (no dedup — each row's (node, t) needs its own cutoff) and returned in the RAW per-walk
+WalkTokens layout ([Q, K, L] nodes / nodes_mask / node-aligned timestamps, seeds + cutoffs). The
+head jointly encodes the source + candidate bags and, per bag, flattens the walks to a [Q, K*L]
+token bag (`walk_tokens.flatten_tokens`) for the attention pooling.
 """
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
-import geoopt
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch, SplitData
 from .evaluator import Evaluator
-from .model import LinkPredHead
+from .model import StatelessLinkHead
 from .negatives import UniformNegativeSampler
-from .probes import CommunityProbe
-from .utils import make_lr_lambda
 from .walk_tokens import build_query_walk_tokens
 from .walks import WalkGenerator
 
@@ -62,13 +57,21 @@ class TrainerConfig:
     # Init only — never a per-step scaler.
     t_train: float = 1.0
 
-    # Model.
-    d_emb: int = 128
-    d_ef: int = 0             # per-edge-feature dim (0 = dataset has no edge features); fed into the
-                             # NeighborhoodProjection attention keys. Set from the loaded dataset.
+    # Model — stateless NodeEncoding + walk-neighbourhood attention head.
+    d_emb: int = 128          # NodeEncoding random-feature width per hop-block (JL basis dim).
+    n_hops: int = 3           # diffusion depth: node_enc = [X0, ÂX0, …, Âⁿ X0], width (n_hops+1)*d_emb.
+    d_ef: int = 0             # per-edge-feature dim (0 = dataset has no edge features); enters the
+                             # attention logit as a stable per-token feature. Set from the loaded dataset.
+    d_nf: int = 0             # per-node-feature dim (0 = dataset has no node features); enters the
+                             # attention logit as a stable per-token feature. Set from the loaded dataset.
+    node_feat: Optional[np.ndarray] = None   # [num_nodes, d_nf] static node-feature table (None if absent).
+    t2v_dim: int = 16         # Time2Vec output dim for the per-token age feature.
 
-    # NeighborhoodProjection (attention pooling of the source's walk-token offsets -> mu_u).
-    t2v_dim: int = 16         # Time2Vec output dim (16 ties dim100 on wiki: 0.8287/0.8040 vs 0.8289/0.8046)
+    # Walk-neighbourhood encoder (per-token embed → residual FFN blocks → attention pool).
+    enc_dim: int = 64         # encoder embedding width (output dim of the per-token encoder).
+    n_layers: int = 2         # number of pre-norm residual FFN blocks (depth).
+    expansion: int = 2        # FFN inner-width multiplier (enc_dim → expansion*enc_dim → enc_dim).
+    dropout: float = 0.1      # dropout inside each residual FFN (TPNet tunes this 0.0-0.5 per dataset).
 
     # Link loss / head.
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
@@ -82,23 +85,15 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
 
-    # Optimisation — cosine decay to lr_min over decay_horizon_epochs (no warmup). ONE param group:
-    # RiemannianAdam applies the Riemannian update to E (a geoopt.ManifoldParameter) and standard Adam
-    # to the Euclidean params, all under the same LR. weight_decay is LOAD-BEARING on the sphere head:
-    # an A/B showed wd 1e-4 reached ~0.828/0.803 while no-wd capped ~0.825/0.797 (the test-gap>val-gap
-    # signature of a lost regulariser).
+    # Optimisation — plain AdamW at a constant LR (no scheduler / decay / warmup). The stateless head is
+    # tiny (~few hundred params) and trains smoothly at a flat LR. weight_decay defaults to 0 (matching
+    # TPNet; GraphMixer uses 1e-6) — the old 1e-4 was tuned for the geometric head, not this one.
     lr: float = 1e-3
-    lr_min: float = 1e-7
-    weight_decay: float = 1e-4
+    weight_decay: float = 0.0
+    optimizer: str = "adamw"  # "adamw" (flat --lr) or "prodigy" (LR-free D-adaptation, base lr=1.0; ignores --lr).
 
     # Run control.
     num_epochs: int = 25
-    # LR-decay horizon in epochs — SEPARATE from num_epochs, ONE value shared by BOTH LR groups. The
-    # per-group cosine reaches each group's lr_min at decay_horizon_epochs, so num_epochs < horizon
-    # keeps LR near peak (freedom to run any epoch count without rescaling the schedule). NOTE: the
-    # ball head's cliff-free "freeze-at-peak" was tuned with horizon == num_epochs == 25 (fast decay);
-    # default 50 with num_epochs 25 leaves LR ~half-decayed at stop — set horizon 25 to reproduce it.
-    decay_horizon_epochs: int = 30
     early_stop_patience: int = 10
 
     # System.
@@ -113,12 +108,18 @@ class Trainer:
         self.device = device or torch.device(
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
-        # Single module owning the sphere node embeddings AND the velocity head.
-        self.model = LinkPredHead(
+        # Stateless, geometry-free head: batch-local NodeEncoding + walk-neighbourhood attention.
+        self.model = StatelessLinkHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
+            n_hops=int(config.n_hops),
             t2v_dim=int(config.t2v_dim),
             d_ef=int(config.d_ef),
+            d_nf=int(config.d_nf),
+            enc_dim=int(config.enc_dim),
+            n_layers=int(config.n_layers),
+            expansion=int(config.expansion),
+            dropout=float(config.dropout),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.
@@ -135,35 +136,29 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # ONE param group: RiemannianAdam applies the Riemannian update to E (a geoopt.ManifoldParameter)
-        # and standard Adam to the Euclidean params, all under one LR + cosine floor.
-        self.opt = geoopt.optim.RiemannianAdam(
-            [{"params": list(self.model.parameters()),
-              "lr": float(config.lr), "weight_decay": float(config.weight_decay)}],
-            stabilize=10,
-        )
+        # Optimiser. Default = plain AdamW at a constant LR, no scheduler (like GraphMixer/TPNet, which both
+        # train temporal link prediction at a flat LR with no decay/warmup). Prodigy is the LR-free
+        # D-adaptation alternative (base lr=1.0; it estimates the step size online) — selectable on this
+        # branch to test whether the stateless head benefits from adaptive LR (Prodigy failed on the old
+        # geometric head; the stateless head is a different regime worth re-testing).
+        if config.optimizer == "prodigy":
+            from prodigyopt import Prodigy
+            self.opt = Prodigy(
+                self.model.parameters(),
+                lr=1.0, weight_decay=float(config.weight_decay),
+                safeguard_warmup=True, use_bias_correction=True,
+            )
+        else:
+            self.opt = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=float(config.lr), weight_decay=float(config.weight_decay),
+            )
 
-        self.sched: Optional[LambdaLR] = None
-        self._global_step = 0
-
-    # ──────────────────────────────────────────────────────────────────
-    # LR schedule (cosine)
-    # ──────────────────────────────────────────────────────────────────
-
-    def _setup_lr_scheduler(self, batches_per_epoch: int) -> None:
-        # Cosine decay to lr_min over decay_horizon_epochs (no warmup); one lambda for the single group.
-        decay_steps = self.config.decay_horizon_epochs * max(batches_per_epoch, 1)
-        peak, floor = float(self.config.lr), float(self.config.lr_min)
-        pg = self.opt.param_groups[0]
-        pg["lr"] = peak
-        pg["initial_lr"] = peak
-        ratio = floor / peak if peak > 0 else 0.0
-        self.sched = LambdaLR(self.opt, lr_lambda=make_lr_lambda(decay_steps, ratio))
-        self._global_step = 0
-        print(
-            f"  LR schedule (cosine): {peak:.1e}->{floor:.1e}; "
-            f"decay_horizon={decay_steps} ({self.config.decay_horizon_epochs}ep x {batches_per_epoch} batches)"
-        )
+    def _effective_lr(self) -> float:
+        """The step size actually applied this epoch. Prodigy folds its online-estimated scale into the
+        param group's 'd'; AdamW has no 'd' so this is just the flat lr."""
+        g = self.opt.param_groups[0]
+        return float(g["lr"]) * float(g.get("d", 1.0))
 
     # ──────────────────────────────────────────────────────────────────
     # Full-graph ingestion (once, up front)
@@ -189,11 +184,11 @@ class Trainer:
                t_query_t: torch.Tensor) -> torch.Tensor:
         """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> logits [B, C].
 
-        ONE-SIDED per-query walks: the SOURCE side samples K backward walks for each query (u_i, t_i)
-        with cutoff = t_i, so every token has t_edge < t_i (strict causal past of that query). The
-        candidate side samples NO walks — each v enters only through its static embedding E[v]. Strict
-        causality comes from the per-query cutoff, NOT from ingestion order, so the batch may already
-        be in Tempest."""
+        TWO-SIDED per-query walks: the SOURCE side samples K backward walks for each query (u_i, t_i)
+        with cutoff = t_i; the CANDIDATE side samples K backward walks for every candidate v_ij with the
+        SAME cutoff t_i (so both sides are causal as of the query time). Both bags flow to the head.
+        (Plumbing scaffold: the current geometric head is a placeholder — only the two-bag sampling
+        matters. Cost: the candidate side is C queries per positive, ~C× the source walks.)"""
         device = self.device
 
         # SOURCE side: per-query (u_i, t_i) → K cutoff=t_i backward walks → raw [B,K,L] token bag.
@@ -202,9 +197,23 @@ class Trainer:
             max_walk_len=self.config.max_walk_len,
             num_walks_per_node=self.config.num_walks_per_node,
             start_bias=self.config.start_bias,
-            walk_bias=self.config.walk_bias)
+            walk_bias=self.config.walk_bias,
+            node_feat=self.config.node_feat)
 
-        return self.model(src_tokens, cand_t)   # cand_t = candidate node ids; head owns E
+        # CANDIDATE side: walk every candidate v with its query's cutoff t_i. Flatten [B,C] → [B*C]
+        # query-major; each candidate inherits its query's cutoff so its walk is causal.
+        b, c = cand_t.shape
+        cand_seeds = cand_t.reshape(-1)                                  # [B*C]
+        cand_cutoffs = t_query_t.unsqueeze(1).expand(b, c).reshape(-1)   # [B*C]
+        cand_tokens = build_query_walk_tokens(
+            self.walk_gen, device, cand_seeds, cand_cutoffs,
+            max_walk_len=self.config.max_walk_len,
+            num_walks_per_node=self.config.num_walks_per_node,
+            start_bias=self.config.start_bias,
+            walk_bias=self.config.walk_bias,
+            node_feat=self.config.node_feat)
+
+        return self.model(src_tokens, cand_tokens)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
@@ -232,9 +241,6 @@ class Trainer:
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         self.opt.step()
-        if self.sched is not None:
-            self.sched.step()
-            self._global_step += 1
 
         return {
             "link": float(loss.detach()),
@@ -329,19 +335,6 @@ class Trainer:
         n_epochs = self.config.num_epochs
         patience = self.config.early_stop_patience
 
-        # One pass over the train batches: count them AND collect the full edge set (for the
-        # community probe's fixed Louvain graph — built once).
-        src_all, dst_all, batches_per_epoch = [], [], 0
-        for b in train_batches_factory():
-            src_all.append(np.asarray(b.src))
-            dst_all.append(np.asarray(b.tgt))
-            batches_per_epoch += 1
-        self._setup_lr_scheduler(batches_per_epoch)
-        self.comm_probe = CommunityProbe(
-            np.concatenate(src_all), np.concatenate(dst_all), self.config.num_nodes)
-        print(f"  CommunityProbe: {self.comm_probe.n_comms} Louvain communities "
-              f"(Q={self.comm_probe.q:.3f}); random-neighbour null purity={self.comm_probe.null:.3f}")
-
         best_val, best_test, best_epoch = -1.0, -1.0, -1
         best_snap: Optional[Dict[str, Any]] = None
         no_improve = 0
@@ -362,12 +355,9 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
-                f"lr={self.opt.param_groups[0]['lr']:.1e}  "
+                f"lr={self._effective_lr():.1e}  "
                 f"train {train_dt:.1f}s"
             )
-            cp = self.comm_probe.measure(self.model.E.weight.detach())     # community-formation probe
-            line += f"  commP={cp:.3f}(x{cp / max(self.comm_probe.null, 1e-9):.1f})"
-
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()
                 val_metric = self._eval(val_evaluator, val_batches_factory())

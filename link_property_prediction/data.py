@@ -73,7 +73,11 @@ def load_tgb(name: str, root: str = "datasets") -> Loaded:
             edge_feat=ef,
         )
 
-    node_feat = getattr(dataset, "node_feat", None) or full.get("node_feat", None)
+    # NB: explicit None checks — `ndarray or ...` raises "ambiguous truth value" when node_feat is an
+    # array (e.g. tgbl-flight), so the short-circuit `or` form would crash exactly when features exist.
+    node_feat = getattr(dataset, "node_feat", None)
+    if node_feat is None:
+        node_feat = full.get("node_feat", None)
     if node_feat is not None:
         node_feat = np.asarray(node_feat, dtype=np.float32)
 

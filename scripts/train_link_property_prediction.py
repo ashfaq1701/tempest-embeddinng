@@ -11,9 +11,9 @@ Hyperparameters exposed at CLI (and their grouping):
   Link/head:      --k-train
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias, --start-bias
                   (backward-only, undirected; source u → μ_u; candidate v via static E[v])
-  Optimisation:   --lr, --lr-min, --weight-decay, --batch-size, --eval-batch-size,
+  Optimisation:   --lr, --weight-decay, --batch-size, --eval-batch-size,
                   --num-epochs, --early-stop-patience
-                  (single-group cosine decay to --lr-min over --decay-horizon-epochs)
+                  (plain AdamW at a constant LR — no scheduler / decay / warmup)
   System:         --seed, --use-gpu, --use-gpu-tempest
   Analysis:       --stratify (post-train per-slice test-MRR stratification)
 
@@ -59,13 +59,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tgb-root", default="datasets", type=str)
 
 
-    # Model.
-    p.add_argument("--d-emb", default=128, type=int)
-
-    # NeighborhoodProjection — attention pooling of the source's walk-token offsets into mu_u.
-    # (Query/key MLPs project to d_emb — no separate attention dim.)
+    # Model — stateless NodeEncoding + walk-neighbourhood attention head.
+    p.add_argument("--d-emb", default=128, type=int,
+                   help="NodeEncoding random-feature width per hop-block (JL basis dim).")
+    p.add_argument("--n-hops", default=3, type=int,
+                   help="Diffusion depth: node_enc = [X0, ÂX0, …, Âⁿ X0], width (n_hops+1)*d_emb.")
     p.add_argument("--t2v-dim", default=16, type=int,
-                   help="Time2Vec output dim (16 ties dim 100 on wiki; TPNet default was 100).")
+                   help="Time2Vec output dim for the per-token age feature.")
+
+    # Walk-neighbourhood encoder (per-token embed → residual FFN blocks → attention pool).
+    p.add_argument("--enc-dim", default=64, type=int,
+                   help="Encoder embedding width (output dim of the per-token encoder).")
+    p.add_argument("--n-layers", default=2, type=int,
+                   help="Number of pre-norm residual FFN blocks (encoder depth).")
+    p.add_argument("--expansion", default=2, type=int,
+                   help="FFN inner-width multiplier (enc_dim → expansion*enc_dim → enc_dim).")
+    p.add_argument("--dropout", default=0.1, type=float,
+                   help="Dropout inside each residual FFN (TPNet tunes this 0.0-0.5 per dataset).")
 
     # Link loss / head.
     p.add_argument(
@@ -74,19 +84,9 @@ def parse_args() -> argparse.Namespace:
              "candidates per query; positive at column 0.",
     )
 
-    # Chronological subsample (wiki-sized window on big datasets, e.g. review).
-    p.add_argument(
-        "--max-train-edges", default=0, type=int,
-        help="If >0, train on only the most-recent N train edges (fixed "
-             "chronological suffix) — a wiki-sized subsample of big datasets.")
-    p.add_argument(
-        "--max-eval-edges", default=0, type=int,
-        help="If >0, eval on only the first N official val/test edges (prefix; "
-             "keeps TGB pre-generated negatives valid).")
-
     # Walks (BACKWARD only, undirected) for the source side (u → μ_u). One-sided head: only the
     # source is walked; each candidate v enters through its static embedding E[v].
-    p.add_argument("--num-walks-per-node", default=10, type=int,
+    p.add_argument("--num-walks-per-node", default=5, type=int,
                    help="K walks per source node u.")
     p.add_argument("--max-walk-len", default=5, type=int,
                    help="L, max walk length. (Sweep on wiki: shorter is better — 20→5 gave "
@@ -103,14 +103,13 @@ def parse_args() -> argparse.Namespace:
                         "more outward exploration; p=4,q=0.25 = most diverse backward walks.")
 
 
-    # Optimisation — RiemannianAdam, single-group cosine decay to --lr-min over --decay-horizon-epochs.
-    # One group covers E (a geoopt.ManifoldParameter, Riemannian update) and all Euclidean params.
-    p.add_argument("--lr", default=1e-3, type=float,
-                   help="Peak LR (sphere default 1e-3).")
-    p.add_argument("--lr-min", default=1e-7, type=float,
-                   help="Cosine-decay floor.")
-    p.add_argument("--weight-decay", default=1e-4, type=float,
-                   help="Weight decay (RiemannianAdam). Load-bearing on the sphere head.")
+    # Optimisation — plain AdamW at a constant LR (no scheduler / decay / warmup), like GraphMixer/TPNet.
+    p.add_argument("--lr", default=1e-4, type=float,
+                   help="Constant learning rate (no decay). GraphMixer/TPNet both use 1e-4.")
+    p.add_argument("--weight-decay", default=0.0, type=float,
+                   help="Weight decay (default 0.0, matching TPNet; GraphMixer uses 1e-6). Applies to both optimisers.")
+    p.add_argument("--optimizer", default="prodigy", choices=["adamw", "prodigy"],
+                   help="Optimiser: prodigy (LR-free D-adaptation, base lr=1.0; ignores --lr) or adamw (flat --lr).")
     p.add_argument(
         "--batch-size", default=200, type=int,
         help="Train batch size. Under the per-query ranking link "
@@ -127,11 +126,7 @@ def parse_args() -> argparse.Namespace:
              "wiki needs --eval-batch-size 25-50 explicitly.",
     )
     p.add_argument("--num-epochs", default=25, type=int)
-    p.add_argument("--decay-horizon-epochs", default=30, type=int,
-                   help="LR cosine-decay horizon in epochs (shared by both LR groups), SEPARATE from "
-                        "--num-epochs: LR reaches lr-min at this horizon, so a shorter --num-epochs "
-                        "stays near peak (freedom to run any epoch count without rescaling the LR).")
-    p.add_argument("--early-stop-patience", default=10, type=int)
+    p.add_argument("--early-stop-patience", default=8, type=int)
 
     # System.
     p.add_argument("--seed", default=42, type=int)
@@ -156,17 +151,6 @@ def parse_args() -> argparse.Namespace:
              "MRR is lost. Writes logs/stratify/<dataset>_seed<seed>_strata.{md,json}. "
              "Re-seeds the trainer's causal stores over train+val first; training is "
              "untouched. Off by default.",
-    )
-    p.add_argument(
-        "--export-best-embedding-table",
-        action="store_true",
-        help="After training, dump the best-val-restored embedding-table "
-             "weights to logs/embeddings/<dataset>_seed<seed>_demb<d_emb>"
-             "_ep<stopped_at_epoch>.npy. Raw float32 [num_nodes, d_emb] "
-             "array; node ids follow TGB's contiguous integer ordering. "
-             "NOTE: rows are now UNIT-NORM (sphere-constrained E) — analyse "
-             "by direction (cosine), not magnitude. "
-             "Off by default.",
     )
 
     return p.parse_args()
@@ -198,22 +182,9 @@ def main() -> Dict[str, Any]:
     # Derived dataset constants.
     num_nodes = loaded.max_node_count
 
-    # Optional chronological subsample: recent suffix of train (so the graph the
-    # walks see stays causal), official prefix of val/test (keeps TGB's
-    # pre-generated negatives valid). Used to run a wiki-sized window on big
-    # datasets (e.g. review) that otherwise OOM an 8 GB GPU at full size.
-    def _trunc(split, n, tail):
-        if n <= 0 or n >= int(split.sources.shape[0]):
-            return split
-        sl = slice(-n, None) if tail else slice(0, n)
-        ef = split.edge_feat[sl] if split.edge_feat is not None else None
-        return split._replace(
-            sources=split.sources[sl], destinations=split.destinations[sl],
-            timestamps=split.timestamps[sl], edge_feat=ef)
-
-    train_sp = _trunc(loaded.train, args.max_train_edges, tail=True)
-    val_sp = _trunc(loaded.val, args.max_eval_edges, tail=False)
-    test_sp = _trunc(loaded.test, args.max_eval_edges, tail=False)
+    train_sp = loaded.train
+    val_sp = loaded.val
+    test_sp = loaded.test
 
     dst_pool = np.unique(train_sp.destinations).astype(np.int32)
     stats = compute_train_stats(train_sp.timestamps)
@@ -265,9 +236,17 @@ def main() -> Dict[str, Any]:
         t_train=float(stats.T_train),
 
         d_emb=args.d_emb,
+        n_hops=args.n_hops,
         d_ef=(int(train_sp.edge_feat.shape[1]) if train_sp.edge_feat is not None else 0),
+        d_nf=(int(loaded.node_feat.shape[1]) if loaded.node_feat is not None else 0),
+        node_feat=loaded.node_feat,
 
         t2v_dim=args.t2v_dim,
+
+        enc_dim=args.enc_dim,
+        n_layers=args.n_layers,
+        expansion=args.expansion,
+        dropout=args.dropout,
 
         K_train=args.k_train,
 
@@ -278,10 +257,9 @@ def main() -> Dict[str, Any]:
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
         lr=args.lr,
-        lr_min=args.lr_min,
         weight_decay=args.weight_decay,
+        optimizer=args.optimizer,
         num_epochs=args.num_epochs,
-        decay_horizon_epochs=args.decay_horizon_epochs,
         early_stop_patience=args.early_stop_patience,
 
         seed=args.seed,
@@ -301,10 +279,7 @@ def main() -> Dict[str, Any]:
 
     print("\n=== Parameter counts ===")
     n_total = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
-    n_E = trainer.model.E.weight.numel()
-    print(f"  model.E:         {n_E:>12,}")
-    print(f"  head params:     {n_total - n_E:>12,}")
-    print(f"  TOTAL trainable: {n_total:>12,}")
+    print(f"  TOTAL trainable: {n_total:>12,}  (stateless: no learned node-embedding table)")
 
     # ─── Train ─────────────────────────────────────────────────────
     print("\n=== Training ===")
@@ -338,23 +313,6 @@ def main() -> Dict[str, Any]:
         run_stratification(
             trainer, train_batches_factory, val_batches_factory,
             test_eval, test_batches_factory, num_nodes, meta)
-
-    # Optional: dump best-val-restored embedding table for downstream
-    # analysis. Raw [num_nodes, d_emb] float32 array; node ids follow
-    # TGB's contiguous integer ordering. Gated by --export-best-
-    # embedding-table; off by default to keep runs side-effect-free.
-    if args.export_best_embedding_table:
-        emb_dir = pathlib.Path("logs/embeddings")
-        emb_dir.mkdir(parents=True, exist_ok=True)
-        emb_path = emb_dir / (
-            f"{args.dataset}_seed{args.seed}_demb{args.d_emb}"
-            f"_ep{result['stopped_at_epoch']}.npy"
-        )
-        np.save(
-            emb_path,
-            trainer.model.E.weight.detach().cpu().numpy(),
-        )
-        print(f"  embedding_table:   saved to {emb_path}")
 
     return result
 

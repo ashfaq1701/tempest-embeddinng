@@ -1,4 +1,46 @@
-# Tempest walk-supervised temporal link prediction
+# ⚠ CURRENT DIRECTION (2026-07-21): stateless, geometry-free head — branch `feature/non-geometric-head`
+
+The geometric sphere-embedding line below (learned E, P[u]=exp_{E[u]}(mu), <P[u],E[v]>) is
+SUPERSEDED. It capped at wiki 0.83 / review 0.21 / coin 0.57 (geometry = lossy bottleneck; every
+capacity add overfit). We PIVOTED to a **GraphMixer/TPNet-family STATELESS model** (no learned
+node-embedding state) fed **Tempest MULTI-HOP** walks (contra GraphMixer's 1-hop-is-enough claim).
+See memory `pivot-stateless-multihop-2026-07-21` and `overnight-stateless-head-2026-07-21`.
+
+**The model (`link_property_prediction/model.py`, `StatelessLinkHead`, ~370 params):**
+- `NodeEncoding`: batch-local, anonymized. Per batch builds the walk-induced adjacency Â=D⁻¹A,
+  draws a FRESH random X0, returns `node_enc = [X0, ÂX0, …, Âⁿ X0]` (JL ⇒ ⟨code_i,code_j⟩ ≈ k-hop
+  co-reachability). Both walk bags (source + candidate) are JOINTLY encoded (shared graph + X0).
+- **Basis law (load-bearing):** fresh X0 ⇒ codes live in a random per-batch basis; a learned dense
+  layer on raw codes sees noise. Codes may enter ONLY through inner products (attention scores + the
+  final pairwise dot products). Stable features (Time2Vec(age), log1p(hop), edge-feat) are the only
+  inputs to learned linears.
+- `WalkNeighborhoodEncoder`: seed-query attention → (x = seed's code, h = nbhd aggregation). Logit =
+  `struct_scale·cos(seed,tok) + GELU_MLP([t2v,hop,ef])`; value = token code.
+- Scorer: MLP over the 4 inner products ⟨x_u,x_v⟩,⟨x_u,h_v⟩,⟨h_u,x_v⟩,⟨h_u,h_v⟩.
+- Trainer: AdamW, two-bag `_score` (walks BOTH source and every candidate, same cutoff).
+
+**Sweep verdict (wiki, subsampled screening — see `logs/stateless/SWEEP.md`):** WINNER = **V7** (the
+nonlinear GELU attention logit), 0.8636/0.8463, +0.007 test over the linear-logit baseline, smooth.
+**THE LAW:** nonlinearity/expressiveness on the STABLE features (attention logit) helps and doesn't
+overfit; capacity on the random CODES or the SCORER overfits ((h,h)-only loses, mean-pool drifts,
+pooled-stable-channel opens a −0.022 test gap, hop-resolved scorer ties, dropout inert).
+
+**FULL-WIKI VALIDATION (V7, non-subsampled, k-train=100, 2026-07-21):** val **0.8704** / test
+**0.8533** — and it was STILL IMPROVING at the 18-epoch cap (set its best on the last epoch; patience
+never triggered), so the true peak is higher — RUN MORE EPOCHS (≥30, longer `--decay-horizon-epochs`).
+This beats the old geometric head (~0.830/0.804) by ~+0.040 val / +0.049 test. ~9 min/epoch on the
+8 GB laptop (train ~183 s + 999-neg eval ~370 s); the server's bigger GPU should raise `--eval-batch-size`.
+
+**For the server run (review / coin / comment / flight — a DIFFERENT agent, more GPU):** run V7 as-is
+(`scripts/train_link_property_prediction.py`; knobs `--n-hops` default 3, `--d-emb`, `--t2v-dim`,
+`--k-train`). Full-wiki two-bag is ~10 min/epoch (candidate walking is C×). On COLD-START / new-pair-
+heavy datasets, first lever to try = the **hop-resolved scorer** (split each of the 4 inner products
+per diffusion hop: hop-0 identity/repeat vs deeper co-reach/new-pair — see SWEEP.md "V8"). It tied on
+repeat-saturated wiki but is the mechanism a new-pair workload should reward.
+
+---
+
+# Tempest walk-supervised temporal link prediction (SUPERSEDED geometric line — kept for reference)
 
 Walks-supervised temporal link prediction with Tempest. The
 architecture below replaces the prior alignment+uniformity design
