@@ -22,6 +22,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .walk_tokens import WalkTokens, flatten_tokens
 
@@ -154,20 +155,23 @@ class TimeEncoder(nn.Module):
         return output
 
 
-class ResidualFFN(nn.Module):
-    """Pre-norm residual feed-forward block (TPNet/transformer style): x + FFN(LayerNorm(x)), where
-    FFN = Linear(d_h → e·d_h) → GELU → Dropout → Linear(e·d_h → d_h) → Dropout. The skip + pre-norm let
-    these stack to depth without the plain-MLP instability (each block is identity + correction)."""
+class GatedResidualFFN(nn.Module):
+    """x + γ ⊙ FFN(RMSNorm(x)) — pre-norm, per-channel γ init ε, SwiGLU branch, one dropout."""
 
-    def __init__(self, d_h: int, dropout: float, expansion: int = 2):
+    def __init__(self, d_h: int, dropout: float, expansion: int = 2, gamma_init: float = 1e-2):
         super().__init__()
-        self.norm = nn.LayerNorm(d_h)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_h, expansion * d_h), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(expansion * d_h, d_h), nn.Dropout(dropout))
+        self.norm = nn.RMSNorm(d_h)
+        d_ff = expansion * d_h
+        self.w_gate = nn.Linear(d_h, d_ff, bias=False)     # SwiGLU: silu(W_g x) ⊙ (W_v x)
+        self.w_val  = nn.Linear(d_h, d_ff, bias=False)
+        self.w_out  = nn.Linear(d_ff, d_h, bias=False)
+        self.drop = nn.Dropout(dropout)
+        self.gamma = nn.Parameter(torch.full((d_h,), gamma_init))   # LayerScale
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.ffn(self.norm(x))
+    def forward(self, x):
+        h = self.norm(x)
+        h = self.w_out(self.drop(F.silu(self.w_gate(h)) * self.w_val(h)))
+        return x + self.gamma * h
 
 
 class WalkNeighborhoodEncoder(nn.Module):
@@ -193,7 +197,7 @@ class WalkNeighborhoodEncoder(nn.Module):
         # One encoder shared by both the tokens and the seed.
         self.input_norm = nn.LayerNorm(in_dim)
         self.input_proj = nn.Linear(in_dim, enc_dim)
-        self.blocks = nn.ModuleList(ResidualFFN(enc_dim, dropout, expansion) for _ in range(n_layers))
+        self.blocks = nn.ModuleList(GatedResidualFFN(enc_dim, dropout, expansion) for _ in range(n_layers))
         self.attn_scale = enc_dim ** -0.5
 
     def _encode(self, feat: torch.Tensor) -> torch.Tensor:
