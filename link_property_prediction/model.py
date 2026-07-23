@@ -7,8 +7,9 @@ MULTI-HOP temporal walks (the differentiator vs GraphMixer/TPNet's 1-hop neighbo
 
 where seed_x / nbhd_x are the node's own / neighbourhood-pooled LEARNED embeddings from
 WalkNeighborhoodEncoder, and the scorer is a pre-norm MLP over both sides' embeddings concatenated
-(TPNet's decoder) plus the four inner products (the affinity prior). Both bags (source + candidate)
-are jointly encoded so they share one batch-local graph.
+(TPNet's decoder) plus the four inner products (the affinity prior). Node codes come from ONE causal
+encoding graph per batch (the batch's unique node union walked at the batch's earliest cutoff, so every
+edge precedes every query — no within-batch leak); the source/candidate walks supply per-query tokens.
 
 FIXED BASIS: NodeEncoding uses a PERMANENT per-node-id random fingerprint (drawn once), so a node's
 coordinates are stable across batches. Unlike the anonymized fresh-basis variant (where the basis
@@ -17,22 +18,20 @@ MLP-usable and carry cross-batch recurrence — so WalkNeighborhoodEncoder embed
 descriptor [node_enc ‖ time ‖ hop ‖ edge ‖ node feats] with a learned encoder (projection + residual
 FFN blocks; the fixed-basis unlock), then attends the seed over the token embeddings to pool the nbhd.
 """
-from typing import Optional
-
 import numpy as np
 import torch
 import torch.nn as nn
 
-from .walk_tokens import WalkTokens, flatten_tokens
+from .walk_tokens import WalkNodes, WalkTokens, flatten_tokens
 
 
 class NodeEncoding(nn.Module):
     """Stateless, batch-local node embedding — a drop-in replacement for a learned E table.
 
-    Per batch, builds the local walk graph from the WalkTokens, then encodes every node that appears
+    Per batch, builds the local walk graph from a WalkNodes bag, then encodes every node that appears
     (walk nodes + query seeds) by a MULTI-HOP diffusion of random features over that graph:
 
-        A        = batch-local recency-weighted (undirected) adjacency [U, U] from consecutive walk steps
+        A        = batch-local (undirected) adjacency [U, U] from consecutive walk steps
         Â        = D^-1 A                                    (random-walk transition)
         X0       = per-id fixed fingerprints [U, dim]        (rows gathered from x0_table by global id)
         node_enc = [ X0 ; Â X0 ; Â² X0 ; … ; Âⁿ X0 ]         [U, (n_hops+1)·dim]
@@ -50,12 +49,11 @@ class NodeEncoding(nn.Module):
     """
 
     def __init__(self, num_nodes: int, dim: int, n_hops: int,
-                 recency_lambda: float = 0.0, undirected: bool = True, basis_seed: int = 0):
+                 undirected: bool = True, basis_seed: int = 0):
         super().__init__()
         self.num_nodes = num_nodes
         self.dim = dim
         self.n_hops = n_hops
-        self.recency_lambda = recency_lambda
         self.undirected = undirected
         # Permanent per-node-id random basis: one fixed row per node, drawn once (seeded). A node's code
         # is therefore stable across batches — the coordinates mean the same thing every batch, so the
@@ -63,42 +61,37 @@ class NodeEncoding(nn.Module):
         gen = torch.Generator().manual_seed(basis_seed)
         self.register_buffer("x0_table", torch.randn(num_nodes, dim, generator=gen))
 
-    def forward(self, tokens: WalkTokens, other: Optional[WalkTokens] = None):
-        """Encode one bag, or JOINTLY encode two bags (e.g. source + candidate walks). When `other` is
-        given, both bags share ONE batch-local graph, ONE random X0, and hence ONE comparable encoding
-        — necessary because encodings from separate forwards live in independent random subspaces
-        (⟨X¹,X²⟩≈0). Gather both sides' ids from the returned node_enc. Returns (assoc, node_enc)."""
-        bags = [tokens] if other is None else [tokens, other]
-        device = tokens.nodes.device
+    def forward(self, walk_nodes: WalkNodes):
+        """Encode one batch-local graph from a single WalkNodes bag (seeds + walk connectivity). Its
+        seeds are the batch's unique node union, all walked at ONE shared cutoff, so every edge precedes
+        every query and A is causal for the whole batch. All nodes share ONE random X0, so the codes are
+        mutually comparable. Returns (assoc, node_enc)."""
+        device = walk_nodes.nodes.device
 
-        # 1. joint batch-local node set (all bags' walk nodes + seeds) + global→local map.
+        # 1. present node set (walk nodes + seeds) + global→local map.
         present = torch.unique(torch.cat(
-            [t.nodes[t.nodes_mask] for t in bags] + [t.seeds for t in bags]))           # [U] sorted global ids
+            [walk_nodes.nodes[walk_nodes.nodes_mask], walk_nodes.seeds]))                # [U] sorted global ids
         u = int(present.numel())
-        assoc = tokens.nodes.new_full((self.num_nodes,), -1)                            # [num_nodes]
+        assoc = walk_nodes.nodes.new_full((self.num_nodes,), -1)                         # [num_nodes]
         assoc[present] = torch.arange(u, device=device)
 
-        # 2. joint edges (l, l+1) from every bag. Ages are node-aligned to the OLDER endpoint l (walks
-        #    stored oldest→seed), so each edge's recency is read from the [..., :-1] slice.
-        si_list, di_list, w_list = [], [], []
-        for t in bags:
-            m = t.nodes_mask
-            em = m[..., :-1] & m[..., 1:]                                               # both endpoints real
-            si_list.append(assoc[t.nodes[..., :-1][em]])                               # local src
-            di_list.append(assoc[t.nodes[..., 1:][em]])                                # local dst
-            w_list.append(torch.exp(-self.recency_lambda * t.ages[..., :-1][em].to(torch.float32)))
-        si, di, w = torch.cat(si_list), torch.cat(di_list), torch.cat(w_list)
+        # 2. undirected adjacency from consecutive walk steps (l, l+1). Edges are UNWEIGHTED — the bare
+        #    WalkNodes carries no ages, so there is no recency weighting (each present edge counts once).
+        m = walk_nodes.nodes_mask
+        em = m[..., :-1] & m[..., 1:]                                                    # both endpoints real
+        si = assoc[walk_nodes.nodes[..., :-1][em]]                                       # local src
+        di = assoc[walk_nodes.nodes[..., 1:][em]]                                        # local dst
         if self.undirected:
             si, di = torch.cat([si, di]), torch.cat([di, si])
-            w = torch.cat([w, w])
 
         # 3. base features — each present node's PERMANENT fingerprint (gathered by global id) — then
-        #    multi-hop diffusion Â X over the (joint) batch-local graph.
+        #    multi-hop diffusion Â X over the batch-local graph.
         x0 = self.x0_table[present]                                                     # [U, dim] per-id fingerprint
         blocks = [x0]
         if si.numel() > 0:
-            adj = torch.sparse_coo_tensor(torch.stack([si, di]), w, (u, u)).coalesce()  # [U,U] weighted
-            deg = torch.sparse.sum(adj, dim=1).to_dense()                               # [U] weighted degree
+            w = torch.ones(si.numel(), device=device)                                   # unweighted edges
+            adj = torch.sparse_coo_tensor(torch.stack([si, di]), w, (u, u)).coalesce()  # [U,U]
+            deg = torch.sparse.sum(adj, dim=1).to_dense()                               # [U] degree
             inv_deg = torch.where(deg > 0, deg.reciprocal(), torch.zeros_like(deg))     # exact 1/deg; 0 if isolated
             xk = x0
             for _ in range(self.n_hops):
@@ -275,15 +268,14 @@ class StatelessLinkHead(nn.Module):
     the walk-neighbourhood encoder, and a tiny pairwise scorer over basis-invariant inner products."""
 
     def __init__(self, num_nodes: int, d_emb: int, n_hops: int = 3,
-                 t2v_dim: int = 16, d_ef: int = 0, d_nf: int = 0, recency_lambda: float = 0.0,
+                 t2v_dim: int = 16, d_ef: int = 0, d_nf: int = 0,
                  enc_dim: int = 64, n_layers: int = 2, expansion: int = 2, dropout: float = 0.1):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_ef = d_ef
         self.d_nf = d_nf
 
-        self.node_encoding = NodeEncoding(
-            num_nodes=num_nodes, dim=d_emb, n_hops=n_hops, recency_lambda=recency_lambda)
+        self.node_encoding = NodeEncoding(num_nodes=num_nodes, dim=d_emb, n_hops=n_hops)
         self.encoder = WalkNeighborhoodEncoder(
             d_code=(n_hops + 1) * d_emb, t2v_dim=t2v_dim, d_ef=d_ef, d_nf=d_nf,
             enc_dim=enc_dim, n_layers=n_layers, expansion=expansion, dropout=dropout)
@@ -298,10 +290,14 @@ class StatelessLinkHead(nn.Module):
             nn.LayerNorm(scorer_in),
             nn.Linear(scorer_in, enc_dim), nn.GELU(), nn.Dropout(dropout), nn.Linear(enc_dim, 1))
 
-    def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate queries (seeds = v)
-        in query-major order, each walked with its query's cutoff. Returns logits [B, C]."""
-        assoc, node_enc = self.node_encoding(src_tokens, cand_tokens)     # joint encode both bags
+    def forward(self, batch_walk_nodes: WalkNodes, src_tokens: WalkTokens,
+                cand_tokens: WalkTokens) -> torch.Tensor:
+        """batch_walk_nodes: ONE causal encoding bag for the whole batch (the batch's unique node union
+        walked at the batch's earliest cutoff), so its graph is causal for every query. src_tokens: B
+        source queries (seeds = u). cand_tokens: the B*C candidate queries (seeds = v) in query-major
+        order. The node codes come from the single causal graph; the source/candidate walks supply each
+        query's token structure for the attention pooling. Returns logits [B, C]."""
+        assoc, node_enc = self.node_encoding(batch_walk_nodes)           # one causal batch-local graph
 
         seed_u, nbhd_u = self.encoder(assoc, node_enc, src_tokens)       # source: [B, enc_dim] each
         seed_v, nbhd_v = self.encoder(assoc, node_enc, cand_tokens)     # candidates: [B*C, enc_dim] each

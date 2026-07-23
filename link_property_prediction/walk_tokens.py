@@ -65,6 +65,23 @@ class WalkTokens:
     seed_node_features: Optional[torch.Tensor] = None  # [Q, d_nf]       per-seed  (query side)
 
 
+@dataclass
+class WalkNodes:
+    """Bare walk connectivity — just the node ids and their validity mask, no ages/features/cutoffs.
+
+        seeds       [Q]         int64  query/source node u (walk origin; present even when cold)
+        nodes       [Q, K, L]   int64  walk node ids; seed at the last real position, padding -1
+        nodes_mask  [Q, K, L]   bool   True on real walk positions
+
+    For consumers that only need the walk-induced GRAPH (which nodes step to which), not the
+    per-token time/edge/node features — e.g. building a batch-local adjacency.
+    """
+
+    seeds: torch.Tensor                        # [Q]
+    nodes: torch.Tensor                        # [Q, K, L]
+    nodes_mask: torch.Tensor                   # [Q, K, L]
+
+
 def build_query_walk_tokens(
     walk_gen,
     device: torch.device,
@@ -140,6 +157,47 @@ def build_query_walk_tokens(
 
     return WalkTokens(seeds_t, nodes, nodes_mask, ages, cutoffs_t,
                       edge_features, node_features, seed_node_features)
+
+
+def build_walk_nodes(
+    walk_gen,
+    device: torch.device,
+    nodes: torch.Tensor,
+    cutoff_timestamp: int,
+    *,
+    max_walk_len: int,
+    num_walks_per_node: int,
+    start_bias: Optional[str] = None,
+    walk_bias: Optional[str] = None,
+) -> WalkNodes:
+    """K backward walks from each node in `nodes`, ALL bounded by the SAME `cutoff_timestamp` (one shared
+    exclusive cutoff applied to every query), returned as bare WalkNodes — connectivity only, no ages or
+    features. Use when a single causal batch-local graph is needed as of one time (every edge < cutoff)."""
+    seeds_t = nodes.detach().to(device=device, dtype=torch.long)              # [Q]
+    q = int(seeds_t.shape[0])
+
+    if q == 0:
+        shape = (0, num_walks_per_node, max_walk_len)
+        return WalkNodes(
+            seeds_t,
+            torch.empty(shape, dtype=torch.int64, device=device),
+            torch.empty(shape, dtype=torch.bool, device=device))
+
+    # Same cutoff for every query — broadcast the single timestamp across all seeds.
+    cutoffs_np = np.full(q, int(cutoff_timestamp), dtype=np.int64)
+    wd = walk_gen.walks_for_nodes(
+        np.ascontiguousarray(seeds_t.cpu().numpy(), dtype=np.int32),
+        max_walk_len=max_walk_len,
+        num_walks_per_node=num_walks_per_node,
+        start_bias=start_bias,
+        walk_bias=walk_bias,
+        cutoff_times=cutoffs_np,
+    )
+    k, length = int(wd.K), int(wd.nodes.shape[1])
+
+    # Rows [q*K, (q+1)*K) are query q's K walks ⇒ reshape [Q*K, L] -> [Q, K, L].
+    walk_nodes = wd.nodes.to(device=device, dtype=torch.int64).reshape(q, k, length)    # [Q, K, L]
+    return WalkNodes(seeds_t, walk_nodes, walk_nodes != -1)
 
 
 def flatten_tokens(
