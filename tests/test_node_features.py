@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from link_property_prediction.model import StatelessLinkHead
-from link_property_prediction.walk_tokens import build_query_walk_tokens, build_walk_nodes
+from link_property_prediction.walk_tokens import build_query_walk_tokens
 from link_property_prediction.walks import WalkGenerator
 
 _CSV = pathlib.Path(__file__).parent / "data" / "sample_data.csv"
@@ -90,12 +90,9 @@ def test_head_consumes_node_features():
     wg = _walk_gen()
     src = _bag(wg, np.array([3, 4]), node_feat)
     cand = _bag(wg, np.array([5, 6, 7, 8]), node_feat)          # 2 queries × 2 candidates
-    # the batch's unique node union, walked at one shared cutoff → the causal encoding graph.
-    union = torch.unique(torch.tensor([3, 4, 5, 6, 7, 8]))
-    batch_nodes = build_walk_nodes(wg, _DEV, union, CUTOFF, max_walk_len=5, num_walks_per_node=6)
 
     head = StatelessLinkHead(NUM_NODES, d_emb=d_emb, n_hops=n_hops, t2v_dim=t2v_dim, d_ef=0, d_nf=d_nf)
-    logits = head(batch_nodes, src, cand)
+    logits = head(src, cand)
     assert logits.shape == (2, 2)
     assert torch.isfinite(logits).all()
     logits.sum().backward()

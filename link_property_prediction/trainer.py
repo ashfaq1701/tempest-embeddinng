@@ -6,9 +6,9 @@ Causality is enforced PER QUERY by Tempest's cutoff, not by ingestion order. The
 (training):
   1. neg = neg_sampler.sample(batch)                 — [B, K_train] uniform negs
   2. candidates = [pos | negs]                       — [B, 1+K_train]
-  3. logits = score(src, candidates)                 — build ONE causal encoding graph (the batch's
-       unique node union walked at the batch's earliest cutoff) + per-query source/candidate walks;
-       encode the graph with NodeEncoding, pool each query into (x, h) and score with StatelessLinkHead.
+  3. logits = score(src, candidates)                 — TWO-SIDED: sample K cutoff=t_i backward
+       walks for the source AND for every candidate, joint-encode both bags with the batch-local
+       NodeEncoding, pool each into (x, h) and score with StatelessLinkHead.
   4. L = cross_entropy(logits, target=0)             — Bruch 2019, upper-bounds 1-MRR
   5. one backward + single optimizer step
 
@@ -25,11 +25,11 @@ There is NO learned node-embedding state — the head derives all structure from
 batch-local NodeEncoding (a fixed per-id random basis diffused over the walk graph) — so only the
 head's few Euclidean params are trained (AdamW).
 
-TOKEN PREP — the source/candidate bags go through `walk_tokens.build_query_walk_tokens` (per-query
-walks, each row cut at its own t_i, RAW [Q, K, L] WalkTokens with node-aligned ages/features); the
-encoding bag goes through `walk_tokens.build_walk_nodes` (the dedup'd node union at one shared cutoff,
-bare WalkNodes = seeds/nodes/mask). NodeEncoding diffuses over the encoding graph; each per-query bag is
-flattened to a [Q, K*L] token bag (`walk_tokens.flatten_tokens`) for the attention pooling.
+TOKEN PREP — both sides go through `walk_tokens.build_query_walk_tokens`: walks are generated PER
+QUERY (no dedup — each row's (node, t) needs its own cutoff) and returned in the RAW per-walk
+WalkTokens layout ([Q, K, L] nodes / nodes_mask / node-aligned timestamps, seeds + cutoffs). The
+head jointly encodes the source + candidate bags and, per bag, flattens the walks to a [Q, K*L]
+token bag (`walk_tokens.flatten_tokens`) for the attention pooling.
 """
 import time
 from dataclasses import dataclass
@@ -43,7 +43,7 @@ from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import StatelessLinkHead
 from .negatives import UniformNegativeSampler
-from .walk_tokens import build_query_walk_tokens, build_walk_nodes
+from .walk_tokens import build_query_walk_tokens
 from .walks import WalkGenerator
 
 
@@ -184,24 +184,12 @@ class Trainer:
                t_query_t: torch.Tensor) -> torch.Tensor:
         """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> logits [B, C].
 
-        Three bags flow to the head:
-        - ENCODING bag: ONE causal graph for the whole batch. Its seeds are the batch's unique node union
-          (sources ∪ candidates), all walked at the batch's EARLIEST query time. One shared cutoff ⇒ every
-          edge precedes every query, so no query sees another query's later interaction through the graph
-          (a per-query pooled graph leaks that within-batch). Dedup'd ⇒ one cheap Tempest query.
-        - SOURCE / CANDIDATE bags: per-query (u_i / v_ij, t_i) backward walks supplying each query's token
-          structure for the attention pooling (their node CODES are read from the encoding graph)."""
+        TWO-SIDED per-query walks: the SOURCE side samples K backward walks for each query (u_i, t_i)
+        with cutoff = t_i; the CANDIDATE side samples K backward walks for every candidate v_ij with the
+        SAME cutoff t_i (so both sides are causal as of the query time). Both bags flow to the head.
+        (Plumbing scaffold: the current geometric head is a placeholder — only the two-bag sampling
+        matters. Cost: the candidate side is C queries per positive, ~C× the source walks.)"""
         device = self.device
-
-        # ENCODING bag: unique batch nodes, one shared earliest cutoff.
-        node_union = torch.unique(torch.cat([src_t, cand_t.reshape(-1)]))               # [U] dedup'd ids
-        earliest_ts = int(t_query_t.min())                                              # earliest query time
-        batch_walk_nodes = build_walk_nodes(
-            self.walk_gen, device, node_union, earliest_ts,
-            max_walk_len=self.config.max_walk_len,
-            num_walks_per_node=self.config.num_walks_per_node,
-            start_bias=self.config.start_bias,
-            walk_bias=self.config.walk_bias)
 
         # SOURCE side: per-query (u_i, t_i) → K cutoff=t_i backward walks → raw [B,K,L] token bag.
         src_tokens = build_query_walk_tokens(
@@ -225,7 +213,7 @@ class Trainer:
             walk_bias=self.config.walk_bias,
             node_feat=self.config.node_feat)
 
-        return self.model(batch_walk_nodes, src_tokens, cand_tokens)
+        return self.model(src_tokens, cand_tokens)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
