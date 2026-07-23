@@ -175,6 +175,12 @@ class LinkPredHead(nn.Module):
         self.neighbourhood = NeighborhoodProjection(
             d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef)
 
+        # Combiner MLP over the 4 pairwise cosines of both sides' identity (E[x]) and neighbourhood
+        # (P[x]) embeddings. All 4 are unit-sphere inner products → rotation-invariant, so the scorer
+        # stays sphere-faithful (no raw coordinates).
+        self.scorer = nn.Sequential(
+            nn.Linear(4, 32), nn.GELU(), nn.Linear(32, 1))
+
     def _token_edge_features(self, tokens: WalkTokens, q: int) -> torch.Tensor:
         """Per-token edge features [Q, T, d_ef] aligned with the flattened token bag. tokens holds
         edge_features as [Q, K, L*d_ef]; reshape to [Q, K*L, d_ef]. When the dataset has no edge
@@ -185,8 +191,9 @@ class LinkPredHead(nn.Module):
         return tokens.nodes.new_zeros((q, k * length, self.d_ef), dtype=torch.float32)
 
     def _project(self, tokens: WalkTokens):
-        """Project one bag of N queries. Returns p [N, d] = exp_{E[seed]}(mu) on the sphere (seed
-        pushed toward its walk-token centroid)."""
+        """Project one bag of N queries. Returns (e_seed, p): e_seed [N, d] = E[seed] (the identity on
+        the sphere), p [N, d] = exp_{E[seed]}(mu) (seed pushed toward its walk-token centroid). Both
+        on-sphere."""
         e_weight = self.E.weight
         e_seed = F.embedding(tokens.seeds, e_weight)                                  # E[x]  [N, d] (E is on-sphere)
         n = e_seed.shape[0]
@@ -199,16 +206,28 @@ class LinkPredHead(nn.Module):
         token_tangent = self.geom.log_map(e_seed.unsqueeze(-2), token_emb)           # [N, T, d] tangent
         mu = self.neighbourhood(
             e_seed, token_tangent, token_ages.to(e_seed.dtype), token_mask, token_pos, token_ef)  # [N, d]
-        return self.geom.exp_map(e_seed, mu)                                         # P[x]  [N, d]
+        return e_seed, self.geom.exp_map(e_seed, mu)                                  # (E[x], P[x])  [N, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Two-sided scoring (plumbing scaffold). src_tokens: B source queries (seeds = u). cand_tokens:
-        the B*C candidate queries (seeds = v) in query-major order, each walked with its query's cutoff.
-        Returns logits [B, C] = <P[u], P[v]>. NOTE: this geometric head is a throwaway — it is being
-        replaced by the stateless NodeEncoding model; only the two-bag (source + candidate) plumbing
-        matters here, so the actual logit value is irrelevant."""
-        p_u = self._project(src_tokens)                                       # P[u]  [B, d]
-        p_v = self._project(cand_tokens)                                      # P[v]  [B*C, d]
-        b, d = p_u.shape
-        p_v = p_v.reshape(b, -1, d)                                           # [B, C, d]
-        return self.geom.similarity(p_u.unsqueeze(1), p_v)                    # <P[u], P[v]>  [B, C]
+        """Two-sided scoring. src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate
+        queries (seeds = v) in query-major order, each walked with its query's cutoff. Score = MLP over
+        the FOUR pairwise cosines of both sides' identity (seed = E[x]) and neighbourhood (nbhd = P[x])
+        embeddings. All four are unit-sphere inner products (rotation-invariant), so the scorer is
+        sphere-faithful — no raw coordinates. Returns logits [B, C]."""
+        seed_u, nbhd_u = self._project(src_tokens)                            # E[u], P[u]  [B, d]
+        seed_v, nbhd_v = self._project(cand_tokens)                           # E[v], P[v]  [B*C, d]
+        b, d = seed_u.shape
+        c = seed_v.shape[0] // b
+        seed_v = seed_v.reshape(b, c, d)                                      # [B, C, d]
+        nbhd_v = nbhd_v.reshape(b, c, d)                                      # [B, C, d]
+        seed_u = seed_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
+        nbhd_u = nbhd_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
+
+        # Four unit-sphere cosines between u's and v's identity / neighbourhood embeddings.
+        inner_products = torch.stack([
+            (seed_u * seed_v).sum(-1),                                        # ⟨E[u], E[v]⟩  identity affinity
+            (seed_u * nbhd_v).sum(-1),                                        # ⟨E[u], P[v]⟩  is u in v's neighbourhood
+            (nbhd_u * seed_v).sum(-1),                                        # ⟨P[u], E[v]⟩  is v in u's neighbourhood
+            (nbhd_u * nbhd_v).sum(-1),                                        # ⟨P[u], P[v]⟩  neighbourhood overlap
+        ], dim=-1)                                                            # [B, C, 4]
+        return self.scorer(inner_products).squeeze(-1)                        # [B, C]
