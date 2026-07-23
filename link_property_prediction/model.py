@@ -100,8 +100,9 @@ class NeighborhoodProjection(nn.Module):
     A source-conditioned query attends over the tokens; the attention scores ARE the pooling weights,
     and mu_u is the weighted centroid of the RAW token tangents:
 
-        q_u  = W_q(E[u])                                  [B, d_a]     (d_a = d_emb // 2)
-        k_p  = W_k([ Log_{E[u]}(E[token_p]) ; Time2Vec(age_p) ; log1p(hop_p) ])   [B, T, d_a]
+        q_u  = W_k([ E[u] ; 0 ; 0 ; 0 ])                  [B, d_a]     (seed as a token: time/hop/edge zero-padded;
+                                                                       SAME W_k as the keys, d_a = d_emb // 2)
+        k_p  = W_k([ Log_{E[u]}(E[token_p]) ; Time2Vec(age_p) ; log1p(hop_p) ; edge_p ])   [B, T, d_a]
         w_p  = softmax_p( (q_u . k_p) / sqrt(d_a) )       [B, T]   (padding masked out)
         mu_u = Sum_p w_p * token_tangent_p                 [B, d_emb]
 
@@ -118,12 +119,12 @@ class NeighborhoodProjection(nn.Module):
         self.scale = 1.0 / math.sqrt(d_a)
 
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        # Query + key are SINGLE linear projections to d_a (a 2-layer projection overfits on wiki —
-        # depth is the regression, not width).
-        self.w_q = nn.Linear(d_emb, d_a)
-        # per-token key: content + time + log-hop position (1 scalar) + edge feats. The hop position
-        # enters as log1p(hop) inside the KEY (not an additive PE), so it can be learned/silenced;
-        # length-agnostic (a scalar function of the hop, works for any walk length).
+        # ONE shared projection to d_a for BOTH query and keys (a 2-layer projection overfits on wiki —
+        # depth is the regression, not width). The per-token descriptor is content + time + log-hop
+        # position (1 scalar) + edge feats. The QUERY is the seed run through this SAME projection with
+        # the time/hop/edge components ZERO-padded (the seed has age 0, hop 0, no edge), so query and
+        # keys live in one aligned subspace. The hop enters as log1p(hop) inside the descriptor (not an
+        # additive PE), so it can be learned/silenced; length-agnostic.
         k_in = d_emb + t2v_dim + 1 + d_ef
         self.w_k = nn.Linear(k_in, d_a)
 
@@ -137,8 +138,16 @@ class NeighborhoodProjection(nn.Module):
         # TPNet scales delta-times by log(Δt + 1) before the time encoder.
         t2v = self.time_encoder(torch.log1p(ages.clamp_min(0.0)))             # [B,T,t2v_dim]
         log_hop = torch.log1p(positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)   # [B,T,1] log-hop position
-        keys = self.w_k(torch.cat([token_tangents, t2v, log_hop, edge_features], dim=-1))   # [B,T,d_emb]
-        query = self.w_q(source)                                             # [B,d_emb]
+        keys = self.w_k(torch.cat([token_tangents, t2v, log_hop, edge_features], dim=-1))   # [B,T,d_a]
+        # Query = the seed AS a token: content = source, but age 0 / hop 0 / no edge, so those three
+        # components are zero-padded. Same w_k as the keys → query and keys align in one subspace.
+        b = source.shape[0]
+        query = self.w_k(torch.cat([
+            source,                                       # [B, d_emb]  seed content
+            source.new_zeros(b, t2v.shape[-1]),           # [B, t2v_dim]  age 0
+            source.new_zeros(b, 1),                       # [B, 1]        hop 0
+            source.new_zeros(b, edge_features.shape[-1]), # [B, d_ef]     no edge
+        ], dim=-1))                                       # [B, d_a]
 
         scores = (query.unsqueeze(1) * keys).sum(-1) * self.scale            # [B,T]
         scores = scores.masked_fill(~mask, float("-inf"))
