@@ -11,9 +11,9 @@ Hyperparameters exposed at CLI (and their grouping):
   Link/head:      --k-train
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias, --start-bias
                   (backward-only, undirected; source u → μ_u; candidate v via static E[v])
-  Optimisation:   --lr, --lr-min, --weight-decay, --batch-size, --eval-batch-size,
+  Optimisation:   --lr, --weight-decay, --batch-size, --eval-batch-size,
                   --num-epochs, --early-stop-patience
-                  (single-group cosine decay to --lr-min over --decay-horizon-epochs)
+                  (plain AdamW at a constant LR — no scheduler)
   System:         --seed, --use-gpu, --use-gpu-tempest
   Analysis:       --stratify (post-train per-slice test-MRR stratification)
 
@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
 
     # Walks (BACKWARD only, undirected) for the source side (u → μ_u). One-sided head: only the
     # source is walked; each candidate v enters through its static embedding E[v].
-    p.add_argument("--num-walks-per-node", default=10, type=int,
+    p.add_argument("--num-walks-per-node", default=5, type=int,
                    help="K walks per source node u.")
     p.add_argument("--max-walk-len", default=5, type=int,
                    help="L, max walk length. (Sweep on wiki: shorter is better — 20→5 gave "
@@ -103,14 +103,11 @@ def parse_args() -> argparse.Namespace:
                         "more outward exploration; p=4,q=0.25 = most diverse backward walks.")
 
 
-    # Optimisation — RiemannianAdam, single-group cosine decay to --lr-min over --decay-horizon-epochs.
-    # One group covers E (a geoopt.ManifoldParameter, Riemannian update) and all Euclidean params.
-    p.add_argument("--lr", default=1e-3, type=float,
-                   help="Peak LR (sphere default 1e-3).")
-    p.add_argument("--lr-min", default=1e-7, type=float,
-                   help="Cosine-decay floor.")
+    # Optimisation — plain AdamW at a constant LR (no scheduler / decay / warmup).
+    p.add_argument("--lr", default=1e-4, type=float,
+                   help="Constant learning rate (no decay).")
     p.add_argument("--weight-decay", default=1e-4, type=float,
-                   help="Weight decay (RiemannianAdam). Load-bearing on the sphere head.")
+                   help="AdamW weight decay.")
     p.add_argument(
         "--batch-size", default=200, type=int,
         help="Train batch size. Under the per-query ranking link "
@@ -127,11 +124,7 @@ def parse_args() -> argparse.Namespace:
              "wiki needs --eval-batch-size 25-50 explicitly.",
     )
     p.add_argument("--num-epochs", default=25, type=int)
-    p.add_argument("--decay-horizon-epochs", default=30, type=int,
-                   help="LR cosine-decay horizon in epochs (shared by both LR groups), SEPARATE from "
-                        "--num-epochs: LR reaches lr-min at this horizon, so a shorter --num-epochs "
-                        "stays near peak (freedom to run any epoch count without rescaling the LR).")
-    p.add_argument("--early-stop-patience", default=10, type=int)
+    p.add_argument("--early-stop-patience", default=8, type=int)
 
     # System.
     p.add_argument("--seed", default=42, type=int)
@@ -164,8 +157,7 @@ def parse_args() -> argparse.Namespace:
              "weights to logs/embeddings/<dataset>_seed<seed>_demb<d_emb>"
              "_ep<stopped_at_epoch>.npy. Raw float32 [num_nodes, d_emb] "
              "array; node ids follow TGB's contiguous integer ordering. "
-             "NOTE: rows are now UNIT-NORM (sphere-constrained E) — analyse "
-             "by direction (cosine), not magnitude. "
+             "Rows are plain Euclidean embeddings (not unit-norm). "
              "Off by default.",
     )
 
@@ -278,10 +270,8 @@ def main() -> Dict[str, Any]:
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
         lr=args.lr,
-        lr_min=args.lr_min,
         weight_decay=args.weight_decay,
         num_epochs=args.num_epochs,
-        decay_horizon_epochs=args.decay_horizon_epochs,
         early_stop_patience=args.early_stop_patience,
 
         seed=args.seed,
