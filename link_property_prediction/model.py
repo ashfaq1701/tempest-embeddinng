@@ -22,7 +22,6 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .walk_tokens import WalkTokens, flatten_tokens
 
@@ -155,23 +154,28 @@ class TimeEncoder(nn.Module):
         return output
 
 
-class GatedResidualFFN(nn.Module):
-    """x + γ ⊙ FFN(RMSNorm(x)) — pre-norm, per-channel γ init ε, SwiGLU branch, one dropout."""
+class ResidualFFN(nn.Module):
+    """Pre-norm gated residual block: x + γ ⊙ FFN(LayerNorm(x)), where FFN = Linear(d_h → e·d_h)
+    → GELU → Linear(e·d_h → d_h) → Dropout. The trunk is a pure identity — nothing operates on x
+    itself; the branch is normalized on entry, so blocks stack without scale drift. γ (LayerScale,
+    per-channel, init ε) starts every block as a near-no-op — the stack begins ≈ the stem's linear
+    encoding and earns its FFN capacity channel-by-channel; trained |γ| doubles as a per-channel
+    utilization probe. Biases dropped in the FFN: LayerNorm's affine already supplies the input
+    offset, and the residual supplies the output offset."""
 
     def __init__(self, d_h: int, dropout: float, expansion: int = 2, gamma_init: float = 1e-2):
         super().__init__()
-        self.norm = nn.RMSNorm(d_h)
-        d_ff = expansion * d_h
-        self.w_gate = nn.Linear(d_h, d_ff, bias=False)     # SwiGLU: silu(W_g x) ⊙ (W_v x)
-        self.w_val  = nn.Linear(d_h, d_ff, bias=False)
-        self.w_out  = nn.Linear(d_ff, d_h, bias=False)
-        self.drop = nn.Dropout(dropout)
-        self.gamma = nn.Parameter(torch.full((d_h,), gamma_init))   # LayerScale
+        self.norm = nn.LayerNorm(d_h)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_h, expansion * d_h, bias=False),
+            nn.GELU(),
+            nn.Linear(expansion * d_h, d_h, bias=False),
+            nn.Dropout(dropout),
+        )
+        self.gamma = nn.Parameter(torch.full((d_h,), float(gamma_init)))
 
-    def forward(self, x):
-        h = self.norm(x)
-        h = self.w_out(self.drop(F.silu(self.w_gate(h)) * self.w_val(h)))
-        return x + self.gamma * h
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.gamma * self.ffn(self.norm(x))
 
 
 class WalkNeighborhoodEncoder(nn.Module):
@@ -197,7 +201,7 @@ class WalkNeighborhoodEncoder(nn.Module):
         # One encoder shared by both the tokens and the seed.
         self.input_norm = nn.LayerNorm(in_dim)
         self.input_proj = nn.Linear(in_dim, enc_dim)
-        self.blocks = nn.ModuleList(GatedResidualFFN(enc_dim, dropout, expansion) for _ in range(n_layers))
+        self.blocks = nn.ModuleList(ResidualFFN(enc_dim, dropout, expansion) for _ in range(n_layers))
         self.attn_scale = enc_dim ** -0.5
 
     def _encode(self, feat: torch.Tensor) -> torch.Tensor:
