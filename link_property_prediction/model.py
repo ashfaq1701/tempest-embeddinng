@@ -7,7 +7,8 @@ seed by mu_x — the attention-pooled centroid of the DISPLACEMENTS (E[token] - 
 Two-sided: both u and every candidate v are walked and projected. The pair (u, v) is scored by an MLP
 over the FOUR inner products of the two sides' identity (E) and neighbourhood (P) embeddings:
     <E[u],E[v]>   <E[u],P[v]>   <P[u],E[v]>   <P[u],P[v]>
-The head owns self.E (a plain nn.Embedding, link-trained in Euclidean space).
+The head owns self.E (an EmbeddingTable; its stored weight is free Euclidean but every lookup is
+L2-normalized, so E[x] is unit-norm / on the sphere — Method A, plain optimizer, no geoopt).
 """
 import math
 
@@ -142,6 +143,27 @@ class NeighborhoodProjection(nn.Module):
         return (weights.unsqueeze(-1) * token_deltas).sum(dim=-2)            # [B,d_emb]
 
 
+class EmbeddingTable(nn.Module):
+    """The learned node-embedding table + a single retrieval method — the one place embeddings are read.
+
+    KEEP-ON-SPHERE (Method A): the stored parameter is a FREE Euclidean vector, but every `lookup`
+    L2-normalizes it, so everything the model sees is unit-norm (on the sphere). Backprop through
+    F.normalize auto-projects the gradient onto the tangent space, giving Riemannian-style gradients
+    under a plain Euclidean optimizer — no geoopt / RiemannianAdam. Pair with weight_decay = 0 on this
+    table (decay + normalization interact badly: it shrinks ‖weight‖ and couples into the effective LR).
+    The raw (UN-normalized) parameter is exposed as `.weight` for callers that need the whole table
+    (probes, dumps) — normalize on export if unit rows are wanted."""
+
+    def __init__(self, num_nodes: int, d_emb: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_nodes, d_emb))
+        nn.init.normal_(self.weight, mean=0.0, std=1.0 / math.sqrt(d_emb))
+
+    def lookup(self, node_ids: torch.Tensor) -> torch.Tensor:
+        """Unit-norm embeddings for `node_ids` [*] -> [*, d_emb] (L2-normalized in the forward pass)."""
+        return F.normalize(F.embedding(node_ids, self.weight), dim=-1, eps=1e-8)
+
+
 class LinkPredHead(nn.Module):
     def __init__(self, num_nodes: int, d_emb: int,
                  t2v_dim: int = 16, d_ef: int = 0):
@@ -151,8 +173,7 @@ class LinkPredHead(nn.Module):
         self.d_ef = d_ef
 
         # Plain Euclidean node embeddings, link-trained (no manifold).
-        self.E = nn.Embedding(num_nodes, d_emb)
-        nn.init.normal_(self.E.weight, mean=0.0, std=1.0 / math.sqrt(d_emb))
+        self.E = EmbeddingTable(num_nodes, d_emb)
 
         self.neighbourhood = NeighborhoodProjection(
             d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef)
@@ -175,15 +196,14 @@ class LinkPredHead(nn.Module):
         """Project one bag of N queries. Returns (e_seed, p): e_seed [N, d] = E[seed] (the identity), and
         p [N, d] = E[seed] + mu (the seed moved by mu, the attention-pooled centroid of its walk tokens'
         displacements). Cold rows (no token) -> mu = 0 -> p = e_seed."""
-        e_weight = self.E.weight
-        e_seed = F.embedding(tokens.seeds, e_weight)                                  # E[x]  [N, d]
+        e_seed = self.E.lookup(tokens.seeds)                                          # E[x]  [N, d]
         n = e_seed.shape[0]
 
         token_ids, token_mask, token_pos = flatten_tokens(
             tokens, exclude_seed_positions=True)
         token_ages = tokens.ages.reshape(n, -1).clamp_min(0)                          # ages read from the instance
         token_ef = self._token_edge_features(tokens, n)                              # [N, T, d_ef]
-        token_emb = F.embedding(token_ids.clamp_min(0), e_weight)                     # [N, T, d]
+        token_emb = self.E.lookup(token_ids.clamp_min(0))                             # [N, T, d]
         token_delta = token_emb - e_seed.unsqueeze(-2)                                # [N, T, d] E[token] - E[seed]
         mu = self.neighbourhood(
             e_seed, token_delta, token_ages.to(e_seed.dtype), token_mask, token_pos, token_ef)  # [N, d]

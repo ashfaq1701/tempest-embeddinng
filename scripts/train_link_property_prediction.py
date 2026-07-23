@@ -106,8 +106,8 @@ def parse_args() -> argparse.Namespace:
     # Optimisation — plain AdamW at a constant LR (no scheduler / decay / warmup).
     p.add_argument("--lr", default=1e-4, type=float,
                    help="Constant learning rate (no decay).")
-    p.add_argument("--weight-decay", default=1e-4, type=float,
-                   help="AdamW weight decay.")
+    p.add_argument("--weight-decay", default=0.0, type=float,
+                   help="AdamW weight decay (default 0: E is L2-normalized, decay couples into eff. LR).")
     p.add_argument(
         "--batch-size", default=200, type=int,
         help="Train batch size. Under the per-query ranking link "

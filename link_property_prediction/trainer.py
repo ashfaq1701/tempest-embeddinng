@@ -79,9 +79,11 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
 
-    # Optimisation — plain AdamW at a constant LR (no scheduler / decay / warmup).
+    # Optimisation — plain AdamW at a constant LR (no scheduler / decay / warmup). weight_decay defaults
+    # to 0: E is L2-normalized in the forward (Method A), and decay interacts badly with normalization
+    # (shrinks ‖weight‖ → couples into the effective LR).
     lr: float = 1e-4
-    weight_decay: float = 1e-4
+    weight_decay: float = 0.0
 
     # Run control.
     num_epochs: int = 25
