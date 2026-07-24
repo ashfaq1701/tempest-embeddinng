@@ -23,20 +23,6 @@ import torch.nn.functional as F
 from .walk_tokens import WalkTokens, flatten_tokens
 
 
-def geodesic_distance(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    """Great-circle (geodesic) distance between UNIT vectors x, y on the sphere, over the last dim.
-
-    Uses the chord form  d = 2·asin(‖x − y‖ / 2)  — mathematically equal to arccos(⟨x, y⟩) for unit
-    vectors, but numerically stable as x → y: asin has a bounded gradient at 0, whereas arccos(⟨x,y⟩)
-    (geoopt's Sphere.dist) has gradient −1/√(1−⟨x,y⟩²) → ∞ at coincidence, which NaNs the backward.
-    The squared chord is clamped away from 0 before the sqrt so the norm's gradient stays finite even
-    at exact coincidence, and the asin argument is clamped to [·, 1] to absorb fp overshoot near the
-    antipode. Returns distance in [0, π]; LOWER = closer. Shapes: x, y [*, d] → [*]."""
-    sq_chord = ((x - y) ** 2).sum(dim=-1)                     # ‖x − y‖² ∈ [0, 4]
-    chord = sq_chord.clamp_min(eps).sqrt()                    # finite gradient even at x == y
-    return 2.0 * torch.asin((chord * 0.5).clamp(max=1.0))     # 2·asin(‖x−y‖/2) ∈ [0, π]
-
-
 def sphere_expmap(base: torch.Tensor, tangent: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     """Exponential map on the unit sphere: move from `base` along `tangent` (a vector in the tangent
     space at base).  exp(base, u) = cos(‖u‖)·base + sinc(‖u‖/π)·u.
@@ -216,12 +202,12 @@ class LinkPredHead(nn.Module):
         seed_u = seed_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
         nbhd_u = nbhd_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
 
-        # Four sphere geodesic distances between u's and v's identity / neighbourhood points
-        # (stable chord/asin form — see geodesic_distance).
+        # Four sphere geodesic distances (geoopt.Sphere.dist = arccos⟨·,·⟩) between u's and v's
+        # identity / neighbourhood points.
         distances = torch.stack([
-            geodesic_distance(seed_u, seed_v),                               # d(E[u], E[v])  identity affinity
-            geodesic_distance(seed_u, nbhd_v),                               # d(E[u], P[v])  is u in v's neighbourhood
-            geodesic_distance(nbhd_u, seed_v),                               # d(P[u], E[v])  is v in u's neighbourhood
-            geodesic_distance(nbhd_u, nbhd_v),                               # d(P[u], P[v])  neighbourhood overlap
+            self.manifold.dist(seed_u, seed_v),                             # d(E[u], E[v])  identity affinity
+            self.manifold.dist(seed_u, nbhd_v),                             # d(E[u], P[v])  is u in v's neighbourhood
+            self.manifold.dist(nbhd_u, seed_v),                             # d(P[u], E[v])  is v in u's neighbourhood
+            self.manifold.dist(nbhd_u, nbhd_v),                             # d(P[u], P[v])  neighbourhood overlap
         ], dim=-1)                                                            # [B, C, 4]
         return self.scorer(distances).squeeze(-1)                            # [B, C]
