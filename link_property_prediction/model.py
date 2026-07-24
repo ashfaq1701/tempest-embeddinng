@@ -1,14 +1,15 @@
-"""Link head — EUCLIDEAN node embeddings + a neighbourhood-projection channel, in one module.
+"""Link head — node embeddings + a residual neighbourhood encoder, in one module.
 
-Each node has a plain learned embedding E[x]. Its neighbourhood embedding P[x] = E[x] + mu_x moves the
-seed by mu_x — the attention-pooled centroid of the DISPLACEMENTS (E[token] - E[x]) of x's walk tokens
-(+ a TPNet Time2Vec of each token's age + log-hop + edge feats), produced by NeighborhoodProjection.
+Each node has a learned embedding E[x] (self.E, an EmbeddingTable; its stored weight is free Euclidean
+but every lookup is L2-normalized, so E[x] is unit-norm — Method A, plain optimizer, no geoopt).
+NeighborhoodEncoder (master's residual encoder, at d_emb — no separate enc_dim) turns each query's
+walk-token bag into a FREE d_emb (seed_emb, nbhd_emb): it embeds the seed E[u] and each token
+[E[token] ‖ Time2Vec(age) ‖ log1p(hop) ‖ edge] through input_proj + n_layers residual FFN, then the
+seed attends over the tokens to pool the neighbourhood.
 
-Two-sided: both u and every candidate v are walked and projected. The pair (u, v) is scored by an MLP
-over the FOUR inner products of the two sides' identity (E) and neighbourhood (P) embeddings:
-    <E[u],E[v]>   <E[u],P[v]>   <P[u],E[v]>   <P[u],P[v]>
-The head owns self.E (an EmbeddingTable; its stored weight is free Euclidean but every lookup is
-L2-normalized, so E[x] is unit-norm / on the sphere — Method A, plain optimizer, no geoopt).
+Two-sided: both u and every candidate v are walked and encoded. The pair (u, v) is scored by an MLP
+over the FOUR inner products of the two sides' seed and neighbourhood embeddings:
+    <seed_u,seed_v>   <seed_u,nbhd_v>   <nbhd_u,seed_v>   <nbhd_u,nbhd_v>
 """
 import math
 
@@ -81,66 +82,63 @@ class ResidualFFN(nn.Module):
         return x + self.gamma * self.ffn(self.norm(x))
 
 
-class NeighborhoodProjection(nn.Module):
-    """Single attention-pooling of a source's walk-token displacements into one vector mu_u.
+class NeighborhoodEncoder(nn.Module):
+    """Encode a query's walk-token bag into (seed_emb, nbhd_emb), each FREE [Q, d_emb]. Master's residual
+    encoder, ported to d_emb width (no separate enc_dim):
 
-    A source-conditioned query attends over the tokens; the attention scores ARE the pooling weights,
-    and mu_u is the weighted centroid of the RAW token displacements:
+    Each per-token descriptor [E[token] ‖ Time2Vec(age) ‖ log1p(hop) ‖ edge] is embedded by input_proj
+    (in_dim → d_emb) then n_layers pre-norm RESIDUAL FFN blocks. The seed is encoded the same way (its
+    own E[u], age 0, hop 0, no edge), then attends over the token embeddings (scaled dot product) and
+    pools them into the neighbourhood embedding. Both outputs are free Euclidean d_emb vectors. Cold
+    queries (no neighbourhood token) get nbhd_emb = 0."""
 
-        q_u  = W_k([ E[u] ; 0 ; 0 ; 0 ])                  [B, d_a]     (seed as a token: time/hop/edge zero-padded;
-                                                                       SAME W_k as the keys, d_a = d_emb // 2)
-        k_p  = W_k([ (E[token_p] - E[u]) ; Time2Vec(age_p) ; log1p(hop_p) ; edge_p ])   [B, T, d_a]
-        w_p  = softmax_p( (q_u . k_p) / sqrt(d_a) )       [B, T]   (padding masked out)
-        mu_u = Sum_p w_p * token_delta_p                   [B, d_emb]
-
-    The value is the token displacement itself, so mu_u stays a genuine weighted centroid (in the span
-    of u's neighbour displacements) — a strict, learnable generalisation of the fixed softmax(-lambda*age)
-    weighting. Candidate-independent (never sees E[v]); cold rows (no token) -> mu_u = 0.
-    """
-
-    def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0):
+    def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0,
+                 n_layers: int = 2, expansion: int = 2, dropout: float = 0.1):
         super().__init__()
-        self.d_emb = d_emb
         self.d_ef = d_ef
-        d_a = d_emb // 2                     # attention (query/key) dim, derived from d_emb
-        self.scale = 1.0 / math.sqrt(d_a)
-
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        # ONE shared projection to d_a for BOTH query and keys (a 2-layer projection overfits on wiki —
-        # depth is the regression, not width). The per-token descriptor is content + time + log-hop
-        # position (1 scalar) + edge feats. The QUERY is the seed run through this SAME projection with
-        # the time/hop/edge components ZERO-padded (the seed has age 0, hop 0, no edge), so query and
-        # keys live in one aligned subspace. The hop enters as log1p(hop) inside the descriptor (not an
-        # additive PE), so it can be learned/silenced; length-agnostic.
-        k_in = d_emb + t2v_dim + 1 + d_ef
-        self.w_k = nn.Linear(k_in, d_a)
+        in_dim = d_emb + t2v_dim + 1 + d_ef                 # E[token] ‖ t2v(age) ‖ log_hop ‖ edge
+        # EMBED (in_dim → d_emb; dim change, no residual), then n_layers pre-norm residual FFN blocks.
+        # One encoder shared by both the tokens and the seed.
+        self.input_norm = nn.LayerNorm(in_dim)
+        self.input_proj = nn.Linear(in_dim, d_emb)
+        self.blocks = nn.ModuleList(ResidualFFN(d_emb, dropout, expansion) for _ in range(n_layers))
+        self.attn_scale = d_emb ** -0.5
 
-    def forward(self, source: torch.Tensor, token_deltas: torch.Tensor,
-                ages: torch.Tensor, mask: torch.Tensor, positions: torch.Tensor,
-                edge_features: torch.Tensor) -> torch.Tensor:
-        """source [B,d_emb] (E[u]); token_deltas [B,T,d_emb] (E[token] - E[u], the displacement from the
-        seed); ages [B,T]; mask [B,T] bool (True = real token); positions [B,T] int hop-from-seed
-        (1=seed, 0=pad); edge_features [B,T,d_ef] per-token edge features (empty [B,T,0] when the
-        dataset has none). Returns mu_u [B,d_emb] the pooled displacement; cold rows (no token) -> 0."""
+    def _encode(self, feat: torch.Tensor) -> torch.Tensor:
+        """Descriptor [*, in_dim] → embedding [*, d_emb]: embed, then the residual blocks."""
+        x = self.input_proj(self.input_norm(feat))
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+    def forward(self, e_seed: torch.Tensor, token_emb: torch.Tensor, ages: torch.Tensor,
+                mask: torch.Tensor, positions: torch.Tensor, edge_features: torch.Tensor) -> tuple:
+        """e_seed [B,d_emb] (E[u]); token_emb [B,T,d_emb] (E[token]); ages/positions [B,T]; mask [B,T]
+        bool (True = real token); edge_features [B,T,d_ef]. Returns (seed_emb, nbhd_emb), each free
+        [B,d_emb]; cold rows (no token) → nbhd_emb = 0."""
         # TPNet scales delta-times by log(Δt + 1) before the time encoder.
-        t2v = self.time_encoder(torch.log1p(ages.clamp_min(0.0)))             # [B,T,t2v_dim]
-        log_hop = torch.log1p(positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)   # [B,T,1] log-hop position
-        keys = self.w_k(torch.cat([token_deltas, t2v, log_hop, edge_features], dim=-1))   # [B,T,d_a]
-        # Query = the seed AS a token: content = source, but age 0 / hop 0 / no edge, so those three
-        # components are zero-padded. Same w_k as the keys → query and keys align in one subspace.
-        b = source.shape[0]
-        query = self.w_k(torch.cat([
-            source,                                       # [B, d_emb]  seed content
-            source.new_zeros(b, t2v.shape[-1]),           # [B, t2v_dim]  age 0
-            source.new_zeros(b, 1),                       # [B, 1]        hop 0
-            source.new_zeros(b, edge_features.shape[-1]), # [B, d_ef]     no edge
-        ], dim=-1))                                       # [B, d_a]
+        t2v = self.time_encoder(torch.log1p(ages.clamp_min(0.0)))                       # [B,T,t2v_dim]
+        log_hop = torch.log1p(positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)       # [B,T,1] log-hop
+        token_feat = torch.cat([token_emb, t2v, log_hop, edge_features], dim=-1)        # [B,T,in_dim]
+        token_enc = self._encode(token_feat)                                           # [B,T,d_emb]
 
-        scores = (query.unsqueeze(1) * keys).sum(-1) * self.scale            # [B,T]
+        # The seed AS a token: content = E[u], age 0 / hop 0 / no edge (zero-padded), SAME encoder.
+        b = e_seed.shape[0]
+        seed_feat = torch.cat([
+            e_seed,                                        # [B, d_emb]  seed content
+            e_seed.new_zeros(b, t2v.shape[-1]),            # [B, t2v_dim]  age 0
+            e_seed.new_zeros(b, 1),                        # [B, 1]        hop 0
+            e_seed.new_zeros(b, edge_features.shape[-1]),  # [B, d_ef]     no edge
+        ], dim=-1)                                         # [B, in_dim]
+        seed_emb = self._encode(seed_feat)                                             # [B, d_emb]
+
+        # The seed attends over its token embeddings (scaled dot product) and pools them.
+        scores = (seed_emb.unsqueeze(1) * token_enc).sum(-1) * self.attn_scale          # [B,T]
         scores = scores.masked_fill(~mask, float("-inf"))
-        weights = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)   # cold row -> all 0
-
-        return (weights.unsqueeze(-1) * token_deltas).sum(dim=-2)            # [B,d_emb]
+        weights = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)             # cold row → all 0
+        nbhd_emb = (weights.unsqueeze(-1) * token_enc).sum(dim=1)                       # [B, d_emb]
+        return seed_emb, nbhd_emb
 
 
 class EmbeddingTable(nn.Module):
@@ -165,21 +163,23 @@ class EmbeddingTable(nn.Module):
 
 
 class LinkPredHead(nn.Module):
-    def __init__(self, num_nodes: int, d_emb: int,
-                 t2v_dim: int = 16, d_ef: int = 0):
+    def __init__(self, num_nodes: int, d_emb: int, t2v_dim: int = 16, d_ef: int = 0,
+                 n_layers: int = 2, expansion: int = 2, dropout: float = 0.1):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_emb = d_emb
         self.d_ef = d_ef
 
-        # Plain Euclidean node embeddings, link-trained (no manifold).
+        # Node embeddings, link-trained; E[x] is unit-norm via the table's forward-normalization.
         self.E = EmbeddingTable(num_nodes, d_emb)
 
-        self.neighbourhood = NeighborhoodProjection(
-            d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef)
+        # Master's residual encoder (ported to d_emb, no separate enc_dim): turns each query's walk-token
+        # bag into free d_emb (seed_emb, nbhd_emb) via input_proj + n_layers residual FFN + attention.
+        self.neighbourhood = NeighborhoodEncoder(
+            d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef,
+            n_layers=n_layers, expansion=expansion, dropout=dropout)
 
-        # Combiner MLP over the 4 pairwise inner products of both sides' identity (E[x]) and
-        # neighbourhood (P[x]) embeddings.
+        # Combiner MLP over the 4 pairwise inner products of both sides' (seed, neighbourhood) embeddings.
         self.scorer = nn.Sequential(
             nn.Linear(4, 32), nn.GELU(), nn.Linear(32, 1))
 
@@ -193,9 +193,9 @@ class LinkPredHead(nn.Module):
         return tokens.nodes.new_zeros((q, k * length, self.d_ef), dtype=torch.float32)
 
     def _project(self, tokens: WalkTokens):
-        """Project one bag of N queries. Returns (e_seed, p): e_seed [N, d] = E[seed] (the identity), and
-        p [N, d] = E[seed] + mu (the seed moved by mu, the attention-pooled centroid of its walk tokens'
-        displacements). Cold rows (no token) -> mu = 0 -> p = e_seed."""
+        """Encode one bag of N queries into (seed_emb, nbhd_emb), each free [N, d]: the residual encoder
+        embeds the seed (E[u]) and each walk token (E[token] + time/hop/edge), then the seed attends over
+        the tokens to pool the neighbourhood. Cold rows (no token) -> nbhd_emb = 0."""
         e_seed = self.E.lookup(tokens.seeds)                                          # E[x]  [N, d]
         n = e_seed.shape[0]
 
@@ -203,19 +203,17 @@ class LinkPredHead(nn.Module):
             tokens, exclude_seed_positions=True)
         token_ages = tokens.ages.reshape(n, -1).clamp_min(0)                          # ages read from the instance
         token_ef = self._token_edge_features(tokens, n)                              # [N, T, d_ef]
-        token_emb = self.E.lookup(token_ids.clamp_min(0))                             # [N, T, d]
-        token_delta = token_emb - e_seed.unsqueeze(-2)                                # [N, T, d] E[token] - E[seed]
-        mu = self.neighbourhood(
-            e_seed, token_delta, token_ages.to(e_seed.dtype), token_mask, token_pos, token_ef)  # [N, d]
-        return e_seed, e_seed + mu                                                    # (E[x], P[x])  [N, d]
+        token_emb = self.E.lookup(token_ids.clamp_min(0))                             # E[token]  [N, T, d]
+        return self.neighbourhood(
+            e_seed, token_emb, token_ages.to(e_seed.dtype), token_mask, token_pos, token_ef)  # (seed_emb, nbhd_emb)
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Two-sided scoring. src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate
         queries (seeds = v) in query-major order, each walked with its query's cutoff. Score = MLP over
-        the FOUR pairwise inner products of both sides' identity (seed = E[x]) and neighbourhood
-        (nbhd = P[x]) embeddings. Returns logits [B, C]."""
-        seed_u, nbhd_u = self._project(src_tokens)                            # E[u], P[u]  [B, d]
-        seed_v, nbhd_v = self._project(cand_tokens)                           # E[v], P[v]  [B*C, d]
+        the FOUR pairwise inner products of both sides' seed and neighbourhood embeddings (all free d_emb
+        from the residual encoder). Returns logits [B, C]."""
+        seed_u, nbhd_u = self._project(src_tokens)                            # seed_u, nbhd_u  [B, d]
+        seed_v, nbhd_v = self._project(cand_tokens)                           # seed_v, nbhd_v  [B*C, d]
         b, d = seed_u.shape
         c = seed_v.shape[0] // b
         seed_v = seed_v.reshape(b, c, d)                                      # [B, C, d]
@@ -223,11 +221,11 @@ class LinkPredHead(nn.Module):
         seed_u = seed_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
         nbhd_u = nbhd_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
 
-        # Four inner products between u's and v's identity / neighbourhood embeddings.
+        # Four inner products between u's and v's seed / neighbourhood embeddings.
         inner_products = torch.stack([
-            (seed_u * seed_v).sum(-1),                                        # ⟨E[u], E[v]⟩  identity affinity
-            (seed_u * nbhd_v).sum(-1),                                        # ⟨E[u], P[v]⟩  is u in v's neighbourhood
-            (nbhd_u * seed_v).sum(-1),                                        # ⟨P[u], E[v]⟩  is v in u's neighbourhood
-            (nbhd_u * nbhd_v).sum(-1),                                        # ⟨P[u], P[v]⟩  neighbourhood overlap
+            (seed_u * seed_v).sum(-1),                                        # ⟨seed_u, seed_v⟩  u–v affinity
+            (seed_u * nbhd_v).sum(-1),                                        # ⟨seed_u, nbhd_v⟩  is u in v's nbhd
+            (nbhd_u * seed_v).sum(-1),                                        # ⟨nbhd_u, seed_v⟩  is v in u's nbhd
+            (nbhd_u * nbhd_v).sum(-1),                                        # ⟨nbhd_u, nbhd_v⟩  neighbourhood overlap
         ], dim=-1)                                                            # [B, C, 4]
         return self.scorer(inner_products).squeeze(-1)                        # [B, C]

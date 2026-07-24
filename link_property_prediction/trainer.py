@@ -62,10 +62,13 @@ class TrainerConfig:
     # Model.
     d_emb: int = 128
     d_ef: int = 0             # per-edge-feature dim (0 = dataset has no edge features); fed into the
-                             # NeighborhoodProjection attention keys. Set from the loaded dataset.
+                             # residual encoder's per-token descriptor. Set from the loaded dataset.
 
-    # NeighborhoodProjection (attention pooling of the source's walk-token offsets -> mu_u).
+    # NeighborhoodEncoder (master's residual encoder → free d_emb (seed_emb, nbhd_emb)).
     t2v_dim: int = 16         # Time2Vec output dim (16 ties dim100 on wiki: 0.8287/0.8040 vs 0.8289/0.8046)
+    n_layers: int = 2         # number of pre-norm residual FFN blocks (encoder depth).
+    expansion: int = 2        # FFN inner-width multiplier (d_emb → expansion*d_emb → d_emb).
+    dropout: float = 0.1      # dropout inside each residual FFN block.
 
     # Link loss / head.
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
@@ -107,6 +110,9 @@ class Trainer:
             d_emb=int(config.d_emb),
             t2v_dim=int(config.t2v_dim),
             d_ef=int(config.d_ef),
+            n_layers=int(config.n_layers),
+            expansion=int(config.expansion),
+            dropout=float(config.dropout),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.

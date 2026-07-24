@@ -62,10 +62,15 @@ def parse_args() -> argparse.Namespace:
     # Model.
     p.add_argument("--d-emb", default=128, type=int)
 
-    # NeighborhoodProjection — attention pooling of the source's walk-token offsets into mu_u.
-    # (Query/key MLPs project to d_emb — no separate attention dim.)
+    # NeighborhoodEncoder — master's residual encoder at d_emb (no separate enc_dim).
     p.add_argument("--t2v-dim", default=16, type=int,
                    help="Time2Vec output dim (16 ties dim 100 on wiki; TPNet default was 100).")
+    p.add_argument("--n-layers", default=2, type=int,
+                   help="Number of pre-norm residual FFN blocks (encoder depth).")
+    p.add_argument("--expansion", default=2, type=int,
+                   help="FFN inner-width multiplier (d_emb → expansion*d_emb → d_emb).")
+    p.add_argument("--dropout", default=0.1, type=float,
+                   help="Dropout inside each residual FFN (TPNet tunes this 0.0-0.5 per dataset).")
 
     # Link loss / head.
     p.add_argument(
@@ -260,6 +265,9 @@ def main() -> Dict[str, Any]:
         d_ef=(int(train_sp.edge_feat.shape[1]) if train_sp.edge_feat is not None else 0),
 
         t2v_dim=args.t2v_dim,
+        n_layers=args.n_layers,
+        expansion=args.expansion,
+        dropout=args.dropout,
 
         K_train=args.k_train,
 
