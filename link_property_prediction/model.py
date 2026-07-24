@@ -7,9 +7,10 @@ walk-token bag into a FREE d_emb (seed_emb, nbhd_emb): it embeds the seed E[u] a
 [E[token] ‖ Time2Vec(age) ‖ log1p(hop) ‖ edge] through input_proj + n_layers residual FFN, then the
 seed attends over the tokens to pool the neighbourhood.
 
-Two-sided: both u and every candidate v are walked and encoded. The pair (u, v) is scored by an MLP
-over the FOUR inner products of the two sides' seed and neighbourhood embeddings:
-    <seed_u,seed_v>   <seed_u,nbhd_v>   <nbhd_u,seed_v>   <nbhd_u,nbhd_v>
+Two-sided: both u and every candidate v are walked and encoded. The pair (u, v) is scored by a
+MergeLayer (master's decoder): a pre-norm MLP over the CONCAT of both sides' RAW (free) (seed, nbhd)
+embeddings PLUS the four COSINE similarities cos(seed_u,seed_v) cos(seed_u,nbhd_v) cos(nbhd_u,seed_v)
+cos(nbhd_u,nbhd_v) — bounded affinity prior; magnitude is carried by the raw concat.
 """
 import math
 
@@ -179,9 +180,13 @@ class LinkPredHead(nn.Module):
             d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef,
             n_layers=n_layers, expansion=expansion, dropout=dropout)
 
-        # Combiner MLP over the 4 pairwise inner products of both sides' (seed, neighbourhood) embeddings.
+        # MergeLayer scorer (master's): a pre-norm MLP over the CONCAT of both sides' (seed, nbhd)
+        # embeddings PLUS the 4 inner products. The concat gives the raw features (fine — the encoder
+        # outputs are free Euclidean); the inner products give the pairwise affinity prior.
+        scorer_in = 4 * d_emb + 4                                       # [seed_u‖nbhd_u‖seed_v‖nbhd_v] + 4 ⟨·,·⟩
         self.scorer = nn.Sequential(
-            nn.Linear(4, 32), nn.GELU(), nn.Linear(32, 1))
+            nn.LayerNorm(scorer_in),
+            nn.Linear(scorer_in, d_emb), nn.GELU(), nn.Dropout(dropout), nn.Linear(d_emb, 1))
 
     def _token_edge_features(self, tokens: WalkTokens, q: int) -> torch.Tensor:
         """Per-token edge features [Q, T, d_ef] aligned with the flattened token bag. tokens holds
@@ -221,11 +226,18 @@ class LinkPredHead(nn.Module):
         seed_u = seed_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
         nbhd_u = nbhd_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
 
-        # Four inner products between u's and v's seed / neighbourhood embeddings.
-        inner_products = torch.stack([
-            (seed_u * seed_v).sum(-1),                                        # ⟨seed_u, seed_v⟩  u–v affinity
-            (seed_u * nbhd_v).sum(-1),                                        # ⟨seed_u, nbhd_v⟩  is u in v's nbhd
-            (nbhd_u * seed_v).sum(-1),                                        # ⟨nbhd_u, seed_v⟩  is v in u's nbhd
-            (nbhd_u * nbhd_v).sum(-1),                                        # ⟨nbhd_u, nbhd_v⟩  neighbourhood overlap
+        # Four COSINE similarities (bounded [-1,1]) between u's and v's seed / neighbourhood embeddings —
+        # a scale-stable affinity prior. The raw (free) vectors still enter the concat below, so the
+        # magnitude they'd otherwise strip is kept there.
+        su, nu = F.normalize(seed_u, dim=-1), F.normalize(nbhd_u, dim=-1)
+        sv, nv = F.normalize(seed_v, dim=-1), F.normalize(nbhd_v, dim=-1)
+        cosines = torch.stack([
+            (su * sv).sum(-1),                                                # cos(seed_u, seed_v)  u–v affinity
+            (su * nv).sum(-1),                                                # cos(seed_u, nbhd_v)  is u in v's nbhd
+            (nu * sv).sum(-1),                                                # cos(nbhd_u, seed_v)  is v in u's nbhd
+            (nu * nv).sum(-1),                                                # cos(nbhd_u, nbhd_v)  neighbourhood overlap
         ], dim=-1)                                                            # [B, C, 4]
-        return self.scorer(inner_products).squeeze(-1)                        # [B, C]
+
+        # MergeLayer: concat both sides' RAW embeddings + the 4 cosines → MLP → scalar.
+        feats = torch.cat([seed_u, nbhd_u, seed_v, nbhd_v, cosines], dim=-1)  # [B, C, 4*d_emb+4]
+        return self.scorer(feats).squeeze(-1)                                # [B, C]
