@@ -8,9 +8,8 @@ walk-token bag into a FREE d_emb (seed_emb, nbhd_emb): it embeds the seed E[u] a
 seed attends over the tokens to pool the neighbourhood.
 
 Two-sided: both u and every candidate v are walked and encoded. The pair (u, v) is scored by a
-MergeLayer (master's decoder): a pre-norm MLP over the CONCAT of both sides' RAW (free) (seed, nbhd)
-embeddings PLUS the four COSINE similarities cos(seed_u,seed_v) cos(seed_u,nbhd_v) cos(nbhd_u,seed_v)
-cos(nbhd_u,nbhd_v) — bounded affinity prior; magnitude is carried by the raw concat.
+MergeLayer (master's decoder): a pre-norm MLP over the CONCAT of both sides' (seed, nbhd) embeddings
+PLUS the four inner products <seed_u,seed_v> <seed_u,nbhd_v> <nbhd_u,seed_v> <nbhd_u,nbhd_v>.
 """
 import math
 
@@ -251,18 +250,14 @@ class LinkPredHead(nn.Module):
         seed_u = seed_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
         nbhd_u = nbhd_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
 
-        # Four COSINE similarities (bounded [-1,1]) between u's and v's seed / neighbourhood embeddings —
-        # a scale-stable affinity prior. The raw (free) vectors still enter the concat below, so the
-        # magnitude they'd otherwise strip is kept there.
-        su, nu = F.normalize(seed_u, dim=-1), F.normalize(nbhd_u, dim=-1)
-        sv, nv = F.normalize(seed_v, dim=-1), F.normalize(nbhd_v, dim=-1)
-        cosines = torch.stack([
-            (su * sv).sum(-1),                                                # cos(seed_u, seed_v)  u–v affinity
-            (su * nv).sum(-1),                                                # cos(seed_u, nbhd_v)  is u in v's nbhd
-            (nu * sv).sum(-1),                                                # cos(nbhd_u, seed_v)  is v in u's nbhd
-            (nu * nv).sum(-1),                                                # cos(nbhd_u, nbhd_v)  neighbourhood overlap
+        # Four inner products (raw dot products, like master) between u's and v's seed / nbhd embeddings.
+        inner_products = torch.stack([
+            (seed_u * seed_v).sum(-1),                                        # ⟨seed_u, seed_v⟩  u–v affinity
+            (seed_u * nbhd_v).sum(-1),                                        # ⟨seed_u, nbhd_v⟩  is u in v's nbhd
+            (nbhd_u * seed_v).sum(-1),                                        # ⟨nbhd_u, seed_v⟩  is v in u's nbhd
+            (nbhd_u * nbhd_v).sum(-1),                                        # ⟨nbhd_u, nbhd_v⟩  neighbourhood overlap
         ], dim=-1)                                                            # [B, C, 4]
 
-        # MergeLayer: concat both sides' RAW embeddings + the 4 cosines → MLP → scalar.
-        feats = torch.cat([seed_u, nbhd_u, seed_v, nbhd_v, cosines], dim=-1)  # [B, C, 4*d_emb+4]
+        # MergeLayer: concat both sides' embeddings + the inner products → MLP → scalar.
+        feats = torch.cat([seed_u, nbhd_u, seed_v, nbhd_v, inner_products], dim=-1)   # [B, C, 4*d_emb+4]
         return self.scorer(feats).squeeze(-1)                                # [B, C]
