@@ -263,6 +263,8 @@ def main() -> Dict[str, Any]:
 
         d_emb=args.d_emb,
         d_ef=(int(train_sp.edge_feat.shape[1]) if train_sp.edge_feat is not None else 0),
+        d_nf=(int(loaded.node_feat.shape[1]) if loaded.node_feat is not None else 0),
+        node_feat=loaded.node_feat,
 
         t2v_dim=args.t2v_dim,
         n_layers=args.n_layers,

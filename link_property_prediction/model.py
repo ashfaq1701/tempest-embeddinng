@@ -93,12 +93,13 @@ class NeighborhoodEncoder(nn.Module):
     pools them into the neighbourhood embedding. Both outputs are free Euclidean d_emb vectors. Cold
     queries (no neighbourhood token) get nbhd_emb = 0."""
 
-    def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0,
+    def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0, d_nf: int = 0,
                  n_layers: int = 2, expansion: int = 2, dropout: float = 0.1):
         super().__init__()
         self.d_ef = d_ef
+        self.d_nf = d_nf
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        in_dim = d_emb + t2v_dim + 1 + d_ef                 # E[token] ‖ t2v(age) ‖ log_hop ‖ edge
+        in_dim = d_emb + t2v_dim + 1 + d_ef + d_nf          # E[token] ‖ t2v(age) ‖ log_hop ‖ edge ‖ node feats
         # EMBED (in_dim → d_emb; dim change, no residual), then n_layers pre-norm residual FFN blocks.
         # One encoder shared by both the tokens and the seed.
         self.input_norm = nn.LayerNorm(in_dim)
@@ -114,23 +115,28 @@ class NeighborhoodEncoder(nn.Module):
         return x
 
     def forward(self, e_seed: torch.Tensor, token_emb: torch.Tensor, ages: torch.Tensor,
-                mask: torch.Tensor, positions: torch.Tensor, edge_features: torch.Tensor) -> tuple:
+                mask: torch.Tensor, positions: torch.Tensor, edge_features: torch.Tensor,
+                token_node_features: torch.Tensor, seed_node_features: torch.Tensor) -> tuple:
         """e_seed [B,d_emb] (E[u]); token_emb [B,T,d_emb] (E[token]); ages/positions [B,T]; mask [B,T]
-        bool (True = real token); edge_features [B,T,d_ef]. Returns (seed_emb, nbhd_emb), each free
-        [B,d_emb]; cold rows (no token) → nbhd_emb = 0."""
+        bool (True = real token); edge_features [B,T,d_ef]; token_node_features [B,T,d_nf] (per-token
+        static node feature); seed_node_features [B,d_nf] (the seed's own node feature). Returns
+        (seed_emb, nbhd_emb), each free [B,d_emb]; cold rows (no token) → nbhd_emb = 0."""
         # TPNet scales delta-times by log(Δt + 1) before the time encoder.
         t2v = self.time_encoder(torch.log1p(ages.clamp_min(0.0)))                       # [B,T,t2v_dim]
         log_hop = torch.log1p(positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)       # [B,T,1] log-hop
-        token_feat = torch.cat([token_emb, t2v, log_hop, edge_features], dim=-1)        # [B,T,in_dim]
+        token_feat = torch.cat(
+            [token_emb, t2v, log_hop, edge_features, token_node_features], dim=-1)      # [B,T,in_dim]
         token_enc = self._encode(token_feat)                                           # [B,T,d_emb]
 
-        # The seed AS a token: content = E[u], age 0 / hop 0 / no edge (zero-padded), SAME encoder.
+        # The seed AS a token: content = E[u], age 0 / hop 0 / no edge (zero-padded), but it KEEPS its own
+        # node feature (a node feature is valid for the seed). SAME encoder.
         b = e_seed.shape[0]
         seed_feat = torch.cat([
             e_seed,                                        # [B, d_emb]  seed content
             e_seed.new_zeros(b, t2v.shape[-1]),            # [B, t2v_dim]  age 0
             e_seed.new_zeros(b, 1),                        # [B, 1]        hop 0
             e_seed.new_zeros(b, edge_features.shape[-1]),  # [B, d_ef]     no edge
+            seed_node_features,                            # [B, d_nf]     the seed's own node feature
         ], dim=-1)                                         # [B, in_dim]
         seed_emb = self._encode(seed_feat)                                             # [B, d_emb]
 
@@ -164,12 +170,13 @@ class EmbeddingTable(nn.Module):
 
 
 class LinkPredHead(nn.Module):
-    def __init__(self, num_nodes: int, d_emb: int, t2v_dim: int = 16, d_ef: int = 0,
+    def __init__(self, num_nodes: int, d_emb: int, t2v_dim: int = 16, d_ef: int = 0, d_nf: int = 0,
                  n_layers: int = 2, expansion: int = 2, dropout: float = 0.1):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_emb = d_emb
         self.d_ef = d_ef
+        self.d_nf = d_nf
 
         # Node embeddings, link-trained; E[x] is unit-norm via the table's forward-normalization.
         self.E = EmbeddingTable(num_nodes, d_emb)
@@ -177,7 +184,7 @@ class LinkPredHead(nn.Module):
         # Master's residual encoder (ported to d_emb, no separate enc_dim): turns each query's walk-token
         # bag into free d_emb (seed_emb, nbhd_emb) via input_proj + n_layers residual FFN + attention.
         self.neighbourhood = NeighborhoodEncoder(
-            d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef,
+            d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef, d_nf=d_nf,
             n_layers=n_layers, expansion=expansion, dropout=dropout)
 
         # MergeLayer scorer (master's): a pre-norm MLP over the CONCAT of both sides' (seed, nbhd)
@@ -197,10 +204,25 @@ class LinkPredHead(nn.Module):
             return tokens.edge_features.reshape(q, k, length, self.d_ef).reshape(q, k * length, self.d_ef)
         return tokens.nodes.new_zeros((q, k * length, self.d_ef), dtype=torch.float32)
 
+    def _token_node_features(self, tokens: WalkTokens, q: int) -> torch.Tensor:
+        """Per-token static node features [Q, T, d_nf] aligned with the flattened token bag. tokens holds
+        node_features as [Q, K, L*d_nf]; reshape to [Q, K*L, d_nf]. Empty [Q, T, 0] when the dataset has
+        no node features (a no-op in the descriptor concat)."""
+        _, k, length = tokens.nodes.shape
+        if tokens.node_features is not None:
+            return tokens.node_features.reshape(q, k, length, self.d_nf).reshape(q, k * length, self.d_nf)
+        return tokens.nodes.new_zeros((q, k * length, self.d_nf), dtype=torch.float32)
+
+    def _seed_node_features(self, tokens: WalkTokens, q: int) -> torch.Tensor:
+        """The query seed's own static node feature [Q, d_nf]; empty [Q, 0] when the dataset has none."""
+        if tokens.seed_node_features is not None:
+            return tokens.seed_node_features
+        return tokens.nodes.new_zeros((q, self.d_nf), dtype=torch.float32)
+
     def _project(self, tokens: WalkTokens):
         """Encode one bag of N queries into (seed_emb, nbhd_emb), each free [N, d]: the residual encoder
-        embeds the seed (E[u]) and each walk token (E[token] + time/hop/edge), then the seed attends over
-        the tokens to pool the neighbourhood. Cold rows (no token) -> nbhd_emb = 0."""
+        embeds the seed (E[u]) and each walk token (E[token] + time/hop/edge/node feats), then the seed
+        attends over the tokens to pool the neighbourhood. Cold rows (no token) -> nbhd_emb = 0."""
         e_seed = self.E.lookup(tokens.seeds)                                          # E[x]  [N, d]
         n = e_seed.shape[0]
 
@@ -208,9 +230,12 @@ class LinkPredHead(nn.Module):
             tokens, exclude_seed_positions=True)
         token_ages = tokens.ages.reshape(n, -1).clamp_min(0)                          # ages read from the instance
         token_ef = self._token_edge_features(tokens, n)                              # [N, T, d_ef]
+        token_nf = self._token_node_features(tokens, n)                              # [N, T, d_nf]
+        seed_nf = self._seed_node_features(tokens, n)                                # [N, d_nf]
         token_emb = self.E.lookup(token_ids.clamp_min(0))                             # E[token]  [N, T, d]
         return self.neighbourhood(
-            e_seed, token_emb, token_ages.to(e_seed.dtype), token_mask, token_pos, token_ef)  # (seed_emb, nbhd_emb)
+            e_seed, token_emb, token_ages.to(e_seed.dtype), token_mask, token_pos,
+            token_ef, token_nf, seed_nf)                                              # (seed_emb, nbhd_emb)
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Two-sided scoring. src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate

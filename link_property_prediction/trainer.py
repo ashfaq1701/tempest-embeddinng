@@ -44,7 +44,6 @@ from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import LinkPredHead
 from .negatives import UniformNegativeSampler
-from .probes import CommunityProbe
 from .walk_tokens import build_query_walk_tokens
 from .walks import WalkGenerator
 
@@ -63,6 +62,9 @@ class TrainerConfig:
     d_emb: int = 128
     d_ef: int = 0             # per-edge-feature dim (0 = dataset has no edge features); fed into the
                              # residual encoder's per-token descriptor. Set from the loaded dataset.
+    d_nf: int = 0             # per-node-feature dim (0 = dataset has no node features); enters the encoder's
+                             # per-token (and per-seed) descriptor. Set from the loaded dataset.
+    node_feat: Optional[np.ndarray] = None   # [num_nodes, d_nf] static node-feature table (None if absent).
 
     # NeighborhoodEncoder (master's residual encoder → free d_emb (seed_emb, nbhd_emb)).
     t2v_dim: int = 16         # Time2Vec output dim (16 ties dim100 on wiki: 0.8287/0.8040 vs 0.8289/0.8046)
@@ -104,12 +106,13 @@ class Trainer:
         self.device = device or torch.device(
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
-        # Single module owning the sphere node embeddings AND the velocity head.
+        # Node embeddings + residual walk-neighbourhood encoder + MergeLayer scorer.
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             t2v_dim=int(config.t2v_dim),
             d_ef=int(config.d_ef),
+            d_nf=int(config.d_nf),
             n_layers=int(config.n_layers),
             expansion=int(config.expansion),
             dropout=float(config.dropout),
@@ -172,7 +175,8 @@ class Trainer:
             max_walk_len=self.config.max_walk_len,
             num_walks_per_node=self.config.num_walks_per_node,
             start_bias=self.config.start_bias,
-            walk_bias=self.config.walk_bias)
+            walk_bias=self.config.walk_bias,
+            node_feat=self.config.node_feat)
 
         # CANDIDATE side: walk every candidate v with its query's cutoff t_i. Flatten [B,C] → [B*C]
         # query-major; each candidate inherits its query's cutoff so its walk is causal.
@@ -184,7 +188,8 @@ class Trainer:
             max_walk_len=self.config.max_walk_len,
             num_walks_per_node=self.config.num_walks_per_node,
             start_bias=self.config.start_bias,
-            walk_bias=self.config.walk_bias)
+            walk_bias=self.config.walk_bias,
+            node_feat=self.config.node_feat)
 
         return self.model(src_tokens, cand_tokens)
 
@@ -308,17 +313,6 @@ class Trainer:
         n_epochs = self.config.num_epochs
         patience = self.config.early_stop_patience
 
-        # One pass over the train batches: collect the full edge set (for the community probe's fixed
-        # Louvain graph — built once).
-        src_all, dst_all = [], []
-        for b in train_batches_factory():
-            src_all.append(np.asarray(b.src))
-            dst_all.append(np.asarray(b.tgt))
-        self.comm_probe = CommunityProbe(
-            np.concatenate(src_all), np.concatenate(dst_all), self.config.num_nodes)
-        print(f"  CommunityProbe: {self.comm_probe.n_comms} Louvain communities "
-              f"(Q={self.comm_probe.q:.3f}); random-neighbour null purity={self.comm_probe.null:.3f}")
-
         best_val, best_test, best_epoch = -1.0, -1.0, -1
         best_snap: Optional[Dict[str, Any]] = None
         no_improve = 0
@@ -342,8 +336,6 @@ class Trainer:
                 f"lr={self.opt.param_groups[0]['lr']:.1e}  "
                 f"train {train_dt:.1f}s"
             )
-            cp = self.comm_probe.measure(self.model.E.weight.detach())     # community-formation probe
-            line += f"  commP={cp:.3f}(x{cp / max(self.comm_probe.null, 1e-9):.1f})"
 
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()
