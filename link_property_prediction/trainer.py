@@ -40,14 +40,12 @@ import geoopt
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import LambdaLR
 
 from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import LinkPredHead
 from .negatives import UniformNegativeSampler
 from .probes import CommunityProbe
-from .utils import make_lr_lambda
 from .walk_tokens import build_query_walk_tokens
 from .walks import WalkGenerator
 
@@ -82,23 +80,15 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
 
-    # Optimisation — cosine decay to lr_min over decay_horizon_epochs (no warmup). ONE param group:
-    # RiemannianAdam applies the Riemannian update to E (a geoopt.ManifoldParameter) and standard Adam
-    # to the Euclidean params, all under the same LR. weight_decay is LOAD-BEARING on the sphere head:
-    # an A/B showed wd 1e-4 reached ~0.828/0.803 while no-wd capped ~0.825/0.797 (the test-gap>val-gap
-    # signature of a lost regulariser).
-    lr: float = 1e-3
-    lr_min: float = 1e-7
+    # Optimisation — CONSTANT lr (no schedule). ONE param group: RiemannianAdam applies the Riemannian
+    # update to E (a geoopt.ManifoldParameter) and standard Adam to the Euclidean params, all under the
+    # same fixed LR. weight_decay is LOAD-BEARING on the sphere head: an A/B showed wd 1e-4 reached
+    # ~0.828/0.803 while no-wd capped ~0.825/0.797 (the test-gap>val-gap signature of a lost regulariser).
+    lr: float = 1e-4
     weight_decay: float = 1e-4
 
     # Run control.
     num_epochs: int = 25
-    # LR-decay horizon in epochs — SEPARATE from num_epochs, ONE value shared by BOTH LR groups. The
-    # per-group cosine reaches each group's lr_min at decay_horizon_epochs, so num_epochs < horizon
-    # keeps LR near peak (freedom to run any epoch count without rescaling the schedule). NOTE: the
-    # ball head's cliff-free "freeze-at-peak" was tuned with horizon == num_epochs == 25 (fast decay);
-    # default 50 with num_epochs 25 leaves LR ~half-decayed at stop — set horizon 25 to reproduce it.
-    decay_horizon_epochs: int = 30
     early_stop_patience: int = 10
 
     # System.
@@ -141,28 +131,6 @@ class Trainer:
             [{"params": list(self.model.parameters()),
               "lr": float(config.lr), "weight_decay": float(config.weight_decay)}],
             stabilize=10,
-        )
-
-        self.sched: Optional[LambdaLR] = None
-        self._global_step = 0
-
-    # ──────────────────────────────────────────────────────────────────
-    # LR schedule (cosine)
-    # ──────────────────────────────────────────────────────────────────
-
-    def _setup_lr_scheduler(self, batches_per_epoch: int) -> None:
-        # Cosine decay to lr_min over decay_horizon_epochs (no warmup); one lambda for the single group.
-        decay_steps = self.config.decay_horizon_epochs * max(batches_per_epoch, 1)
-        peak, floor = float(self.config.lr), float(self.config.lr_min)
-        pg = self.opt.param_groups[0]
-        pg["lr"] = peak
-        pg["initial_lr"] = peak
-        ratio = floor / peak if peak > 0 else 0.0
-        self.sched = LambdaLR(self.opt, lr_lambda=make_lr_lambda(decay_steps, ratio))
-        self._global_step = 0
-        print(
-            f"  LR schedule (cosine): {peak:.1e}->{floor:.1e}; "
-            f"decay_horizon={decay_steps} ({self.config.decay_horizon_epochs}ep x {batches_per_epoch} batches)"
         )
 
     # ──────────────────────────────────────────────────────────────────
@@ -244,9 +212,6 @@ class Trainer:
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         self.opt.step()
-        if self.sched is not None:
-            self.sched.step()
-            self._global_step += 1
 
         return {
             "link": float(loss.detach()),
@@ -348,7 +313,6 @@ class Trainer:
             src_all.append(np.asarray(b.src))
             dst_all.append(np.asarray(b.tgt))
             batches_per_epoch += 1
-        self._setup_lr_scheduler(batches_per_epoch)
         self.comm_probe = CommunityProbe(
             np.concatenate(src_all), np.concatenate(dst_all), self.config.num_nodes)
         print(f"  CommunityProbe: {self.comm_probe.n_comms} Louvain communities "
