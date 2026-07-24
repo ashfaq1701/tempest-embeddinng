@@ -37,6 +37,19 @@ def geodesic_distance(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-12) -> t
     return 2.0 * torch.asin((chord * 0.5).clamp(max=1.0))     # 2·asin(‖x−y‖/2) ∈ [0, π]
 
 
+def sphere_expmap(base: torch.Tensor, tangent: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Exponential map on the unit sphere: move from `base` along `tangent` (a vector in the tangent
+    space at base).  exp(base, u) = cos(‖u‖)·base + sinc(‖u‖/π)·u.
+
+    torch.sinc is a smooth primitive (no explicit /‖u‖), so ‖u‖ = 0 is an exact no-op — it returns
+    `base` with a FINITE gradient. geoopt's Sphere.expmap instead uses sin(‖u‖)/‖u‖ under a
+    torch.where, which leaks a NaN gradient at ‖u‖ = 0 — the COLD-ROW case (mu = 0, a node with no
+    walk tokens), which is common on wiki and is what NaN'd the loss. The squared norm is clamped off
+    0 before the sqrt for extra safety. base [*, d], tangent [*, d] → point [*, d]."""
+    angle = (tangent ** 2).sum(dim=-1, keepdim=True).clamp_min(eps).sqrt()   # ‖u‖, finite grad at 0
+    return torch.cos(angle) * base + torch.sinc(angle / math.pi) * tangent
+
+
 class TimeEncoder(nn.Module):
     """Time2Vec time encoding, ported verbatim from TPNet (TGB_TPNet/models/modules.py)."""
 
@@ -186,7 +199,7 @@ class LinkPredHead(nn.Module):
         token_tangent = self.manifold.logmap(e_seed.unsqueeze(-2), token_emb)         # [N, T, d] tangent
         mu = self.neighbourhood(
             e_seed, token_tangent, token_ages.to(e_seed.dtype), token_mask, token_pos, token_ef)  # [N, d]
-        return e_seed, self.manifold.expmap(e_seed, mu)                               # (E[x], P[x])  [N, d]
+        return e_seed, sphere_expmap(e_seed, mu)                                      # (E[x], P[x])  [N, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Two-sided scoring. src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate
