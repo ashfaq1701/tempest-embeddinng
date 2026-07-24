@@ -5,8 +5,8 @@
 where P[u] = exp_{E[u]}(mu_u) pushes the source off E[u] toward mu_u — the deep pooling of u's
 walk-token tangents (in the tangent space at E[u]) + a TPNet Time2Vec of each token's age, produced
 by NeighborhoodProjection. One-sided: only u is walked/projected; each candidate v enters through
-its static embedding E[v]. The head owns self.E (link-trained on the sphere); geometry goes through
-self.geom.
+its static embedding E[v]. The head owns self.E (a ManifoldParameter on a geoopt.Sphere, link-
+trained on it); the log/exp maps come straight from geoopt.Sphere (self.manifold).
 
 (The dual-sided variant — walk every candidate too and score <P[u], P[v]> — was falsified on wiki:
 at matched walks it lost to one-sided at ~8x the cost. It lives one `git revert` away; see the
@@ -21,40 +21,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .walk_tokens import WalkTokens, flatten_tokens
-
-
-class SphereManifold:
-    """Unit-sphere geometry behind a manifold-agnostic contract (swap the class to swap the space):
-    manifold, log_map, exp_map, similarity. similarity is HIGHER = closer (inner product = cosine).
-    E is kept on-sphere by RiemannianAdam, so no read-time re-projection is needed.
-
-    Both maps are exact-formula, clamp-free in the smooth region:
-    - log_map uses atan2(‖perp‖, cos) for the angle — accurate to ~1e-9 at small angles (arccos of
-      a clamped cosine has a ~1.4e-3 angle floor in fp32 AND amplifies gradients by floor/θ for
-      near-coincident pairs); the only guard left is the direction denominator, which is reached
-      only at the two theory-degenerate points (coincident: tangent ~1e-7 noise, harmless;
-      antipodal: norm π, direction undefined by theory, returned as noise by convention).
-    - exp_map is the exact formula for ALL tangent norms: cos²+sin² keeps it on-sphere identically,
-      and norms > π wrap past the antipode (the true exponential, smooth gradients everywhere —
-      no clamp, hence no flat-gradient trap). sinc makes tangent = 0 a LIVE exact no-op
-      (P = base bit-exactly, Jacobian = I). Bounding ‖mu‖ is model policy, not manifold policy:
-      if a head wants locality, it caps its own tangent before calling exp."""
-
-    def __init__(self):
-        self.manifold = geoopt.Sphere()
-
-    def log_map(self, base: torch.Tensor, point: torch.Tensor) -> torch.Tensor:
-        cos_angle = (base * point).sum(-1, keepdim=True)
-        perp = point - cos_angle * base
-        perp_norm = perp.norm(dim=-1, keepdim=True)
-        return torch.atan2(perp_norm, cos_angle) * perp / perp_norm.clamp_min(1e-12)
-
-    def exp_map(self, base: torch.Tensor, tangent: torch.Tensor) -> torch.Tensor:
-        angle = tangent.norm(dim=-1, keepdim=True)
-        return torch.cos(angle) * base + torch.sinc(angle / math.pi) * tangent
-
-    def similarity(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return (a * b).sum(-1)
 
 
 class TimeEncoder(nn.Module):
@@ -163,21 +129,21 @@ class LinkPredHead(nn.Module):
         self.num_nodes = num_nodes
         self.d_emb = d_emb
         self.d_ef = d_ef
-        self.eps = 1e-6
-        self.geom = SphereManifold()
+        self.manifold = geoopt.Sphere()
 
+        # E lives on the unit sphere: init uniformly at random on it (geoopt.Sphere.random_uniform),
+        # then wrap as a ManifoldParameter so RiemannianAdam keeps it there.
         self.E = nn.Embedding(num_nodes, d_emb)
-        nn.init.normal_(self.E.weight, mean=0.0, std=1.0 / math.sqrt(d_emb))
         with torch.no_grad():
-            unit_rows = self.E.weight.data / self.E.weight.data.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-        self.E.weight = geoopt.ManifoldParameter(unit_rows, manifold=self.geom.manifold)
+            init = self.manifold.random_uniform(num_nodes, d_emb)
+        self.E.weight = geoopt.ManifoldParameter(init, manifold=self.manifold)
 
         self.neighbourhood = NeighborhoodProjection(
             d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef)
 
-        # Combiner MLP over the 4 pairwise cosines of both sides' identity (E[x]) and neighbourhood
-        # (P[x]) embeddings. All 4 are unit-sphere inner products → rotation-invariant, so the scorer
-        # stays sphere-faithful (no raw coordinates).
+        # Combiner MLP over the 4 pairwise GEODESIC DISTANCES on the sphere between both sides'
+        # identity (E[x]) and neighbourhood (P[x]) points. Distances are rotation-invariant, so the
+        # scorer stays sphere-faithful (no raw coordinates); LOWER distance = closer.
         self.scorer = nn.Sequential(
             nn.Linear(4, 32), nn.GELU(), nn.Linear(32, 1))
 
@@ -203,17 +169,17 @@ class LinkPredHead(nn.Module):
         token_ages = tokens.ages.reshape(n, -1).clamp_min(0)                          # ages read from the instance
         token_ef = self._token_edge_features(tokens, n)                              # [N, T, d_ef]
         token_emb = F.embedding(token_ids.clamp_min(0), e_weight)                     # [N, T, d]
-        token_tangent = self.geom.log_map(e_seed.unsqueeze(-2), token_emb)           # [N, T, d] tangent
+        token_tangent = self.manifold.logmap(e_seed.unsqueeze(-2), token_emb)         # [N, T, d] tangent
         mu = self.neighbourhood(
             e_seed, token_tangent, token_ages.to(e_seed.dtype), token_mask, token_pos, token_ef)  # [N, d]
-        return e_seed, self.geom.exp_map(e_seed, mu)                                  # (E[x], P[x])  [N, d]
+        return e_seed, self.manifold.expmap(e_seed, mu)                               # (E[x], P[x])  [N, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Two-sided scoring. src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate
         queries (seeds = v) in query-major order, each walked with its query's cutoff. Score = MLP over
-        the FOUR pairwise cosines of both sides' identity (seed = E[x]) and neighbourhood (nbhd = P[x])
-        embeddings. All four are unit-sphere inner products (rotation-invariant), so the scorer is
-        sphere-faithful — no raw coordinates. Returns logits [B, C]."""
+        the FOUR pairwise geodesic distances on the sphere between both sides' identity (seed = E[x])
+        and neighbourhood (nbhd = P[x]) points (rotation-invariant, so the scorer is sphere-faithful —
+        no raw coordinates; lower distance = closer). Returns logits [B, C]."""
         seed_u, nbhd_u = self._project(src_tokens)                            # E[u], P[u]  [B, d]
         seed_v, nbhd_v = self._project(cand_tokens)                           # E[v], P[v]  [B*C, d]
         b, d = seed_u.shape
@@ -223,11 +189,11 @@ class LinkPredHead(nn.Module):
         seed_u = seed_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
         nbhd_u = nbhd_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
 
-        # Four unit-sphere cosines between u's and v's identity / neighbourhood embeddings.
-        inner_products = torch.stack([
-            (seed_u * seed_v).sum(-1),                                        # ⟨E[u], E[v]⟩  identity affinity
-            (seed_u * nbhd_v).sum(-1),                                        # ⟨E[u], P[v]⟩  is u in v's neighbourhood
-            (nbhd_u * seed_v).sum(-1),                                        # ⟨P[u], E[v]⟩  is v in u's neighbourhood
-            (nbhd_u * nbhd_v).sum(-1),                                        # ⟨P[u], P[v]⟩  neighbourhood overlap
+        # Four sphere geodesic distances between u's and v's identity / neighbourhood points.
+        distances = torch.stack([
+            self.manifold.dist(seed_u, seed_v),                              # d(E[u], E[v])  identity affinity
+            self.manifold.dist(seed_u, nbhd_v),                              # d(E[u], P[v])  is u in v's neighbourhood
+            self.manifold.dist(nbhd_u, seed_v),                              # d(P[u], E[v])  is v in u's neighbourhood
+            self.manifold.dist(nbhd_u, nbhd_v),                              # d(P[u], P[v])  neighbourhood overlap
         ], dim=-1)                                                            # [B, C, 4]
-        return self.scorer(inner_products).squeeze(-1)                        # [B, C]
+        return self.scorer(distances).squeeze(-1)                            # [B, C]
