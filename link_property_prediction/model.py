@@ -6,7 +6,8 @@ where P[u] = exp_{E[u]}(mu_u) pushes the source off E[u] toward mu_u — the dee
 walk-token tangents (in the tangent space at E[u]) + a TPNet Time2Vec of each token's age, produced
 by NeighborhoodProjection. One-sided: only u is walked/projected; each candidate v enters through
 its static embedding E[v]. The head owns self.E (a ManifoldParameter on a geoopt.Sphere, link-
-trained on it); the log/exp maps come straight from geoopt.Sphere (self.manifold).
+trained on it); geometry goes through self.geom (SphereManifold): dist/logmap proxy to geoopt, expmap
+is ours (geoopt's NaNs the gradient at the cold-row zero tangent).
 
 (The dual-sided variant — walk every candidate too and score <P[u], P[v]> — was falsified on wiki:
 at matched walks it lost to one-sided at ~8x the cost. It lives one `git revert` away; see the
@@ -23,17 +24,30 @@ import torch.nn.functional as F
 from .walk_tokens import WalkTokens, flatten_tokens
 
 
-def sphere_expmap(base: torch.Tensor, tangent: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    """Exponential map on the unit sphere: move from `base` along `tangent` (a vector in the tangent
-    space at base).  exp(base, u) = cos(‖u‖)·base + sinc(‖u‖/π)·u.
+class SphereManifold:
+    """Unit-sphere geometry over geoopt.Sphere. dist and logmap PROXY straight to geoopt; expmap is
+    OURS — geoopt's Sphere.expmap uses sin(‖u‖)/‖u‖ under a torch.where and leaks a NaN gradient at
+    ‖u‖ = 0 (the cold-row tangent mu = 0, a node with no walk tokens — common on wiki). E is kept
+    on-sphere by RiemannianAdam, so no read-time re-projection is needed."""
 
-    torch.sinc is a smooth primitive (no explicit /‖u‖), so ‖u‖ = 0 is an exact no-op — it returns
-    `base` with a FINITE gradient. geoopt's Sphere.expmap instead uses sin(‖u‖)/‖u‖ under a
-    torch.where, which leaks a NaN gradient at ‖u‖ = 0 — the COLD-ROW case (mu = 0, a node with no
-    walk tokens), which is common on wiki and is what NaN'd the loss. The squared norm is clamped off
-    0 before the sqrt for extra safety. base [*, d], tangent [*, d] → point [*, d]."""
-    angle = (tangent ** 2).sum(dim=-1, keepdim=True).clamp_min(eps).sqrt()   # ‖u‖, finite grad at 0
-    return torch.cos(angle) * base + torch.sinc(angle / math.pi) * tangent
+    def __init__(self):
+        self.manifold = geoopt.Sphere()
+
+    def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Geodesic distance arccos(⟨x, y⟩) on the sphere — geoopt.Sphere.dist. LOWER = closer."""
+        return self.manifold.dist(x, y)
+
+    def logmap(self, base: torch.Tensor, point: torch.Tensor) -> torch.Tensor:
+        """Log map at `base` of `point` — geoopt.Sphere.logmap (its gradient is finite at coincidence)."""
+        return self.manifold.logmap(base, point)
+
+    def expmap(self, base: torch.Tensor, tangent: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+        """Exponential map: move from `base` along `tangent`.  exp(base, u) = cos(‖u‖)·base +
+        sinc(‖u‖/π)·u.  torch.sinc is a smooth primitive (no explicit /‖u‖), so ‖u‖ = 0 is an exact
+        differentiable no-op — returns `base` with a FINITE gradient. (geoopt's expmap NaNs the
+        gradient there.) The squared norm is clamped off 0 before the sqrt for extra safety."""
+        angle = (tangent ** 2).sum(dim=-1, keepdim=True).clamp_min(eps).sqrt()   # ‖u‖, finite grad at 0
+        return torch.cos(angle) * base + torch.sinc(angle / math.pi) * tangent
 
 
 class TimeEncoder(nn.Module):
@@ -142,14 +156,14 @@ class LinkPredHead(nn.Module):
         self.num_nodes = num_nodes
         self.d_emb = d_emb
         self.d_ef = d_ef
-        self.manifold = geoopt.Sphere()
+        self.geom = SphereManifold()
 
         # E lives on the unit sphere: init uniformly at random on it (geoopt.Sphere.random_uniform),
         # then wrap as a ManifoldParameter so RiemannianAdam keeps it there.
         self.E = nn.Embedding(num_nodes, d_emb)
         with torch.no_grad():
-            init = self.manifold.random_uniform(num_nodes, d_emb)
-        self.E.weight = geoopt.ManifoldParameter(init, manifold=self.manifold)
+            init = self.geom.manifold.random_uniform(num_nodes, d_emb)
+        self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
         self.neighbourhood = NeighborhoodProjection(
             d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef)
@@ -182,10 +196,10 @@ class LinkPredHead(nn.Module):
         token_ages = tokens.ages.reshape(n, -1).clamp_min(0)                          # ages read from the instance
         token_ef = self._token_edge_features(tokens, n)                              # [N, T, d_ef]
         token_emb = F.embedding(token_ids.clamp_min(0), e_weight)                     # [N, T, d]
-        token_tangent = self.manifold.logmap(e_seed.unsqueeze(-2), token_emb)         # [N, T, d] tangent
+        token_tangent = self.geom.logmap(e_seed.unsqueeze(-2), token_emb)             # [N, T, d] tangent
         mu = self.neighbourhood(
             e_seed, token_tangent, token_ages.to(e_seed.dtype), token_mask, token_pos, token_ef)  # [N, d]
-        return e_seed, sphere_expmap(e_seed, mu)                                      # (E[x], P[x])  [N, d]
+        return e_seed, self.geom.expmap(e_seed, mu)                                   # (E[x], P[x])  [N, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Two-sided scoring. src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate
@@ -205,9 +219,9 @@ class LinkPredHead(nn.Module):
         # Four sphere geodesic distances (geoopt.Sphere.dist = arccos⟨·,·⟩) between u's and v's
         # identity / neighbourhood points.
         distances = torch.stack([
-            self.manifold.dist(seed_u, seed_v),                             # d(E[u], E[v])  identity affinity
-            self.manifold.dist(seed_u, nbhd_v),                             # d(E[u], P[v])  is u in v's neighbourhood
-            self.manifold.dist(nbhd_u, seed_v),                             # d(P[u], E[v])  is v in u's neighbourhood
-            self.manifold.dist(nbhd_u, nbhd_v),                             # d(P[u], P[v])  neighbourhood overlap
+            self.geom.dist(seed_u, seed_v),                                 # d(E[u], E[v])  identity affinity
+            self.geom.dist(seed_u, nbhd_v),                                 # d(E[u], P[v])  is u in v's neighbourhood
+            self.geom.dist(nbhd_u, seed_v),                                 # d(P[u], E[v])  is v in u's neighbourhood
+            self.geom.dist(nbhd_u, nbhd_v),                                 # d(P[u], P[v])  neighbourhood overlap
         ], dim=-1)                                                            # [B, C, 4]
         return self.scorer(distances).squeeze(-1)                            # [B, C]
