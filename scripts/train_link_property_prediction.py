@@ -66,6 +66,10 @@ def parse_args() -> argparse.Namespace:
     # (Query/key MLPs project to d_emb — no separate attention dim.)
     p.add_argument("--t2v-dim", default=16, type=int,
                    help="Time2Vec output dim (16 ties dim 100 on wiki; TPNet default was 100).")
+    p.add_argument("--n-heads", default=4, type=int,
+                   help="Multi-head displaced-tangent attention heads in NeighborhoodProjection "
+                        "(each head proposes a tangent direction; W_o combines them). 1 ≈ the old "
+                        "single-head centroid pool.")
 
     # Link loss / head.
     p.add_argument(
@@ -262,6 +266,7 @@ def main() -> Dict[str, Any]:
         d_ef=(int(train_sp.edge_feat.shape[1]) if train_sp.edge_feat is not None else 0),
 
         t2v_dim=args.t2v_dim,
+        n_heads=args.n_heads,
 
         K_train=args.k_train,
 
