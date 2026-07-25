@@ -110,10 +110,16 @@ class NeighborhoodProjection(nn.Module):
         weighted sum can only point mu_u in ONE blended direction; H heads let it aim where no single
         neighbour tangent pointed.
 
-    Sphere validity: each mu_h is a free R^d vector; the COMBINED mu is projected ONCE onto the
-    tangent space at E[u] (mu -= ⟨mu, E[u]⟩·E[u]) — projection is linear, so one projection at the end
-    equals projecting every head — then radially clamped below π so exp_{E[u]}(mu) stays injective.
+    Sphere validity: each token value and each mu_h is a FREE R^d vector (the displacement and the
+    head-mix W_o both leave the tangent subspace); the COMBINED mu is projected ONCE onto the tangent
+    space at E[u] (mu -= ⟨mu, E[u]⟩·E[u]), which is all exp_{E[u]} needs. This is the standard
+    retraction / extrinsic-mean pattern (compute freely off the tangent space, project back once).
+    Projecting once at the END is deliberate and is NOT the same as projecting per head/value: the
+    projection is linear, so per-step projection would DISCARD the off-tangent (span-E[u]) component
+    that a later linear map (W_o) can rotate back into the tangent plane — one final projection retains
+    strictly MORE information. mu is then radially clamped below π so exp_{E[u]}(mu) stays injective.
     Candidate-independent (never sees E[v]); cold rows (no token) -> weights 0 -> mu_u = 0 -> P[u]=E[u].
+    (Literature basis: researches/off-tangent-intermediate-values-and-project-once.txt.)
     """
 
     def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0, n_heads: int = 4):

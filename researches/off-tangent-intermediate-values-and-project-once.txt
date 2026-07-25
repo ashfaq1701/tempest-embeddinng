@@ -1,0 +1,265 @@
+================================================================================
+Off-tangent intermediate values + project-once: is it valid on the sphere?
+================================================================================
+
+Context
+-------
+In NeighborhoodProjection (link_property_prediction/model.py, the multi-head
+displaced-tangent attention head) the per-token VALUES and the per-head outputs
+mu_h are general R^d vectors that are NOT on the tangent space at E[u]: the
+learned displacement (W_v.g_p + Enc(stable)) and the head-mix W_o both leave the
+(d-1)-dim tangent subspace {v : <v, E[u]> = 0}. The design projects the COMBINED
+aggregate onto the tangent space ONCE, at the very end (mu -= <mu,E[u]>.E[u]),
+then applies exp_{E[u]}.
+
+The question researched: is "compute freely off the tangent space, project once
+at the end, then exp" mathematically valid and accepted practice, or do people
+insist every intermediate value stays on the tangent plane?
+
+
+================================================================================
+VERDICT: Valid and standard — and project-once is the BETTER choice here
+================================================================================
+
+The pattern is mathematically valid and matches accepted, foundational practice
+in Riemannian / manifold deep learning. It is not considered wrong. For our
+pipeline specifically -- where every op before the final projection is LINEAR
+(the displacement map, the attention-weighted sum, the head-mix W_o) and the
+sphere's tangent projection P_x(v) = v - <v,x>x = (I - x x^T) v is itself LINEAR
+-- the pattern is cleaner than the general case, and projecting ONCE at the end
+is strictly more information-preserving than projecting at every step.
+
+
+1. The pattern IS the definition of a retraction (foundational support)
+-----------------------------------------------------------------------
+Riemannian optimization is built on "take a step that leaves the manifold, then
+map back." This is the framework, not a shortcut.
+
+- Boumal, "An Introduction to Optimization on Smooth Manifolds" (2023),
+  Example 3.49 / Eq. 3.32 gives our sphere case verbatim: to move from x along v
+  while staying on the sphere, take the step in R^d then project back:
+  R_x(v) = (x + v) / ||x + v||. The step x+v is OFF the sphere; normalization
+  returns it. (Def. 3.47; Sec. 5.12 metric-projection retraction, Eq. 5.45.)
+
+- Absil & Malick, "Projection-like Retractions on Matrix Manifolds" (SIAM J.
+  Optim. 22(1), 2012): thesis is that "taking a tangent step in the embedding
+  Euclidean space followed by a projection onto the submanifold is a retraction."
+  Sec. 2.2: "x + eta_x in general does not belong to M ... The concept of
+  retraction was introduced to provide a framework for these approximations to
+  the exponential update." Leaving the manifold for intermediate computation and
+  mapping back is the STATED PURPOSE of the framework.
+
+- Absil, Mahony & Sepulchre, "Optimization Algorithms on Matrix Manifolds"
+  (2008), Def. 4.1.1, with local-rigidity DR_x(0) = id (retraction agrees with
+  exp to first order).
+
+- geoopt implements exactly this: Sphere.retr(x,u) = projx(x+u) = (x+u)/||x+u||;
+  RiemannianAdam / RiemannianSGD compute the update in the tangent/ambient space
+  and retract back.
+
+
+2. Tangent-space neural nets do exactly this (with one nuance)
+--------------------------------------------------------------
+Dominant hyperbolic/spherical NN template: Log -> ordinary Euclidean
+linear/attention -> Exp.
+
+- Ganea et al., Hyperbolic Neural Networks (NeurIPS 2018): a map's Moebius
+  version is f^{\otimes c}(x) := exp_0^c(f(log_0^c(x))) (Def. 3.2); Moebius
+  matmul is exp_0(W log_0(x)).
+
+- Chami et al., HGCN (NeurIPS 2019), Eq. 6: W \otimes^K x^H := exp_o^K(W
+  log_o^K(x^H)) -- "project hyperbolic points to the tangent space, then project
+  back using the exponential map."
+
+- Gulcehre et al., Hyperbolic Attention Networks (ICLR 2019): aggregates via the
+  Klein/Einstein midpoint (weighted coordinate combination), then projects back.
+
+NUANCE (the adversarial catch): in the Poincare ball, the tangent space at the
+ORIGIN is all of R^n, so a generic W never "leaves" anything -- the orthogonality
+issue is vacuous there. On the SPHERE and the Lorentz hyperboloid, the tangent
+space at a general base point IS a proper subspace {v : <v,x> = 0}, and there a
+generic dense W genuinely leaves it. Fully Hyperbolic Neural Networks (Chen et
+al., ACL 2022) is the primary critique: existing tangent-space linear layers use
+a STRUCTURED block-diagonal matrix that zeroes the base coordinate to stay
+orthogonal, and they prove this is "a relaxation of the Lorentz rotation and does
+not include the boost" -- i.e. STRICTLY LESS EXPRESSIVE than a general manifold
+map. Their alternative accepts a generic W and re-derives the base coordinate to
+land back on the manifold.
+
+Upshot for us: letting W (and W_o) leave the tangent subspace and re-projecting
+once is the MORE EXPRESSIVE choice, not the impoverished one. Papers that "stay
+on the tangent subspace" do so by RESTRICTING W -- exactly the restriction the
+fully-hyperbolic line criticizes as a limitation.
+
+
+3. "Weighted sum in ambient space, then project" is a named aggregation
+-----------------------------------------------------------------------
+Our attention-weighted aggregation followed by a single projection is the
+EXTRINSIC MEAN.
+
+- Bhattacharya & Patrangenaru (Annals of Statistics 31(1), 2003): the extrinsic
+  mean embeds points, takes the ordinary ambient arithmetic mean (which lies OFF
+  the manifold), then projects to the closest manifold point. On S^{d-1} the
+  closed form is normalize(sum_i w_i x_i). Preferred because it is FASTER than
+  the intrinsic Karcher/Frechet mean, which has no closed form for >2 points and
+  needs iterative Log/average/Exp.
+
+- Spherical k-means (Dhillon & Modha, Machine Learning 42, 2001): centroids are
+  normalize(sum x_i); the mean of unit vectors is not a unit vector until
+  projected.
+
+- HGCN aggregates by weighted Euclidean sum in the tangent space then Exp,
+  stating the reason: "the Frechet mean ... has no closed form solution." The
+  accepted one-step approximation.
+
+All have exactly our property: the intermediate weighted sum lives off the
+manifold and is returned by a single normalization/projection.
+
+
+4. The subtlety that matters: project-once != project-every-step (once is better)
+---------------------------------------------------------------------------------
+First-principles linear algebra (follows cleanly; no single ML paper states it as
+a theorem):
+
+- P_x(v) = (I - x x^T) v is LINEAR, idempotent, symmetric. It distributes over
+  weighted sums: P_x(sum_i w_i v_i) = sum_i w_i P_x(v_i).
+
+- For a chain of linear layers, project-once = P_x A_k ... A_1 v0, while
+  project-every-step = P_x A_k P_x ... P_x A_1 v0. These are equal for all inputs
+  IFF every intermediate map keeps its output in the tangent subspace --
+  otherwise they DIFFER, because intermediate projection DISCARDS the off-tangent
+  (span-x) component that a LATER linear layer could rotate back into the tangent
+  space.
+
+- Therefore project-once retains STRICTLY MORE information. This is an argument IN
+  FAVOR of our design. Order matters (P_x . A != A . P_x for generic A), so
+  "project once at the very end" is deliberate, not an accident.
+
+- The clean equivalence to "operate on the manifold throughout" holds only to
+  FIRST ORDER, because the true intrinsic op uses the NONLINEAR exp/log, of which
+  P_x is the linearization at x. Our pipeline has exactly one nonlinearity before
+  projection (the softmax attention weights -- scalars) plus the final exp_x, so
+  there is no per-step nonlinear distortion for the projection to compound. The
+  "tangent space is only a local approximation" critique (Dai et al., H2H-GCN,
+  CVPR 2021) targets networks that REPEATEDLY round-trip through exp/log; it does
+  not bite a single-projection, single-exp design like ours.
+
+
+5. Gradient / numerical behavior of the final projection: benign
+----------------------------------------------------------------
+Backprop through the final projection is the SAFE part. v -> v - <v,x>x has
+constant Jacobian I - x x^T (for fixed base point x) -- no singularity, nothing
+to clamp. The documented numerical hazards in this literature (catastrophic NaNs,
+vanishing gradients) come from the NONLINEAR maps -- exp/log/arcosh, normalization
+v/||v|| as ||v||->0, boundary effects -- not from the linear tangent projection
+(Mishne et al., "The Numerical Stability of Hyperbolic Representation Learning,"
+ICML 2023: Float64 radius bounds ~19-38; Poincare gradients shrink like delta^2
+near the boundary; geoopt clamps accordingly). Keep guards on exp_x / Log_x, not
+on the projection. (Our expmap already uses torch.sinc + clamp_min norms; the
+radial clamp keeps ||mu|| < pi.)
+
+
+================================================================================
+Which convention is more common, and why
+================================================================================
+"Compute in a Euclidean/tangent parametrization and project (or exp) back" is BY
+FAR the more common convention -- the entire tangent-space school of
+hyperbolic/spherical NNs, the retraction framework in optimization, and
+extrinsic-mean aggregation. It wins on simplicity, speed, numerical stability,
+and reuse of ordinary Euclidean layers.
+
+The competing "stay intrinsic / never leave the manifold" school (Fully
+Hyperbolic / Lorentz-direct nets, H2H-GCN, exact Frechet-mean aggregation) exists
+and argues two real points: (a) tangent-space linear maps at a FIXED base point
+are less expressive (no Lorentz boost) and non-equivariant to base-point choice;
+(b) repeated exp/log round-trips distort global geometry. BOTH critiques are about
+REPEATED round-trips and RESTRICTED linear maps -- the opposite of what we do. Our
+design (unrestricted linear ops off the tangent space, ONE projection, ONE exp)
+sidesteps both.
+
+Two honest live disagreements in the literature (for the caveats section):
+- Whether the exp/log round-trip HURTS stability (Chen et al. 2021) or a
+  single-exp Euclidean parametrization HELPS it (Mishne et al. 2023) is contested.
+- Whether backprop through a final exp_0 causes gradient vanishing (Guo et al.
+  2022) is explicitly rebutted by Mishne et al. (Remark 4.3): the exp_0 Jacobian
+  "reduce[s] the power of delta from 2 to 1 and thus help[s] alleviate the
+  gradient vanishing problem."
+
+
+================================================================================
+Bottom line for NeighborhoodProjection
+================================================================================
+Valid and standard. Keep the current design (unconstrained W_v / W_o, single
+final projection). It is effectively an extrinsic/projected aggregation with a
+learned ambient transform -- MORE expressive than the tangent-preserving
+structured maps of classic tangent-space nets, and STRICTLY MORE
+information-preserving than projecting at every step. The "tangent-faithful"
+variant (project per-value + scalar/diagonal W_o) would be LESS expressive and
+LESS information-preserving; only adopt it if base-point equivariance is a hard
+requirement. Keep numerical guards on exp_x / Log_x, not on the projection.
+
+
+================================================================================
+Methodological caveat (from the research pass)
+================================================================================
+Several equation numbers were read from ar5iv HTML renderings rather than the
+official PDFs, and a couple of textbook/paywalled sources (Absil 2008 book,
+Dhillon & Modha) were corroborated via faithful secondary restatements rather
+than direct fetch. The mechanisms and load-bearing quotes are consistent across
+sources, but verify exact equation numbers against official PDFs before quoting
+verbatim in a publication.
+
+
+================================================================================
+Citations
+================================================================================
+[1]  Boumal, N. (2023). An Introduction to Optimization on Smooth Manifolds.
+     Cambridge University Press. Def. 3.47; Example 3.49 / Eq. 3.32; Sec. 5.12
+     metric-projection retraction, Eq. 5.45.  https://www.nicolasboumal.net/book
+
+[2]  Absil, P.-A. & Malick, J. (2012). Projection-like Retractions on Matrix
+     Manifolds. SIAM Journal on Optimization 22(1):135-158. Sec. 2.2.
+
+[3]  Absil, P.-A., Mahony, R. & Sepulchre, R. (2008). Optimization Algorithms on
+     Matrix Manifolds. Princeton University Press. Def. 4.1.1.
+
+[4]  Ganea, O., Becigneul, G. & Hofmann, T. (2018). Hyperbolic Neural Networks.
+     NeurIPS 2018. arXiv:1805.09112. Def. 3.2 (Moebius version / matmul).
+
+[5]  Chami, I., Ying, R., Re, C. & Leskovec, J. (2019). Hyperbolic Graph
+     Convolutional Neural Networks. NeurIPS 2019. arXiv:1910.12933. Eq. 6.
+
+[6]  Gulcehre, C. et al. (2019). Hyperbolic Attention Networks. ICLR 2019.
+     arXiv:1805.09786. (Klein/Einstein midpoint aggregation.)
+
+[7]  Chen, W. et al. (2022). Fully Hyperbolic Neural Networks. ACL 2022.
+     arXiv:2105.14686. (Expressiveness / Lorentz-boost critique of tangent-space
+     linear maps; Lorentz-direct alternative.)
+
+[8]  Shimizu, R., Mukuta, Y. & Harada, T. (2021). Hyperbolic Neural Networks++.
+     ICLR 2021. arXiv:2006.08210.
+
+[9]  Dai, J. et al. (2021). A Hyperbolic-to-Hyperbolic Graph Convolutional
+     Network (H2H-GCN). CVPR 2021. arXiv:2104.06942. (Tangent-space-as-local-
+     approximation critique.)
+
+[10] Bhattacharya, R. & Patrangenaru, V. (2003). Large sample theory of intrinsic
+     and extrinsic sample means on manifolds. Annals of Statistics 31(1).
+     (Extrinsic mean.)
+
+[11] Dhillon, I. S. & Modha, D. S. (2001). Concept Decompositions for Large Sparse
+     Text Data Using Clustering. Machine Learning 42. (Spherical k-means centroids
+     = normalize(sum x_i).)
+
+[12] Lou, A. et al. (2020). Differentiating through the Frechet Mean. ICML 2020.
+
+[13] Mishne, G. et al. (2023). The Numerical Stability of Hyperbolic
+     Representation Learning. ICML 2023. arXiv:2211.00181. (Remark 4.3 on exp_0
+     Jacobian and gradient vanishing.)
+
+[14] Kochurov, M., Karimov, R. & Kozlukov, S. (2020). geoopt: Riemannian
+     Optimization in PyTorch. arXiv:2005.02819.
+     Repo: https://github.com/geoopt/geoopt  (manifolds/sphere.py: proju, retr.)
+
+[15] Guo, Y. et al. (2022). (Claim that backprop through a final exp_0 causes
+     gradient vanishing; rebutted by [13] Remark 4.3.)
