@@ -67,7 +67,6 @@ class TrainerConfig:
 
     # NeighborhoodProjection (attention pooling of the source's walk-token offsets -> mu_u).
     t2v_dim: int = 16         # Time2Vec output dim (16 ties dim100 on wiki: 0.8287/0.8040 vs 0.8289/0.8046)
-    n_heads: int = 4          # multi-head displaced-tangent attention heads (1 ≈ the old single-head pool)
 
     # Link loss / head.
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
@@ -110,7 +109,6 @@ class Trainer:
             d_emb=int(config.d_emb),
             t2v_dim=int(config.t2v_dim),
             d_ef=int(config.d_ef),
-            n_heads=int(config.n_heads),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.

@@ -88,46 +88,41 @@ class TimeEncoder(nn.Module):
 
 
 class NeighborhoodProjection(nn.Module):
-    """Multi-head DISPLACED-tangent attention pooling of a source's walk-token tangents into one
-    tangent vector mu_u at E[u].
+    """DISPLACED-tangent attention pooling of a source's walk-token tangents into one tangent vector
+    mu_u at E[u]. Single-head.
 
-    Generalises the previous single-head "rescale-only" centroid (mu_u = Σ_p w_p·g_p, the value being
-    the RAW tangent g_p = Log_{E[u]}(E[token_p]), so the only learnable per token was the scalar
-    attention weight w_p — mu_u was trapped in the conic hull of the FIXED neighbour tangents). Two
-    added degrees of freedom:
+    Generalises the old "rescale-only" centroid (mu_u = Σ_p w_p·g_p, value = the RAW tangent
+    g_p = Log_{E[u]}(E[token_p]), so the only learnable per token was the scalar attention weight —
+    mu_u was trapped in the conic hull of the FIXED neighbour tangents) by giving the VALUE a learned
+    displacement:
 
-      • VALUE displacement. Each token's value is its raw tangent PLUS a learned displacement
-            v_{p,h} = g_p + γ_h ⊙ ( W_v^h · g_p  +  Enc^h([Time2Vec(age_p), log1p(hop_p), edge_p]) )
-        a content-LINEAR reshape of the tangent (W_v) plus a DEEP displacement driven only by the
-        STABLE features (Enc). Depth lives on the stable path on purpose — a 2-layer projection on the
-        embedding/code path overfit on wiki (see the old shared-w_k note); width/linear is the safe
-        lever there. γ_h is a per-(head, channel) LayerScale init 0, so at start v == g (displacement
-        OFF) and the head is a plain tangent centroid, earning capacity channel-by-channel.
+        v_p = g_p + γ ⊙ ( W_v · g_p  +  Enc([Time2Vec(age_p), log1p(hop_p), edge_p]) )
 
-      • MULTI-HEAD. H heads each pool the tokens with their own DECOUPLED query/key (no more shared
-        w_k / seed-as-token trick — the centroid interpretation it served is gone once values are
-        transformed), proposing H candidate tangent directions mu_h; W_o combines them. A single
-        weighted sum can only point mu_u in ONE blended direction; H heads let it aim where no single
-        neighbour tangent pointed.
+    a content-LINEAR reshape of the tangent (W_v) plus a DEEP displacement driven only by the STABLE
+    features (Enc). Depth lives on the stable path on purpose — a 2-layer projection on the
+    embedding/code path overfit on wiki; width/linear is the safe lever there. γ is a per-channel
+    LayerScale init 0, so at start v == g (displacement OFF) and the module is a plain tangent
+    centroid, earning capacity channel-by-channel. A seed-conditioned query (decoupled from the keys)
+    attends over the tokens; mu_u = Σ_p w_p · v_p.
 
-    Sphere validity: each token value and each mu_h is a FREE R^d vector (the displacement and the
-    head-mix W_o both leave the tangent subspace); the COMBINED mu is projected ONCE onto the tangent
-    space at E[u] (mu -= ⟨mu, E[u]⟩·E[u]), which is all exp_{E[u]} needs. This is the standard
-    retraction / extrinsic-mean pattern (compute freely off the tangent space, project back once).
-    Projecting once at the END is deliberate and is NOT the same as projecting per head/value: the
-    projection is linear, so per-step projection would DISCARD the off-tangent (span-E[u]) component
-    that a later linear map (W_o) can rotate back into the tangent plane — one final projection retains
-    strictly MORE information. mu is then radially clamped below π so exp_{E[u]}(mu) stays injective.
-    Candidate-independent (never sees E[v]); cold rows (no token) -> weights 0 -> mu_u = 0 -> P[u]=E[u].
-    (Literature basis: researches/off-tangent-intermediate-values-and-project-once.txt.)
+    Sphere validity: each value v_p (and mu_u) is a FREE R^d vector (the displacement leaves the
+    tangent subspace); mu_u is projected ONCE onto the tangent space at E[u] (mu -= ⟨mu, E[u]⟩·E[u]),
+    which is all exp_{E[u]} needs — the standard retraction / extrinsic-mean pattern (compute freely
+    off the tangent space, project back once). Project-once retains strictly MORE information than
+    per-step projection (see researches/off-tangent-intermediate-values-and-project-once.txt). mu is
+    then radially clamped below π so exp_{E[u]}(mu) stays injective. Candidate-independent (never sees
+    E[v]); cold rows (no token) -> weights 0 -> mu_u = 0 -> P[u] = E[u].
+
+    (The multi-head variant — H decoupled heads + a W_o head-combine — is at commit 889c59f. On coin
+    it bought only ~+0.004 val/test over this single-head displacement at 3x the head params and
+    ~1.5x the compute; recover it from there if the multi-head lever is wanted again.)
     """
 
-    def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0, n_heads: int = 4):
+    def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0):
         super().__init__()
         self.d_emb = d_emb
         self.d_ef = d_ef
-        self.n_heads = n_heads
-        self.d_a = max(1, (d_emb // 2) // n_heads)     # per-head attention (query/key) dim
+        self.d_a = d_emb // 2                           # attention (query/key) dim
         self.scale = 1.0 / math.sqrt(self.d_a)
         self.max_radius = math.pi - 1e-2               # keep ‖mu‖ < π so exp_{E[u]} stays injective
 
@@ -135,25 +130,17 @@ class NeighborhoodProjection(nn.Module):
         s_in = t2v_dim + 1 + d_ef                      # stable-feature dim: [Time2Vec, log-hop, edge]
         desc_in = d_emb + s_in                         # full token descriptor: [tangent, stable]
 
-        # Attention: DECOUPLED query (from the seed) and key (from the token descriptor), H heads.
-        self.w_q = nn.Linear(desc_in, n_heads * self.d_a)
-        self.w_k = nn.Linear(desc_in, n_heads * self.d_a)
+        # Attention: DECOUPLED query (from the seed) and key (from the token descriptor).
+        self.w_q = nn.Linear(desc_in, self.d_a)
+        self.w_k = nn.Linear(desc_in, self.d_a)
 
-        # Value displacement, per head, each head emitting a FULL d_emb tangent-direction candidate:
+        # Value displacement:
         #   content path — LINEAR reshape of the tangent (depth here overfits; keep it linear);
         #   stable  path — DEEP (safe: driven only by time / hop / edge).
-        self.w_v = nn.Linear(d_emb, n_heads * d_emb, bias=False)
+        self.w_v = nn.Linear(d_emb, d_emb, bias=False)
         self.disp_enc = nn.Sequential(
-            nn.Linear(s_in, d_emb), nn.GELU(), nn.Linear(d_emb, n_heads * d_emb))
-        self.gamma = nn.Parameter(torch.zeros(n_heads, d_emb))    # LayerScale, init 0 -> displacement off
-
-        # Combine the H head directions -> one d_emb vector. Init to AVERAGE the heads so mu starts as
-        # a plain (multi-head) tangent centroid; the displacement (γ=0) is off, so the head begins in
-        # the same well-behaved regime as the old single-head centroid.
-        self.w_o = nn.Linear(n_heads * d_emb, d_emb, bias=False)
-        with torch.no_grad():
-            eye = torch.eye(d_emb)
-            self.w_o.weight.copy_(torch.cat([eye for _ in range(n_heads)], dim=1) / n_heads)
+            nn.Linear(s_in, d_emb), nn.GELU(), nn.Linear(d_emb, d_emb))
+        self.gamma = nn.Parameter(torch.zeros(d_emb))    # LayerScale, init 0 -> displacement off
 
     def forward(self, source: torch.Tensor, token_tangents: torch.Tensor,
                 ages: torch.Tensor, mask: torch.Tensor, positions: torch.Tensor,
@@ -162,30 +149,27 @@ class NeighborhoodProjection(nn.Module):
         ages [B,T]; mask [B,T] bool (True = real token); positions [B,T] int hop-from-seed (1=seed,
         0=pad); edge_features [B,T,d_ef]. Returns mu_u [B,d_emb], a tangent at E[u] (⊥ E[u], ‖·‖<π);
         cold rows (no token) -> 0."""
-        b, t, d = token_tangents.shape
-        h, d_a = self.n_heads, self.d_a
+        b = source.shape[0]
 
         # TPNet scales delta-times by log(Δt + 1) before the time encoder.
         t2v = self.time_encoder(torch.log1p(ages.clamp_min(0.0)))                  # [B,T,t2v_dim]
         log_hop = torch.log1p(positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)  # [B,T,1]
         stable = torch.cat([t2v, log_hop, edge_features], dim=-1)                  # [B,T,s_in]
 
-        # ── attention (H heads, decoupled Q/K) ─────────────────────────────────────────────────
-        keys = self.w_k(torch.cat([token_tangents, stable], dim=-1)).view(b, t, h, d_a)   # [B,T,H,d_a]
+        # ── attention (decoupled Q/K) ──────────────────────────────────────────────────────────
+        keys = self.w_k(torch.cat([token_tangents, stable], dim=-1))              # [B,T,d_a]
         # Query = the seed: content = E[u], stable features (age/hop/edge) zero.
-        query = self.w_q(torch.cat([source, stable.new_zeros(b, stable.shape[-1])], dim=-1))
-        query = query.view(b, h, d_a)                                             # [B,H,d_a]
-        scores = torch.einsum("bhk,bthk->bht", query, keys) * self.scale          # [B,H,T]
-        scores = scores.masked_fill(~mask.unsqueeze(1), float("-inf"))
-        weights = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)        # [B,H,T]; cold row -> 0
+        query = self.w_q(torch.cat([source, stable.new_zeros(b, stable.shape[-1])], dim=-1))  # [B,d_a]
+        scores = (query.unsqueeze(1) * keys).sum(-1) * self.scale                 # [B,T]
+        scores = scores.masked_fill(~mask, float("-inf"))
+        weights = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)        # [B,T]; cold row -> 0
 
-        # ── displaced values (H heads; each a full-d tangent-direction candidate) ───────────────
-        disp = (self.w_v(token_tangents) + self.disp_enc(stable)).view(b, t, h, d)   # [B,T,H,d]
-        values = token_tangents.unsqueeze(2) + self.gamma * disp                  # [B,T,H,d]; γ init 0
+        # ── displaced values ───────────────────────────────────────────────────────────────────
+        disp = self.w_v(token_tangents) + self.disp_enc(stable)                   # [B,T,d]
+        values = token_tangents + self.gamma * disp                               # [B,T,d]; γ init 0
 
-        # ── per-head pool -> combine -> project onto T_{E[u]} -> radial clamp ───────────────────
-        mu_h = torch.einsum("bht,bthd->bhd", weights, values)                     # [B,H,d]
-        mu = self.w_o(mu_h.reshape(b, h * d))                                     # [B,d]
+        # ── pool -> project onto T_{E[u]} -> radial clamp ──────────────────────────────────────
+        mu = (weights.unsqueeze(-1) * values).sum(dim=-2)                         # [B,d]
         mu = mu - (mu * source).sum(-1, keepdim=True) * source                    # Π_{E[u]}: ⊥ E[u]
         norm = (mu * mu).sum(-1, keepdim=True).clamp_min(1e-12).sqrt()            # finite grad at 0
         return mu * (self.max_radius / norm).clamp(max=1.0)                       # ‖mu‖ ≤ max_radius
@@ -193,7 +177,7 @@ class NeighborhoodProjection(nn.Module):
 
 class LinkPredHead(nn.Module):
     def __init__(self, num_nodes: int, d_emb: int,
-                 t2v_dim: int = 16, d_ef: int = 0, n_heads: int = 4):
+                 t2v_dim: int = 16, d_ef: int = 0):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_emb = d_emb
@@ -208,7 +192,7 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
         self.neighbourhood = NeighborhoodProjection(
-            d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef, n_heads=n_heads)
+            d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef)
 
         # Combiner MLP over the 4 pairwise SIMILARITIES (inner products = cosines) on the sphere
         # between both sides' identity (E[x]) and neighbourhood (P[x]) points. Rotation-invariant, so
