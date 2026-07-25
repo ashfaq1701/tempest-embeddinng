@@ -1,0 +1,254 @@
+================================================================================
+Is our tangent-space head valid geometric DL? Defenders, critics, and the verdict
+================================================================================
+
+Context / our architecture
+--------------------------
+Learned node embeddings E on the unit SPHERE (geoopt.Sphere ManifoldParameter),
+optimized by RiemannianAdam. Per query:
+  1. Log_{E[u]}(E[token]) maps neighbour points into the TANGENT SPACE at E[u].
+  2. STANDARD EUCLIDEAN layers run on those tangent vectors — attention, a Linear
+     stem, and a stack of pre-norm residual FFN blocks (LayerNorm -> Linear ->
+     GELU -> Linear -> Dropout, per-channel LayerScale) — producing a displaced
+     tangent vector mu.
+  3. mu is projected ONCE back onto the tangent space and mapped to the manifold
+     with a SINGLE exp map, P[u] = exp_{E[u]}(mu).
+  4. Links scored by GEODESIC DISTANCE d(P[u], E[v]) = arccos<P[u],E[v]> -> MLP.
+Key properties: exactly ONE logmap + ONE expmap per forward (no repeated
+round-trips); the tangent-space ops (LayerNorm, dense MLP) are COORDINATE-
+DEPENDENT, i.e. NOT rotation-equivariant / not intrinsic.
+
+Question: by which leading geometric-DL papers' standards is this legitimate, and
+is non-rotation-equivariance in the tangent space a real problem or normal?
+
+
+================================================================================
+EXECUTIVE VERDICT: legitimate, mainstream, and at the CLEANEST end
+================================================================================
+Every load-bearing component of the design has a NeurIPS/ICML/ICLR precedent that
+does the same thing and treats it as standard. The critics (HyboNet, H2H-GCN)
+target a DIFFERENT regime — REPEATED per-layer round-trips — and their own text
+("especially FREQUENTLY using tangent space approximations") does not indict a
+single projection. Non-rotation-equivariance of tangent-space ops is NORMAL
+practice in the embedding literature, not a disqualifier; coordinate-independence
+is a goal pursued by a separate sub-field (gauge / spherical CNNs on signal
+fields), not a standard applied to embedding models like ours.
+
+
+================================================================================
+1 & 2. DEFENDERS (ranked) — the "log -> Euclidean op -> exp" recipe
+================================================================================
+
+#1  HGCN — Chami, Ying, Re, Leskovec, NeurIPS 2019, arXiv:1910.12933.
+    Closest match: the recipe AND a PER-NODE base point (log/exp at the center
+    node's own embedding, exactly like our E[u]) AND a geodesic-distance decoder.
+    - Feature transform (Eq. 6): W (x)^K x^H := exp_o^K(W log_o^K(x^H)); "the
+      matrix representing the transform is defined on the tangent space, which is
+      Euclidean and isomorphic to R^d."
+    - Aggregation at the node's own point (Eq. 9):
+      Agg^K(x^H)_i = exp_{x_i^H}^K( Sum_j w_ij log_{x_i^H}^K(x_j^H) ) — "aggregation
+      is directly performed in the tangent space of each center point x_i^H, AS
+      THIS IS WHERE THE EUCLIDEAN APPROXIMATION IS BEST." Ablation: beats
+      aggregation at the origin.
+    - Coordinate-dependent op: sigma^(x)(x^H) = exp_o(sigma(log_o(x^H))) (Eq. 10).
+    => Our "log/exp at E[u]" is HGCN's RECOMMENDED construction, not a liberty.
+
+#2  Hyperbolic Neural Networks — Ganea, Becigneul, Hofmann, NeurIPS 2018,
+    arXiv:1805.09112. Canonical origin of the recipe.
+    - Def. 3.2: f^(x)c(x) := exp_0^c( f( log_0^c(x) ) ).
+    - COLLAPSE THEOREM (blesses our design): a stack of tangent layers collapses
+      to a SINGLE round-trip: f_k^(x) o ... o f_1^(x) = exp_0 o f_k o ... o f_1 o log_0.
+      Our one-log/one-exp head IS the algebraic ideal a deep tangent stack only
+      approximates.
+    - T_0 D = R^n (tangent space is the Euclidean vector space).
+
+#3  kappa-GCN (Constant Curvature GCN) — Bachmann, Becigneul, Ganea, ICML 2020,
+    arXiv:1911.05076. PRIMARY SPHERE DEFENDER: same recipe explicitly extended to
+    POSITIVE curvature.
+    - kappa-Right-Matrix-Mult (Eq. 10): (X (x)k W)_i = exp_0^k((log_0^k(X) W)_i);
+      tangent aggregation exp_x^k(Sum_i alpha_i log_x^k(x_i)).
+    - "For positive curvature, we choose the stereographic projection of the
+      sphere..."; models "smoothly recover their Euclidean counterparts when the
+      curvature goes to zero FROM EITHER SIDE."
+
+#4  Hyperbolic Graph Neural Networks — Liu, Nickel, Kiela, NeurIPS 2019,
+    arXiv:1910.12892. Manifold-agnostic recipe:
+    h_u^{k+1} = sigma( exp_{x'}( Sum_v A~_uv W^k log_{x'}(h_v^k) ) ).
+
+#5  HNN++ — Shimizu, Mukuta, Harada, ICLR 2021, arXiv:2006.08210. Concatenation,
+    split, and attention done in the tangent space then exp back (closed-form
+    generalization of Ganea).
+
+#6  LAYERNORM SMOKING GUN — HVT, "A Comprehensive Vision Framework for Learning in
+    Non-Euclidean Space", arXiv:2409.16897. Publishes our exact coordinate-
+    dependent ops:
+      LayerNorm^D(x) = exp_0( LayerNorm( log_0(x) ) )
+      ReLU^D(x)      = exp_0( ReLU( log_0(x) ) )
+    "Activation functions and normalization are applied in the tangent space at
+    the origin to leverage familiar Euclidean operations."
+
+"Tangent space is a Euclidean vector space where standard ops apply" (the exact
+framing): HGNN review arXiv:2202.13852 — "the tangent space T_x M is an
+n-dimension vector space and isomorphic to R^n... the transformation takes place
+there. Subsequently, the nodes are mapped back... using the exponential map."
+
+ADVERSARIAL CORRECTION (do NOT miscite as a defender): Gulcehre et al.,
+Hyperbolic Attention Networks (ICLR 2019, arXiv:1805.09786) is NOT a
+tangent-space-recipe paper — it uses INTRINSIC ops (attention by hyperbolic
+distance, aggregation by the Einstein midpoint in the Klein model, no log/exp
+sandwich). It belongs on the intrinsic/critic side.
+
+Which defenders use coordinate-dependent / non-rotation-equivariant tangent ops:
+HVT (LayerNorm + ReLU), Ganea (pointwise nonlinearity), HGCN (nonlinearity),
+kappa-GCN (matrix multiply), HNN++ (concat/attention) — ALL standard, NONE treats
+coordinate-dependence as a problem. No defender explicitly concedes-and-defends
+the equivariance loss; it simply is never raised (which is the evidence it is
+considered normal).
+
+
+================================================================================
+3. GEODESIC-DISTANCE DECODERS are standard
+================================================================================
+- HGCN (arXiv:1910.12933) — Fermi-Dirac decoder, exact match to our form:
+  p((i,j) in E | x_i,x_j) = [ exp((d(x_i,x_j)^2 - r)/t) + 1 ]^-1, d = geodesic.
+- Nickel & Kiela, Poincare Embeddings (NeurIPS 2017, arXiv:1705.08039) — softmax
+  over negative geodesic distance: L = Sum log( e^{-d(u,v)} / Sum_{v'} e^{-d(u,v')} ).
+- Ganea, Hyperbolic Entailment Cones (ICML 2018, arXiv:1804.01882) — angular
+  (geodesic-cone) energy.
+- SPHERE-SPECIFIC: Mettes et al., Hyperspherical Prototype Networks (NeurIPS 2019,
+  arXiv:1901.10514) — classify by argmax cos theta (= arccos<.,.> on S^{D-1}),
+  prototypes on the unit sphere. OUR EXACT DECODER ON OUR EXACT MANIFOLD.
+- Davidson et al., Hyperspherical VAE (UAI 2018, arXiv:1804.00891) — vMF on
+  S^{m-1}, similarity via mu^T z (cosine/geodesic).
+
+
+================================================================================
+3b. SPHERE / POSITIVE-CURVATURE defenders
+================================================================================
+- kappa-GCN (arXiv:1911.05076) — tangent-space recipe for spheres. Primary.
+- Gu, Sala, Re et al., Learning Mixed-Curvature Representations in Product Spaces
+  (ICLR 2019, OpenReview HJxeWnCcF7) — product manifolds with explicit SPHERICAL
+  factors, Riemannian optimization.
+- Skopek, Ganea, Becigneul, Mixed-curvature VAEs (ICLR 2020, arXiv:1911.08411) —
+  VAE on spherical latents S_K^n with sphere exp/log; uses PARALLEL TRANSPORT
+  between tangent spaces at different base points (the principled tool for
+  per-point tangent spaces like ours).
+- Becigneul & Ganea, Riemannian Adaptive Optimization / RiemannianAdam
+  (ICLR 2019, arXiv:1810.00760) — the optimizer we use (sphere qualifies;
+  framework-level, headline experiment is hyperbolic).
+- geoopt (arXiv:2005.02819) — geoopt.Sphere + RiemannianAdam is our toolchain,
+  documented as standard.
+
+
+================================================================================
+4. CRITICS (strongest quotes)
+================================================================================
+- Chen et al., Fully Hyperbolic NN / HyboNet, ACL 2022, arXiv:2105.14686.
+  - Expressiveness: "linear transformation in tangent spaces used by existing
+    hyperbolic networks is A RELAXATION OF THE LORENTZ ROTATION AND DOES NOT
+    INCLUDE THE BOOST, implicitly limiting the capabilities."
+  - Stability of repeated maps: "transform features between hyperbolic spaces and
+    tangent spaces via the logarithmic and exponential maps... The compositions of
+    these functions are complicated and usually range to infinity, significantly
+    weakening the stability."
+- Dai et al., H2H-GCN, CVPR 2021, arXiv:2104.06942.
+  - "tangent space is only a local approximation of a manifold"; the mapping "is
+    only locally diffeomorphic, which may distort the global structure...
+    ESPECIALLY FREQUENTLY USING TANGENT SPACE APPROXIMATIONS." Targets the
+    per-layer manifold-tangent-manifold scheme.
+- Hypformer (KDD 2024, arXiv:2407.01290) and the Hyperbolic DNN survey
+  (arXiv:2101.04562) echo: tangent methods "can lead to significant mapping errors
+  for distant points"; stacking tangent-space CNNs "may collapse to a vanilla
+  Euclidean CNN."
+
+
+================================================================================
+5. Does the critique bite OUR design? NO.
+================================================================================
+(a) Expressiveness (HyboNet): a tangent-space LINEAR map is weaker than a full
+    Lorentz transformation (missing the boost). Narrow: (i) hyperbolic-specific,
+    no sphere claim; (ii) we do NOT use a bare linear map — we use a full
+    nonlinear Euclidean net (attention + residual FFNs), so "linear map lacks a
+    boost" is largely orthogonal to what we compute.
+(b) Round-trip distortion (H2H-GCN): its own wording is about FREQUENCY —
+    "especially frequently using tangent space approximations," aimed at the
+    per-layer scheme. We do EXACTLY ONE log + ONE exp per forward — no repeated
+    round-trip to accumulate distortion. Ganea's collapse theorem
+    (exp_0 o f_k...f_1 o log_0) says a single-projection network is the IDEAL form
+    a deep tangent stack can only approximate. We are already at the ideal.
+Base-point choice: log/exp at the node's own E[u] (not origin) is HGCN's
+    recommended, empirically superior construction; parallel transport (Skopek)
+    is the standard machinery for per-point tangent spaces.
+Non-rotation-equivariance: NORMAL across the entire embedding literature (Ganea,
+    HGCN, HNN++, kappa-GCN, HVT, Mathieu Poincare VAE arXiv:1901.06033, Skopek,
+    Davidson). The "coordinate-dependence is a flaw" position exists only in the
+    gauge / spherical-CNN line (Cohen et al., arXiv:1902.04615, 1801.10130), which
+    solves a DIFFERENT problem (equivariant convolution of signal fields over a
+    manifold) and is not a standard applied to embedding models. So
+    non-rotation-equivariance is NOT disqualifying; it is the field's DEFAULT.
+
+
+================================================================================
+BOTTOM LINE
+================================================================================
+By the standards of HGCN (NeurIPS 2019), Ganea HNN (NeurIPS 2018), kappa-GCN
+(ICML 2020), HNN++ (ICLR 2021), Liu HGNN (NeurIPS 2019), HVT (LayerNorm-in-
+tangent-space), and the sphere line (Mettes hyperspherical prototypes / Davidson
+hyperspherical VAE / geoopt), our architecture is a legitimate, conventional
+instance of the accepted tangent-space-linearization + geodesic-decoder paradigm.
+Being single-log/single-exp with a per-node base point, it sits at the CLEANEST
+end of that paradigm, not the criticized end. The critics argue for going fully
+intrinsic to gain expressiveness and avoid REPEATED round-trips; those arguments
+motivate a possible alternative but do NOT invalidate a single-projection design,
+and non-rotation-equivariance in the tangent space is normal practice.
+
+NOTE: this settles VALIDITY (is it legitimate Riemannian DL? yes). It is separate
+from the open PERFORMANCE question (is the geometry load-bearing here, vs a
+normalized Euclidean / Method-A version? — see the coin evidence: E doesn't
+cluster, cosine ~ geodesic, the non-geometric stateless head beats it). Both
+answers stand independently.
+
+
+================================================================================
+Citations
+================================================================================
+[1]  Chami, Ying, Re, Leskovec. Hyperbolic Graph Convolutional Neural Networks.
+     NeurIPS 2019. arXiv:1910.12933. (Recipe Eq.6; per-node aggregation Eq.9;
+     Fermi-Dirac geodesic decoder.)
+[2]  Ganea, Becigneul, Hofmann. Hyperbolic Neural Networks. NeurIPS 2018.
+     arXiv:1805.09112. (Def. 3.2; tangent-stack collapse theorem.)
+[3]  Bachmann, Becigneul, Ganea. Constant Curvature Graph Convolutional Networks
+     (kappa-GCN). ICML 2020. arXiv:1911.05076. (Sphere / positive curvature.)
+[4]  Liu, Nickel, Kiela. Hyperbolic Graph Neural Networks. NeurIPS 2019.
+     arXiv:1910.12892.
+[5]  Shimizu, Mukuta, Harada. Hyperbolic Neural Networks++. ICLR 2021.
+     arXiv:2006.08210.
+[6]  HVT — A Comprehensive Vision Framework for Learning in Non-Euclidean Space.
+     arXiv:2409.16897. (LayerNorm/ReLU in tangent space.)
+[7]  HGNN review. arXiv:2202.13852. ("tangent space is isomorphic to R^n.")
+[8]  Nickel, Kiela. Poincare Embeddings. NeurIPS 2017. arXiv:1705.08039.
+[9]  Ganea, Becigneul, Hofmann. Hyperbolic Entailment Cones. ICML 2018.
+     arXiv:1804.01882.
+[10] Mettes, van der Pol, Snoek. Hyperspherical Prototype Networks. NeurIPS 2019.
+     arXiv:1901.10514. (Sphere; arccos<.,.> decoder — our exact decoder/manifold.)
+[11] Davidson, Falorsi, De Cao, Kipf, Tomczak. Hyperspherical VAE. UAI 2018.
+     arXiv:1804.00891.
+[12] Gu, Sala, Gunel, Re. Learning Mixed-Curvature Representations in Product
+     Spaces. ICLR 2019. OpenReview HJxeWnCcF7.
+[13] Skopek, Ganea, Becigneul. Mixed-curvature Variational Autoencoders.
+     ICLR 2020. arXiv:1911.08411. (Sphere latents; parallel transport.)
+[14] Becigneul, Ganea. Riemannian Adaptive Optimization Methods (RiemannianAdam).
+     ICLR 2019. arXiv:1810.00760.
+[15] Kochurov, Karimov, Kozlukov. geoopt: Riemannian Optimization in PyTorch.
+     arXiv:2005.02819.
+[16] Chen, Han, Wang, Jia, Zhang, ... Fully Hyperbolic Neural Networks (HyboNet).
+     ACL 2022. arXiv:2105.14686. (Critic: boost/expressiveness + stability.)
+[17] Dai, Wu, Gao, ... A Hyperbolic-to-Hyperbolic GCN (H2H-GCN). CVPR 2021.
+     arXiv:2104.06942. (Critic: local-approx / global distortion.)
+[18] Hypformer. KDD 2024. arXiv:2407.01290. (Critic-adjacent.)
+[19] Peng et al. Hyperbolic Deep Neural Networks: A Survey. arXiv:2101.04562.
+[20] Mathieu, Le Lan, Maddison, Tomioka, Teh. Continuous Hierarchical
+     Representations with Poincare VAEs. NeurIPS 2019. arXiv:1901.06033.
+[21] Cohen, Weiler, Kicanaoglu, Welling. Gauge Equivariant CNNs. arXiv:1902.04615;
+     Cohen et al. Spherical CNNs, ICLR 2018, arXiv:1801.10130. (Different problem:
+     equivariant convolution of signal fields — the coordinate-independence camp.)
