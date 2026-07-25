@@ -91,6 +91,30 @@ class TimeEncoder(nn.Module):
         return output
 
 
+class ResidualFFN(nn.Module):
+    """Pre-norm gated residual block: x + γ ⊙ FFN(LayerNorm(x)), where FFN = Linear(d_h → e·d_h)
+    → GELU → Linear(e·d_h → d_h) → Dropout. The trunk is a pure identity — nothing operates on x
+    itself; the branch is normalized on entry, so blocks stack without scale drift. γ (LayerScale,
+    per-channel, init ε) starts every block as a near-no-op — the stack begins ≈ the stem's linear
+    encoding and earns its FFN capacity channel-by-channel; trained |γ| doubles as a per-channel
+    utilization probe. Biases dropped in the FFN: LayerNorm's affine already supplies the input
+    offset, and the residual supplies the output offset."""
+
+    def __init__(self, d_h: int, dropout: float, expansion: int = 2, gamma_init: float = 1e-2):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_h)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_h, expansion * d_h, bias=False),
+            nn.GELU(),
+            nn.Linear(expansion * d_h, d_h, bias=False),
+            nn.Dropout(dropout),
+        )
+        self.gamma = nn.Parameter(torch.full((d_h,), float(gamma_init)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.gamma * self.ffn(self.norm(x))
+
+
 class NeighborhoodProjection(nn.Module):
     """DISPLACED-tangent attention pooling of a source's walk-token tangents into one tangent vector
     mu_u at E[u]. Single-head.
@@ -100,14 +124,15 @@ class NeighborhoodProjection(nn.Module):
     mu_u was trapped in the conic hull of the FIXED neighbour tangents) by giving the VALUE a learned
     displacement:
 
-        v_p = g_p + γ ⊙ ( W_v · g_p  +  Enc([Time2Vec(age_p), log1p(hop_p), edge_p]) )
+        v_p = g_p + γ ⊙ DeepDisp([ g_p ; Time2Vec(age_p) ; log1p(hop_p) ; edge_p ])
 
-    a content-LINEAR reshape of the tangent (W_v) plus a DEEP displacement driven only by the STABLE
-    features (Enc). Depth lives on the stable path on purpose — a 2-layer projection on the
-    embedding/code path overfit on wiki; width/linear is the safe lever there. γ is a per-channel
-    LayerScale init 0, so at start v == g (displacement OFF) and the module is a plain tangent
-    centroid, earning capacity channel-by-channel. A seed-conditioned query (decoupled from the keys)
-    attends over the tokens; mu_u = Σ_p w_p · v_p.
+    where DeepDisp = a Linear stem (fuses tangent + stable -> d) followed by an n_layers ResidualFFN
+    stack (pre-norm + per-block LayerScale + dropout). The outer γ is a per-channel LayerScale init 0,
+    so at start v == g (displacement OFF) and the module is a plain tangent centroid; the block
+    LayerScales (init ε) make each FFN a near-no-op, so the stack begins ≈ the stem's linear encoding
+    and earns FFN depth channel-by-channel. Depth now touches the tangent/code path — ResidualFFN's
+    pre-norm + LayerScale + dropout are the overfit guards a bare deep MLP lacked. A seed-conditioned
+    query (decoupled from the keys) attends over the tokens; mu_u = Σ_p w_p · v_p.
 
     Sphere validity: each value v_p (and mu_u) is a FREE R^d vector (the displacement leaves the
     tangent subspace); mu_u is projected ONCE onto the tangent space at E[u] (mu -= ⟨mu, E[u]⟩·E[u]),
@@ -122,7 +147,8 @@ class NeighborhoodProjection(nn.Module):
     ~1.5x the compute; recover it from there if the multi-head lever is wanted again.)
     """
 
-    def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0):
+    def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0,
+                 n_layers: int = 2, expansion: int = 2, dropout: float = 0.1):
         super().__init__()
         self.d_emb = d_emb
         self.d_ef = d_ef
@@ -138,13 +164,14 @@ class NeighborhoodProjection(nn.Module):
         self.w_q = nn.Linear(desc_in, self.d_a)
         self.w_k = nn.Linear(desc_in, self.d_a)
 
-        # Value displacement:
-        #   content path — LINEAR reshape of the tangent (depth here overfits; keep it linear);
-        #   stable  path — DEEP (safe: driven only by time / hop / edge).
-        self.w_v = nn.Linear(d_emb, d_emb, bias=False)
-        self.disp_enc = nn.Sequential(
-            nn.Linear(s_in, d_emb), nn.GELU(), nn.Linear(d_emb, d_emb))
-        self.gamma = nn.Parameter(torch.zeros(d_emb))    # LayerScale, init 0 -> displacement off
+        # DEEP displacement: a Linear stem fuses [tangent, stable] -> d, then an n_layers ResidualFFN
+        # stack refines it. The stem (a plain Linear) sees g_p's magnitude, and g_p's magnitude also
+        # survives via the residual anchor (values = g_p + γ·disp). Depth now touches the tangent/code
+        # path — ResidualFFN's pre-norm + per-block LayerScale + dropout are the overfit guards.
+        self.disp_stem = nn.Linear(desc_in, d_emb)
+        self.disp_blocks = nn.ModuleList(
+            ResidualFFN(d_emb, dropout=dropout, expansion=expansion) for _ in range(n_layers))
+        self.gamma = nn.Parameter(torch.zeros(d_emb))    # OUTER LayerScale, init 0 -> displacement off
 
     def forward(self, source: torch.Tensor, token_tangents: torch.Tensor,
                 ages: torch.Tensor, mask: torch.Tensor, positions: torch.Tensor,
@@ -168,8 +195,10 @@ class NeighborhoodProjection(nn.Module):
         scores = scores.masked_fill(~mask, float("-inf"))
         weights = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)        # [B,T]; cold row -> 0
 
-        # ── displaced values ───────────────────────────────────────────────────────────────────
-        disp = self.w_v(token_tangents) + self.disp_enc(stable)                   # [B,T,d]
+        # ── displaced values: g_p + γ·(DEEP displacement over [tangent, stable]) ─────────────────
+        disp = self.disp_stem(torch.cat([token_tangents, stable], dim=-1))        # [B,T,d] stem encoding
+        for blk in self.disp_blocks:
+            disp = blk(disp)                                                       # ResidualFFN refinement
         values = token_tangents + self.gamma * disp                               # [B,T,d]; γ init 0
 
         # ── pool -> project onto T_{E[u]} -> radial clamp ──────────────────────────────────────
@@ -181,7 +210,8 @@ class NeighborhoodProjection(nn.Module):
 
 class LinkPredHead(nn.Module):
     def __init__(self, num_nodes: int, d_emb: int,
-                 t2v_dim: int = 16, d_ef: int = 0):
+                 t2v_dim: int = 16, d_ef: int = 0,
+                 n_layers: int = 2, expansion: int = 2, dropout: float = 0.1):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_emb = d_emb
@@ -196,7 +226,8 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
         self.neighbourhood = NeighborhoodProjection(
-            d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef)
+            d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef,
+            n_layers=n_layers, expansion=expansion, dropout=dropout)
 
         # Combiner MLP over the 4 pairwise GEODESIC DISTANCES (geoopt.Sphere.dist = arccos⟨·,·⟩) on the
         # sphere between both sides' identity (E[x]) and neighbourhood (P[x]) points. Rotation-invariant,

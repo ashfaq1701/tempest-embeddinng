@@ -66,6 +66,12 @@ def parse_args() -> argparse.Namespace:
     # (Query/key MLPs project to d_emb — no separate attention dim.)
     p.add_argument("--t2v-dim", default=16, type=int,
                    help="Time2Vec output dim (16 ties dim 100 on wiki; TPNet default was 100).")
+    p.add_argument("--n-layers", default=2, type=int,
+                   help="ResidualFFN blocks in the deep displacement encoder (displacement depth).")
+    p.add_argument("--expansion", default=2, type=int,
+                   help="ResidualFFN inner-width multiplier (d_emb -> expansion*d_emb -> d_emb).")
+    p.add_argument("--dropout", default=0.1, type=float,
+                   help="Dropout inside each ResidualFFN displacement block.")
 
     # Link loss / head.
     p.add_argument(
@@ -262,6 +268,9 @@ def main() -> Dict[str, Any]:
         d_ef=(int(train_sp.edge_feat.shape[1]) if train_sp.edge_feat is not None else 0),
 
         t2v_dim=args.t2v_dim,
+        n_layers=args.n_layers,
+        expansion=args.expansion,
+        dropout=args.dropout,
 
         K_train=args.k_train,
 
