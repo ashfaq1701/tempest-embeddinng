@@ -37,6 +37,10 @@ class SphereManifold:
         """Sphere similarity: inner product ⟨a, b⟩ (= cosine for unit vectors). HIGHER = closer."""
         return (a * b).sum(-1)
 
+    def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Geodesic distance arccos(⟨x, y⟩) on the sphere — geoopt.Sphere.dist. LOWER = closer."""
+        return self.manifold.dist(x, y)
+
     def logmap(self, base: torch.Tensor, point: torch.Tensor) -> torch.Tensor:
         """Log map at `base` of `point` — geoopt.Sphere.logmap (its gradient is finite at coincidence)."""
         return self.manifold.logmap(base, point)
@@ -194,9 +198,10 @@ class LinkPredHead(nn.Module):
         self.neighbourhood = NeighborhoodProjection(
             d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef)
 
-        # Combiner MLP over the 4 pairwise SIMILARITIES (inner products = cosines) on the sphere
-        # between both sides' identity (E[x]) and neighbourhood (P[x]) points. Rotation-invariant, so
-        # the scorer stays sphere-faithful (no raw coordinates); HIGHER similarity = closer.
+        # Combiner MLP over the 4 pairwise GEODESIC DISTANCES (geoopt.Sphere.dist = arccos⟨·,·⟩) on the
+        # sphere between both sides' identity (E[x]) and neighbourhood (P[x]) points. Rotation-invariant,
+        # so the scorer stays sphere-faithful (no raw coordinates); LOWER distance = closer (the MLP
+        # learns the sign). (Expmap NaN was fixed in SphereManifold, so geoopt.dist is safe to score on.)
         self.scorer = nn.Sequential(
             nn.Linear(4, 32), nn.GELU(), nn.Linear(32, 1))
 
@@ -242,12 +247,12 @@ class LinkPredHead(nn.Module):
         seed_u = seed_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
         nbhd_u = nbhd_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
 
-        # Four sphere similarities (inner products = cosines) between u's and v's identity /
-        # neighbourhood points.
-        similarities = torch.stack([
-            self.geom.similarity(seed_u, seed_v),                           # ⟨E[u], E[v]⟩  identity affinity
-            self.geom.similarity(seed_u, nbhd_v),                           # ⟨E[u], P[v]⟩  is u in v's neighbourhood
-            self.geom.similarity(nbhd_u, seed_v),                           # ⟨P[u], E[v]⟩  is v in u's neighbourhood
-            self.geom.similarity(nbhd_u, nbhd_v),                           # ⟨P[u], P[v]⟩  neighbourhood overlap
+        # Four sphere geodesic distances (geoopt.Sphere.dist = arccos⟨·,·⟩) between u's and v's
+        # identity / neighbourhood points.
+        distances = torch.stack([
+            self.geom.dist(seed_u, seed_v),                                 # d(E[u], E[v])  identity affinity
+            self.geom.dist(seed_u, nbhd_v),                                 # d(E[u], P[v])  is u in v's neighbourhood
+            self.geom.dist(nbhd_u, seed_v),                                 # d(P[u], E[v])  is v in u's neighbourhood
+            self.geom.dist(nbhd_u, nbhd_v),                                 # d(P[u], P[v])  neighbourhood overlap
         ], dim=-1)                                                            # [B, C, 4]
-        return self.scorer(similarities).squeeze(-1)                         # [B, C]
+        return self.scorer(distances).squeeze(-1)                            # [B, C]
