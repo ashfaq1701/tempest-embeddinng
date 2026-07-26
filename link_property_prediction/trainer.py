@@ -67,9 +67,6 @@ class TrainerConfig:
 
     # NeighborhoodProjection (attention pooling of the source's walk-token offsets -> mu_u).
     t2v_dim: int = 16         # Time2Vec output dim (16 ties dim100 on wiki: 0.8287/0.8040 vs 0.8289/0.8046)
-    n_layers: int = 2         # ResidualFFN blocks in the deep displacement encoder (displacement depth)
-    expansion: int = 2        # ResidualFFN inner-width multiplier (d -> expansion*d -> d)
-    dropout: float = 0.1      # dropout inside each ResidualFFN displacement block
 
     # Link loss / head.
     K_train: int = 100          # per-query training negatives ([B, 1+K_train])
@@ -112,9 +109,6 @@ class Trainer:
             d_emb=int(config.d_emb),
             t2v_dim=int(config.t2v_dim),
             d_ef=int(config.d_ef),
-            n_layers=int(config.n_layers),
-            expansion=int(config.expansion),
-            dropout=float(config.dropout),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.
