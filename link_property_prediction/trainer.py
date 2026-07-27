@@ -26,11 +26,10 @@ by a single RiemannianAdam.
 
 TOKEN PREP — the source side (u → μ_u) goes through `walk_tokens.build_query_walk_tokens`:
 walks are generated PER QUERY (no dedup — each row's (node, t) needs its own cutoff) and returned
-in the RAW per-walk WalkTokens layout ([Q, K, L] nodes / nodes_mask / node-aligned timestamps,
-seeds + cutoffs). This RAW layout is the SHARED walk contract for every head; LinkPredHead
-flattens it to a [Q, K*L] token bag and masks padding + the seed node u via
-`walk_tokens.flatten_tokens`, then builds μ_u with a per-row softmax (ages =
-cutoffs − t_edge) and scores identity + velocity against E[v].
+ALREADY FLATTENED into a [Q, T] WalkTokens bag (T = K·L): nodes / ages / positions / mask
+/ seed_mask, plus seeds + cutoffs. LinkPredHead reads these flat fields directly — context tokens
+are `mask & ~seed_mask` — and builds μ_u with a per-row softmax (ages = cutoffs − t_edge),
+scoring identity + neighbourhood against E[v].
 """
 import time
 from dataclasses import dataclass

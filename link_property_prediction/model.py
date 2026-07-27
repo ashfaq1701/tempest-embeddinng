@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .walk_tokens import WalkTokens, flatten_tokens
+from .walk_tokens import WalkTokens
 
 
 class SphereManifold:
@@ -205,14 +205,13 @@ class LinkPredHead(nn.Module):
         self.scorer = nn.Sequential(
             nn.Linear(4, 32), nn.GELU(), nn.Linear(32, 1))
 
-    def _token_edge_features(self, tokens: WalkTokens, q: int) -> torch.Tensor:
-        """Per-token edge features [Q, T, d_ef] aligned with the flattened token bag. tokens holds
-        edge_features as [Q, K, L*d_ef]; reshape to [Q, K*L, d_ef]. When the dataset has no edge
-        features (d_ef == 0) this is an empty [Q, T, 0] tensor (a no-op in the key concat)."""
-        _, k, length = tokens.nodes.shape
+    def _token_edge_features(self, tokens: WalkTokens) -> torch.Tensor:
+        """Per-token edge features [N, T, d_ef], already flattened on WalkTokens. When the dataset has
+        no edge features (d_ef == 0) return an empty [N, T, 0] tensor (a no-op in the key concat)."""
         if tokens.edge_features is not None:
-            return tokens.edge_features.reshape(q, k, length, self.d_ef).reshape(q, k * length, self.d_ef)
-        return tokens.nodes.new_zeros((q, k * length, self.d_ef), dtype=torch.float32)
+            return tokens.edge_features
+        n, t = tokens.nodes.shape
+        return tokens.nodes.new_zeros((n, t, self.d_ef), dtype=torch.float32)
 
     def _project(self, tokens: WalkTokens):
         """Project one bag of N queries. Returns (e_seed, p): e_seed [N, d] = E[seed] (the identity on
@@ -220,16 +219,16 @@ class LinkPredHead(nn.Module):
         on-sphere."""
         e_weight = self.E.weight
         e_seed = F.embedding(tokens.seeds, e_weight)                                  # E[x]  [N, d] (E is on-sphere)
-        n = e_seed.shape[0]
 
-        token_ids, token_mask, token_pos = flatten_tokens(
-            tokens, exclude_seed_positions=True)
-        token_ages = tokens.ages.reshape(n, -1).clamp_min(0)                          # ages read from the instance
-        token_ef = self._token_edge_features(tokens, n)                              # [N, T, d_ef]
-        token_emb = F.embedding(token_ids.clamp_min(0), e_weight)                     # [N, T, d]
+        # Context tokens = real walk nodes EXCLUDING the seed's own origin slot (mid-walk seed
+        # recurrences are kept). Everything is already flattened to [N, T] on WalkTokens.
+        context_mask = tokens.mask & ~tokens.seed_mask                      # [N, T]
+        token_ages = tokens.ages.clamp_min(0)                                         # [N, T]
+        token_ef = self._token_edge_features(tokens)                                  # [N, T, d_ef]
+        token_emb = F.embedding(tokens.nodes.clamp_min(0), e_weight)                  # [N, T, d]
         token_tangent = self.geom.logmap(e_seed.unsqueeze(-2), token_emb)             # [N, T, d] tangent
         mu = self.neighbourhood(
-            e_seed, token_tangent, token_ages.to(e_seed.dtype), token_mask, token_pos, token_ef)  # [N, d]
+            e_seed, token_tangent, token_ages.to(e_seed.dtype), context_mask, tokens.positions, token_ef)  # [N, d]
         return e_seed, self.geom.expmap(e_seed, mu)                                   # (E[x], P[x])  [N, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:

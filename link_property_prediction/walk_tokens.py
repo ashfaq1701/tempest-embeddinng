@@ -1,28 +1,29 @@
-"""Per-query RAW walk tensors (nodes + node-aligned timestamps), straight from Tempest.
+"""Per-query FLATTENED walk tensors (nodes + node-aligned ages + hop positions), from Tempest.
 
 A "query" is a (seed node, cutoff time t) pair. `build_query_walk_tokens` runs K backward walks
-per query, each bounded by cutoff = t (every edge has t_edge < t — strict causal past), and
-returns them in their RAW per-walk layout — no packing, no dedup, no seed/origin exclusions:
+per query, each bounded by cutoff = t (every edge has t_edge < t — strict causal past), and returns
+them ALREADY FLATTENED into one [Q, T] token bag per query (T = K·L). Nothing consumes the raw
+per-walk [Q, K, L] layout, so the K/L structure is collapsed here once; heads read the flat fields
+directly (no separate flatten step).
 
-    seeds       [Q]         int64  the query/source node u of each query (the walk origin). Kept
-                                   explicitly so the consumer has u even for cold/empty walks,
-                                   where the seed is not placed in `nodes`.
-    nodes       [Q, K, L]   int64  walk node ids; backward — oldest predecessor at position 0,
-                                   the seed at the LAST real position (lens-1); padding = -1.
-    nodes_mask  [Q, K, L]   bool   True on real walk positions (nodes != -1), False on padding.
-    ages        [Q, K, L]   int64  NODE-ALIGNED age of each node = cutoff − t_edge (query-relative):
-                                   a non-seed node's age is (cutoff − time of the edge that reached
-                                   it), ≥ 1 since the cutoff is exclusive; the SEED (last node) sits
-                                   at "now" → age 0. Padding = -1. Shares `nodes_mask`.
-    cutoffs     [Q]         int64  each query's exclusive cutoff t (kept so ages can be re-derived).
+    seeds          [Q]          int64  query/source node u (walk origin; present even when cold)
+    cutoffs        [Q]          int64  each query's exclusive cutoff t (kept so ages can be re-derived)
+    nodes          [Q, T]       int64  flattened walk node ids; padding = -1 (clamp before embedding)
+    ages           [Q, T]       int64  NODE-ALIGNED age = cutoff − t_edge (query-relative): a non-seed
+                                       node's age is (cutoff − time of the edge that reached it), ≥ 1
+                                       since the cutoff is exclusive; the SEED sits at "now" → age 0;
+                                       padding = -1.
+    positions      [Q, T]       int64  within-walk HOP from the seed: 1 = seed (walk end), 2 = its
+                                       immediate predecessor, …, lens = oldest node; 0 on padding.
+    mask [Q, T]       bool   True on real walk positions (nodes != -1) — INCLUDING the seed.
+    seed_mask      [Q, T]       bool   True ONLY on the seed's own walk-origin slot (age 0 & real).
+                                       The context (non-seed) tokens are `mask & ~seed_mask`;
+                                       mid-walk recurrences of the seed are context, not seed_mask.
+    edge_features  [Q, T, d_ef] float  flattened per-token edge features; the seed slot and padding
+                                       carry [0]*d_ef. None if the dataset has no edge features.
 
-This RAW layout is the SHARED walk contract for every head (point / velocity / …): the trainer
-samples a query's backward walks into it (`build_query_walk_tokens`) and each head turns it into
-the flat token bag its μ needs via `flatten_tokens` — so the sampling pipeline is
-identical across heads and only the scoring model differs.
-
-Requires shuffle_walk_order=False at the Tempest constructor so a query's K walk rows are
-contiguous (rows [q*K, (q+1)*K)) and reshape cleanly to [Q, K, L].
+Requires shuffle_walk_order=False at the Tempest constructor so a query's K walk rows are contiguous
+(rows [q*K, (q+1)*K)) and reshape cleanly before flattening.
 """
 from dataclasses import dataclass
 from typing import Optional
@@ -36,24 +37,17 @@ _TS_SENTINEL = torch.iinfo(torch.int64).max
 
 @dataclass
 class WalkTokens:
-    """Raw per-query backward walks (see module docstring).
+    """Per-query FLATTENED backward walks (see module docstring). Every tensor except `seeds` /
+    `cutoffs` is [Q, T] (T = K·L), or [Q, T, d_ef] for `edge_features`."""
 
-        seeds         [Q]           int64  query/source node u (walk origin; present even when cold)
-        nodes         [Q, K, L]     int64  node ids; seed at the last real position, padding -1
-        nodes_mask    [Q, K, L]     bool   True on real walk positions
-        ages          [Q, K, L]     int64  node-aligned age = cutoff − t_edge; seed 0, edges ≥ 1, pad -1
-        cutoffs       [Q]           int64  per-query exclusive cutoff t
-        edge_features [Q, K, L*d_ef] float per-position edge features flattened over the L axis; the
-                                          seed position and padding carry [0]*d_ef. None if the dataset
-                                          has no edge features.
-    """
-
-    seeds: torch.Tensor                        # [Q]
-    nodes: torch.Tensor                        # [Q, K, L]
-    nodes_mask: torch.Tensor                   # [Q, K, L]
-    ages: torch.Tensor                         # [Q, K, L]
-    cutoffs: torch.Tensor                      # [Q]
-    edge_features: Optional[torch.Tensor] = None   # [Q, K, L*d_ef]
+    seeds: torch.Tensor                             # [Q]
+    cutoffs: torch.Tensor                           # [Q]
+    nodes: torch.Tensor                             # [Q, T]
+    ages: torch.Tensor                              # [Q, T]
+    positions: torch.Tensor                         # [Q, T]
+    mask: torch.Tensor                    # [Q, T]  bool
+    seed_mask: torch.Tensor                         # [Q, T]  bool
+    edge_features: Optional[torch.Tensor] = None    # [Q, T, d_ef]
 
 
 def build_query_walk_tokens(
@@ -67,19 +61,16 @@ def build_query_walk_tokens(
     start_bias: Optional[str] = None,
     walk_bias: Optional[str] = None,
 ) -> WalkTokens:
-    """Per-query backward walks → raw [Q, K, L] nodes + mask + node-aligned timestamps (see WalkTokens)."""
+    """Per-query backward walks → FLATTENED [Q, T] nodes + ages + positions + masks (see WalkTokens)."""
     seeds_t = query_seeds.detach().to(device=device, dtype=torch.long)        # [Q]
     cutoffs_t = query_cutoffs.detach().to(device=device, dtype=torch.long)    # [Q]
     q = int(seeds_t.shape[0])
 
     if q == 0:
-        shape = (0, num_walks_per_node, max_walk_len)
-        return WalkTokens(
-            seeds_t,
-            torch.empty(shape, dtype=torch.int64, device=device),
-            torch.empty(shape, dtype=torch.bool, device=device),
-            torch.empty(shape, dtype=torch.int64, device=device),
-            cutoffs_t)
+        t = num_walks_per_node * max_walk_len
+        empty_i = torch.empty((0, t), dtype=torch.int64, device=device)
+        empty_b = torch.empty((0, t), dtype=torch.bool, device=device)
+        return WalkTokens(seeds_t, cutoffs_t, empty_i, empty_i, empty_i, empty_b, empty_b)
 
     # ── Walk: K backward walks per query, each bounded by its own cutoff t. ──
     wd = walk_gen.walks_for_nodes(
@@ -92,57 +83,42 @@ def build_query_walk_tokens(
     )
     k, length = int(wd.K), int(wd.nodes.shape[1])
 
-    # Rows [q*K, (q+1)*K) are query q's K walks ⇒ reshape [Q*K, L] -> [Q, K, L].
+    # Rows [q*K, (q+1)*K) are query q's K walks ⇒ reshape [Q*K, L] -> [Q, K, L] to build per-walk fields.
     nodes = wd.nodes.to(device=device, dtype=torch.int64).reshape(q, k, length)        # [Q, K, L]
-    nodes_mask = nodes != -1                                                            # [Q, K, L]
+    node_mask = nodes != -1                                                             # [Q, K, L]
 
     # Node-aligned AGE = cutoff − t_edge (query-relative). Each non-seed node's edge time is < cutoff
     # (exclusive) → age ≥ 1; the seed slot (Tempest sentinel) is "now" → age 0; padding → -1.
     ts = wd.timestamps.to(device=device, dtype=torch.int64).reshape(q, k, length)      # [Q, K, L] raw edge time
     edge_ts = torch.where(ts == _TS_SENTINEL, cutoffs_t.view(q, 1, 1), ts)             # seed sentinel → cutoff
     ages = cutoffs_t.view(q, 1, 1) - edge_ts                                           # seed → 0, edges ≥ 1
-    ages = torch.where(nodes_mask, ages, torch.full_like(ages, -1))                    # padding → -1
+    ages = torch.where(node_mask, ages, torch.full_like(ages, -1))                     # padding → -1
 
-    # Per-position edge features → [Q, K, L*d_ef]. wd.edge_feats is [N*K, L, d_ef] node-aligned; the
-    # seed position (age 0) and padding are forced to [0]*d_ef so they carry no edge. None if absent.
+    # HOP position from the seed: seed (last real slot, index lens-1) = 1, oldest (index 0) = lens;
+    # padding → 0. Backward walks are stored oldest→seed, so pos = lens − array_index.
+    lens = node_mask.sum(dim=-1, keepdim=True)                                          # [Q, K, 1] real length
+    arange = torch.arange(length, device=device).view(1, 1, length)
+    positions = (lens - arange).clamp_min(0)                                            # [Q, K, L]
+
+    seed_mask = node_mask & (ages == 0)                                                 # [Q, K, L] seed origin slot
+
+    # Per-token edge features → [Q, T, d_ef]. wd.edge_feats is [N*K, L, d_ef] node-aligned; the seed
+    # slot (age 0) and padding are forced to [0]*d_ef so they carry no edge. None if the dataset has none.
     edge_features = None
     if wd.edge_feats is not None:
         d_ef = int(wd.edge_feats.shape[-1])
         ef = wd.edge_feats.to(device=device, dtype=torch.float32).reshape(q, k, length, d_ef)
-        real = (nodes_mask & (ages != 0)).unsqueeze(-1)                                # [Q, K, L, 1] non-seed, non-pad
-        edge_features = (ef * real).reshape(q, k, length * d_ef)                       # zero seed + padding
+        real = (node_mask & (ages != 0)).unsqueeze(-1)                                  # [Q, K, L, 1] non-seed, non-pad
+        edge_features = (ef * real).reshape(q, k * length, d_ef)                        # [Q, T, d_ef]
 
-    return WalkTokens(seeds_t, nodes, nodes_mask, ages, cutoffs_t, edge_features)
-
-
-def flatten_tokens(
-    tokens: WalkTokens,
-    exclude_seed_positions: bool = True,
-):
-    """Collapse the raw [Q, K, L] walks into one flat [Q, K*L] token bag for the μ pooling.
-
-    Padding (nodes == -1) is ALWAYS masked. One flag controls whether the seed's own slot is masked:
-
-      exclude_seed_positions (default True) — mask the seed's walk-origin slot, the position where the
-          seed sits at the walk end, identified by timestamp == cutoff (age 0). Mid-walk recurrences of
-          u are KEPT. False — no seed filtering; the seed is kept everywhere (padding-only mask).
-
-    Returns (ages are NOT returned — read them from the instance as tokens.ages, [Q, K, L]):
-        ids   [Q, T]  int64  token node ids (−1 in padding/masked slots; clamp before embedding)
-        mask  [Q, T]  bool   True on kept tokens
-        pos   [Q, T]  int64  within-walk HOP position from the seed: 1 = seed (walk end), 2 = its
-                             immediate predecessor, …, lens = oldest node; 0 on padding. Backward
-                             walks are stored oldest→seed, so pos = lens − array_index.
-    with T = K*L. The per-walk (K) structure is intentionally flattened away — every head consumes
-    one flat token bag; the raw [Q, K, L] shape exists only to share the walk-sampling pipeline."""
-    q = tokens.nodes.shape[0]
-    L = tokens.nodes.shape[2]
-    ids = tokens.nodes.reshape(q, -1)                                       # [Q, T]
-    mask = tokens.nodes_mask.reshape(q, -1)                                 # [Q, T]  padding
-    # Hop position from the seed: seed (last real slot, index lens-1) = 1, oldest (index 0) = lens.
-    lens = tokens.nodes_mask.sum(dim=-1, keepdim=True)                      # [Q, K, 1] real length
-    arange = torch.arange(L, device=tokens.nodes.device).view(1, 1, L)
-    pos = (lens - arange).clamp_min(0).reshape(q, -1)                       # [Q, T]  pad → 0
-    if exclude_seed_positions:                                              # only the walk-origin slot (age 0)
-        mask = mask & (tokens.ages.reshape(q, -1) != 0)
-    return ids, mask, pos
+    # ── Flatten K·L → T for every field. ──
+    return WalkTokens(
+        seeds_t,
+        cutoffs_t,
+        nodes.reshape(q, -1),               # [Q, T]
+        ages.reshape(q, -1),                # [Q, T]
+        positions.reshape(q, -1),           # [Q, T]
+        node_mask.reshape(q, -1),           # [Q, T]  mask
+        seed_mask.reshape(q, -1),           # [Q, T]  seed_mask
+        edge_features,                      # [Q, T, d_ef] or None
+    )
