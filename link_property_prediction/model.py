@@ -6,8 +6,8 @@ where P[u] = exp_{E[u]}(mu_u) pushes the source off E[u] toward mu_u — the dee
 walk-token tangents (in the tangent space at E[u]) + a TPNet Time2Vec of each token's age, produced
 by NeighborhoodProjection. One-sided: only u is walked/projected; each candidate v enters through
 its static embedding E[v]. The head owns self.E (a ManifoldParameter on a geoopt.Sphere, link-
-trained on it); geometry goes through self.geom (SphereManifold): logmap proxies to geoopt, expmap and
-similarity are ours (geoopt's expmap NaNs the gradient at the cold-row zero tangent).
+trained on it); geometry goes through self.geom (SphereManifold): dist/logmap proxy to geoopt, expmap
+is ours (geoopt's expmap NaNs the gradient at the cold-row zero tangent).
 
 (The dual-sided variant — walk every candidate too and score <P[u], P[v]> — was falsified on wiki:
 at matched walks it lost to one-sided at ~8x the cost. It lives one `git revert` away; see the
@@ -33,10 +33,6 @@ class SphereManifold:
 
     def __init__(self):
         self.manifold = geoopt.Sphere()
-
-    def similarity(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """Sphere similarity: inner product ⟨a, b⟩ (= cosine for unit vectors). HIGHER = closer."""
-        return (a * b).sum(-1)
 
     def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Geodesic distance arccos(⟨x, y⟩) on the sphere — geoopt.Sphere.dist. LOWER = closer."""
