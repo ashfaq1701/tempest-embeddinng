@@ -129,6 +129,7 @@ class NeighborhoodProjection(nn.Module):
         self.d_a = d_emb // 2                           # attention (query/key) dim
         self.scale = 1.0 / math.sqrt(self.d_a)
         self.max_radius = math.pi - 1e-2               # keep ‖mu‖ < π so exp_{E[u]} stays injective
+        self.geom = SphereManifold()                   # stateless; used for the token log-map
 
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
         s_in = t2v_dim + 1 + d_ef                      # stable-feature dim: [Time2Vec, log-hop, edge]
@@ -146,18 +147,26 @@ class NeighborhoodProjection(nn.Module):
             nn.Linear(s_in, d_emb), nn.GELU(), nn.Linear(d_emb, d_emb))
         self.gamma = nn.Parameter(torch.zeros(d_emb))    # LayerScale, init 0 -> displacement off
 
-    def forward(self, source: torch.Tensor, token_tangents: torch.Tensor,
-                ages: torch.Tensor, mask: torch.Tensor, positions: torch.Tensor,
-                edge_features: torch.Tensor) -> torch.Tensor:
-        """source [B,d_emb] (E[u], unit-norm); token_tangents [B,T,d_emb] (Log_{E[u]}(E[token]), ⊥ E[u]);
-        ages [B,T]; mask [B,T] bool (True = real token); positions [B,T] int hop-from-seed (1=seed,
-        0=pad); edge_features [B,T,d_ef]. Returns mu_u [B,d_emb], a tangent at E[u] (⊥ E[u], ‖·‖<π);
-        cold rows (no token) -> 0."""
-        b = source.shape[0]
+    def forward(self, walk_bag: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
+        """walk_bag: the flattened WalkTokens bag (seeds / nodes / ages / positions / mask / seed_mask
+        / edge_features). emb: the FULL node-embedding table [num_nodes, d_emb], on the sphere. E[u],
+        the token tangents, the stable features and the context mask are ALL derived here. Returns mu_u
+        [B,d_emb], a tangent at E[u] (⊥ E[u], ‖·‖<π); cold rows (no token) -> 0."""
+        source = F.embedding(walk_bag.seeds, emb)                                 # E[u]  [B,d_emb]
+        token_emb = F.embedding(walk_bag.nodes.clamp_min(0), emb)                 # E[token]  [B,T,d_emb]
+        token_tangents = self.geom.logmap(source.unsqueeze(-2), token_emb)        # [B,T,d_emb] ⊥ E[u]
+        b, t, _ = token_tangents.shape
+
+        # Read the per-token stable features from the bag; context = real NON-seed tokens.
+        mask = walk_bag.mask & ~walk_bag.seed_mask                               # [B,T]  context
+        ages = walk_bag.ages.clamp_min(0).to(token_tangents.dtype)               # [B,T]
+        edge_features = walk_bag.edge_features                                    # [B,T,d_ef] or None
+        if edge_features is None:
+            edge_features = token_tangents.new_zeros(b, t, self.d_ef)             # empty edge channel
 
         # TPNet scales delta-times by log(Δt + 1) before the time encoder.
-        t2v = self.time_encoder(torch.log1p(ages.clamp_min(0.0)))                  # [B,T,t2v_dim]
-        log_hop = torch.log1p(positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)  # [B,T,1]
+        t2v = self.time_encoder(torch.log1p(ages))                               # [B,T,t2v_dim]
+        log_hop = torch.log1p(walk_bag.positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)  # [B,T,1]
         stable = torch.cat([t2v, log_hop, edge_features], dim=-1)                  # [B,T,s_in]
 
         # ── attention (decoupled Q/K) ──────────────────────────────────────────────────────────
@@ -205,31 +214,13 @@ class LinkPredHead(nn.Module):
         self.scorer = nn.Sequential(
             nn.Linear(4, 32), nn.GELU(), nn.Linear(32, 1))
 
-    def _token_edge_features(self, tokens: WalkTokens) -> torch.Tensor:
-        """Per-token edge features [N, T, d_ef], already flattened on WalkTokens. When the dataset has
-        no edge features (d_ef == 0) return an empty [N, T, 0] tensor (a no-op in the key concat)."""
-        if tokens.edge_features is not None:
-            return tokens.edge_features
-        n, t = tokens.nodes.shape
-        return tokens.nodes.new_zeros((n, t, self.d_ef), dtype=torch.float32)
-
-    def _project(self, tokens: WalkTokens):
-        """Project one bag of N queries. Returns (e_seed, p): e_seed [N, d] = E[seed] (the identity on
-        the sphere), p [N, d] = exp_{E[seed]}(mu) (seed pushed toward its walk-token centroid). Both
-        on-sphere."""
-        e_weight = self.E.weight
-        e_seed = F.embedding(tokens.seeds, e_weight)                                  # E[x]  [N, d] (E is on-sphere)
-
-        # Context tokens = real walk nodes EXCLUDING the seed's own origin slot (mid-walk seed
-        # recurrences are kept). Everything is already flattened to [N, T] on WalkTokens.
-        context_mask = tokens.mask & ~tokens.seed_mask                      # [N, T]
-        token_ages = tokens.ages.clamp_min(0)                                         # [N, T]
-        token_ef = self._token_edge_features(tokens)                                  # [N, T, d_ef]
-        token_emb = F.embedding(tokens.nodes.clamp_min(0), e_weight)                  # [N, T, d]
-        token_tangent = self.geom.logmap(e_seed.unsqueeze(-2), token_emb)             # [N, T, d] tangent
-        mu = self.neighbourhood(
-            e_seed, token_tangent, token_ages.to(e_seed.dtype), context_mask, tokens.positions, token_ef)  # [N, d]
-        return e_seed, self.geom.expmap(e_seed, mu)                                   # (E[x], P[x])  [N, d]
+    def _project(self, tokens: WalkTokens) -> torch.Tensor:
+        """Neighbourhood projection P[x] = exp_{E[seed]}(mu) [N, d] for a bag of N queries. The
+        neighbourhood takes the bag + the full E table and derives E[u] / token tangents / stable
+        feats / masks itself; E[seed] is looked up separately by the caller."""
+        e_seed = F.embedding(tokens.seeds, self.E.weight)                            # E[seed]  [N, d]
+        mu = self.neighbourhood(tokens, self.E.weight)                               # [N, d]
+        return self.geom.expmap(e_seed, mu)                                          # P[x]  [N, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Two-sided scoring. src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate
@@ -237,8 +228,10 @@ class LinkPredHead(nn.Module):
         the FOUR pairwise similarities (inner products = cosines) on the sphere between both sides'
         identity (seed = E[x]) and neighbourhood (nbhd = P[x]) points (rotation-invariant, so the
         scorer is sphere-faithful — no raw coordinates; higher = closer). Returns logits [B, C]."""
-        seed_u, nbhd_u = self._project(src_tokens)                            # E[u], P[u]  [B, d]
-        seed_v, nbhd_v = self._project(cand_tokens)                           # E[v], P[v]  [B*C, d]
+        seed_u = F.embedding(src_tokens.seeds, self.E.weight)                 # E[u]  [B, d]
+        nbhd_u = self._project(src_tokens)                                    # P[u]  [B, d]
+        seed_v = F.embedding(cand_tokens.seeds, self.E.weight)                # E[v]  [B*C, d]
+        nbhd_v = self._project(cand_tokens)                                   # P[v]  [B*C, d]
         b, d = seed_u.shape
         c = seed_v.shape[0] // b
         seed_v = seed_v.reshape(b, c, d)                                      # [B, C, d]
