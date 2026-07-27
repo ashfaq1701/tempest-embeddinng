@@ -14,6 +14,7 @@ at matched walks it lost to one-sided at ~8x the cost. It lives one `git revert`
 "Important: revert this commit to bring back dual side walks" commit.)
 """
 import math
+from typing import Optional
 
 import geoopt
 import numpy as np
@@ -100,7 +101,7 @@ class NeighborhoodProjection(nn.Module):
     mu_u was trapped in the conic hull of the FIXED neighbour tangents) by giving the VALUE a learned
     displacement:
 
-        v_p = g_p + γ ⊙ ( W_v · g_p  +  Enc([Time2Vec(age_p), log1p(hop_p), edge_p]) )
+        v_p = g_p + γ ⊙ ( W_v · g_p  +  Enc([node_feat_p, Time2Vec(age_p), log1p(hop_p), edge_p]) )
 
     a content-LINEAR reshape of the tangent (W_v) plus a DEEP displacement driven only by the STABLE
     features (Enc). Depth lives on the stable path on purpose — a 2-layer projection on the
@@ -122,57 +123,73 @@ class NeighborhoodProjection(nn.Module):
     ~1.5x the compute; recover it from there if the multi-head lever is wanted again.)
     """
 
-    def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0):
+    def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0, d_nf: int = 0):
         super().__init__()
         self.d_emb = d_emb
         self.d_ef = d_ef
+        self.d_nf = d_nf
         self.d_a = d_emb // 2                           # attention (query/key) dim
         self.scale = 1.0 / math.sqrt(self.d_a)
         self.max_radius = math.pi - 1e-2               # keep ‖mu‖ < π so exp_{E[u]} stays injective
         self.geom = SphereManifold()                   # stateless; used for the token log-map
 
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        s_in = t2v_dim + 1 + d_ef                      # stable-feature dim: [Time2Vec, log-hop, edge]
-        desc_in = d_emb + s_in                         # full token descriptor: [tangent, stable]
+        s_in = d_nf + t2v_dim + 1 + d_ef               # stable-feature dim: [node-feat, Time2Vec, log-hop, edge]
+        desc_in = d_emb + s_in                         # descriptor: [content, node-feat, t2v, log-hop, edge]
 
-        # Attention: DECOUPLED query (from the seed) and key (from the token descriptor).
+        # Attention: DECOUPLED query (seed descriptor) and key (token descriptor).
         self.w_q = nn.Linear(desc_in, self.d_a)
         self.w_k = nn.Linear(desc_in, self.d_a)
 
         # Value displacement:
         #   content path — LINEAR reshape of the tangent (depth here overfits; keep it linear);
-        #   stable  path — DEEP (safe: driven only by time / hop / edge).
+        #   stable  path — DEEP (safe: driven only by node-feat / time / hop / edge).
         self.w_v = nn.Linear(d_emb, d_emb, bias=False)
         self.disp_enc = nn.Sequential(
             nn.Linear(s_in, d_emb), nn.GELU(), nn.Linear(d_emb, d_emb))
         self.gamma = nn.Parameter(torch.zeros(d_emb))    # LayerScale, init 0 -> displacement off
 
-    def forward(self, walk_bag: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
-        """walk_bag: the flattened WalkTokens bag (seeds / nodes / ages / positions / mask / seed_mask
-        / edge_features). emb: the FULL node-embedding table [num_nodes, d_emb], on the sphere. E[u],
-        the token tangents, the stable features and the context mask are ALL derived here. Returns mu_u
-        [B,d_emb], a tangent at E[u] (⊥ E[u], ‖·‖<π); cold rows (no token) -> 0."""
+    def forward(self, walk_bag: WalkTokens, emb: torch.Tensor,
+                node_features: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """walk_bag: the flattened WalkTokens bag. emb: the FULL node-embedding table [num_nodes,d_emb]
+        on the sphere. node_features: the FULL static node-feature table [num_nodes, d_nf] (None if the
+        dataset has none). Builds the per-token KEY descriptor [tangent ‖ nf ‖ t2v(age) ‖ log-hop ‖ edge]
+        and the SEED QUERY descriptor [E[u] ‖ nf_seed ‖ 0 ‖ 0 ‖ 0] — the seed keeps its OWN node feature,
+        but its time/hop/edge are zero. Returns mu_u [B,d_emb], ⊥ E[u], ‖·‖<π; cold rows -> 0."""
+        node_ids = walk_bag.nodes.clamp_min(0)                                    # [B,T]  (padding → row 0)
         source = F.embedding(walk_bag.seeds, emb)                                 # E[u]  [B,d_emb]
-        token_emb = F.embedding(walk_bag.nodes.clamp_min(0), emb)                 # E[token]  [B,T,d_emb]
-        token_tangents = self.geom.logmap(source.unsqueeze(-2), token_emb)        # [B,T,d_emb] ⊥ E[u]
+        token_tangents = self.geom.logmap(source.unsqueeze(-2), F.embedding(node_ids, emb))  # [B,T,d_emb] ⊥ E[u]
         b, t, _ = token_tangents.shape
 
-        # Read the per-token stable features from the bag; context = real NON-seed tokens.
-        mask = walk_bag.mask & ~walk_bag.seed_mask                               # [B,T]  context
+        mask = walk_bag.mask & ~walk_bag.seed_mask                               # [B,T]  context (non-seed real)
         ages = walk_bag.ages.clamp_min(0).to(token_tangents.dtype)               # [B,T]
+
+        # Static node features — per token (padding zeroed) AND the seed's own (kept in the query).
+        if node_features is None:
+            nf_token = token_tangents.new_zeros(b, t, self.d_nf)                  # [B,T,0]
+            nf_seed = source.new_zeros(b, self.d_nf)                             # [B,0]
+        else:
+            nf_token = F.embedding(node_ids, node_features) * walk_bag.mask.unsqueeze(-1)   # [B,T,d_nf]
+            nf_seed = F.embedding(walk_bag.seeds, node_features)                            # [B,d_nf]
+
+        # Edge features (seed/padding already zeroed on the bag); empty channel if absent.
         edge_features = walk_bag.edge_features                                    # [B,T,d_ef] or None
         if edge_features is None:
-            edge_features = token_tangents.new_zeros(b, t, self.d_ef)             # empty edge channel
+            edge_features = token_tangents.new_zeros(b, t, self.d_ef)             # [B,T,0]
 
         # TPNet scales delta-times by log(Δt + 1) before the time encoder.
         t2v = self.time_encoder(torch.log1p(ages))                               # [B,T,t2v_dim]
         log_hop = torch.log1p(walk_bag.positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)  # [B,T,1]
-        stable = torch.cat([t2v, log_hop, edge_features], dim=-1)                  # [B,T,s_in]
+
+        # Per-token STABLE features: [node-feat, Time2Vec, log-hop, edge].
+        stable = torch.cat([nf_token, t2v, log_hop, edge_features], dim=-1)        # [B,T,s_in]
 
         # ── attention (decoupled Q/K) ──────────────────────────────────────────────────────────
+        #   key   = W_k · [tangent ‖ nf_token ‖ t2v ‖ log-hop ‖ edge]
+        #   query = W_q · [E[u]    ‖ nf_seed  ‖ 0   ‖ 0       ‖ 0   ]   (seed keeps its node feature)
         keys = self.w_k(torch.cat([token_tangents, stable], dim=-1))              # [B,T,d_a]
-        # Query = the seed: content = E[u], stable features (age/hop/edge) zero.
-        query = self.w_q(torch.cat([source, stable.new_zeros(b, stable.shape[-1])], dim=-1))  # [B,d_a]
+        query_zeros = source.new_zeros(b, stable.shape[-1] - self.d_nf)           # [B, t2v+1+d_ef]
+        query = self.w_q(torch.cat([source, nf_seed, query_zeros], dim=-1))       # [B,d_a]
         scores = (query.unsqueeze(1) * keys).sum(-1) * self.scale                 # [B,T]
         scores = scores.masked_fill(~mask, float("-inf"))
         weights = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)        # [B,T]; cold row -> 0
@@ -190,11 +207,17 @@ class NeighborhoodProjection(nn.Module):
 
 class LinkPredHead(nn.Module):
     def __init__(self, num_nodes: int, d_emb: int,
-                 t2v_dim: int = 16, d_ef: int = 0):
+                 t2v_dim: int = 16, d_ef: int = 0,
+                 node_features: Optional[torch.Tensor] = None):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_emb = d_emb
         self.d_ef = d_ef
+        self.d_nf = 0 if node_features is None else int(node_features.shape[1])
+        # Static per-node feature table [num_nodes, d_nf] (dataset-derived, NOT learned). A buffer so
+        # it rides model.to(device) and stays out of the optimizer; non-persistent (derivable from the
+        # dataset, so kept out of checkpoints). None when the dataset has no node features.
+        self.register_buffer("node_features", node_features, persistent=False)
         self.geom = SphereManifold()
 
         # E lives on the unit sphere: init uniformly at random on it (geoopt.Sphere.random_uniform),
@@ -205,7 +228,7 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
         self.neighbourhood = NeighborhoodProjection(
-            d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef)
+            d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef, d_nf=self.d_nf)
 
         # Combiner MLP over the 4 pairwise GEODESIC DISTANCES (geoopt.Sphere.dist = arccos⟨·,·⟩) on the
         # sphere between both sides' identity (E[x]) and neighbourhood (P[x]) points. Rotation-invariant,
@@ -219,7 +242,7 @@ class LinkPredHead(nn.Module):
         neighbourhood takes the bag + the full E table and derives E[u] / token tangents / stable
         feats / masks itself; E[seed] is looked up separately by the caller."""
         e_seed = F.embedding(tokens.seeds, self.E.weight)                            # E[seed]  [N, d]
-        mu = self.neighbourhood(tokens, self.E.weight)                               # [N, d]
+        mu = self.neighbourhood(tokens, self.E.weight, self.node_features)           # [N, d]
         return self.geom.expmap(e_seed, mu)                                          # P[x]  [N, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:

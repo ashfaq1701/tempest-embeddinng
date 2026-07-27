@@ -63,6 +63,8 @@ class TrainerConfig:
     d_emb: int = 128
     d_ef: int = 0             # per-edge-feature dim (0 = dataset has no edge features); fed into the
                              # NeighborhoodProjection attention keys. Set from the loaded dataset.
+    node_feat: Optional[np.ndarray] = None   # [num_nodes, d_nf] static node features (None if the dataset
+                                             # has none); fed to the head (d_nf derived). Set from the dataset.
 
     # NeighborhoodProjection (attention pooling of the source's walk-token offsets -> mu_u).
     t2v_dim: int = 16         # Time2Vec output dim (16 ties dim100 on wiki: 0.8287/0.8040 vs 0.8289/0.8046)
@@ -102,12 +104,16 @@ class Trainer:
         self.device = device or torch.device(
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
-        # Single module owning the sphere node embeddings AND the velocity head.
+        # Single module owning the sphere node embeddings AND the velocity head. Node features (if any)
+        # are handed over as a float tensor; the head registers them as a device-resident buffer.
+        node_feats = (torch.from_numpy(np.ascontiguousarray(config.node_feat, dtype=np.float32))
+                      if config.node_feat is not None else None)
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             t2v_dim=int(config.t2v_dim),
             d_ef=int(config.d_ef),
+            node_features=node_feats,
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.
