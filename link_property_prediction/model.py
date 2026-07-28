@@ -176,12 +176,15 @@ class LinkPredHead(nn.Module):
         self.neighbourhood = NeighborhoodProjection(
             d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef, d_nf=self.d_nf)
 
-        # Combiner MLP over the 4 pairwise GEODESIC DISTANCES (geoopt.Sphere.dist = arccos⟨·,·⟩) on the
-        # sphere between both sides' identity (E[x]) and neighbourhood (P[x]) points. Rotation-invariant,
-        # so the scorer stays sphere-faithful (no raw coordinates); LOWER distance = closer (the MLP
-        # learns the sign). (Expmap NaN was fixed in SphereManifold, so geoopt.dist is safe to score on.)
+        # Scorer: MLP over the concatenation  [ P[u] | E[u] | nf[u] | P[v] | E[v] | nf[v] ]  for each
+        # (source u, candidate v). Feeding the embeddings themselves (not just pairwise distances) lets
+        # the scorer use positional/directional structure that scalar distances discard; nf[·] are the
+        # external static node features (frame-free). NB: raw manifold coordinates make this scorer NOT
+        # rotation-invariant (unlike a pure-distance scorer) — a deliberate expressiveness/invariance
+        # trade, relying on the now-clustered, load-bearing E to keep the extra capacity in check.
+        score_in = 2 * (2 * d_emb + self.d_nf)                    # per side: P(d) + E(d) + nf(d_nf); ×2 sides
         self.scorer = nn.Sequential(
-            nn.Linear(4, 32), nn.GELU(), nn.Linear(32, 1))
+            nn.Linear(score_in, d_emb), nn.GELU(), nn.Linear(d_emb, 1))
 
     def _project(self, tokens: WalkTokens) -> torch.Tensor:
         """Neighbourhood projection P[x] = exp_{E[seed]}(mu) [N, d] for a bag of N queries. The
@@ -191,29 +194,33 @@ class LinkPredHead(nn.Module):
         mu = self.neighbourhood(tokens, self.E.weight, self.node_features)           # [N, d]
         return self.geom.expmap(e_seed, mu)                                          # P[x]  [N, d]
 
+    def _node_feats(self, seeds: torch.Tensor) -> torch.Tensor:
+        """Static node features [N, d_nf] for the given seed ids; a zero-width [N, 0] tensor when the
+        dataset has no node features (so it concatenates as a no-op — no branching at the call site)."""
+        if self.node_features is None:
+            return self.E.weight.new_zeros(seeds.shape[0], 0)
+        return F.embedding(seeds, self.node_features)
+
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Two-sided scoring. src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate
-        queries (seeds = v) in query-major order, each walked with its query's cutoff. Score = MLP over
-        the FOUR pairwise similarities (inner products = cosines) on the sphere between both sides'
-        identity (seed = E[x]) and neighbourhood (nbhd = P[x]) points (rotation-invariant, so the
-        scorer is sphere-faithful — no raw coordinates; higher = closer). Returns logits [B, C]."""
-        seed_u = F.embedding(src_tokens.seeds, self.E.weight)                 # E[u]  [B, d]
-        nbhd_u = self._project(src_tokens)                                    # P[u]  [B, d]
-        seed_v = F.embedding(cand_tokens.seeds, self.E.weight)                # E[v]  [B*C, d]
-        nbhd_v = self._project(cand_tokens)                                   # P[v]  [B*C, d]
+        queries (seeds = v) in query-major order, each walked with its query's cutoff. Logit = MLP over
+        concat[ P[u] | E[u] | nf[u] | P[v] | E[v] | nf[v] ] per (u, candidate v). Returns logits [B, C]."""
+        seed_u = F.embedding(src_tokens.seeds, self.E.weight)                 # E[u]   [B, d]
+        nbhd_u = self._project(src_tokens)                                    # P[u]   [B, d]
+        nf_u = self._node_feats(src_tokens.seeds)                             # nf[u]  [B, d_nf]
+        seed_v = F.embedding(cand_tokens.seeds, self.E.weight)                # E[v]   [B*C, d]
+        nbhd_v = self._project(cand_tokens)                                   # P[v]   [B*C, d]
+        nf_v = self._node_feats(cand_tokens.seeds)                            # nf[v]  [B*C, d_nf]
+
         b, d = seed_u.shape
         c = seed_v.shape[0] // b
+        # candidate (v) side -> [B, C, ·]; source (u) side broadcast over the C candidates -> [B, C, ·].
         seed_v = seed_v.reshape(b, c, d)                                      # [B, C, d]
         nbhd_v = nbhd_v.reshape(b, c, d)                                      # [B, C, d]
+        nf_v = nf_v.reshape(b, c, self.d_nf)                                  # [B, C, d_nf]
         seed_u = seed_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
         nbhd_u = nbhd_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
+        nf_u = nf_u.unsqueeze(1).expand(b, c, self.d_nf)                      # [B, C, d_nf]
 
-        # Four sphere geodesic distances (geoopt.Sphere.dist = arccos⟨·,·⟩) between u's and v's
-        # identity / neighbourhood points.
-        distances = torch.stack([
-            self.geom.dist(seed_u, seed_v),                                 # d(E[u], E[v])  identity affinity
-            self.geom.dist(seed_u, nbhd_v),                                 # d(E[u], P[v])  is u in v's neighbourhood
-            self.geom.dist(nbhd_u, seed_v),                                 # d(P[u], E[v])  is v in u's neighbourhood
-            self.geom.dist(nbhd_u, nbhd_v),                                 # d(P[u], P[v])  neighbourhood overlap
-        ], dim=-1)                                                            # [B, C, 4]
-        return self.scorer(distances).squeeze(-1)                            # [B, C]
+        feats = torch.cat([nbhd_u, seed_u, nf_u, nbhd_v, seed_v, nf_v], dim=-1)   # [B, C, score_in]
+        return self.scorer(feats).squeeze(-1)                                    # [B, C]
