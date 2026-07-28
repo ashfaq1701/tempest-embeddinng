@@ -176,15 +176,12 @@ class LinkPredHead(nn.Module):
         self.neighbourhood = NeighborhoodProjection(
             d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef, d_nf=self.d_nf)
 
-        # Scorer: MLP over the concatenation  [ P[u] | E[u] | nf[u] | P[v] | E[v] | nf[v] ]  for each
-        # (source u, candidate v). Feeding the embeddings themselves (not just pairwise distances) lets
-        # the scorer use positional/directional structure that scalar distances discard; nf[·] are the
-        # external static node features (frame-free). NB: raw manifold coordinates make this scorer NOT
-        # rotation-invariant (unlike a pure-distance scorer) — a deliberate expressiveness/invariance
-        # trade, relying on the now-clustered, load-bearing E to keep the extra capacity in check.
-        score_in = 2 * (2 * d_emb + self.d_nf)                    # per side: P(d) + E(d) + nf(d_nf); ×2 sides
+        # Scorer: MLP over the 4 pairwise GEODESIC DISTANCES between {E[x], P[x]} of u and v, plus the two
+        # nodes' static node features nf[u], nf[v]. The distances are isometry-invariant (no raw coords);
+        # nf[·] are external, frame-free channels. LOWER distance = closer (the MLP learns the sign).
+        score_in = 4 + 2 * self.d_nf                             # 4 distances + nf[u] + nf[v]
         self.scorer = nn.Sequential(
-            nn.Linear(score_in, d_emb), nn.GELU(), nn.Linear(d_emb, 1))
+            nn.Linear(score_in, 32), nn.GELU(), nn.Linear(32, 1))
 
     def _project(self, tokens: WalkTokens) -> torch.Tensor:
         """Neighbourhood projection P[x] = exp_{E[seed]}(mu) [N, d] for a bag of N queries. The
@@ -204,7 +201,8 @@ class LinkPredHead(nn.Module):
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Two-sided scoring. src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate
         queries (seeds = v) in query-major order, each walked with its query's cutoff. Logit = MLP over
-        concat[ P[u] | E[u] | nf[u] | P[v] | E[v] | nf[v] ] per (u, candidate v). Returns logits [B, C]."""
+        [ d(E_u,E_v), d(E_u,P_v), d(P_u,E_v), d(P_u,P_v), nf[u], nf[v] ] per (u, candidate v). Returns
+        logits [B, C]."""
         seed_u = F.embedding(src_tokens.seeds, self.E.weight)                 # E[u]   [B, d]
         nbhd_u = self._project(src_tokens)                                    # P[u]   [B, d]
         nf_u = self._node_feats(src_tokens.seeds)                             # nf[u]  [B, d_nf]
@@ -222,5 +220,12 @@ class LinkPredHead(nn.Module):
         nbhd_u = nbhd_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
         nf_u = nf_u.unsqueeze(1).expand(b, c, self.d_nf)                      # [B, C, d_nf]
 
-        feats = torch.cat([nbhd_u, seed_u, nf_u, nbhd_v, seed_v, nf_v], dim=-1)   # [B, C, score_in]
-        return self.scorer(feats).squeeze(-1)                                    # [B, C]
+        # Four pairwise geodesic distances (self.geom.dist) between u's and v's identity / nbhd points.
+        distances = torch.stack([
+            self.geom.dist(seed_u, seed_v),                                  # d(E[u], E[v])  identity affinity
+            self.geom.dist(seed_u, nbhd_v),                                  # d(E[u], P[v])  is u in v's nbhd
+            self.geom.dist(nbhd_u, seed_v),                                  # d(P[u], E[v])  is v in u's nbhd
+            self.geom.dist(nbhd_u, nbhd_v),                                  # d(P[u], P[v])  nbhd overlap
+        ], dim=-1)                                                            # [B, C, 4]
+        feats = torch.cat([distances, nf_u, nf_v], dim=-1)                    # [B, C, 4 + 2*d_nf]
+        return self.scorer(feats).squeeze(-1)                                 # [B, C]
