@@ -85,8 +85,14 @@ class TrainerConfig:
     # update to E (a geoopt.ManifoldParameter) and standard Adam to the Euclidean params, all under the
     # same fixed LR. weight_decay is LOAD-BEARING on the sphere head: an A/B showed wd 1e-4 reached
     # ~0.828/0.803 while no-wd capped ~0.825/0.797 (the test-gap>val-gap signature of a lost regulariser).
-    lr: float = 1e-4
+    lr: float = 1e-4          # legacy single LR (superseded by the two-group split below; kept for compat)
     weight_decay: float = 1e-4
+    # TWO LR GROUPS. E (the sphere manifold param) gets a HIGH lr so clustering moves fast; the head
+    # (nn params) gets a LOW lr so the memorisation/free-ride path develops slowly, letting E win the
+    # race and become load-bearing. RiemannianAdam applies the Riemannian update to E, standard Adam
+    # to the head, each under its own group lr.
+    manifold_lr: float = 1e-3
+    model_lr: float = 1e-4
 
     # Run control.
     num_epochs: int = 25
@@ -130,11 +136,18 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # ONE param group: RiemannianAdam applies the Riemannian update to E (a geoopt.ManifoldParameter)
-        # and standard Adam to the Euclidean params, all under one LR + cosine floor.
+        # TWO param groups: E (the geoopt.ManifoldParameter) at manifold_lr (Riemannian update, HIGH lr
+        # so clustering moves fast); the head (Euclidean nn params) at model_lr (standard Adam, LOW lr so
+        # the free-ride/memorisation develops slowly and E can win the race to carry the signal).
+        e_param = self.model.E.weight
+        head_params = [p for p in self.model.parameters() if p is not e_param]
         self.opt = geoopt.optim.RiemannianAdam(
-            [{"params": list(self.model.parameters()),
-              "lr": float(config.lr), "weight_decay": float(config.weight_decay)}],
+            [
+                {"params": [e_param], "lr": float(config.manifold_lr),
+                 "weight_decay": float(config.weight_decay)},
+                {"params": head_params, "lr": float(config.model_lr),
+                 "weight_decay": float(config.weight_decay)},
+            ],
             stabilize=10,
         )
 
@@ -343,7 +356,7 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
-                f"lr={self.opt.param_groups[0]['lr']:.1e}  "
+                f"lr(E/head)={self.opt.param_groups[0]['lr']:.0e}/{self.opt.param_groups[1]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
             cp = self.comm_probe.measure(self.model.E.weight.detach())     # community-formation probe

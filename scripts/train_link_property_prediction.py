@@ -106,7 +106,11 @@ def parse_args() -> argparse.Namespace:
     # Optimisation — RiemannianAdam at a CONSTANT lr (no schedule). One group covers E
     # (a geoopt.ManifoldParameter, Riemannian update) and all Euclidean params.
     p.add_argument("--lr", default=1e-4, type=float,
-                   help="Constant LR (default 1e-4).")
+                   help="Legacy single LR (superseded by --manifold-lr / --model-lr).")
+    p.add_argument("--manifold-lr", default=1e-3, type=float,
+                   help="LR for E (the sphere manifold param). HIGH so clustering moves fast (default 1e-3).")
+    p.add_argument("--model-lr", default=1e-4, type=float,
+                   help="LR for the head (nn params). LOW so memorisation/free-ride is slow (default 1e-4).")
     p.add_argument("--weight-decay", default=1e-4, type=float,
                    help="Weight decay (RiemannianAdam). Load-bearing on the sphere head.")
     p.add_argument(
@@ -273,6 +277,8 @@ def main() -> Dict[str, Any]:
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
         lr=args.lr,
+        manifold_lr=args.manifold_lr,
+        model_lr=args.model_lr,
         weight_decay=args.weight_decay,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
