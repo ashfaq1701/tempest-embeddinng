@@ -89,67 +89,34 @@ class TimeEncoder(nn.Module):
 
 
 class NeighborhoodProjection(nn.Module):
-    """DISPLACED-tangent attention pooling of a source's walk-token tangents into one tangent vector
-    mu_u at E[u]. Single-head.
+    """MEAN-pooling of a source's walk-token descriptors into one tangent vector mu_u at E[u].
 
-    Generalises the old "rescale-only" centroid (mu_u = Σ_p w_p·g_p, value = the RAW tangent
-    g_p = Log_{E[u]}(E[token_p]), so the only learnable per token was the scalar attention weight —
-    mu_u was trapped in the conic hull of the FIXED neighbour tangents) by giving the VALUE a learned
-    displacement:
+    No attention, no displacement. Each CONTEXT token (the walk, EXCLUDING the seed) is described by
 
-        v_p = g_p + γ ⊙ ( W_v · g_p  +  Enc([node_feat_p, Time2Vec(age_p), log1p(hop_p), edge_p]) )
+        [ Log_{E[u]}(E[token]) ‖ node_feat ‖ Time2Vec(age) ‖ log1p(hop) ‖ edge_feat ]
 
-    a content-LINEAR reshape of the tangent (W_v) plus a DEEP displacement driven only by the STABLE
-    features (Enc). Depth lives on the stable path on purpose — a 2-layer projection on the
-    embedding/code path overfit on wiki; width/linear is the safe lever there. γ is a per-channel
-    LayerScale init 0, so at start v == g (displacement OFF) and the module is a plain tangent
-    centroid, earning capacity channel-by-channel. A seed-conditioned query (decoupled from the keys)
-    attends over the tokens; mu_u = Σ_p w_p · v_p.
-
-    Sphere validity: each value v_p (and mu_u) is a FREE R^d vector (the displacement leaves the
-    tangent subspace); mu_u is projected ONCE onto the tangent space at E[u] (mu -= ⟨mu, E[u]⟩·E[u]),
-    which is all exp_{E[u]} needs — the standard retraction / extrinsic-mean pattern (compute freely
-    off the tangent space, project back once). Project-once retains strictly MORE information than
-    per-step projection (see researches/off-tangent-intermediate-values-and-project-once.txt).
-    Candidate-independent (never sees E[v]); cold rows (no token) -> weights 0 -> mu_u = 0 -> P[u] = E[u].
-
-    (The multi-head variant — H decoupled heads + a W_o head-combine — is at commit 889c59f. On coin
-    it bought only ~+0.004 val/test over this single-head displacement at 3x the head params and
-    ~1.5x the compute; recover it from there if the multi-head lever is wanted again.)
-    """
+    and mapped by a single linear layer w_token -> R^d; mu_u is the UNIFORM MEAN of those projections
+    over the context tokens. mu_u is then projected onto the tangent space at E[u] (mu -= ⟨mu,E[u]⟩·E[u])
+    and fed to exp_{E[u]} downstream to give P[u]. Candidate-independent (never sees E[v]); cold rows
+    (no context token) -> mu_u = 0 -> P[u] = E[u]."""
 
     def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0, d_nf: int = 0):
         super().__init__()
         self.d_emb = d_emb
         self.d_ef = d_ef
         self.d_nf = d_nf
-        self.d_a = d_emb // 2                           # attention (query/key) dim
-        self.scale = 1.0 / math.sqrt(self.d_a)
         self.geom = SphereManifold()                   # stateless; used for the token log-map
 
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        s_in = d_nf + t2v_dim + 1 + d_ef               # stable-feature dim: [node-feat, Time2Vec, log-hop, edge]
-        desc_in = d_emb + s_in                         # descriptor: [content, node-feat, t2v, log-hop, edge]
-
-        # Attention: DECOUPLED query (seed descriptor) and key (token descriptor).
-        self.w_q = nn.Linear(desc_in, self.d_a)
-        self.w_k = nn.Linear(desc_in, self.d_a)
-
-        # Value displacement:
-        #   content path — LINEAR reshape of the tangent (depth here overfits; keep it linear);
-        #   stable  path — DEEP (safe: driven only by node-feat / time / hop / edge).
-        self.w_v = nn.Linear(d_emb, d_emb, bias=False)
-        self.disp_enc = nn.Sequential(
-            nn.Linear(s_in, d_emb), nn.GELU(), nn.Linear(d_emb, d_emb))
-        self.gamma = nn.Parameter(torch.zeros(d_emb))    # LayerScale, init 0 -> displacement off
+        # Per-token descriptor -> d_emb: [token_tangent, node_feat, Time2Vec(age), log1p(hop), edge_feat].
+        desc_in = d_emb + d_nf + t2v_dim + 1 + d_ef
+        self.w_token = nn.Linear(desc_in, d_emb)
 
     def forward(self, walk_bag: WalkTokens, emb: torch.Tensor,
                 node_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         """walk_bag: the flattened WalkTokens bag. emb: the FULL node-embedding table [num_nodes,d_emb]
         on the sphere. node_features: the FULL static node-feature table [num_nodes, d_nf] (None if the
-        dataset has none). Builds the per-token KEY descriptor [tangent ‖ nf ‖ t2v(age) ‖ log-hop ‖ edge]
-        and the SEED QUERY descriptor [E[u] ‖ nf_seed ‖ 0 ‖ 0 ‖ 0] — the seed keeps its OWN node feature,
-        but its time/hop/edge are zero. Returns mu_u [B,d_emb], ⊥ E[u], ‖·‖<π; cold rows -> 0."""
+        dataset has none). Returns mu_u [B,d_emb], projected onto T_{E[u]} (⊥ E[u]); cold rows -> 0."""
         node_ids = walk_bag.nodes.clamp_min(0)                                    # [B,T]  (padding → row 0)
         source = F.embedding(walk_bag.seeds, emb)                                 # E[u]  [B,d_emb]
         token_tangents = self.geom.logmap(source.unsqueeze(-2), F.embedding(node_ids, emb))  # [B,T,d_emb] ⊥ E[u]
@@ -158,13 +125,11 @@ class NeighborhoodProjection(nn.Module):
         mask = walk_bag.mask & ~walk_bag.seed_mask                               # [B,T]  context (non-seed real)
         ages = walk_bag.ages.clamp_min(0).to(token_tangents.dtype)               # [B,T]
 
-        # Static node features — per token (padding zeroed) AND the seed's own (kept in the query).
+        # Static node features per token (padding zeroed); empty channel if the dataset has none.
         if node_features is None:
             nf_token = token_tangents.new_zeros(b, t, self.d_nf)                  # [B,T,0]
-            nf_seed = source.new_zeros(b, self.d_nf)                             # [B,0]
         else:
             nf_token = F.embedding(node_ids, node_features) * walk_bag.mask.unsqueeze(-1)   # [B,T,d_nf]
-            nf_seed = F.embedding(walk_bag.seeds, node_features)                            # [B,d_nf]
 
         # Edge features (seed/padding already zeroed on the bag); empty channel if absent.
         edge_features = walk_bag.edge_features                                    # [B,T,d_ef] or None
@@ -175,26 +140,15 @@ class NeighborhoodProjection(nn.Module):
         t2v = self.time_encoder(torch.log1p(ages))                               # [B,T,t2v_dim]
         log_hop = torch.log1p(walk_bag.positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)  # [B,T,1]
 
-        # Per-token STABLE features: [node-feat, Time2Vec, log-hop, edge].
-        stable = torch.cat([nf_token, t2v, log_hop, edge_features], dim=-1)        # [B,T,s_in]
+        # Per-token descriptor -> w_token -> R^d; UNIFORM MEAN over the context tokens.
+        desc = torch.cat([token_tangents, nf_token, t2v, log_hop, edge_features], dim=-1)   # [B,T,desc_in]
+        proj = self.w_token(desc)                                                # [B,T,d_emb]
+        w = mask.to(proj.dtype)                                                  # [B,T]
+        w = w / w.sum(-1, keepdim=True).clamp_min(1.0)                           # uniform mean; cold row -> 0
+        mu = (w.unsqueeze(-1) * proj).sum(dim=-2)                                # [B,d_emb]
 
-        # ── attention (decoupled Q/K) ──────────────────────────────────────────────────────────
-        #   key   = W_k · [tangent ‖ nf_token ‖ t2v ‖ log-hop ‖ edge]
-        #   query = W_q · [E[u]    ‖ nf_seed  ‖ 0   ‖ 0       ‖ 0   ]   (seed keeps its node feature)
-        keys = self.w_k(torch.cat([token_tangents, stable], dim=-1))              # [B,T,d_a]
-        query_zeros = source.new_zeros(b, stable.shape[-1] - self.d_nf)           # [B, t2v+1+d_ef]
-        query = self.w_q(torch.cat([source, nf_seed, query_zeros], dim=-1))       # [B,d_a]
-        scores = (query.unsqueeze(1) * keys).sum(-1) * self.scale                 # [B,T]
-        scores = scores.masked_fill(~mask, float("-inf"))
-        weights = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)        # [B,T]; cold row -> 0
-
-        # ── displaced values ───────────────────────────────────────────────────────────────────
-        disp = self.w_v(token_tangents) + self.disp_enc(stable)                   # [B,T,d]
-        values = token_tangents + self.gamma * disp                               # [B,T,d]; γ init 0
-
-        # ── pool -> project onto T_{E[u]} ───────────────────────────────────────────────────────
-        mu = (weights.unsqueeze(-1) * values).sum(dim=-2)                         # [B,d]
-        return mu - (mu * source).sum(-1, keepdim=True) * source                  # Π_{E[u]}: ⊥ E[u]
+        # Project onto the tangent space at E[u] (⊥ E[u]); exp_{E[u]} applied downstream -> P[u].
+        return mu - (mu * source).sum(-1, keepdim=True) * source                 # Π_{E[u]}: ⊥ E[u]
 
 
 class LinkPredHead(nn.Module):
