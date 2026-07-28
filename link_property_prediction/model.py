@@ -143,9 +143,9 @@ class NeighborhoodProjection(nn.Module):
         # Per-token descriptor -> w_token -> R^d; UNIFORM MEAN over the context tokens.
         desc = torch.cat([token_tangents, nf_token, t2v, log_hop, edge_features], dim=-1)   # [B,T,desc_in]
         proj = self.w_token(desc)                                                # [B,T,d_emb]
-        w = mask.to(proj.dtype)                                                  # [B,T]
-        w = w / w.sum(-1, keepdim=True).clamp_min(1.0)                           # uniform mean; cold row -> 0
-        mu = (w.unsqueeze(-1) * proj).sum(dim=-2)                                # [B,d_emb]
+        is_context = mask.unsqueeze(-1).to(proj.dtype)                           # [B,T,1]  1.0 at context tokens
+        n_context = is_context.sum(dim=-2).clamp_min(1.0)                        # [B,1]    #context tokens (cold->1)
+        mu = (proj * is_context).sum(dim=-2) / n_context                        # [B,d_emb]  mean; cold row -> 0
 
         # Project onto the tangent space at E[u] (⊥ E[u]); exp_{E[u]} applied downstream -> P[u].
         return mu - (mu * source).sum(-1, keepdim=True) * source                 # Π_{E[u]}: ⊥ E[u]
