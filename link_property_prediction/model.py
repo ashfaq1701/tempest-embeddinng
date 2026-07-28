@@ -110,9 +110,8 @@ class NeighborhoodProjection(nn.Module):
     tangent subspace); mu_u is projected ONCE onto the tangent space at E[u] (mu -= ⟨mu, E[u]⟩·E[u]),
     which is all exp_{E[u]} needs — the standard retraction / extrinsic-mean pattern (compute freely
     off the tangent space, project back once). Project-once retains strictly MORE information than
-    per-step projection (see researches/off-tangent-intermediate-values-and-project-once.txt). mu is
-    then radially clamped below π so exp_{E[u]}(mu) stays injective. Candidate-independent (never sees
-    E[v]); cold rows (no token) -> weights 0 -> mu_u = 0 -> P[u] = E[u].
+    per-step projection (see researches/off-tangent-intermediate-values-and-project-once.txt).
+    Candidate-independent (never sees E[v]); cold rows (no token) -> weights 0 -> mu_u = 0 -> P[u] = E[u].
 
     (The multi-head variant — H decoupled heads + a W_o head-combine — is at commit 889c59f. On coin
     it bought only ~+0.004 val/test over this single-head displacement at 3x the head params and
@@ -126,7 +125,6 @@ class NeighborhoodProjection(nn.Module):
         self.d_nf = d_nf
         self.d_a = d_emb // 2                           # attention (query/key) dim
         self.scale = 1.0 / math.sqrt(self.d_a)
-        self.max_radius = math.pi - 1e-2               # keep ‖mu‖ < π so exp_{E[u]} stays injective
         self.geom = SphereManifold()                   # stateless; used for the token log-map
 
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
@@ -194,11 +192,9 @@ class NeighborhoodProjection(nn.Module):
         disp = self.w_v(token_tangents) + self.disp_enc(stable)                   # [B,T,d]
         values = token_tangents + self.gamma * disp                               # [B,T,d]; γ init 0
 
-        # ── pool -> project onto T_{E[u]} -> radial clamp ──────────────────────────────────────
+        # ── pool -> project onto T_{E[u]} ───────────────────────────────────────────────────────
         mu = (weights.unsqueeze(-1) * values).sum(dim=-2)                         # [B,d]
-        mu = mu - (mu * source).sum(-1, keepdim=True) * source                    # Π_{E[u]}: ⊥ E[u]
-        norm = (mu * mu).sum(-1, keepdim=True).clamp_min(1e-12).sqrt()            # finite grad at 0
-        return mu * (self.max_radius / norm).clamp(max=1.0)                       # ‖mu‖ ≤ max_radius
+        return mu - (mu * source).sum(-1, keepdim=True) * source                  # Π_{E[u]}: ⊥ E[u]
 
 
 class LinkPredHead(nn.Module):
