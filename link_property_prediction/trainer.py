@@ -40,6 +40,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .alignment_loss import alignment_loss
 from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import LinkPredHead
@@ -172,8 +173,10 @@ class Trainer:
     # ──────────────────────────────────────────────────────────────────
 
     def _score(self, src_t: torch.Tensor, cand_t: torch.Tensor,
-               t_query_t: torch.Tensor) -> torch.Tensor:
-        """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> logits [B, C].
+               t_query_t: torch.Tensor):
+        """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> (logits [B, C], src_tokens,
+        cand_tokens). The two walk bags are returned so the training step can run the alignment loss
+        on them without re-walking (eval ignores them).
 
         TWO-SIDED per-query walks: the SOURCE side samples K backward walks for each query (u_i, t_i)
         with cutoff = t_i; the CANDIDATE side samples K backward walks for every candidate v_ij with the
@@ -202,7 +205,7 @@ class Trainer:
             start_bias=self.config.start_bias,
             walk_bias=self.config.walk_bias)
 
-        return self.model(src_tokens, cand_tokens)
+        return self.model(src_tokens, cand_tokens), src_tokens, cand_tokens
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
@@ -223,16 +226,23 @@ class Trainer:
         cand_t = torch.from_numpy(cand_np).to(device)
         t_query_t = torch.from_numpy(batch.ts.astype(np.int64)).to(device)
 
-        logits = self._score(src_t, cand_t, t_query_t)                 # [B, 1+K]
+        logits, src_tokens, cand_tokens = self._score(src_t, cand_t, t_query_t)   # [B, 1+K], both bags
         target = torch.zeros(B, dtype=torch.long, device=device)
-        loss = F.cross_entropy(logits, target)
+        link_loss = F.cross_entropy(logits, target)
+
+        # Walk-neighbour alignment on BOTH bags (source + candidate): clusters E by walk-neighbourhood.
+        E = self.model.E.weight
+        alignment = (alignment_loss(src_tokens, E, self.model.geom)
+                     + alignment_loss(cand_tokens, E, self.model.geom))
+        loss = link_loss + alignment
 
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         self.opt.step()
 
         return {
-            "link": float(loss.detach()),
+            "link": float(link_loss.detach()),
+            "align": float(alignment.detach()),
             "lr": float(self.opt.param_groups[0]["lr"]),
         }
 
@@ -271,7 +281,8 @@ class Trainer:
                 src_t = torch.from_numpy(batch.src.astype(np.int64)).to(self.device)
                 cand_t = torch.from_numpy(cand_v_np).to(self.device)
                 t_query_t = torch.from_numpy(batch.ts.astype(np.int64)).to(self.device)
-                logits = self._score(src_t, cand_t, t_query_t).cpu().numpy()
+                logits, _, _ = self._score(src_t, cand_t, t_query_t)
+                logits = logits.cpu().numpy()
 
                 for i in range(B):
                     rr = evaluator.score_to_metric(
@@ -346,16 +357,18 @@ class Trainer:
             self.model.train()
 
             t0 = time.time()
-            link_sum, n_batches = 0.0, 0
+            link_sum, align_sum, n_batches = 0.0, 0.0, 0
             for batch in train_batches_factory():
                 m = self._train_step(batch)
                 link_sum += m["link"]
+                align_sum += m.get("align", 0.0)
                 n_batches += 1
             train_dt = time.time() - t0
 
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
+                f"align={align_sum / max(n_batches, 1):.4f}  "
                 f"lr(E/head)={self.opt.param_groups[0]['lr']:.0e}/{self.opt.param_groups[1]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )

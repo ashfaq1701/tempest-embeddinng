@@ -208,8 +208,9 @@ class LinkPredHead(nn.Module):
         """Neighbourhood projection P[x] = exp_{E[seed]}(mu) [N, d] for a bag of N queries. The
         neighbourhood takes the bag + the full E table and derives E[u] / token tangents / stable
         feats / masks itself; E[seed] is looked up separately by the caller."""
-        e_seed = F.embedding(tokens.seeds, self.E.weight)                            # E[seed]  [N, d]
-        mu = self.neighbourhood(tokens, self.E.weight, self.node_features)           # [N, d]
+        emb = self.E.weight.detach()                                                 # link head reads E DETACHED
+        e_seed = F.embedding(tokens.seeds, emb)                                      # E[seed]  [N, d]
+        mu = self.neighbourhood(tokens, emb, self.node_features)                     # [N, d]
         return self.geom.expmap(e_seed, mu)                                          # P[x]  [N, d]
 
     def _node_feats(self, seeds: torch.Tensor) -> torch.Tensor:
@@ -224,10 +225,11 @@ class LinkPredHead(nn.Module):
         queries (seeds = v) in query-major order, each walked with its query's cutoff. Logit = MLP over
         [ d(E_u,E_v), d(E_u,P_v), d(P_u,E_v), d(P_u,P_v), nf[u], nf[v] ] per (u, candidate v). Returns
         logits [B, C]."""
-        seed_u = F.embedding(src_tokens.seeds, self.E.weight)                 # E[u]   [B, d]
+        emb = self.E.weight.detach()                                          # link head reads E DETACHED
+        seed_u = F.embedding(src_tokens.seeds, emb)                           # E[u]   [B, d]
         nbhd_u = self._project(src_tokens)                                    # P[u]   [B, d]
         nf_u = self._node_feats(src_tokens.seeds)                             # nf[u]  [B, d_nf]
-        seed_v = F.embedding(cand_tokens.seeds, self.E.weight)                # E[v]   [B*C, d]
+        seed_v = F.embedding(cand_tokens.seeds, emb)                          # E[v]   [B*C, d]
         nbhd_v = self._project(cand_tokens)                                   # P[v]   [B*C, d]
         nf_v = self._node_feats(cand_tokens.seeds)                            # nf[v]  [B*C, d_nf]
 
