@@ -230,10 +230,11 @@ class Trainer:
         target = torch.zeros(B, dtype=torch.long, device=device)
         link_loss = F.cross_entropy(logits, target)
 
-        # Walk-neighbour alignment on BOTH bags (source + candidate): clusters E by walk-neighbourhood.
+        # Walk-neighbour alignment on the SOURCE bag: clusters E by walk-neighbourhood. (The candidate-side
+        # term is dropped here — at K_train it makes Q=B*(1+K) seeds and the [Q,M,d] denominator OOMs; the
+        # source side (Q=B) is the loss's designed use per alignment_loss's docstring.)
         E = self.model.E.weight
-        alignment = (alignment_loss(src_tokens, E, self.model.geom)
-                     + alignment_loss(cand_tokens, E, self.model.geom))
+        alignment = alignment_loss(src_tokens, E, self.model.geom)
         loss = link_loss + alignment
 
         self.opt.zero_grad(set_to_none=True)
