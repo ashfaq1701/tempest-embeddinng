@@ -89,16 +89,23 @@ class TimeEncoder(nn.Module):
 
 
 class NeighborhoodProjection(nn.Module):
-    """MEAN-pooling of a source's walk-token descriptors into one tangent vector mu_u at E[u].
+    """Weighted-sum pooling of a source's walk-token values into one tangent vector mu_u at E[u].
 
-    No attention, no displacement. Each CONTEXT token (the walk, EXCLUDING the seed) is described by
+    Two nets, one weighted sum:
+      VALUE  v_p = (W_v · g_p) ⊙ (1 + γ ⊙ tanh(gate([edge_p, nf_p])))
+             g_p = Log_{E[u]}(E[token_p]) is the E-DEPENDENT geometric content; W_v has NO bias, so there
+             is no E-independent additive term. External features [edge, nf] enter ONLY as a MULTIPLICATIVE
+             per-channel gate (γ = LayerScale, init 0 -> starts ×1), so they modulate the geometry but
+             cannot bypass E. gate is None when the dataset has no edge/node features (then v_p = W_v · g_p).
+      WEIGHT a_p = weight_net([Time2Vec(age_p), log1p(hop_p)]) — a scalar from time/position ONLY
+             (isometry-invariant, content-free), softmax-normalised over the CONTEXT tokens. Because the
+             weight never sees identity it CANNOT select-and-copy a token; it only up-weights recent/close ones.
+      mu_u = Σ_p softmax(a)_p · v_p.
 
-        [ Log_{E[u]}(E[token]) ‖ node_feat ‖ Time2Vec(age) ‖ log1p(hop) ‖ edge_feat ]
-
-    and mapped by a single linear layer w_token -> R^d; mu_u is the UNIFORM MEAN of those projections
-    over the context tokens. mu_u is then projected onto the tangent space at E[u] (mu -= ⟨mu,E[u]⟩·E[u])
-    and fed to exp_{E[u]} downstream to give P[u]. Candidate-independent (never sees E[v]); cold rows
-    (no context token) -> mu_u = 0 -> P[u] = E[u]."""
+    Every external signal (age/hop, edge/nf) enters MULTIPLICATIVELY; the tangent is the sole additive base,
+    so nothing predicts without routing through E's geometry (free-lunch-resistant by construction). mu_u is
+    projected onto T_{E[u]} (⊥ E[u]) and fed to exp_{E[u]} downstream -> P[u]. Candidate-independent (never
+    sees E[v]); cold rows (no context token) -> mu_u = 0 -> P[u] = E[u]."""
 
     def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0, d_nf: int = 0):
         super().__init__()
@@ -108,9 +115,17 @@ class NeighborhoodProjection(nn.Module):
         self.geom = SphereManifold()                   # stateless; used for the token log-map
 
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        # Per-token descriptor -> d_emb: [token_tangent, node_feat, Time2Vec(age), log1p(hop), edge_feat].
-        desc_in = d_emb + d_nf + t2v_dim + 1 + d_ef
-        self.w_token = nn.Linear(desc_in, d_emb)
+        # VALUE base: W_v · g_p (tangent). NO bias -> no E-independent additive term (keeps E load-bearing).
+        self.w_v = nn.Linear(d_emb, d_emb, bias=False)
+        # Channel GATE from external features [edge, nf] -> modulates the value MULTIPLICATIVELY (never adds).
+        # gate_in == 0 (e.g. wiki, no edge/nf) -> no gate at all (v_p = W_v · g_p).
+        gate_in = d_ef + d_nf
+        self.gate = nn.Linear(gate_in, d_emb) if gate_in > 0 else None
+        self.gate_scale = nn.Parameter(torch.zeros(d_emb))     # γ LayerScale, init 0 -> gate starts as ×1
+        # WEIGHT net: [Time2Vec(age), log1p(hop)] -> scalar per token (softmax over context tokens).
+        w_in = t2v_dim + 1
+        self.weight_net = nn.Sequential(
+            nn.Linear(w_in, w_in), nn.GELU(), nn.Linear(w_in, 1))
 
     def forward(self, walk_bag: WalkTokens, emb: torch.Tensor,
                 node_features: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -140,12 +155,18 @@ class NeighborhoodProjection(nn.Module):
         t2v = self.time_encoder(torch.log1p(ages))                               # [B,T,t2v_dim]
         log_hop = torch.log1p(walk_bag.positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)  # [B,T,1]
 
-        # Per-token descriptor -> w_token -> R^d; UNIFORM MEAN over the context tokens.
-        desc = torch.cat([token_tangents, nf_token, t2v, log_hop, edge_features], dim=-1)   # [B,T,desc_in]
-        proj = self.w_token(desc)                                                # [B,T,d_emb]
-        is_context = mask.unsqueeze(-1).to(proj.dtype)                           # [B,T,1]  1.0 at context tokens
-        n_context = is_context.sum(dim=-2).clamp_min(1.0)                        # [B,1]    #context tokens (cold->1)
-        mu = (proj * is_context).sum(dim=-2) / n_context                        # [B,d_emb]  mean; cold row -> 0
+        # VALUE: geometric base (W_v · g_p), channel-gated by [edge, nf] (multiplicative, ≈1 at init).
+        value = self.w_v(token_tangents)                                         # [B,T,d]  E-dependent base
+        if self.gate is not None:
+            feats = torch.cat([edge_features, nf_token], dim=-1)                  # [B,T, d_ef+d_nf]
+            value = value * (1.0 + self.gate_scale * torch.tanh(self.gate(feats)))
+
+        # WEIGHT: scalar per token from [Time2Vec(age), log-hop]; softmax over the context tokens.
+        w_logit = self.weight_net(torch.cat([t2v, log_hop], dim=-1)).squeeze(-1)  # [B,T]
+        w_logit = w_logit.masked_fill(~mask, float("-inf"))
+        weights = torch.nan_to_num(torch.softmax(w_logit, dim=-1), nan=0.0)       # [B,T]; cold row -> 0
+
+        mu = (weights.unsqueeze(-1) * value).sum(dim=-2)                          # [B,d]  weighted sum
 
         # Project onto the tangent space at E[u] (⊥ E[u]); exp_{E[u]} applied downstream -> P[u].
         return mu - (mu * source).sum(-1, keepdim=True) * source                 # Π_{E[u]}: ⊥ E[u]
