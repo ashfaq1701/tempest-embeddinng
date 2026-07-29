@@ -1,19 +1,18 @@
-"""Link head — sphere node embeddings + a deep neighbourhood-projection channel, in one module.
+"""Link head — Poincaré-ball node embeddings + a deep neighbourhood-projection channel, in one module.
 
     logit = <P[u], E[v]>                               is v near u's neighbourhood?
 
 where P[u] = exp_{E[u]}(mu_u) pushes the source off E[u] toward mu_u — the deep pooling of u's
 walk-token tangents (in the tangent space at E[u]) + a TPNet Time2Vec of each token's age, produced
 by NeighborhoodProjection. One-sided: only u is walked/projected; each candidate v enters through
-its static embedding E[v]. The head owns self.E (a ManifoldParameter on a geoopt.Sphere, link-
-trained on it); geometry goes through self.geom (SphereManifold): dist/logmap proxy to geoopt, expmap
-is ours (geoopt's expmap NaNs the gradient at the cold-row zero tangent).
+its static embedding E[v]. The head owns self.E (a ManifoldParameter on a geoopt.PoincareBall, link-
+trained on it); geometry goes through self.geom (PoincareManifold): dist/logmap/expmap all proxy to
+geoopt (the ball's expmap has a finite gradient at the cold-row zero tangent).
 
 (The dual-sided variant — walk every candidate too and score <P[u], P[v]> — was falsified on wiki:
 at matched walks it lost to one-sided at ~8x the cost. It lives one `git revert` away; see the
 "Important: revert this commit to bring back dual side walks" commit.)
 """
-import math
 from typing import Optional
 
 import geoopt
@@ -25,30 +24,27 @@ import torch.nn.functional as F
 from .walk_tokens import WalkTokens
 
 
-class SphereManifold:
-    """Unit-sphere geometry over geoopt.Sphere. dist and logmap PROXY straight to geoopt; expmap is
-    OURS — geoopt's Sphere.expmap uses sin(‖u‖)/‖u‖ under a torch.where and leaks a NaN gradient at
-    ‖u‖ = 0 (the cold-row tangent mu = 0, a node with no walk tokens — common on wiki). E is kept
-    on-sphere by RiemannianAdam, so no read-time re-projection is needed."""
+class PoincareManifold:
+    """Poincaré-ball geometry over geoopt.PoincareBall(c=1). dist / logmap / expmap all PROXY straight to
+    geoopt — the ball's expmap already has a FINITE gradient at the zero tangent (the cold-row mu = 0, a
+    node with no walk tokens), so no custom expmap is needed (unlike the sphere). The tangent space at any
+    point is all of R^d — no orthogonal projection. E is kept in the ball by RiemannianAdam."""
 
-    def __init__(self):
-        self.manifold = geoopt.Sphere()
+    def __init__(self, c: float = 1.0):
+        self.manifold = geoopt.PoincareBall(c=c)
 
     def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Geodesic distance arccos(⟨x, y⟩) on the sphere — geoopt.Sphere.dist. LOWER = closer."""
+        """Geodesic (hyperbolic) distance on the ball — geoopt.PoincareBall.dist. LOWER = closer."""
         return self.manifold.dist(x, y)
 
     def logmap(self, base: torch.Tensor, point: torch.Tensor) -> torch.Tensor:
-        """Log map at `base` of `point` — geoopt.Sphere.logmap (its gradient is finite at coincidence)."""
+        """Log map at `base` of `point` — geoopt.PoincareBall.logmap (finite gradient at coincidence)."""
         return self.manifold.logmap(base, point)
 
-    def expmap(self, base: torch.Tensor, tangent: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-        """Exponential map: move from `base` along `tangent`.  exp(base, u) = cos(‖u‖)·base +
-        sinc(‖u‖/π)·u.  torch.sinc is a smooth primitive (no explicit /‖u‖), so ‖u‖ = 0 is an exact
-        differentiable no-op — returns `base` with a FINITE gradient. (geoopt's expmap NaNs the
-        gradient there.) The squared norm is clamped off 0 before the sqrt for extra safety."""
-        angle = (tangent ** 2).sum(dim=-1, keepdim=True).clamp_min(eps).sqrt()   # ‖u‖, finite grad at 0
-        return torch.cos(angle) * base + torch.sinc(angle / math.pi) * tangent
+    def expmap(self, base: torch.Tensor, tangent: torch.Tensor) -> torch.Tensor:
+        """Exp map from `base` along `tangent` — geoopt.PoincareBall.expmap. Finite gradient at u = 0, so
+        the cold-row zero tangent is a safe differentiable no-op returning `base`."""
+        return self.manifold.expmap(base, tangent)
 
 
 class TimeEncoder(nn.Module):
@@ -112,7 +108,7 @@ class NeighborhoodProjection(nn.Module):
         self.d_emb = d_emb
         self.d_ef = d_ef
         self.d_nf = d_nf
-        self.geom = SphereManifold()                   # stateless; used for the token log-map
+        self.geom = PoincareManifold()                 # stateless; used for the token log-map
 
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
         # VALUE base: W_v · g_p (tangent). NO bias -> no E-independent additive term (keeps E load-bearing).
@@ -130,8 +126,8 @@ class NeighborhoodProjection(nn.Module):
     def forward(self, walk_bag: WalkTokens, emb: torch.Tensor,
                 node_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         """walk_bag: the flattened WalkTokens bag. emb: the FULL node-embedding table [num_nodes,d_emb]
-        on the sphere. node_features: the FULL static node-feature table [num_nodes, d_nf] (None if the
-        dataset has none). Returns mu_u [B,d_emb], projected onto T_{E[u]} (⊥ E[u]); cold rows -> 0."""
+        in the Poincaré ball. node_features: the FULL static node-feature table [num_nodes, d_nf] (None if
+        the dataset has none). Returns mu_u [B,d_emb], a tangent vector at E[u]; cold rows -> 0."""
         node_ids = walk_bag.nodes.clamp_min(0)                                    # [B,T]  (padding → row 0)
         source = F.embedding(walk_bag.seeds, emb)                                 # E[u]  [B,d_emb]
         token_tangents = self.geom.logmap(source.unsqueeze(-2), F.embedding(node_ids, emb))  # [B,T,d_emb] ⊥ E[u]
@@ -168,8 +164,9 @@ class NeighborhoodProjection(nn.Module):
 
         mu = (weights.unsqueeze(-1) * value).sum(dim=-2)                          # [B,d]  weighted sum
 
-        # Project onto the tangent space at E[u] (⊥ E[u]); exp_{E[u]} applied downstream -> P[u].
-        return mu - (mu * source).sum(-1, keepdim=True) * source                 # Π_{E[u]}: ⊥ E[u]
+        # On the Poincaré ball the tangent space at E[u] is all of R^d (no ⊥-projection); mu is fed to
+        # exp_{E[u]} downstream -> P[u].  (cold rows: mu = 0 -> P[u] = E[u].)
+        return mu
 
 
 class LinkPredHead(nn.Module):
@@ -185,13 +182,14 @@ class LinkPredHead(nn.Module):
         # it rides model.to(device) and stays out of the optimizer; non-persistent (derivable from the
         # dataset, so kept out of checkpoints). None when the dataset has no node features.
         self.register_buffer("node_features", node_features, persistent=False)
-        self.geom = SphereManifold()
+        self.geom = PoincareManifold()
 
-        # E lives on the unit sphere: init uniformly at random on it (geoopt.Sphere.random_uniform),
-        # then wrap as a ManifoldParameter so RiemannianAdam keeps it there.
+        # E lives in the Poincaré ball: init near the origin (small-std wrapped normal) so the conformal
+        # metric — which blows up near the boundary — stays well-conditioned early; then wrap as a
+        # ManifoldParameter so RiemannianAdam keeps it in the ball.
         self.E = nn.Embedding(num_nodes, d_emb)
         with torch.no_grad():
-            init = self.geom.manifold.random_uniform(num_nodes, d_emb)
+            init = self.geom.manifold.random_normal(num_nodes, d_emb, std=1e-2)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
         self.neighbourhood = NeighborhoodProjection(
