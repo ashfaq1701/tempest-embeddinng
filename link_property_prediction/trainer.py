@@ -40,7 +40,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .alignment_loss import alignment_loss
+from .alignment_loss import alignment_loss, boundary_penalty
 from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import LinkPredHead
@@ -235,7 +235,7 @@ class Trainer:
         # matmul-form geodesic matrix makes the candidate side cheap (no [Q,M,d] blow-up).
         E = self.model.E.weight
         alignment = alignment_loss(src_tokens, cand_tokens, E, self.model.geom)
-        loss = link_loss + alignment
+        loss = link_loss + alignment + boundary_penalty(E)
 
         self.opt.zero_grad(set_to_none=True)
         loss.backward()

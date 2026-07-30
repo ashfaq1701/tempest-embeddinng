@@ -58,6 +58,15 @@ def _pad_cols(t: torch.Tensor, width: int, value) -> torch.Tensor:
     return t if t.shape[1] == width else F.pad(t, (0, width - t.shape[1]), value=value)
 
 
+def boundary_penalty(emb: torch.Tensor) -> torch.Tensor:
+    """Soft radial barrier for Poincaré-ball embeddings: -mean(log(1 - ‖E‖²)). Its gradient 2x/(1-‖x‖²)
+    is a ≈linear inward force at moderate radius (sets a soft equilibrium radius) diverging to a hard wall
+    as ‖x‖→1 — the confining potential the non-compact ball lacks. Caps the outward migration that inflates
+    distances and drifts the scorer. (Ball only: on the sphere ‖E‖≡1 → log(0).)"""
+    r2 = (emb * emb).sum(-1)                                        # [N]  ‖E‖²  (< 1 in the ball)
+    return -torch.log1p(-r2.clamp(max=1.0 - 1e-6)).mean()
+
+
 def alignment_loss(src_bag: WalkTokens, cand_bag: WalkTokens, emb: torch.Tensor, geom) -> torch.Tensor:
     """src_bag / cand_bag: the two flattened WalkTokens (seeds = query sources u / candidates v). emb: the
     full node-embedding table [num_nodes, d] on the manifold. geom: exposes `pairwise_dist(X, Y) -> [|X|,|Y|]`.
