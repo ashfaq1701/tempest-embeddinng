@@ -58,13 +58,12 @@ def _pad_cols(t: torch.Tensor, width: int, value) -> torch.Tensor:
     return t if t.shape[1] == width else F.pad(t, (0, width - t.shape[1]), value=value)
 
 
-def boundary_penalty(emb: torch.Tensor) -> torch.Tensor:
-    """Soft radial barrier for Poincaré-ball embeddings: -mean(log(1 - ‖E‖²)). Its gradient 2x/(1-‖x‖²)
-    is a ≈linear inward force at moderate radius (sets a soft equilibrium radius) diverging to a hard wall
-    as ‖x‖→1 — the confining potential the non-compact ball lacks. Caps the outward migration that inflates
-    distances and drifts the scorer. (Ball only: on the sphere ‖E‖≡1 → log(0).)"""
-    r2 = (emb * emb).sum(-1)                                        # [N]  ‖E‖²  (< 1 in the ball)
-    return -torch.log1p(-r2.clamp(max=1.0 - 1e-6)).mean()
+def boundary_penalty(emb: torch.Tensor, geom) -> torch.Tensor:
+    """Wrapped-normal prior for Poincaré-ball embeddings: mean squared HYPERBOLIC distance from the origin,
+    d_H(0, E)² (geoopt PoincareBall.dist0). A Gaussian-in-the-ball prior — quadratic restoring force toward
+    the origin that diverges near the boundary — giving the non-compact ball a finite equilibrium radius and
+    capping the outward-migration distance inflation that drifts the scale-sensitive scorer. (Ball only.)"""
+    return (geom.manifold.dist0(emb) ** 2).mean()
 
 
 def alignment_loss(src_bag: WalkTokens, cand_bag: WalkTokens, emb: torch.Tensor, geom) -> torch.Tensor:
