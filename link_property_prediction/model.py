@@ -122,10 +122,8 @@ class NeighborhoodProjection(nn.Module):
         self.geom = PoincareManifold()                 # stateless; used for the token log-map
 
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        # VALUE base: W_v · g_p (tangent). NO bias -> no E-independent additive term (keeps E load-bearing).
-        self.w_v = nn.Linear(d_emb, d_emb, bias=False)
-        # Channel GATE from external features [edge, nf] -> modulates the value MULTIPLICATIVELY (never adds).
-        # gate_in == 0 (e.g. wiki, no edge/nf) -> no gate at all (v_p = W_v · g_p).
+        # Channel GATE from external features [edge, nf] -> modulates the RAW tangent MULTIPLICATIVELY (never
+        # adds). gate_in == 0 (e.g. wiki, no edge/nf) -> no gate at all (v_p = g_p, the raw tangent).
         gate_in = d_ef + d_nf
         self.gate = nn.Linear(gate_in, d_emb) if gate_in > 0 else None
         self.gate_scale = nn.Parameter(torch.zeros(d_emb))     # γ LayerScale, init 0 -> gate starts as ×1
@@ -162,8 +160,9 @@ class NeighborhoodProjection(nn.Module):
         t2v = self.time_encoder(torch.log1p(ages))                               # [B,T,t2v_dim]
         log_hop = torch.log1p(walk_bag.positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)  # [B,T,1]
 
-        # VALUE: geometric base (W_v · g_p), channel-gated by [edge, nf] (multiplicative, ≈1 at init).
-        value = self.w_v(token_tangents)                                         # [B,T,d]  E-dependent base
+        # VALUE: the RAW token tangent g_p = Log_{E[u]}(E[token]), channel-gated by [edge, nf] (multiplicative,
+        # ≈1 at init). No W_v — the weight and the [edge, nf] gate interact directly with the raw tangent.
+        value = token_tangents                                                   # [B,T,d]  raw tangent
         if self.gate is not None:
             feats = torch.cat([edge_features, nf_token], dim=-1)                  # [B,T, d_ef+d_nf]
             value = value * (1.0 + self.gate_scale * torch.tanh(self.gate(feats)))
