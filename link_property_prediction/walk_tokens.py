@@ -17,8 +17,10 @@ directly (no separate flatten step).
                                        immediate predecessor, …, lens = oldest node; 0 on padding.
     mask [Q, T]       bool   True on real walk positions (nodes != -1) — INCLUDING the seed.
     seed_mask      [Q, T]       bool   True ONLY on the seed's own walk-origin slot (age 0 & real).
-                                       The context (non-seed) tokens are `mask & ~seed_mask`;
-                                       mid-walk recurrences of the seed are context, not seed_mask.
+    seed_node_mask [Q, T]       bool   True on EVERY real slot whose node == the seed node, i.e. the origin
+                                       slot AND any mid-walk recurrence of the seed. Use `mask & ~seed_node_mask`
+                                       to drop ALL self-node slots (each contributes Log_{E[u]}(E[u])=0 to μ but
+                                       still consumes softmax weight, diluting μ toward 0).
     edge_features  [Q, T, d_ef] float  flattened per-token edge features; the seed slot and padding
                                        carry [0]*d_ef. None if the dataset has no edge features.
 
@@ -46,7 +48,8 @@ class WalkTokens:
     ages: torch.Tensor                              # [Q, T]
     positions: torch.Tensor                         # [Q, T]
     mask: torch.Tensor                    # [Q, T]  bool
-    seed_mask: torch.Tensor                         # [Q, T]  bool
+    seed_mask: torch.Tensor                         # [Q, T]  bool  True ONLY on the seed's origin slot
+    seed_node_mask: torch.Tensor                    # [Q, T]  bool  True on EVERY slot whose node == seed node
     edge_features: Optional[torch.Tensor] = None    # [Q, T, d_ef]
 
 
@@ -70,7 +73,7 @@ def build_query_walk_tokens(
         t = num_walks_per_node * max_walk_len
         empty_i = torch.empty((0, t), dtype=torch.int64, device=device)
         empty_b = torch.empty((0, t), dtype=torch.bool, device=device)
-        return WalkTokens(seeds_t, cutoffs_t, empty_i, empty_i, empty_i, empty_b, empty_b)
+        return WalkTokens(seeds_t, cutoffs_t, empty_i, empty_i, empty_i, empty_b, empty_b, empty_b)
 
     # ── Walk: K backward walks per query, each bounded by its own cutoff t. ──
     wd = walk_gen.walks_for_nodes(
@@ -101,6 +104,7 @@ def build_query_walk_tokens(
     positions = (lens - arange).clamp_min(0)                                            # [Q, K, L]
 
     seed_mask = node_mask & (ages == 0)                                                 # [Q, K, L] seed origin slot
+    seed_node_mask = node_mask & (nodes == seeds_t.view(q, 1, 1))                        # [Q, K, L] ANY seed-node slot
 
     # Per-token edge features → [Q, T, d_ef]. wd.edge_feats is [N*K, L, d_ef] node-aligned; the seed
     # slot (age 0) and padding are forced to [0]*d_ef so they carry no edge. None if the dataset has none.
@@ -120,5 +124,6 @@ def build_query_walk_tokens(
         positions.reshape(q, -1),           # [Q, T]
         node_mask.reshape(q, -1),           # [Q, T]  mask
         seed_mask.reshape(q, -1),           # [Q, T]  seed_mask
+        seed_node_mask.reshape(q, -1),      # [Q, T]  seed_node_mask
         edge_features,                      # [Q, T, d_ef] or None
     )

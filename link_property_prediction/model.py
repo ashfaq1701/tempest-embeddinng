@@ -144,7 +144,7 @@ class NeighborhoodProjection(nn.Module):
         token_tangents = self.geom.logmap(source.unsqueeze(-2), F.embedding(node_ids, emb))  # [B,T,d_emb] ⊥ E[u]
         b, t, _ = token_tangents.shape
 
-        mask = walk_bag.mask & ~walk_bag.seed_mask                               # [B,T]  context (non-seed real)
+        mask = walk_bag.mask & ~walk_bag.seed_mask & ~walk_bag.seed_node_mask    # [B,T]  context (non-seed-node real)
         ages = walk_bag.ages.clamp_min(0).to(token_tangents.dtype)               # [B,T]
 
         # Static node features per token (padding zeroed); empty channel if the dataset has none.
