@@ -73,7 +73,8 @@ class TrainerConfig:
     t2v_dim: int = 16         # Time2Vec output dim (16 ties dim100 on wiki: 0.8287/0.8040 vs 0.8289/0.8046)
 
     # Link loss / head.
-    K_train: int = 100          # per-query training negatives ([B, 1+K_train])
+    K_train: int = 10           # per-query training negatives ([B, 1+K_train]); 10 keeps the candidate
+                                # bag + alignment [S,P] matrix small enough to fit bs 1000 on review
 
     # Walks (BACKWARD only, undirected) for the source side (u → μ_u); the one-sided head samples
     # walks only for the source, each candidate v enters through its static embedding E[v].

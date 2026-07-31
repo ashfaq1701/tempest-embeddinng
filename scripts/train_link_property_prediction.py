@@ -72,9 +72,11 @@ def parse_args() -> argparse.Namespace:
 
     # Link loss / head.
     p.add_argument(
-        "--k-train", type=int, default=100,
+        "--k-train", type=int, default=10,
         help="Per-query training negatives. The head sees [B, 1+K_train] "
-             "candidates per query; positive at column 0.",
+             "candidates per query; positive at column 0. Default 10 keeps the "
+             "candidate bag (and the alignment [S,P] matrix) small enough to fit "
+             "bs 1000 on review / big low-recurrence graphs.",
     )
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
