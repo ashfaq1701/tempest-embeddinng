@@ -98,47 +98,30 @@ class TimeEncoder(nn.Module):
 
 
 class NeighborhoodProjection(nn.Module):
-    """Weighted-MEAN pooling of a source's walk-token tangents into one tangent vector mu_u at E[u].
+    """Weighted-MEAN pooling of a source's walk-token TANGENTS into one tangent vector mu_u at E[u]:
 
-        mu_u = Σ_p softmax(a_p) · g_p,
-        g_p  = Log_{E[u]}(E[token_p])                                  (raw geometric tangent)
-        a_p  = weight_net([Time2Vec(age_p), log1p(hop_p)])            (scalar from time/position ONLY)
+        mu_u = Σ_p softmax(a_p) · g_p,   g_p = Log_{E[u]}(E[token_p])   (raw geometric tangent)
 
-    PURE GEOMETRY — no learned mixing (no W_v) and no feature gate. The value is the raw tangent; the weight
-    is a rotation-invariant scalar from time/position, softmax-normalised over the context tokens. Because
-    every value is a raw tangent and every weight a rotation-invariant scalar, mu_u is ROTATION-INVARIANT
-    (it co-rotates with E). Fed to exp_{E[u]} downstream -> P[u]. Candidate-independent; cold rows (no
-    context token) -> mu_u = 0 -> P[u] = E[u]. (Static node / edge features are handled separately by
-    NeighborFeatureProjection.)"""
+    The per-token weight logits a_p are computed ONCE by LinkPredHead (its shared recency/hop weight net)
+    and passed in; here they are softmaxed over the GEOMETRY context (mask & ~seed_mask & ~seed_node_mask —
+    seed-node revisits are dropped, since Log_{E[u]}(E[u]) = 0 contributes nothing but would dilute). PURE
+    GEOMETRY and PARAMETER-FREE: raw tangents pooled by rotation-invariant scalar weights, so mu_u is
+    ROTATION-INVARIANT. Fed to exp_{E[u]} downstream -> P[u]. Cold rows (no context) -> mu_u = 0 -> P[u]=E[u]."""
 
-    def __init__(self, d_emb: int, t2v_dim: int = 16):
+    def __init__(self):
         super().__init__()
-        self.d_emb = d_emb
         self.geom = PoincareManifold()                 # stateless; used for the token log-map
-        self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        # WEIGHT net: [Time2Vec(age), log1p(hop)] -> scalar per token (softmax over context tokens).
-        w_in = t2v_dim + 1
-        self.weight_net = nn.Sequential(
-            nn.Linear(w_in, w_in), nn.GELU(), nn.Linear(w_in, 1))
 
-    def forward(self, walk_bag: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
-        """walk_bag: the flattened WalkTokens bag. emb: the FULL node-embedding table [num_nodes,d_emb] in
-        the Poincaré ball. Returns mu_u [B,d_emb], a tangent vector at E[u]; cold rows -> 0."""
+    def forward(self, walk_bag: WalkTokens, emb: torch.Tensor, w_logit: torch.Tensor) -> torch.Tensor:
+        """walk_bag: flattened WalkTokens. emb: full [num_nodes,d_emb] table in the ball. w_logit: [B,T]
+        shared per-token weight logits. Returns mu_u [B,d_emb], a tangent at E[u]; cold rows -> 0."""
         node_ids = walk_bag.nodes.clamp_min(0)                                    # [B,T]  (padding → row 0)
         source = F.embedding(walk_bag.seeds, emb)                                 # E[u]  [B,d_emb]
         token_tangents = self.geom.logmap(source.unsqueeze(-2), F.embedding(node_ids, emb))  # [B,T,d_emb]
 
-        mask = walk_bag.mask & ~walk_bag.seed_mask & ~walk_bag.seed_node_mask    # [B,T]  context (non-seed-node real)
-        ages = walk_bag.ages.clamp_min(0).to(token_tangents.dtype)               # [B,T]
-
-        # TPNet scales delta-times by log(Δt + 1) before the time encoder.
-        t2v = self.time_encoder(torch.log1p(ages))                               # [B,T,t2v_dim]
-        log_hop = torch.log1p(walk_bag.positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)  # [B,T,1]
-
-        # WEIGHT: scalar per token from [Time2Vec(age), log-hop]; softmax over the context tokens.
-        w_logit = self.weight_net(torch.cat([t2v, log_hop], dim=-1)).squeeze(-1)  # [B,T]
-        w_logit = w_logit.masked_fill(~mask, float("-inf"))
-        weights = torch.nan_to_num(torch.softmax(w_logit, dim=-1), nan=0.0)       # [B,T]; cold row -> 0
+        mask = walk_bag.mask & ~walk_bag.seed_mask & ~walk_bag.seed_node_mask    # [B,T]  geometry context
+        weights = torch.nan_to_num(
+            torch.softmax(w_logit.masked_fill(~mask, float("-inf")), dim=-1), nan=0.0)   # [B,T]; cold row -> 0
 
         # mu = weighted mean of the RAW token tangents (rotation-invariant). No ⊥-projection on the ball;
         # mu is fed to exp_{E[u]} downstream -> P[u].  (cold rows: mu = 0 -> P[u] = E[u].)
@@ -146,10 +129,11 @@ class NeighborhoodProjection(nn.Module):
 
 
 class NeighborFeatureProjection(nn.Module):
-    """Per-token encoder for the walk tokens' STATIC node features + per-token edge features — the
-    NON-geometric channel, kept separate from the (rotation-invariant) NeighborhoodProjection. Concatenates
-    [node_feat, edge_feat] per token, encodes to a feature_dim vector, and LayerNorms it. Returns a 0-width
-    [B, T, 0] tensor when the dataset has neither node nor edge features (d_nf == d_ef == 0)."""
+    """WEIGHTED-mean-pooled encoder for the walk tokens' STATIC node features + per-token edge features —
+    the non-geometric channel, kept separate from the (rotation-invariant) NeighborhoodProjection. Per
+    token: concat [node_feat, edge_feat] -> Linear-GELU-Linear -> LayerNorm. Pooled to one [N, feature_dim]
+    vector by the SAME shared recency/hop weights (passed in as w_logit), softmaxed over (mask & ~seed_mask)
+    — only non-seed tokens carry an edge feature. Returns [N, 0] when d_nf == d_ef == 0."""
 
     def __init__(self, d_nf: int, d_ef: int, feature_dim: int = 16):
         super().__init__()
@@ -162,31 +146,34 @@ class NeighborFeatureProjection(nn.Module):
                 nn.Linear(in_dim, feature_dim), nn.GELU(), nn.Linear(feature_dim, feature_dim))
             self.out_norm = nn.LayerNorm(feature_dim)
 
-    def forward(self, walk_bag: WalkTokens,
-                node_features: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Returns [B, T, feature_dim] per-token LayerNorm-ed feature encodings, or [B, T, 0] if the dataset
-        has no node/edge features. node_features: the FULL static node-feature table [num_nodes, d_nf]."""
-        node_ids = walk_bag.nodes.clamp_min(0)                                    # [B,T]  (padding → row 0)
-        b, t = node_ids.shape
+    def forward(self, walk_bag: WalkTokens, node_features: Optional[torch.Tensor],
+                w_logit: torch.Tensor) -> torch.Tensor:
+        """Returns [N, feature_dim] the recency/hop-weighted mean of the per-token feature encodings, or
+        [N, 0] if the dataset has no node/edge features. w_logit: [N, T] shared per-token weight logits."""
+        node_ids = walk_bag.nodes.clamp_min(0)                                    # [N,T]  (padding → row 0)
+        n, t = node_ids.shape
         dev = node_ids.device
         if self.feature_dim == 0:
-            return torch.zeros(b, t, 0, device=dev)
-
-        # Only non-seed real tokens carry a (non-empty) edge feature — the seed slot has no outgoing edge.
-        mask = (walk_bag.mask & ~walk_bag.seed_mask).unsqueeze(-1)                # [B,T,1]
+            return torch.zeros(n, 0, device=dev)
 
         if node_features is None or self.d_nf == 0:
-            nf_token = torch.zeros(b, t, self.d_nf, device=dev)
+            nf_token = torch.zeros(n, t, self.d_nf, device=dev)
         else:
-            nf_token = F.embedding(node_ids, node_features)                       # [B,T,d_nf]
+            nf_token = F.embedding(node_ids, node_features)                       # [N,T,d_nf]
 
         if walk_bag.edge_features is None or self.d_ef == 0:
-            edge_features = torch.zeros(b, t, self.d_ef, device=dev)
+            edge_features = torch.zeros(n, t, self.d_ef, device=dev)
         else:
-            edge_features = walk_bag.edge_features                                # [B,T,d_ef]
+            edge_features = walk_bag.edge_features                                # [N,T,d_ef]
 
-        feats = torch.cat([nf_token, edge_features], dim=-1) * mask                # zero seed slot + padding
-        return self.out_norm(self.encode(feats)) * mask                           # [B,T,feature_dim], masked
+        ft = self.out_norm(self.encode(torch.cat([nf_token, edge_features], dim=-1)))    # [N,T,F]  per-token
+
+        # Weighted mean via the shared weights, softmaxed over the non-seed real tokens (seed slot / padding
+        # get weight 0 -> excluded; cold rows -> all-0 weights -> 0 vector).
+        mask = walk_bag.mask & ~walk_bag.seed_mask                                # [N,T]
+        weights = torch.nan_to_num(
+            torch.softmax(w_logit.masked_fill(~mask, float("-inf")), dim=-1), nan=0.0)   # [N,T]
+        return (weights.unsqueeze(-1) * ft).sum(dim=-2)                           # [N,F]  weighted mean
 
 
 class LinkPredHead(nn.Module):
@@ -217,10 +204,17 @@ class LinkPredHead(nn.Module):
             init = self.geom.manifold.random_normal(num_nodes, d_emb, std=1e-2)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        self.neighbourhood = NeighborhoodProjection(d_emb=d_emb, t2v_dim=t2v_dim)
-        # Non-geometric per-token feature channel (static node + per-token edge features). feature_dim 16;
-        # 0-width (no-op) when the dataset has no node/edge features. Pooled per-node and fed to the scorer.
+        self.neighbourhood = NeighborhoodProjection()   # parameter-free tangent pooling (weights passed in)
+        # Non-geometric feature channel (static node + per-token edge features). feature_dim 16; 0-width
+        # (no-op) when the dataset has no node/edge features. Weighted-mean pooled per node -> scorer.
         self.neighbour_feats = NeighborFeatureProjection(d_nf=self.d_nf, d_ef=d_ef, feature_dim=16)
+        # SHARED recency/hop weight net: [Time2Vec(age), log1p(hop)] -> one per-token weight logit, used to
+        # pool BOTH the geometry tangents (NeighborhoodProjection) and the feature encodings
+        # (NeighborFeatureProjection). One "token relevance" function; each channel softmaxes over its own mask.
+        self.time_encoder = TimeEncoder(time_dim=t2v_dim)
+        w_in = t2v_dim + 1
+        self.weight_net = nn.Sequential(
+            nn.Linear(w_in, w_in), nn.GELU(), nn.Linear(w_in, 1))
 
         # Scorer: MLP over the 4 pairwise GEODESIC DISTANCES between {E[x], P[x]} of u and v, plus each node's
         # static node features nf[·] and its pooled walk-neighbour feature encoding (NeighborFeatureProjection).
@@ -229,13 +223,20 @@ class LinkPredHead(nn.Module):
         self.scorer = nn.Sequential(
             nn.Linear(score_in, 32), nn.GELU(), nn.Linear(32, 1))
 
-    def _project(self, tokens: WalkTokens) -> torch.Tensor:
-        """Neighbourhood projection P[x] = exp_{E[seed]}(mu) [N, d] for a bag of N queries. The
-        neighbourhood takes the bag + the full E table and derives E[u] / token tangents / stable
-        feats / masks itself; E[seed] is looked up separately by the caller."""
+    def _token_weight_logits(self, tokens: WalkTokens) -> torch.Tensor:
+        """Shared per-token recency/hop weight logits [N, T] from [Time2Vec(log1p(age)), log1p(hop)].
+        Computed once per bag; each channel softmaxes over its own context mask."""
+        ages = tokens.ages.clamp_min(0).to(self.E.weight.dtype)                       # [N, T]
+        t2v = self.time_encoder(torch.log1p(ages))                                   # [N, T, t2v_dim]
+        log_hop = torch.log1p(tokens.positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)  # [N, T, 1]
+        return self.weight_net(torch.cat([t2v, log_hop], dim=-1)).squeeze(-1)         # [N, T]
+
+    def _project(self, tokens: WalkTokens, w_logit: torch.Tensor) -> torch.Tensor:
+        """Neighbourhood projection P[x] = exp_{E[seed]}(mu) [N, d]. w_logit: the bag's shared per-token
+        weight logits. E is read DETACHED (E is trained by the alignment loss, not the link head)."""
         emb = self.E.weight.detach()                                                 # link head reads E DETACHED
         e_seed = F.embedding(tokens.seeds, emb)                                      # E[seed]  [N, d]
-        mu = self.neighbourhood(tokens, emb)                                         # [N, d]
+        mu = self.neighbourhood(tokens, emb, w_logit)                                # [N, d]
         return self.geom.expmap(e_seed, mu)                                          # P[x]  [N, d]
 
     def _node_feats(self, seeds: torch.Tensor) -> torch.Tensor:
@@ -245,28 +246,23 @@ class LinkPredHead(nn.Module):
             return self.E.weight.new_zeros(seeds.shape[0], 0)
         return F.embedding(seeds, self.node_features)
 
-    def _neighbour_feats(self, tokens: WalkTokens) -> torch.Tensor:
-        """Pooled walk-neighbour feature encoding for a bag of N queries -> [N, feature_dim]: a masked MEAN
-        over the seed's non-seed real tokens of NeighborFeatureProjection's per-token encodings. Zero-width
-        [N, 0] when the dataset has no node/edge features."""
-        ft = self.neighbour_feats(tokens, self.node_features)                        # [N, T, F] (0 at seed/pad)
-        n = (tokens.mask & ~tokens.seed_mask).unsqueeze(-1).to(ft.dtype)             # [N, T, 1]
-        return ft.sum(dim=-2) / n.sum(dim=-2).clamp_min(1.0)                          # [N, F]  masked mean
-
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Two-sided scoring. src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate
         queries (seeds = v) in query-major order, each walked with its query's cutoff. Logit = MLP over
         [ d(E_u,E_v), d(E_u,P_v), d(P_u,E_v), d(P_u,P_v), nf[u], nf[v], nbhd_feat[u], nbhd_feat[v] ]
         per (u, candidate v). Returns logits [B, C]."""
         emb = self.E.weight.detach()                                          # link head reads E DETACHED
+        # Shared per-token weight logits, computed once per bag and used to pool BOTH channels.
+        w_src = self._token_weight_logits(src_tokens)                         # [B, T]
+        w_cand = self._token_weight_logits(cand_tokens)                       # [B*C, T]
         seed_u = F.embedding(src_tokens.seeds, emb)                           # E[u]   [B, d]
-        nbhd_u = self._project(src_tokens)                                    # P[u]   [B, d]
+        nbhd_u = self._project(src_tokens, w_src)                             # P[u]   [B, d]
         nf_u = self._node_feats(src_tokens.seeds)                             # nf[u]  [B, d_nf]
+        nbhd_feat_u = self.neighbour_feats(src_tokens, self.node_features, w_src)   # nbhd_feat[u]  [B, F]
         seed_v = F.embedding(cand_tokens.seeds, emb)                          # E[v]   [B*C, d]
-        nbhd_v = self._project(cand_tokens)                                   # P[v]   [B*C, d]
+        nbhd_v = self._project(cand_tokens, w_cand)                           # P[v]   [B*C, d]
         nf_v = self._node_feats(cand_tokens.seeds)                            # nf[v]  [B*C, d_nf]
-        nbhd_feat_u = self._neighbour_feats(src_tokens)                           # nbhd_feat[u]  [B, F]
-        nbhd_feat_v = self._neighbour_feats(cand_tokens)                          # nbhd_feat[v]  [B*C, F]
+        nbhd_feat_v = self.neighbour_feats(cand_tokens, self.node_features, w_cand)  # nbhd_feat[v]  [B*C, F]
 
         b, d = seed_u.shape
         c = seed_v.shape[0] // b
