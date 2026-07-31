@@ -66,6 +66,8 @@ class TrainerConfig:
                              # NeighborhoodProjection attention keys. Set from the loaded dataset.
     node_feat: Optional[np.ndarray] = None   # [num_nodes, d_nf] static node features (None if the dataset
                                              # has none); fed to the head (d_nf derived). Set from the dataset.
+    feature_dim: int = 16     # NeighborFeatureProjection output width (per-token node+edge feature encoding);
+                             # collapses to 0 when the dataset has neither node nor edge features.
 
     # NeighborhoodProjection (attention pooling of the source's walk-token offsets -> mu_u).
     t2v_dim: int = 16         # Time2Vec output dim (16 ties dim100 on wiki: 0.8287/0.8040 vs 0.8289/0.8046)
@@ -120,6 +122,7 @@ class Trainer:
             d_emb=int(config.d_emb),
             t2v_dim=int(config.t2v_dim),
             d_ef=int(config.d_ef),
+            feature_dim=int(config.feature_dim),
             node_features=node_feats,
         ).to(self.device)
 

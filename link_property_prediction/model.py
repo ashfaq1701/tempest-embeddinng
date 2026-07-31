@@ -178,7 +178,7 @@ class NeighborFeatureProjection(nn.Module):
 
 class LinkPredHead(nn.Module):
     def __init__(self, num_nodes: int, d_emb: int,
-                 t2v_dim: int = 16, d_ef: int = 0,
+                 t2v_dim: int = 16, d_ef: int = 0, feature_dim: int = 16,
                  node_features: Optional[torch.Tensor] = None):
         super().__init__()
         self.num_nodes = num_nodes
@@ -205,9 +205,9 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
         self.neighbourhood = NeighborhoodProjection()   # parameter-free tangent pooling (weights passed in)
-        # Non-geometric feature channel (static node + per-token edge features). feature_dim 16; 0-width
-        # (no-op) when the dataset has no node/edge features. Weighted-mean pooled per node -> scorer.
-        self.neighbour_feats = NeighborFeatureProjection(d_nf=self.d_nf, d_ef=d_ef, feature_dim=16)
+        # Non-geometric feature channel (static node + per-token edge features). feature_dim from config;
+        # 0-width (no-op) when the dataset has no node/edge features. Weighted-mean pooled per node -> scorer.
+        self.neighbour_feats = NeighborFeatureProjection(d_nf=self.d_nf, d_ef=d_ef, feature_dim=feature_dim)
         # SHARED recency/hop weight net: [Time2Vec(age), log1p(hop)] -> one per-token weight logit, used to
         # pool BOTH the geometry tangents (NeighborhoodProjection) and the feature encodings
         # (NeighborFeatureProjection). One "token relevance" function; each channel softmaxes over its own mask.

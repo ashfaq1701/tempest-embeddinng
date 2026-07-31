@@ -66,6 +66,9 @@ def parse_args() -> argparse.Namespace:
     # (Query/key MLPs project to d_emb — no separate attention dim.)
     p.add_argument("--t2v-dim", default=16, type=int,
                    help="Time2Vec output dim (16 ties dim 100 on wiki; TPNet default was 100).")
+    p.add_argument("--feature-dim", default=16, type=int,
+                   help="NeighborFeatureProjection output width (per-token node+edge feature encoding); "
+                        "collapses to 0 when the dataset has neither node nor edge features.")
 
     # Link loss / head.
     p.add_argument(
@@ -267,6 +270,7 @@ def main() -> Dict[str, Any]:
         node_feat=loaded.node_feat,
 
         t2v_dim=args.t2v_dim,
+        feature_dim=args.feature_dim,
 
         K_train=args.k_train,
 
