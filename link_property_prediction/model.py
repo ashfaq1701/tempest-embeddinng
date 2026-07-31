@@ -1,8 +1,8 @@
 """Link head — Poincaré-ball node embeddings + a walk-neighbourhood scoring head, in one module.
 
 Per (u, candidate v) the logit is an MLP (self.scorer) over:
-  - 4 pairwise GEODESIC DISTANCES between {E[·], P[·]} of u and v:
-        d(E_u,E_v), d(E_u,P_v), d(P_u,E_v), d(P_u,P_v)
+  - 6 pairwise GEODESIC DISTANCES between {E[·], P[·]} of u and v:
+        d(E_u,E_v), d(E_u,P_v), d(P_u,E_v), d(P_u,P_v)  (4 cross)  +  d(E_u,P_u), d(E_v,P_v)  (2 self-disp)
   - each node's per-dim-standardised STATIC node features   nf[u], nf[v]
   - each node's pooled WALK-NEIGHBOUR feature encoding       nbhd_feat[u], nbhd_feat[v]
         (NeighborFeatureProjection over the walk tokens' node/edge features, masked-mean pooled)
@@ -219,7 +219,8 @@ class LinkPredHead(nn.Module):
         # Scorer: MLP over the 4 pairwise GEODESIC DISTANCES between {E[x], P[x]} of u and v, plus each node's
         # static node features nf[·] and its pooled walk-neighbour feature encoding (NeighborFeatureProjection).
         # Distances are isometry-invariant; nf / nbhd-feats are external, frame-free channels.
-        score_in = 4 + 2 * self.d_nf + 2 * self.neighbour_feats.feature_dim   # 4 dists + nf[u,v] + nbhd_feat[u,v]
+        # 6 dists = 4 cross + 2 self-displacements d(E,P); + nf[u,v] + nbhd_feat[u,v].
+        score_in = 6 + 2 * self.d_nf + 2 * self.neighbour_feats.feature_dim
         self.scorer = nn.Sequential(
             nn.Linear(score_in, 32), nn.GELU(), nn.Linear(32, 1))
 
@@ -277,12 +278,15 @@ class LinkPredHead(nn.Module):
         nbhd_feat_v = nbhd_feat_v.reshape(b, c, fd)                                   # [B, C, F]
         nbhd_feat_u = nbhd_feat_u.unsqueeze(1).expand(b, c, fd)                       # [B, C, F]
 
-        # Four pairwise geodesic distances (self.geom.dist) between u's and v's identity / nbhd points.
+        # Six pairwise geodesic distances (self.geom.dist): the 4 cross distances + the 2 self-displacements
+        # d(E[·], P[·]) that complete the frame-free set (0 exactly for a cold row, where P = E).
         distances = torch.stack([
             self.geom.dist(seed_u, seed_v),                                  # d(E[u], E[v])  identity affinity
             self.geom.dist(seed_u, nbhd_v),                                  # d(E[u], P[v])  is u in v's nbhd
             self.geom.dist(nbhd_u, seed_v),                                  # d(P[u], E[v])  is v in u's nbhd
             self.geom.dist(nbhd_u, nbhd_v),                                  # d(P[u], P[v])  nbhd overlap
-        ], dim=-1)                                                            # [B, C, 4]
-        feats = torch.cat([distances, nf_u, nf_v, nbhd_feat_u, nbhd_feat_v], dim=-1)  # [B, C, 4 + 2*d_nf + 2*F]
+            self.geom.dist(seed_u, nbhd_u),                                  # d(E[u], P[u])  u's self-displacement
+            self.geom.dist(seed_v, nbhd_v),                                  # d(E[v], P[v])  v's self-displacement
+        ], dim=-1)                                                            # [B, C, 6]
+        feats = torch.cat([distances, nf_u, nf_v, nbhd_feat_u, nbhd_feat_v], dim=-1)  # [B, C, 6 + 2*d_nf + 2*F]
         return self.scorer(feats).squeeze(-1)                                 # [B, C]
