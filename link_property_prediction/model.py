@@ -1,17 +1,19 @@
-"""Link head — Poincaré-ball node embeddings + a deep neighbourhood-projection channel, in one module.
+"""Link head — Poincaré-ball node embeddings + a walk-neighbourhood scoring head, in one module.
 
-    logit = <P[u], E[v]>                               is v near u's neighbourhood?
+Per (u, candidate v) the logit is an MLP (self.scorer) over:
+  - 4 pairwise GEODESIC DISTANCES between {E[·], P[·]} of u and v:
+        d(E_u,E_v), d(E_u,P_v), d(P_u,E_v), d(P_u,P_v)
+  - each node's per-dim-standardised STATIC node features   nf[u], nf[v]
+  - each node's pooled WALK-NEIGHBOUR feature encoding       nbhd_feat[u], nbhd_feat[v]
+        (NeighborFeatureProjection over the walk tokens' node/edge features, masked-mean pooled)
 
-where P[u] = exp_{E[u]}(mu_u) pushes the source off E[u] toward mu_u — the deep pooling of u's
-walk-token tangents (in the tangent space at E[u]) + a TPNet Time2Vec of each token's age, produced
-by NeighborhoodProjection. One-sided: only u is walked/projected; each candidate v enters through
-its static embedding E[v]. The head owns self.E (a ManifoldParameter on a geoopt.PoincareBall, link-
-trained on it); geometry goes through self.geom (PoincareManifold): dist/logmap/expmap all proxy to
-geoopt (the ball's expmap has a finite gradient at the cold-row zero tangent).
+P[x] = exp_{E[x]}(mu_x) pushes x off E[x] toward mu_x — the ROTATION-INVARIANT weighted mean of x's
+walk-token tangents (NeighborhoodProjection: pure geometry, no learned mixing and no feature gate).
 
-(The dual-sided variant — walk every candidate too and score <P[u], P[v]> — was falsified on wiki:
-at matched walks it lost to one-sided at ~8x the cost. It lives one `git revert` away; see the
-"Important: revert this commit to bring back dual side walks" commit.)
+TWO-SIDED: both the source u AND every candidate v are walked and projected (P[u], P[v] both used).
+The head owns self.E (a ManifoldParameter on a geoopt.PoincareBall, link-trained on it); geometry goes
+through self.geom (PoincareManifold): dist/logmap/expmap all proxy to geoopt (the ball's expmap has a
+finite gradient at the cold-row zero tangent).
 """
 from typing import Optional
 
@@ -96,87 +98,95 @@ class TimeEncoder(nn.Module):
 
 
 class NeighborhoodProjection(nn.Module):
-    """Weighted-sum pooling of a source's walk-token values into one tangent vector mu_u at E[u].
+    """Weighted-MEAN pooling of a source's walk-token tangents into one tangent vector mu_u at E[u].
 
-    Two nets, one weighted sum:
-      VALUE  v_p = (W_v · g_p) ⊙ (1 + γ ⊙ tanh(gate([edge_p, nf_p])))
-             g_p = Log_{E[u]}(E[token_p]) is the E-DEPENDENT geometric content; W_v has NO bias, so there
-             is no E-independent additive term. External features [edge, nf] enter ONLY as a MULTIPLICATIVE
-             per-channel gate (γ = LayerScale, init 0 -> starts ×1), so they modulate the geometry but
-             cannot bypass E. gate is None when the dataset has no edge/node features (then v_p = W_v · g_p).
-      WEIGHT a_p = weight_net([Time2Vec(age_p), log1p(hop_p)]) — a scalar from time/position ONLY
-             (isometry-invariant, content-free), softmax-normalised over the CONTEXT tokens. Because the
-             weight never sees identity it CANNOT select-and-copy a token; it only up-weights recent/close ones.
-      mu_u = Σ_p softmax(a)_p · v_p.
+        mu_u = Σ_p softmax(a_p) · g_p,
+        g_p  = Log_{E[u]}(E[token_p])                                  (raw geometric tangent)
+        a_p  = weight_net([Time2Vec(age_p), log1p(hop_p)])            (scalar from time/position ONLY)
 
-    Every external signal (age/hop, edge/nf) enters MULTIPLICATIVELY; the tangent is the sole additive base,
-    so nothing predicts without routing through E's geometry (free-lunch-resistant by construction). mu_u is
-    projected onto T_{E[u]} (⊥ E[u]) and fed to exp_{E[u]} downstream -> P[u]. Candidate-independent (never
-    sees E[v]); cold rows (no context token) -> mu_u = 0 -> P[u] = E[u]."""
+    PURE GEOMETRY — no learned mixing (no W_v) and no feature gate. The value is the raw tangent; the weight
+    is a rotation-invariant scalar from time/position, softmax-normalised over the context tokens. Because
+    every value is a raw tangent and every weight a rotation-invariant scalar, mu_u is ROTATION-INVARIANT
+    (it co-rotates with E). Fed to exp_{E[u]} downstream -> P[u]. Candidate-independent; cold rows (no
+    context token) -> mu_u = 0 -> P[u] = E[u]. (Static node / edge features are handled separately by
+    NeighborFeatureProjection.)"""
 
-    def __init__(self, d_emb: int, t2v_dim: int = 16, d_ef: int = 0, d_nf: int = 0):
+    def __init__(self, d_emb: int, t2v_dim: int = 16):
         super().__init__()
         self.d_emb = d_emb
-        self.d_ef = d_ef
-        self.d_nf = d_nf
         self.geom = PoincareManifold()                 # stateless; used for the token log-map
-
         self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        # Channel GATE from external features [edge, nf] -> modulates the RAW tangent MULTIPLICATIVELY (never
-        # adds). gate_in == 0 (e.g. wiki, no edge/nf) -> no gate at all (v_p = g_p, the raw tangent).
-        gate_in = d_ef + d_nf
-        self.gate = nn.Linear(gate_in, d_emb) if gate_in > 0 else None
-        self.gate_scale = nn.Parameter(torch.zeros(d_emb))     # γ LayerScale, init 0 -> gate starts as ×1
         # WEIGHT net: [Time2Vec(age), log1p(hop)] -> scalar per token (softmax over context tokens).
         w_in = t2v_dim + 1
         self.weight_net = nn.Sequential(
             nn.Linear(w_in, w_in), nn.GELU(), nn.Linear(w_in, 1))
 
-    def forward(self, walk_bag: WalkTokens, emb: torch.Tensor,
-                node_features: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """walk_bag: the flattened WalkTokens bag. emb: the FULL node-embedding table [num_nodes,d_emb]
-        in the Poincaré ball. node_features: the FULL static node-feature table [num_nodes, d_nf] (None if
-        the dataset has none). Returns mu_u [B,d_emb], a tangent vector at E[u]; cold rows -> 0."""
+    def forward(self, walk_bag: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
+        """walk_bag: the flattened WalkTokens bag. emb: the FULL node-embedding table [num_nodes,d_emb] in
+        the Poincaré ball. Returns mu_u [B,d_emb], a tangent vector at E[u]; cold rows -> 0."""
         node_ids = walk_bag.nodes.clamp_min(0)                                    # [B,T]  (padding → row 0)
         source = F.embedding(walk_bag.seeds, emb)                                 # E[u]  [B,d_emb]
-        token_tangents = self.geom.logmap(source.unsqueeze(-2), F.embedding(node_ids, emb))  # [B,T,d_emb] ⊥ E[u]
-        b, t, _ = token_tangents.shape
+        token_tangents = self.geom.logmap(source.unsqueeze(-2), F.embedding(node_ids, emb))  # [B,T,d_emb]
 
         mask = walk_bag.mask & ~walk_bag.seed_mask & ~walk_bag.seed_node_mask    # [B,T]  context (non-seed-node real)
         ages = walk_bag.ages.clamp_min(0).to(token_tangents.dtype)               # [B,T]
 
-        # Static node features per token (padding zeroed); empty channel if the dataset has none.
-        if node_features is None:
-            nf_token = token_tangents.new_zeros(b, t, self.d_nf)                  # [B,T,0]
-        else:
-            nf_token = F.embedding(node_ids, node_features) * walk_bag.mask.unsqueeze(-1)   # [B,T,d_nf]
-
-        # Edge features (seed/padding already zeroed on the bag); empty channel if absent.
-        edge_features = walk_bag.edge_features                                    # [B,T,d_ef] or None
-        if edge_features is None:
-            edge_features = token_tangents.new_zeros(b, t, self.d_ef)             # [B,T,0]
-
         # TPNet scales delta-times by log(Δt + 1) before the time encoder.
         t2v = self.time_encoder(torch.log1p(ages))                               # [B,T,t2v_dim]
         log_hop = torch.log1p(walk_bag.positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)  # [B,T,1]
-
-        # VALUE: the RAW token tangent g_p = Log_{E[u]}(E[token]), channel-gated by [edge, nf] (multiplicative,
-        # ≈1 at init). No W_v — the weight and the [edge, nf] gate interact directly with the raw tangent.
-        value = token_tangents                                                   # [B,T,d]  raw tangent
-        if self.gate is not None:
-            feats = torch.cat([edge_features, nf_token], dim=-1)                  # [B,T, d_ef+d_nf]
-            value = value * (1.0 + self.gate_scale * torch.tanh(self.gate(feats)))
 
         # WEIGHT: scalar per token from [Time2Vec(age), log-hop]; softmax over the context tokens.
         w_logit = self.weight_net(torch.cat([t2v, log_hop], dim=-1)).squeeze(-1)  # [B,T]
         w_logit = w_logit.masked_fill(~mask, float("-inf"))
         weights = torch.nan_to_num(torch.softmax(w_logit, dim=-1), nan=0.0)       # [B,T]; cold row -> 0
 
-        mu = (weights.unsqueeze(-1) * value).sum(dim=-2)                          # [B,d]  weighted sum
+        # mu = weighted mean of the RAW token tangents (rotation-invariant). No ⊥-projection on the ball;
+        # mu is fed to exp_{E[u]} downstream -> P[u].  (cold rows: mu = 0 -> P[u] = E[u].)
+        return (weights.unsqueeze(-1) * token_tangents).sum(dim=-2)               # [B,d]
 
-        # On the Poincaré ball the tangent space at E[u] is all of R^d (no ⊥-projection); mu is fed to
-        # exp_{E[u]} downstream -> P[u].  (cold rows: mu = 0 -> P[u] = E[u].)
-        return mu
+
+class NeighborFeatureProjection(nn.Module):
+    """Per-token encoder for the walk tokens' STATIC node features + per-token edge features — the
+    NON-geometric channel, kept separate from the (rotation-invariant) NeighborhoodProjection. Concatenates
+    [node_feat, edge_feat] per token, encodes to a feature_dim vector, and LayerNorms it. Returns a 0-width
+    [B, T, 0] tensor when the dataset has neither node nor edge features (d_nf == d_ef == 0)."""
+
+    def __init__(self, d_nf: int, d_ef: int, feature_dim: int = 16):
+        super().__init__()
+        self.d_nf = d_nf
+        self.d_ef = d_ef
+        in_dim = d_nf + d_ef
+        self.feature_dim = feature_dim if in_dim > 0 else 0        # overridden to 0 when no features present
+        if self.feature_dim > 0:
+            self.encode = nn.Sequential(
+                nn.Linear(in_dim, feature_dim), nn.GELU(), nn.Linear(feature_dim, feature_dim))
+            self.out_norm = nn.LayerNorm(feature_dim)
+
+    def forward(self, walk_bag: WalkTokens,
+                node_features: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Returns [B, T, feature_dim] per-token LayerNorm-ed feature encodings, or [B, T, 0] if the dataset
+        has no node/edge features. node_features: the FULL static node-feature table [num_nodes, d_nf]."""
+        node_ids = walk_bag.nodes.clamp_min(0)                                    # [B,T]  (padding → row 0)
+        b, t = node_ids.shape
+        dev = node_ids.device
+        if self.feature_dim == 0:
+            return torch.zeros(b, t, 0, device=dev)
+
+        # Only non-seed real tokens carry a (non-empty) edge feature — the seed slot has no outgoing edge.
+        mask = (walk_bag.mask & ~walk_bag.seed_mask).unsqueeze(-1)                # [B,T,1]
+
+        if node_features is None or self.d_nf == 0:
+            nf_token = torch.zeros(b, t, self.d_nf, device=dev)
+        else:
+            nf_token = F.embedding(node_ids, node_features)                       # [B,T,d_nf]
+
+        if walk_bag.edge_features is None or self.d_ef == 0:
+            edge_features = torch.zeros(b, t, self.d_ef, device=dev)
+        else:
+            edge_features = walk_bag.edge_features                                # [B,T,d_ef]
+
+        feats = torch.cat([nf_token, edge_features], dim=-1) * mask                # zero seed slot + padding
+        return self.out_norm(self.encode(feats)) * mask                           # [B,T,feature_dim], masked
 
 
 class LinkPredHead(nn.Module):
@@ -188,9 +198,14 @@ class LinkPredHead(nn.Module):
         self.d_emb = d_emb
         self.d_ef = d_ef
         self.d_nf = 0 if node_features is None else int(node_features.shape[1])
-        # Static per-node feature table [num_nodes, d_nf] (dataset-derived, NOT learned). A buffer so
-        # it rides model.to(device) and stays out of the optimizer; non-persistent (derivable from the
-        # dataset, so kept out of checkpoints). None when the dataset has no node features.
+        # Static per-node feature table [num_nodes, d_nf] (dataset-derived, NOT learned). Per-dimension
+        # STANDARDISED (z-score across nodes) so nf[u], nf[v] enter the scorer at ~unit scale — consistent
+        # with the LayerNorm-ed nbhd feats, and well-conditioned for the MLP (raw features can be arbitrary
+        # scale). A buffer so it rides model.to(device) and stays out of the optimizer; non-persistent.
+        if node_features is not None and self.d_nf > 0:
+            mu = node_features.mean(dim=0, keepdim=True)
+            sd = node_features.std(dim=0, keepdim=True).clamp_min(1e-6)
+            node_features = (node_features - mu) / sd                    # [num_nodes, d_nf]  per-dim z-score
         self.register_buffer("node_features", node_features, persistent=False)
         self.geom = PoincareManifold()
 
@@ -202,13 +217,15 @@ class LinkPredHead(nn.Module):
             init = self.geom.manifold.random_normal(num_nodes, d_emb, std=1e-2)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        self.neighbourhood = NeighborhoodProjection(
-            d_emb=d_emb, t2v_dim=t2v_dim, d_ef=d_ef, d_nf=self.d_nf)
+        self.neighbourhood = NeighborhoodProjection(d_emb=d_emb, t2v_dim=t2v_dim)
+        # Non-geometric per-token feature channel (static node + per-token edge features). feature_dim 16;
+        # 0-width (no-op) when the dataset has no node/edge features. Pooled per-node and fed to the scorer.
+        self.neighbour_feats = NeighborFeatureProjection(d_nf=self.d_nf, d_ef=d_ef, feature_dim=16)
 
-        # Scorer: MLP over the 4 pairwise GEODESIC DISTANCES between {E[x], P[x]} of u and v, plus the two
-        # nodes' static node features nf[u], nf[v]. The distances are isometry-invariant (no raw coords);
-        # nf[·] are external, frame-free channels. LOWER distance = closer (the MLP learns the sign).
-        score_in = 4 + 2 * self.d_nf                             # 4 distances + nf[u] + nf[v]
+        # Scorer: MLP over the 4 pairwise GEODESIC DISTANCES between {E[x], P[x]} of u and v, plus each node's
+        # static node features nf[·] and its pooled walk-neighbour feature encoding (NeighborFeatureProjection).
+        # Distances are isometry-invariant; nf / nbhd-feats are external, frame-free channels.
+        score_in = 4 + 2 * self.d_nf + 2 * self.neighbour_feats.feature_dim   # 4 dists + nf[u,v] + nbhd_feat[u,v]
         self.scorer = nn.Sequential(
             nn.Linear(score_in, 32), nn.GELU(), nn.Linear(32, 1))
 
@@ -218,7 +235,7 @@ class LinkPredHead(nn.Module):
         feats / masks itself; E[seed] is looked up separately by the caller."""
         emb = self.E.weight.detach()                                                 # link head reads E DETACHED
         e_seed = F.embedding(tokens.seeds, emb)                                      # E[seed]  [N, d]
-        mu = self.neighbourhood(tokens, emb, self.node_features)                     # [N, d]
+        mu = self.neighbourhood(tokens, emb)                                         # [N, d]
         return self.geom.expmap(e_seed, mu)                                          # P[x]  [N, d]
 
     def _node_feats(self, seeds: torch.Tensor) -> torch.Tensor:
@@ -228,11 +245,19 @@ class LinkPredHead(nn.Module):
             return self.E.weight.new_zeros(seeds.shape[0], 0)
         return F.embedding(seeds, self.node_features)
 
+    def _neighbour_feats(self, tokens: WalkTokens) -> torch.Tensor:
+        """Pooled walk-neighbour feature encoding for a bag of N queries -> [N, feature_dim]: a masked MEAN
+        over the seed's non-seed real tokens of NeighborFeatureProjection's per-token encodings. Zero-width
+        [N, 0] when the dataset has no node/edge features."""
+        ft = self.neighbour_feats(tokens, self.node_features)                        # [N, T, F] (0 at seed/pad)
+        n = (tokens.mask & ~tokens.seed_mask).unsqueeze(-1).to(ft.dtype)             # [N, T, 1]
+        return ft.sum(dim=-2) / n.sum(dim=-2).clamp_min(1.0)                          # [N, F]  masked mean
+
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Two-sided scoring. src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate
         queries (seeds = v) in query-major order, each walked with its query's cutoff. Logit = MLP over
-        [ d(E_u,E_v), d(E_u,P_v), d(P_u,E_v), d(P_u,P_v), nf[u], nf[v] ] per (u, candidate v). Returns
-        logits [B, C]."""
+        [ d(E_u,E_v), d(E_u,P_v), d(P_u,E_v), d(P_u,P_v), nf[u], nf[v], nbhd_feat[u], nbhd_feat[v] ]
+        per (u, candidate v). Returns logits [B, C]."""
         emb = self.E.weight.detach()                                          # link head reads E DETACHED
         seed_u = F.embedding(src_tokens.seeds, emb)                           # E[u]   [B, d]
         nbhd_u = self._project(src_tokens)                                    # P[u]   [B, d]
@@ -240,6 +265,8 @@ class LinkPredHead(nn.Module):
         seed_v = F.embedding(cand_tokens.seeds, emb)                          # E[v]   [B*C, d]
         nbhd_v = self._project(cand_tokens)                                   # P[v]   [B*C, d]
         nf_v = self._node_feats(cand_tokens.seeds)                            # nf[v]  [B*C, d_nf]
+        nbhd_feat_u = self._neighbour_feats(src_tokens)                           # nbhd_feat[u]  [B, F]
+        nbhd_feat_v = self._neighbour_feats(cand_tokens)                          # nbhd_feat[v]  [B*C, F]
 
         b, d = seed_u.shape
         c = seed_v.shape[0] // b
@@ -250,6 +277,9 @@ class LinkPredHead(nn.Module):
         seed_u = seed_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
         nbhd_u = nbhd_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
         nf_u = nf_u.unsqueeze(1).expand(b, c, self.d_nf)                      # [B, C, d_nf]
+        fd = self.neighbour_feats.feature_dim
+        nbhd_feat_v = nbhd_feat_v.reshape(b, c, fd)                                   # [B, C, F]
+        nbhd_feat_u = nbhd_feat_u.unsqueeze(1).expand(b, c, fd)                       # [B, C, F]
 
         # Four pairwise geodesic distances (self.geom.dist) between u's and v's identity / nbhd points.
         distances = torch.stack([
@@ -258,5 +288,5 @@ class LinkPredHead(nn.Module):
             self.geom.dist(nbhd_u, seed_v),                                  # d(P[u], E[v])  is v in u's nbhd
             self.geom.dist(nbhd_u, nbhd_v),                                  # d(P[u], P[v])  nbhd overlap
         ], dim=-1)                                                            # [B, C, 4]
-        feats = torch.cat([distances, nf_u, nf_v], dim=-1)                    # [B, C, 4 + 2*d_nf]
+        feats = torch.cat([distances, nf_u, nf_v, nbhd_feat_u, nbhd_feat_v], dim=-1)  # [B, C, 4 + 2*d_nf + 2*F]
         return self.scorer(feats).squeeze(-1)                                 # [B, C]
