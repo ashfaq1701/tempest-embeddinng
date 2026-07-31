@@ -113,9 +113,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", default=1e-4, type=float,
                    help="Legacy single LR (superseded by --manifold-lr / --model-lr).")
     p.add_argument("--manifold-lr", default=1e-3, type=float,
-                   help="LR for E (the sphere manifold param). HIGH so clustering moves fast (default 1e-3).")
-    p.add_argument("--model-lr", default=1e-4, type=float,
-                   help="LR for the head (nn params). LOW so memorisation/free-ride is slow (default 1e-4).")
+                   help="LR for E (manifold param), trained by the alignment loss; governs clustering speed (default 1e-3).")
+    p.add_argument("--model-lr", default=1e-3, type=float,
+                   help="LR for the head (nn params), trained by the link CE reading detached E (default 1e-3).")
     p.add_argument("--weight-decay", default=1e-4, type=float,
                    help="Weight decay (RiemannianAdam). Load-bearing on the sphere head.")
     p.add_argument(

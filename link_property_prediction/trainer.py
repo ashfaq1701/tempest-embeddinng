@@ -91,12 +91,14 @@ class TrainerConfig:
     # ~0.828/0.803 while no-wd capped ~0.825/0.797 (the test-gap>val-gap signature of a lost regulariser).
     lr: float = 1e-4          # legacy single LR (superseded by the two-group split below; kept for compat)
     weight_decay: float = 1e-4
-    # TWO LR GROUPS. E (the sphere manifold param) gets a HIGH lr so clustering moves fast; the head
-    # (nn params) gets a LOW lr so the memorisation/free-ride path develops slowly, letting E win the
-    # race and become load-bearing. RiemannianAdam applies the Riemannian update to E, standard Adam
-    # to the head, each under its own group lr.
+    # TWO LR GROUPS. E (the manifold param) is trained by the ALIGNMENT loss only (the link head reads E
+    # detached), so its lr governs how fast the walk-neighbour clustering forms; the head (nn params) is
+    # trained by the link CE and its lr governs how fast it reads the clustered E. Both fast (1e-3/1e-3)
+    # is the best config on Poincaré: alignment clusters E to commP ~x20 within an epoch AND the head
+    # reads it immediately (val > 0.75 on wiki). RiemannianAdam does the Riemannian update on E, standard
+    # Adam on the head, each under its own group lr.
     manifold_lr: float = 1e-3
-    model_lr: float = 1e-4
+    model_lr: float = 1e-3
 
     # Run control.
     num_epochs: int = 25
