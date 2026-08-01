@@ -50,17 +50,6 @@ class PoincareManifold:
         the cold-row zero tangent is a safe differentiable no-op returning `base`."""
         return self.manifold.expmap(base, tangent)
 
-    def pairwise_dist(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
-        """All-pairs geodesic distances between rows of X [n,d] and Y [m,d] (both in the c=1 ball), as
-        [n, m] — WITHOUT materialising an [n,m,d] tensor. Everything factors through the Gram matrix
-        ⟨x,y⟩ = X @ Yᵀ:  d(x,y) = arccosh(1 + 2‖x-y‖²/((1-‖x‖²)(1-‖y‖²))),  ‖x-y‖² = ‖x‖²+‖y‖²-2⟨x,y⟩.
-        Differentiable in E (grad flows through the matmul). Matches geoopt.PoincareBall(c=1).dist to ~1e-7."""
-        xn = (X * X).sum(-1)                                              # ‖x‖²  [n]
-        yn = (Y * Y).sum(-1)                                              # ‖y‖²  [m]
-        sq = xn[:, None] + yn[None, :] - 2.0 * (X @ Y.t())               # ‖x-y‖²  [n,m]
-        arg = 1.0 + 2.0 * sq / ((1.0 - xn)[:, None] * (1.0 - yn)[None, :])
-        return torch.arccosh(arg.clamp_min(1.0 + 1e-7))                  # [n,m]
-
 
 class TimeEncoder(nn.Module):
     """Time2Vec time encoding, ported verbatim from TPNet (TGB_TPNet/models/modules.py)."""
