@@ -11,7 +11,7 @@ Hyperparameters exposed at CLI (and their grouping):
   Link/head:      --k-train
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias, --start-bias
                   (backward-only, undirected; source u → μ_u; candidate v via static E[v])
-  Optimisation:   --lr, --weight-decay, --batch-size, --eval-batch-size,
+  Optimisation:   --lr, --batch-size, --eval-batch-size,
                   --num-epochs, --early-stop-patience
                   (constant lr, no schedule)
   System:         --seed, --use-gpu, --use-gpu-tempest
@@ -119,9 +119,6 @@ def parse_args() -> argparse.Namespace:
                    help="LR for E (manifold param), trained by the alignment loss; governs clustering speed (default 1e-3).")
     p.add_argument("--model-lr", default=1e-3, type=float,
                    help="LR for the head (nn params), trained by the link CE reading detached E (default 1e-3).")
-    p.add_argument("--weight-decay", default=0.0, type=float,
-                   help="Weight decay (RiemannianAdam). Default 0: with the boundary prior removed, no-wd "
-                        "let E spread and beat wd 1e-4 on link MRR (wiki).")
     p.add_argument(
         "--batch-size", default=200, type=int,
         help="Train batch size. Under the per-query ranking link "
@@ -290,7 +287,6 @@ def main() -> Dict[str, Any]:
         lr=args.lr,
         manifold_lr=args.manifold_lr,
         model_lr=args.model_lr,
-        weight_decay=args.weight_decay,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 

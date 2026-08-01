@@ -86,13 +86,11 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
 
-    # Optimisation — CONSTANT lr (no schedule). ONE param group: RiemannianAdam applies the Riemannian
-    # update to E (a geoopt.ManifoldParameter) and standard Adam to the Euclidean params, all under the
-    # same fixed LR. weight_decay is LOAD-BEARING on the sphere head: an A/B showed wd 1e-4 reached
-    # ~0.828/0.803 while no-wd capped ~0.825/0.797 (the test-gap>val-gap signature of a lost regulariser).
+    # Optimisation — CONSTANT lr (no schedule). RiemannianAdam applies the Riemannian update to E
+    # (a geoopt.ManifoldParameter) and standard Adam to the Euclidean params. NO weight decay: a wiki A/B
+    # (with the boundary prior removed) showed no-wd lets E spread and beats wd 1e-4 on link MRR — wd was
+    # compressing E toward the origin like the old boundary prior.
     lr: float = 1e-4          # legacy single LR (superseded by the two-group split below; kept for compat)
-    weight_decay: float = 0.0   # 0 default: wiki A/B (with the boundary prior removed) — no-wd let E spread
-                                # and beat wd 1e-4 on link MRR. wd was compressing E like the boundary prior.
     # TWO LR GROUPS. E (the manifold param) and the head (nn params) are BOTH trained by the link CE now —
     # E end-to-end (no detach, no alignment loss), so ranking gradients flow into E through the head.
     # manifold_lr is E's Riemannian-update lr; model_lr is the head's Adam lr. RiemannianAdam does the
@@ -151,10 +149,8 @@ class Trainer:
         head_params = [p for p in self.model.parameters() if p is not e_param]
         self.opt = geoopt.optim.RiemannianAdam(
             [
-                {"params": [e_param], "lr": float(config.manifold_lr),
-                 "weight_decay": float(config.weight_decay)},
-                {"params": head_params, "lr": float(config.model_lr),
-                 "weight_decay": float(config.weight_decay)},
+                {"params": [e_param], "lr": float(config.manifold_lr)},
+                {"params": head_params, "lr": float(config.model_lr)},
             ],
             stabilize=10,
         )
