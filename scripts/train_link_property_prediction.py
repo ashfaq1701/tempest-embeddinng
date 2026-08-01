@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
              "candidate bag (and the alignment [S,P] matrix) small enough to fit "
              "bs 1000 on review / big low-recurrence graphs.",
     )
-    p.add_argument("--dropout", default=0.1, type=float,
+    p.add_argument("--dropout", default=0.2, type=float,
                    help="Scorer-MLP dropout. Breaks head memorisation, turning the post-peak "
                         "overfit cliff into a gentle valley on wiki. 0 = off.")
 

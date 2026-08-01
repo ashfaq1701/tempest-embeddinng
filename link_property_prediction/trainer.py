@@ -74,7 +74,7 @@ class TrainerConfig:
     # Link loss / head.
     K_train: int = 10           # per-query training negatives ([B, 1+K_train]); 10 keeps the candidate
                                 # bag + alignment [S,P] matrix small enough to fit bs 1000 on review
-    dropout: float = 0.1        # scorer-MLP dropout — breaks head memorisation, turns the post-peak overfit
+    dropout: float = 0.2        # scorer-MLP dropout — breaks head memorisation, turns the post-peak overfit
                                 # cliff into a gentle valley (wiki). 0 = off.
 
     # Walks (BACKWARD only, undirected) for the source side (u → μ_u); the one-sided head samples
