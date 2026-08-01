@@ -99,14 +99,14 @@ class NeighborhoodProjection(nn.Module):
     directly in the ball, so M[u] is the exact manifold-preserving weighted mean and is rotation-EQUIVARIANT.
 
     The per-token weight logits a_p are computed ONCE by LinkPredHead (shared recency/hop weight net) and
-    passed in; here they are softmaxed over the GEOMETRY context (mask & ~seed_mask). Because there is NO
-    base point, seed-node occurrences are KEPT — only the trivial walk-origin slot (seed_mask) is dropped;
-    u's mid-walk recurrences are legitimate points of the intrinsic mean (contrast the tangent pool, where
-    Log_{E[u]}(E[u]) = 0 made them inert and they were excluded via seed_node_mask). Softmax is retained
-    for POSITIVITY (keeps the gyromidpoint denominator Σw(γ−1) bounded away from 0 / inside the gyroconvex
-    hull); its normalisation is redundant since weighted_midpoint(lincomb=False) is scale-invariant. Cold
-    rows (no context tokens) -> M[u] = E[u] (a differentiable no-op, so d(E[u],M[u]) = 0 stays the cold-row
-    indicator the scorer reads)."""
+    passed in; here they are softmaxed over the GEOMETRY context (mask & ~seed_mask & ~seed_node_mask).
+    EVERY occurrence of the seed node u is excluded (origin slot AND mid-walk recurrences): the gyromidpoint
+    treats each E[u] as a real point, so on recurrence-heavy graphs u's self-recurrences would drag M[u]
+    toward E[u] and collapse the neighbourhood signal — unlike the tangent pool where Log_{E[u]}(E[u]) = 0
+    made them inert. Softmax is retained for POSITIVITY (keeps the gyromidpoint denominator Σw(γ−1) bounded
+    away from 0 / inside the gyroconvex hull); its normalisation is redundant since weighted_midpoint
+    (lincomb=False) is scale-invariant. Cold rows (no context tokens) -> M[u] = E[u] (a differentiable
+    no-op, so d(E[u],M[u]) = 0 stays the cold-row indicator the scorer reads)."""
 
     def __init__(self):
         super().__init__()
@@ -119,9 +119,12 @@ class NeighborhoodProjection(nn.Module):
         source = F.embedding(walk_bag.seeds, emb)                                 # E[u]  [B,d_emb]
         tok_pts = F.embedding(node_ids, emb)                                      # [B,T,d_emb]  token POINTS
 
-        # Geometry context: valid, non-origin-slot tokens. seed_node_mask is NOT applied — with no base
-        # point, u's own mid-walk recurrences are real points of the mean (only the walk-origin slot drops).
-        mask = walk_bag.mask & ~walk_bag.seed_mask                                # [B,T]
+        # Geometry context: valid tokens, EXCLUDING every occurrence of the seed node u (origin slot AND
+        # mid-walk recurrences). Unlike the tangent pool — where Log_{E[u]}(E[u]) = 0 made u's occurrences
+        # inert — the gyromidpoint treats each E[u] as a REAL point, so on recurrence-heavy graphs (wiki) u's
+        # frequent self-recurrences drag M[u] toward E[u], collapsing d(M_u,M_v)→d(E_u,E_v) and d(E_u,M_u)→0
+        # (the neighbourhood signal vanishes). So seed_node_mask stays ON for the midpoint too.
+        mask = walk_bag.mask & ~walk_bag.seed_mask & ~walk_bag.seed_node_mask     # [B,T]
         # Zero weight == token removed for the midpoint, so masked slots (weight 0) drop out cleanly; softmax
         # guarantees the surviving weights are strictly positive (denominator stays bounded away from 0).
         weights = torch.nan_to_num(
