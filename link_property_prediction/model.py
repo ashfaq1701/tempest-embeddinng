@@ -223,6 +223,11 @@ class LinkPredHead(nn.Module):
         score_in = 6 + 2 * self.d_nf + 2 * self.neighbour_feats.feature_dim
         self.scorer = nn.Sequential(
             nn.Linear(score_in, 32), nn.GELU(), nn.Linear(32, 1))
+        # Single learned temperature on the whole distance block: distances / tau.clamp(...). The raw
+        # geodesic distances inflate ~77x over training (median ~0.03 early -> ~2.1 late) while nf / nbhd_feat
+        # sit at O(1); one clamped scalar absorbs that global scale so the scorer's first Linear sees
+        # comparable channels. Pairs with boundary_penalty (which caps inflation on the E side). Init 1 = no-op.
+        self.dist_tau = nn.Parameter(torch.tensor(1.0))
 
     def _token_weight_logits(self, tokens: WalkTokens) -> torch.Tensor:
         """Shared per-token recency/hop weight logits [N, T] from [Time2Vec(log1p(age)), log1p(hop)].
@@ -234,8 +239,8 @@ class LinkPredHead(nn.Module):
 
     def _project(self, tokens: WalkTokens, w_logit: torch.Tensor) -> torch.Tensor:
         """Neighbourhood projection P[x] = exp_{E[seed]}(mu) [N, d]. w_logit: the bag's shared per-token
-        weight logits. E is read DETACHED (E is trained by the alignment loss, not the link head)."""
-        emb = self.E.weight.detach()                                                 # link head reads E DETACHED
+        weight logits. E is read LIVE — the link loss trains E end-to-end through the head (no detach)."""
+        emb = self.E.weight                                                          # E trained by the link loss
         e_seed = F.embedding(tokens.seeds, emb)                                      # E[seed]  [N, d]
         mu = self.neighbourhood(tokens, emb, w_logit)                                # [N, d]
         return self.geom.expmap(e_seed, mu)                                          # P[x]  [N, d]
@@ -252,7 +257,7 @@ class LinkPredHead(nn.Module):
         queries (seeds = v) in query-major order, each walked with its query's cutoff. Logit = MLP over
         [ d(E_u,E_v), d(E_u,P_v), d(P_u,E_v), d(P_u,P_v), nf[u], nf[v], nbhd_feat[u], nbhd_feat[v] ]
         per (u, candidate v). Returns logits [B, C]."""
-        emb = self.E.weight.detach()                                          # link head reads E DETACHED
+        emb = self.E.weight                                                   # E trained end-to-end by the link loss
         # Shared per-token weight logits, computed once per bag and used to pool BOTH channels.
         w_src = self._token_weight_logits(src_tokens)                         # [B, T]
         w_cand = self._token_weight_logits(cand_tokens)                       # [B*C, T]
@@ -288,5 +293,6 @@ class LinkPredHead(nn.Module):
             self.geom.dist(seed_u, nbhd_u),                                  # d(E[u], P[u])  u's self-displacement
             self.geom.dist(seed_v, nbhd_v),                                  # d(E[v], P[v])  v's self-displacement
         ], dim=-1)                                                            # [B, C, 6]
+        distances = distances / self.dist_tau.clamp(0.05, 20.0)              # learned global scale (conditioning)
         feats = torch.cat([distances, nf_u, nf_v, nbhd_feat_u, nbhd_feat_v], dim=-1)  # [B, C, 6 + 2*d_nf + 2*F]
         return self.scorer(feats).squeeze(-1)                                 # [B, C]
