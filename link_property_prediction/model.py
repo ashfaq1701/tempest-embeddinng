@@ -87,15 +87,17 @@ class TimeEncoder(nn.Module):
 
 
 class NeighborhoodProjection(nn.Module):
-    """Weighted-MEAN pooling of a source's walk-token TANGENTS into one tangent vector mu_u at E[u]:
+    """Weighted-MEAN pooling of a source's walk-token TANGENTS, mapped to the ball point P[u] = exp_{E[u]}(mu_u):
 
         mu_u = Σ_p softmax(a_p) · g_p,   g_p = Log_{E[u]}(E[token_p])   (raw geometric tangent)
+        P[u] = exp_{E[u]}(mu_u)                                          (back to the ball)
 
     The per-token weight logits a_p are computed ONCE by LinkPredHead (its shared recency/hop weight net)
     and passed in; here they are softmaxed over the GEOMETRY context (mask & ~seed_mask & ~seed_node_mask —
     seed-node revisits are dropped, since Log_{E[u]}(E[u]) = 0 contributes nothing but would dilute). PURE
-    GEOMETRY and PARAMETER-FREE: raw tangents pooled by rotation-invariant scalar weights, so mu_u is
-    ROTATION-INVARIANT. Fed to exp_{E[u]} downstream -> P[u]. Cold rows (no context) -> mu_u = 0 -> P[u]=E[u]."""
+    GEOMETRY and PARAMETER-FREE: raw tangents pooled by rotation-invariant scalar weights, so mu_u — and
+    hence P[u] — is ROTATION-INVARIANT. The exp map is applied HERE so forward returns a valid ball POINT
+    directly (not a tangent). Cold rows (no context) -> mu_u = 0 -> exp_{E[u]}(0) = E[u]."""
 
     def __init__(self):
         super().__init__()
@@ -103,7 +105,8 @@ class NeighborhoodProjection(nn.Module):
 
     def forward(self, walk_bag: WalkTokens, emb: torch.Tensor, w_logit: torch.Tensor) -> torch.Tensor:
         """walk_bag: flattened WalkTokens. emb: full [num_nodes,d_emb] table in the ball. w_logit: [B,T]
-        shared per-token weight logits. Returns mu_u [B,d_emb], a tangent at E[u]; cold rows -> 0."""
+        shared per-token weight logits. Returns P[u] = exp_{E[u]}(mu_u) [B,d_emb], a POINT in the ball;
+        cold rows (no context) -> mu_u = 0 -> P[u] = E[u]."""
         node_ids = walk_bag.nodes.clamp_min(0)                                    # [B,T]  (padding → row 0)
         source = F.embedding(walk_bag.seeds, emb)                                 # E[u]  [B,d_emb]
         token_tangents = self.geom.logmap(source.unsqueeze(-2), F.embedding(node_ids, emb))  # [B,T,d_emb]
@@ -112,9 +115,10 @@ class NeighborhoodProjection(nn.Module):
         weights = torch.nan_to_num(
             torch.softmax(w_logit.masked_fill(~mask, float("-inf")), dim=-1), nan=0.0)   # [B,T]; cold row -> 0
 
-        # mu = weighted mean of the RAW token tangents (rotation-invariant). No ⊥-projection on the ball;
-        # mu is fed to exp_{E[u]} downstream -> P[u].  (cold rows: mu = 0 -> P[u] = E[u].)
-        return (weights.unsqueeze(-1) * token_tangents).sum(dim=-2)               # [B,d]
+        # mu = weighted mean of the RAW token tangents (rotation-invariant); exp_{E[u]}(mu) maps it back to
+        # the ball as P[u]. (Cold rows: mu = 0 -> exp_{E[u]}(0) = E[u], a differentiable no-op.)
+        mu = (weights.unsqueeze(-1) * token_tangents).sum(dim=-2)                 # [B,d]  tangent at E[u]
+        return self.geom.expmap(source, mu)                                      # P[u]  [B,d]  ball point
 
 
 class NeighborFeatureProjection(nn.Module):
@@ -230,12 +234,10 @@ class LinkPredHead(nn.Module):
         return self.weight_net(torch.cat([t2v, log_hop], dim=-1)).squeeze(-1)         # [N, T]
 
     def _project(self, tokens: WalkTokens, w_logit: torch.Tensor) -> torch.Tensor:
-        """Neighbourhood projection P[x] = exp_{E[seed]}(mu) [N, d]. w_logit: the bag's shared per-token
+        """Neighbourhood projection P[x] = exp_{E[seed]}(mu) [N, d] — the ball point returned by
+        NeighborhoodProjection (which applies the exp map itself). w_logit: the bag's shared per-token
         weight logits. E is read LIVE — the link loss trains E end-to-end through the head (no detach)."""
-        emb = self.E.weight                                                          # E trained by the link loss
-        e_seed = F.embedding(tokens.seeds, emb)                                      # E[seed]  [N, d]
-        mu = self.neighbourhood(tokens, emb, w_logit)                                # [N, d]
-        return self.geom.expmap(e_seed, mu)                                          # P[x]  [N, d]
+        return self.neighbourhood(tokens, self.E.weight, w_logit)                    # P[x]  [N, d]
 
     def _node_feats(self, seeds: torch.Tensor) -> torch.Tensor:
         """Static node features [N, d_nf] for the given seed ids; a zero-width [N, 0] tensor when the
