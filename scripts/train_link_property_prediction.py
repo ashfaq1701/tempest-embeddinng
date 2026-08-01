@@ -78,6 +78,9 @@ def parse_args() -> argparse.Namespace:
              "candidate bag (and the alignment [S,P] matrix) small enough to fit "
              "bs 1000 on review / big low-recurrence graphs.",
     )
+    p.add_argument("--dropout", default=0.1, type=float,
+                   help="Scorer-MLP dropout. Breaks head memorisation, turning the post-peak "
+                        "overfit cliff into a gentle valley on wiki. 0 = off.")
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
     p.add_argument(
@@ -112,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     # (a geoopt.ManifoldParameter, Riemannian update) and all Euclidean params.
     p.add_argument("--lr", default=1e-4, type=float,
                    help="Legacy single LR (superseded by --manifold-lr / --model-lr).")
-    p.add_argument("--manifold-lr", default=1e-3, type=float,
+    p.add_argument("--manifold-lr", default=1e-4, type=float,
                    help="LR for E (manifold param), trained by the alignment loss; governs clustering speed (default 1e-3).")
     p.add_argument("--model-lr", default=1e-3, type=float,
                    help="LR for the head (nn params), trained by the link CE reading detached E (default 1e-3).")
@@ -275,6 +278,7 @@ def main() -> Dict[str, Any]:
         feature_dim=args.feature_dim,
 
         K_train=args.k_train,
+        dropout=args.dropout,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,

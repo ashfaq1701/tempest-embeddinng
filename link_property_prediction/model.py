@@ -179,7 +179,7 @@ class NeighborFeatureProjection(nn.Module):
 class LinkPredHead(nn.Module):
     def __init__(self, num_nodes: int, d_emb: int,
                  t2v_dim: int = 16, d_ef: int = 0, feature_dim: int = 16,
-                 node_features: Optional[torch.Tensor] = None):
+                 node_features: Optional[torch.Tensor] = None, dropout: float = 0.1):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_emb = d_emb
@@ -221,8 +221,11 @@ class LinkPredHead(nn.Module):
         # Distances are isometry-invariant; nf / nbhd-feats are external, frame-free channels.
         # 6 dists = 4 cross + 2 self-displacements d(E,P); + nf[u,v] + nbhd_feat[u,v].
         score_in = 6 + 2 * self.d_nf + 2 * self.neighbour_feats.feature_dim
+        # Dropout on the scorer hidden layer breaks the head's co-adaptation/memorisation — the lever that
+        # converts the post-peak overfit CLIFF into a gentle valley (wiki: dropout 0.1 held a stable
+        # ~0.795-0.805 valley vs a hard -0.066 crash with no dropout). Load-bearing for stability.
         self.scorer = nn.Sequential(
-            nn.Linear(score_in, 32), nn.GELU(), nn.Linear(32, 1))
+            nn.Linear(score_in, 32), nn.GELU(), nn.Dropout(dropout), nn.Linear(32, 1))
         # Single learned temperature on the whole distance block: distances / tau.clamp(...). The raw
         # geodesic distances inflate ~77x over training (median ~0.03 early -> ~2.1 late) while nf / nbhd_feat
         # sit at O(1); one clamped scalar absorbs that global scale so the scorer's first Linear sees
