@@ -1,18 +1,16 @@
 """Link head — Poincaré-ball node embeddings + a walk-neighbourhood scoring head, in one module.
 
 Per (u, candidate v) the logit is an MLP (self.scorer) over:
-  - 6 pairwise GEODESIC DISTANCES between {E[·], M[·]} of u and v:
-        d(E_u,E_v), d(E_u,M_v), d(M_u,E_v), d(M_u,M_v)  (4 cross)  +  d(E_u,M_u), d(E_v,M_v)  (2 self-disp)
+  - 6 pairwise GEODESIC DISTANCES between {E[·], P[·]} of u and v:
+        d(E_u,E_v), d(E_u,P_v), d(P_u,E_v), d(P_u,P_v)  (4 cross)  +  d(E_u,P_u), d(E_v,P_v)  (2 self-disp)
   - each node's per-dim-standardised STATIC node features   nf[u], nf[v]
   - each node's pooled WALK-NEIGHBOUR feature encoding       nbhd_feat[u], nbhd_feat[v]
         (NeighborFeatureProjection over the walk tokens' node/edge features, masked-mean pooled)
 
-M[x] is the intrinsic weighted GYROMIDPOINT of x's walk-token points (NeighborhoodProjection via
-geoopt.weighted_midpoint) — base-point-free, rotation-EQUIVARIANT, manifold-preserving (no tangent-space
-approximation at a learned base point). Cold rows (no context) -> M[x] = E[x], so d(E_x,M_x) = 0 is the
-cold-row indicator.
+P[x] = exp_{E[x]}(mu_x) pushes x off E[x] toward mu_x — the ROTATION-INVARIANT weighted mean of x's
+walk-token tangents (NeighborhoodProjection: pure geometry, no learned mixing and no feature gate).
 
-TWO-SIDED: both the source u AND every candidate v are walked and aggregated (M[u], M[v] both used).
+TWO-SIDED: both the source u AND every candidate v are walked and projected (P[u], P[v] both used).
 The head owns self.E (a ManifoldParameter on a geoopt.PoincareBall, link-trained on it); geometry goes
 through self.geom (PoincareManifold): dist/logmap/expmap all proxy to geoopt (the ball's expmap has a
 finite gradient at the cold-row zero tangent).
@@ -89,50 +87,34 @@ class TimeEncoder(nn.Module):
 
 
 class NeighborhoodProjection(nn.Module):
-    """Weighted GYROMIDPOINT of a source's walk-token points into one ball point M[u] (Ungar's gyromidpoint
-    via geoopt.PoincareBall.weighted_midpoint):
+    """Weighted-MEAN pooling of a source's walk-token TANGENTS into one tangent vector mu_u at E[u]:
 
-        M[u] = ½ ⊗ ( Σ_p w_p·γ_p·E[token_p] / Σ_p w_p·(γ_p − 1) ),   γ_p = 2/(1 − ‖E[token_p]‖²)
+        mu_u = Σ_p softmax(a_p) · g_p,   g_p = Log_{E[u]}(E[token_p])   (raw geometric tangent)
 
-    INTRINSIC and base-point-free: unlike the previous tangent-pool (Log_{E[u]} → mean → Exp_{E[u]}, a
-    first-order approximation at the learned base point E[u]), the gyromidpoint combines the token POINTS
-    directly in the ball, so M[u] is the exact manifold-preserving weighted mean and is rotation-EQUIVARIANT.
-
-    The per-token weight logits a_p are computed ONCE by LinkPredHead (shared recency/hop weight net) and
-    passed in; here they are softmaxed over the GEOMETRY context (mask & ~seed_mask). Because there is NO
-    base point, seed-node occurrences are KEPT — only the trivial walk-origin slot (seed_mask) is dropped;
-    u's mid-walk recurrences are legitimate points of the intrinsic mean (contrast the tangent pool, where
-    Log_{E[u]}(E[u]) = 0 made them inert and they were excluded via seed_node_mask). Softmax is retained
-    for POSITIVITY (keeps the gyromidpoint denominator Σw(γ−1) bounded away from 0 / inside the gyroconvex
-    hull); its normalisation is redundant since weighted_midpoint(lincomb=False) is scale-invariant. Cold
-    rows (no context tokens) -> M[u] = E[u] (a differentiable no-op, so d(E[u],M[u]) = 0 stays the cold-row
-    indicator the scorer reads)."""
+    The per-token weight logits a_p are computed ONCE by LinkPredHead (its shared recency/hop weight net)
+    and passed in; here they are softmaxed over the GEOMETRY context (mask & ~seed_mask & ~seed_node_mask —
+    seed-node revisits are dropped, since Log_{E[u]}(E[u]) = 0 contributes nothing but would dilute). PURE
+    GEOMETRY and PARAMETER-FREE: raw tangents pooled by rotation-invariant scalar weights, so mu_u is
+    ROTATION-INVARIANT. Fed to exp_{E[u]} downstream -> P[u]. Cold rows (no context) -> mu_u = 0 -> P[u]=E[u]."""
 
     def __init__(self):
         super().__init__()
-        self.geom = PoincareManifold()                 # stateless; used for weighted_midpoint
+        self.geom = PoincareManifold()                 # stateless; used for the token log-map
 
     def forward(self, walk_bag: WalkTokens, emb: torch.Tensor, w_logit: torch.Tensor) -> torch.Tensor:
         """walk_bag: flattened WalkTokens. emb: full [num_nodes,d_emb] table in the ball. w_logit: [B,T]
-        shared per-token weight logits. Returns M[u] [B,d_emb], a POINT in the ball; cold rows -> E[u]."""
+        shared per-token weight logits. Returns mu_u [B,d_emb], a tangent at E[u]; cold rows -> 0."""
         node_ids = walk_bag.nodes.clamp_min(0)                                    # [B,T]  (padding → row 0)
         source = F.embedding(walk_bag.seeds, emb)                                 # E[u]  [B,d_emb]
-        tok_pts = F.embedding(node_ids, emb)                                      # [B,T,d_emb]  token POINTS
+        token_tangents = self.geom.logmap(source.unsqueeze(-2), F.embedding(node_ids, emb))  # [B,T,d_emb]
 
-        # Geometry context: valid, non-origin-slot tokens. seed_node_mask is NOT applied — with no base
-        # point, u's own mid-walk recurrences are real points of the mean (only the walk-origin slot drops).
-        mask = walk_bag.mask & ~walk_bag.seed_mask                                # [B,T]
-        # Zero weight == token removed for the midpoint, so masked slots (weight 0) drop out cleanly; softmax
-        # guarantees the surviving weights are strictly positive (denominator stays bounded away from 0).
+        mask = walk_bag.mask & ~walk_bag.seed_mask & ~walk_bag.seed_node_mask    # [B,T]  geometry context
         weights = torch.nan_to_num(
-            torch.softmax(w_logit.masked_fill(~mask, float("-inf")), dim=-1), nan=0.0)   # [B,T]; cold row -> all 0
+            torch.softmax(w_logit.masked_fill(~mask, float("-inf")), dim=-1), nan=0.0)   # [B,T]; cold row -> 0
 
-        # Intrinsic weighted mean of the token points (reduce over the T token axis). No base point, no
-        # Log/Exp round-trip. weighted_midpoint clamps its denominator, so an all-zero (cold) row is finite
-        # (lands at the origin) — masked back to E[u] below rather than relied upon.
-        mid = self.geom.manifold.weighted_midpoint(tok_pts, weights, reducedim=[1])      # [B,d]
-        has_ctx = mask.any(dim=-1, keepdim=True)                                          # [B,1]
-        return torch.where(has_ctx, mid, source)                                          # cold row -> E[u]
+        # mu = weighted mean of the RAW token tangents (rotation-invariant). No ⊥-projection on the ball;
+        # mu is fed to exp_{E[u]} downstream -> P[u].  (cold rows: mu = 0 -> P[u] = E[u].)
+        return (weights.unsqueeze(-1) * token_tangents).sum(dim=-2)               # [B,d]
 
 
 class NeighborFeatureProjection(nn.Module):
@@ -248,10 +230,12 @@ class LinkPredHead(nn.Module):
         return self.weight_net(torch.cat([t2v, log_hop], dim=-1)).squeeze(-1)         # [N, T]
 
     def _project(self, tokens: WalkTokens, w_logit: torch.Tensor) -> torch.Tensor:
-        """Neighbourhood gyromidpoint M[x] [N, d] — the intrinsic weighted mean of x's walk-token points
-        (base-point-free; cold rows -> E[x]). w_logit: the bag's shared per-token weight logits. E is read
-        LIVE — the link loss trains E end-to-end through the head (no detach)."""
-        return self.neighbourhood(tokens, self.E.weight, w_logit)                    # M[x]  [N, d]
+        """Neighbourhood projection P[x] = exp_{E[seed]}(mu) [N, d]. w_logit: the bag's shared per-token
+        weight logits. E is read LIVE — the link loss trains E end-to-end through the head (no detach)."""
+        emb = self.E.weight                                                          # E trained by the link loss
+        e_seed = F.embedding(tokens.seeds, emb)                                      # E[seed]  [N, d]
+        mu = self.neighbourhood(tokens, emb, w_logit)                                # [N, d]
+        return self.geom.expmap(e_seed, mu)                                          # P[x]  [N, d]
 
     def _node_feats(self, seeds: torch.Tensor) -> torch.Tensor:
         """Static node features [N, d_nf] for the given seed ids; a zero-width [N, 0] tensor when the
@@ -262,20 +246,19 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Two-sided scoring. src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate
-        queries (seeds = v) in query-major order, each walked with its query's cutoff. M[x] is the walk
-        neighbourhood's intrinsic GYROMIDPOINT (base-point-free). Logit = MLP over
-        [ d(E_u,E_v), d(E_u,M_v), d(M_u,E_v), d(M_u,M_v), nf[u], nf[v], nbhd_feat[u], nbhd_feat[v] ]
+        queries (seeds = v) in query-major order, each walked with its query's cutoff. Logit = MLP over
+        [ d(E_u,E_v), d(E_u,P_v), d(P_u,E_v), d(P_u,P_v), nf[u], nf[v], nbhd_feat[u], nbhd_feat[v] ]
         per (u, candidate v). Returns logits [B, C]."""
         emb = self.E.weight                                                   # E trained end-to-end by the link loss
         # Shared per-token weight logits, computed once per bag and used to pool BOTH channels.
         w_src = self._token_weight_logits(src_tokens)                         # [B, T]
         w_cand = self._token_weight_logits(cand_tokens)                       # [B*C, T]
         seed_u = F.embedding(src_tokens.seeds, emb)                           # E[u]   [B, d]
-        nbhd_u = self._project(src_tokens, w_src)                             # M[u]   [B, d]  gyromidpoint
+        nbhd_u = self._project(src_tokens, w_src)                             # P[u]   [B, d]
         nf_u = self._node_feats(src_tokens.seeds)                             # nf[u]  [B, d_nf]
         nbhd_feat_u = self.neighbour_feats(src_tokens, self.node_features, w_src)   # nbhd_feat[u]  [B, F]
         seed_v = F.embedding(cand_tokens.seeds, emb)                          # E[v]   [B*C, d]
-        nbhd_v = self._project(cand_tokens, w_cand)                           # M[v]   [B*C, d]  gyromidpoint
+        nbhd_v = self._project(cand_tokens, w_cand)                           # P[v]   [B*C, d]
         nf_v = self._node_feats(cand_tokens.seeds)                            # nf[v]  [B*C, d_nf]
         nbhd_feat_v = self.neighbour_feats(cand_tokens, self.node_features, w_cand)  # nbhd_feat[v]  [B*C, F]
 
@@ -293,14 +276,14 @@ class LinkPredHead(nn.Module):
         nbhd_feat_u = nbhd_feat_u.unsqueeze(1).expand(b, c, fd)                       # [B, C, F]
 
         # Six pairwise geodesic distances (self.geom.dist): the 4 cross distances + the 2 self-displacements
-        # d(E[·], M[·]) that complete the frame-free set (0 exactly for a cold row, where M = E).
+        # d(E[·], P[·]) that complete the frame-free set (0 exactly for a cold row, where P = E).
         distances = torch.stack([
             self.geom.dist(seed_u, seed_v),                                  # d(E[u], E[v])  identity affinity
-            self.geom.dist(seed_u, nbhd_v),                                  # d(E[u], M[v])  is u in v's nbhd
-            self.geom.dist(nbhd_u, seed_v),                                  # d(M[u], E[v])  is v in u's nbhd
-            self.geom.dist(nbhd_u, nbhd_v),                                  # d(M[u], M[v])  nbhd overlap
-            self.geom.dist(seed_u, nbhd_u),                                  # d(E[u], M[u])  u's self-displacement
-            self.geom.dist(seed_v, nbhd_v),                                  # d(E[v], M[v])  v's self-displacement
+            self.geom.dist(seed_u, nbhd_v),                                  # d(E[u], P[v])  is u in v's nbhd
+            self.geom.dist(nbhd_u, seed_v),                                  # d(P[u], E[v])  is v in u's nbhd
+            self.geom.dist(nbhd_u, nbhd_v),                                  # d(P[u], P[v])  nbhd overlap
+            self.geom.dist(seed_u, nbhd_u),                                  # d(E[u], P[u])  u's self-displacement
+            self.geom.dist(seed_v, nbhd_v),                                  # d(E[v], P[v])  v's self-displacement
         ], dim=-1)                                                            # [B, C, 6]
         distances = distances / self.dist_tau.clamp(0.05, 20.0)              # learned global scale (conditioning)
         feats = torch.cat([distances, nf_u, nf_v, nbhd_feat_u, nbhd_feat_v], dim=-1)  # [B, C, 6 + 2*d_nf + 2*F]
