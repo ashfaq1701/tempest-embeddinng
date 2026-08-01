@@ -40,7 +40,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .alignment_loss import alignment_loss, boundary_penalty
 from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import LinkPredHead
@@ -91,12 +90,10 @@ class TrainerConfig:
     # ~0.828/0.803 while no-wd capped ~0.825/0.797 (the test-gap>val-gap signature of a lost regulariser).
     lr: float = 1e-4          # legacy single LR (superseded by the two-group split below; kept for compat)
     weight_decay: float = 1e-4
-    # TWO LR GROUPS. E (the manifold param) is trained by the ALIGNMENT loss only (the link head reads E
-    # detached), so its lr governs how fast the walk-neighbour clustering forms; the head (nn params) is
-    # trained by the link CE and its lr governs how fast it reads the clustered E. Both fast (1e-3/1e-3)
-    # is the best config on Poincaré: alignment clusters E to commP ~x20 within an epoch AND the head
-    # reads it immediately (val > 0.75 on wiki). RiemannianAdam does the Riemannian update on E, standard
-    # Adam on the head, each under its own group lr.
+    # TWO LR GROUPS. E (the manifold param) and the head (nn params) are BOTH trained by the link CE now —
+    # E end-to-end (no detach, no alignment loss), so ranking gradients flow into E through the head.
+    # manifold_lr is E's Riemannian-update lr; model_lr is the head's Adam lr. RiemannianAdam does the
+    # Riemannian update on E, standard Adam on the head, each under its own group lr.
     manifold_lr: float = 1e-3
     model_lr: float = 1e-3
 
@@ -181,8 +178,8 @@ class Trainer:
     def _score(self, src_t: torch.Tensor, cand_t: torch.Tensor,
                t_query_t: torch.Tensor):
         """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> (logits [B, C], src_tokens,
-        cand_tokens). The two walk bags are returned so the training step can run the alignment loss
-        on them without re-walking (eval ignores them).
+        cand_tokens). The two walk bags are returned alongside the logits (the head already consumed them;
+        eval ignores them).
 
         TWO-SIDED per-query walks: the SOURCE side samples K backward walks for each query (u_i, t_i)
         with cutoff = t_i; the CANDIDATE side samples K backward walks for every candidate v_ij with the
@@ -236,12 +233,12 @@ class Trainer:
         target = torch.zeros(B, dtype=torch.long, device=device)
         link_loss = F.cross_entropy(logits, target)
 
-        # Walk-neighbour alignment over BOTH bags (source + candidate): clusters E by walk-neighbourhood.
-        # Seeds from both bags share ONE frequency-weighted negative pool; dedup to unique nodes + a single
-        # matmul-form geodesic matrix makes the candidate side cheap (no [Q,M,d] blow-up).
+        # E is trained END-TO-END by the LINK loss (no alignment loss, no E-detach — the head reads E live,
+        # so ranking gradients flow into E). A wrapped-normal boundary prior d_H(0, E)^2 is kept as a stability
+        # guard: it caps E's radius so link-training cannot migrate E to the ball boundary where the geodesic
+        # metric blows up.
         E = self.model.E.weight
-        alignment = alignment_loss(src_tokens, cand_tokens, E, self.model.geom)
-        loss = link_loss + alignment + boundary_penalty(E, self.model.geom)
+        loss = link_loss + (self.model.geom.manifold.dist0(E) ** 2).mean()
 
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -249,7 +246,6 @@ class Trainer:
 
         return {
             "link": float(link_loss.detach()),
-            "align": float(alignment.detach()),
             "lr": float(self.opt.param_groups[0]["lr"]),
         }
 
@@ -364,18 +360,16 @@ class Trainer:
             self.model.train()
 
             t0 = time.time()
-            link_sum, align_sum, n_batches = 0.0, 0.0, 0
+            link_sum, n_batches = 0.0, 0
             for batch in train_batches_factory():
                 m = self._train_step(batch)
                 link_sum += m["link"]
-                align_sum += m.get("align", 0.0)
                 n_batches += 1
             train_dt = time.time() - t0
 
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
-                f"align={align_sum / max(n_batches, 1):.4f}  "
                 f"lr(E/head)={self.opt.param_groups[0]['lr']:.0e}/{self.opt.param_groups[1]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
