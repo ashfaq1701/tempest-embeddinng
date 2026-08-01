@@ -91,7 +91,8 @@ class TrainerConfig:
     # same fixed LR. weight_decay is LOAD-BEARING on the sphere head: an A/B showed wd 1e-4 reached
     # ~0.828/0.803 while no-wd capped ~0.825/0.797 (the test-gap>val-gap signature of a lost regulariser).
     lr: float = 1e-4          # legacy single LR (superseded by the two-group split below; kept for compat)
-    weight_decay: float = 1e-4
+    weight_decay: float = 0.0   # 0 default: wiki A/B (with the boundary prior removed) — no-wd let E spread
+                                # and beat wd 1e-4 on link MRR. wd was compressing E like the boundary prior.
     # TWO LR GROUPS. E (the manifold param) and the head (nn params) are BOTH trained by the link CE now —
     # E end-to-end (no detach, no alignment loss), so ranking gradients flow into E through the head.
     # manifold_lr is E's Riemannian-update lr; model_lr is the head's Adam lr. RiemannianAdam does the
@@ -237,11 +238,11 @@ class Trainer:
         link_loss = F.cross_entropy(logits, target)
 
         # E is trained END-TO-END by the LINK loss (no alignment loss, no E-detach — the head reads E live,
-        # so ranking gradients flow into E). A wrapped-normal boundary prior d_H(0, E)^2 is kept as a stability
-        # guard: it caps E's radius so link-training cannot migrate E to the ball boundary where the geodesic
-        # metric blows up.
-        E = self.model.E.weight
-        loss = link_loss + (self.model.geom.manifold.dist0(E) ** 2).mean()
+        # so ranking gradients flow into E). The former boundary prior d_H(0, E)^2 was REMOVED: an A/B on
+        # wiki showed it was over-compressing E toward the origin (inflating community-probe purity) at the
+        # cost of link-prediction MRR — dropping it lifted peak val 0.8048 -> 0.8232 / test 0.7688 -> 0.8005
+        # (E spreads out, commP develops organically, no boundary blow-up under manifold_lr 1e-4).
+        loss = link_loss
 
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
