@@ -45,7 +45,7 @@ import torch.nn.functional as F
 from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import LinkPredHead
-from .negatives import UniformNegativeSampler
+from .negatives import MixedNegativeSampler
 from .probes import CommunityProbe
 from .walk_tokens import build_query_walk_tokens
 from .walks import WalkGenerator
@@ -72,6 +72,12 @@ class TrainerConfig:
     # Link loss / head.
     K_train: int = 10           # per-query training negatives ([B, 1+K_train]); 10 keeps the candidate
                                 # bag small enough to fit bs 1000 on review
+    hist_neg_ratio: float = 0.0  # fraction of training negatives drawn from the source's PAST destinations
+                                 # (per-source reservoir), rest random — mirrors TGB eval's hist/rnd mix.
+                                 # 0 = pure uniform (no reservoir). NOT for wiki (trains against eval signal);
+                                 # for low-recurrence sets like review. See negatives.MixedNegativeSampler.
+    reservoir_size: int = 256    # per-source historical reservoir depth M (only used when hist_neg_ratio>0);
+                                 # size ~ typical per-source history — under-fill dilutes the hist fraction.
 
     # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked, each
     # bounded by the query's own cutoff t_i; both bags flow to the head.
@@ -124,8 +130,15 @@ class Trainer:
             temporal_node2vec_p=config.t2nv_p,
             temporal_node2vec_q=config.t2nv_q,
         )
-        self.neg_sampler_train = UniformNegativeSampler(
-            num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
+        # Training negatives: hist_neg_ratio=0 -> pure uniform (no reservoir allocated);
+        # >0 -> a hist/rnd mix from a per-source causal reservoir (fed post-scoring via observe()).
+        self.neg_sampler_train = MixedNegativeSampler(
+            num_neg_per_pos=config.K_train,
+            hist_ratio=config.hist_neg_ratio,
+            dst_pool=config.dst_pool,
+            num_nodes=config.num_nodes,
+            reservoir_size=config.reservoir_size,
+            seed=config.seed,
         )
 
         # ONE param group at a single lr: RiemannianAdam gives E (the geoopt.ManifoldParameter) the
@@ -231,6 +244,12 @@ class Trainer:
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         self.opt.step()
+
+        # Feed this batch's positives into the (optional) historical reservoir AFTER scoring —
+        # strict-causal: at score time the reservoir held only strictly-earlier batches' edges.
+        # No-op when hist_neg_ratio == 0. Relies on chronological train-batch order (which the
+        # per-query cutoff=t protocol already assumes).
+        self.neg_sampler_train.observe(batch.src, batch.tgt)
 
         return {
             "link": float(link_loss.detach()),
@@ -372,6 +391,9 @@ class Trainer:
 
         for ep in range(1, n_epochs + 1):
             self.model.train()
+            self.neg_sampler_train.reset()   # drop last epoch's reservoir (re-derives identically next pass;
+                                             # without it, epoch-1's whole pass would pollute epoch-2's early
+                                             # batches with future edges — strict-causal violation). No-op at ratio 0.
 
             t0 = time.time()
             link_sum, align_sum, n_batches = 0.0, 0.0, 0
