@@ -81,6 +81,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dropout", default=0.2, type=float,
                    help="Scorer-MLP dropout. Breaks head memorisation, turning the post-peak "
                         "overfit cliff into a gentle valley on wiki. 0 = off.")
+    p.add_argument("--hist-neg-ratio", default=0.0, type=float,
+                   help="Fraction of TRAINING negatives drawn from the source's past destinations "
+                        "(per-source causal reservoir), rest random — mirrors TGB eval's hist/rnd mix. "
+                        "0 = pure uniform (no reservoir). NOT for wiki; for low-recurrence sets like review.")
+    p.add_argument("--reservoir-size", default=256, type=int,
+                   help="Per-source historical reservoir depth M (only used when --hist-neg-ratio>0). "
+                        "Size ~ typical per-source history; under-fill dilutes the historical fraction.")
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
     p.add_argument(
@@ -277,6 +284,8 @@ def main() -> Dict[str, Any]:
 
         K_train=args.k_train,
         dropout=args.dropout,
+        hist_neg_ratio=args.hist_neg_ratio,
+        reservoir_size=args.reservoir_size,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,
