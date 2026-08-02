@@ -16,7 +16,7 @@ is what keeps EVAL seamless: the eval sampler satisfies the same contract.
 Samplers:
   - UniformNegativeSampler   : random destinations from a pool (a provider; also
                                usable standalone). Dense [B, K].
-  - HistoricalNegativeSampler: per-source reservoir (Vitter R) of PAST
+  - HistoricalReservoir: per-source reservoir (Vitter R) of PAST
                                destinations — a PROVIDER, not a standalone
                                sampler. Exposes observe()/reset()/draw(); the
                                random fallback for cold sources is the MIXER's
@@ -107,7 +107,7 @@ class UniformNegativeSampler(NegativeSampler):
         return neg_src, neg_tgt
 
 
-class HistoricalNegativeSampler:
+class HistoricalReservoir:
     """Per-source reservoir of past destinations (Vitter's algorithm R) — a
     PROVIDER of historical negatives for MixedNegativeSampler (not a standalone
     NegativeSampler; it never does its own random fallback).
@@ -221,9 +221,9 @@ class MixedNegativeSampler(NegativeSampler):
             num_neg_per_pos=self.K, dst_pool=dst_pool, seed=seed,
         )
         # Only allocate the reservoir when historical negatives are requested.
-        self.historical: Optional[HistoricalNegativeSampler] = None
+        self.historical: Optional[HistoricalReservoir] = None
         if self.K_hist > 0:
-            self.historical = HistoricalNegativeSampler(
+            self.historical = HistoricalReservoir(
                 num_nodes=num_nodes,
                 reservoir_size=reservoir_size,
                 seed=(None if seed is None else seed + 1),
