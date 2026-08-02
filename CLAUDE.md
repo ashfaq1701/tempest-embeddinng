@@ -1336,3 +1336,62 @@ saturated and the specialization's venue is review, not more wiki pair features.
 
 Branch `experiment/overnight-pair-features` (commits c07b34d #1, f271282 #2, 0619c5c #3);
 full trace in `logs/OVERNIGHT_PAIR_FEATURES.md`.
+
+---
+
+## TGB dataset stats: node counts + historical-negative % (2026-08-02)
+
+Per-dataset statistics for the four link-property datasets, computed directly from the
+installed TGB data (`tgb/datasets/*`) — node counts from `full_data`, historical-% classified
+against every negative in the pre-generated eval NS pkls. Numbers are EXACT (whole-population,
+not sampled).
+
+### Node / edge counts
+
+| dataset | edges | train edges | **unique target (dst)** | unique src | total nodes | neg/pos (K_eval) |
+|---|---|---|---|---|---|---|
+| tgbl-review | 4,873,540 | 3,413,837 | **298,590** | 352,636 | 352,637 | 100 |
+| tgbl-coin | 22,809,486 | 15,966,659 | **628,373** | 612,852 | 638,486 | 20 |
+| tgbl-comment | 44,314,507 | 31,020,155 | **809,700** | 875,536 | 994,790 | 20 |
+| tgbl-flight | 67,169,570 | 47,043,612 | **17,927** | 16,706 | 18,143 | 20 |
+
+None are strictly bipartite (`src ∩ dst` is large in every case; e.g. review shares 298,589
+nodes between the two roles). "Unique target" = distinct nodes ever observed as a destination
+= the effective negative-candidate pool. (TGB's random sampler actually draws from the
+contiguous dst-ID range `[first_dst_id, last_dst_id]`, which can be marginally larger than the
+unique *observed* dst above.)
+
+### Historical-negative percentage (all four use the `hist_rnd` strategy)
+
+TGB's `hist_rnd` (Poursafaei et al. 2022): for each positive `(u, v, t)`, up to 50% of the
+negatives are drawn from destinations `u` linked to in **TRAIN** (minus current positives), the
+rest uniformly random. Random negatives EXCLUDE all train-seen dst, so the two pools are
+DISJOINT by construction → a negative is historical **iff** `(u, neg_dst)` is a train edge
+(exact, unambiguous classification). The 50% is a CAP, not a fixed ratio: a source with fewer
+than `0.5·K_eval` distinct train destinations backfills with random, so the realised fraction
+reads out per-source history depth.
+
+| dataset | **val historical %** | **test historical %** | %pos at 50% cap (test) | %pos with 0 hist (test) |
+|---|---|---|---|---|
+| tgbl-review | **8.70%** | **7.88%** | 1.9% | 19.3% |
+| tgbl-coin | **35.27%** | **32.95%** | 60.7% | 23.8% |
+| tgbl-comment | **39.33%** | **32.16%** | 61.8% | 31.8% |
+| tgbl-flight | **49.71%** | **49.51%** | 98.6% | 0.6% |
+
+Read: the historical fraction tracks graph density / source-history depth.
+- **review ~8%** — sparse user→product graph, most sources reviewed few products; eval is ~92%
+  the easy random slice. The hard part of review is the cold / new-pair slice (surprise ≈ 0.987),
+  NOT recurrence — consistent with the ep1-peak-then-crash one-epoch behaviour on review.
+- **coin ~33% / comment ~32–39%** — moderate density; ~60–75% of sources hit the cap but a long
+  cold-source tail (24–32% with zero historical) pulls the mean down.
+- **flight ~49.5%** — only ~18k airports but 67M edges, so nearly every source has ≫ K_eval/2
+  historical partners → 98–99% of positives pin at the 50% cap. Half of every flight ranking is
+  hard historical negatives → recurrence discrimination is decisive there.
+
+Implication for eval difficulty: the historical (recurrence-confusable) share, i.e. how much of
+MRR is decided on the hard slice, is dataset-specific — flight ≫ coin ≈ comment ≫ review.
+
+Reproduce: load `LinkPropPredDataset(name, root="datasets")` → train `(src,dst)` → encode
+`src*NODES+dst`, `np.unique` = historical key set; `pickle.load` the `*_ns*.pkl` → per positive
+`np.isin(src*NODES + negs, hist_keys)`. Source of truth for the strategy:
+`tgb/linkproppred/negative_generator.py::generate_negative_samples_hist_rnd`.
