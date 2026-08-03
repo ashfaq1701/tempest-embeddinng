@@ -448,3 +448,53 @@ memorise) target. Hard negatives are a **head/loss-side** lever, and by now we
 have strong evidence (head ablations, ±tau, learned-vs-fixed weighting,
 E-speed) that the collapse is **not** on the head/loss side. So: **hard
 negatives are ruled out as a fix — already tried, no effect on the curve.**
+
+---
+
+### 2026-08-03 — Learnable age/hop pooling coefficients (the "free weights" test)
+
+**Prompts:** "Make age + hop scoring learnable by the model. No Time2Vec." →
+"Let's make it free to choose." → "Rerun wiki 1e-4."
+
+**What / how:** replaced the fixed recency/hop prior with two FREE learnable
+scalars — a bias-free linear map `log_weight = c_age·log1p(age) + c_hop·log1p(hop-1)`.
+Init `c_age = c_hop = -1` reproduces the fixed prior exactly; no exp/clamp, so the
+model can shrink a coeff to 0 (ignore a feature) or flip its sign (invert). Only 2
+params. (Temp per-epoch logging of the coeffs added to the trainer.)
+
+**Run:** wiki, K=100, manifold_lr 1e-4, fixed head otherwise. Compared to the
+fixed-prior wiki-1e-4 run (peak 0.8164, stable plateau).
+
+**RESULT — neutral-to-slightly-WORSE; freedom is not a win:**
+
+| ep | val (learnable) | val (fixed prior) | c_age | c_hop |
+|---|---|---|---|---|
+| 4 | 0.7230 | 0.7364 | -0.66 | -0.60 |
+| 5 | 0.8089 | 0.8125 | -0.67 | -0.67 |
+| 9 | **0.8131** (peak) | **0.8164** (peak) | -0.51 | -0.76 |
+| 11 | 0.8114 (drifting) | — | -0.43 | -0.77 |
+
+- Tracked the fixed prior but **marginally below at every epoch**; peaked 0.8131 vs
+  0.8164 (−0.003), then drifted as c_age kept shrinking.
+- **Learned asymmetry (the one interesting byproduct):** coeffs converged near
+  −0.66 each by ep5, then DIVERGED — c_age → −0.43 (recency weakening toward
+  irrelevance) while c_hop held ≈ −0.76. So wiki, given freedom, prefers
+  **proximity (hop) ≫ recency (age)** — something the fixed −1/−1 prior can't
+  express. But it does NOT convert to a metric gain.
+- The direction of drift (weaken the recency term) is the **memorisation
+  signature in miniature**: the model softens a useful prior because it lowers
+  *training* loss, and it costs a little val — even on the "safe" (climbing)
+  dataset.
+
+**Verdict:** keep the FIXED prior as default. The freedom is neutral-to-negative
+on wiki, and (per the standing E-side diagnosis) can't fix the review/coin
+collapse anyway — head/pooling is not the lever. Reverted to `stash@{0}`
+(recoverable). Whether the freedom is actively HARMFUL on review's memorisation
+was left untested (the one open downside), but there is no upside case for it.
+
+Consistent with the running conclusion: **the collapse is E-side; every
+head/loss/pooling lever tried (distances, tau, hard negatives, learned-vs-fixed
+weighting, learnable coeffs) is neutral-or-worse.** The only two things that ever
+changed a curve: E LEARNING RATE (fixes wiki's over-cluster drift; useless on
+review's memorisation cliff) and the ALIGNMENT LOSS (the only lever that made
+review climb).
