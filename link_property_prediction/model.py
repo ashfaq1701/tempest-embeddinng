@@ -18,7 +18,6 @@ finite gradient at the cold-row zero tangent).
 from typing import Optional
 
 import geoopt
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -47,43 +46,6 @@ class PoincareManifold:
         """Exp map from `base` along `tangent` — geoopt.PoincareBall.expmap. Finite gradient at u = 0, so
         the cold-row zero tangent is a safe differentiable no-op returning `base`."""
         return self.manifold.expmap(base, tangent)
-
-
-class TimeEncoder(nn.Module):
-    """Time2Vec time encoding, ported verbatim from TPNet (TGB_TPNet/models/modules.py)."""
-
-    def __init__(self, time_dim: int, parameter_requires_grad: bool = True):
-        """
-        Time encoder.
-        :param time_dim: int, dimension of time encodings
-        :param parameter_requires_grad: boolean, whether the parameter in TimeEncoder needs gradient
-        """
-        super(TimeEncoder, self).__init__()
-
-        self.time_dim = time_dim
-        # trainable parameters for time encoding
-        self.w = nn.Linear(1, time_dim)
-        self.w.weight = nn.Parameter(
-            (torch.from_numpy(1 / 10 ** np.linspace(0, 9, time_dim, dtype=np.float32))).reshape(time_dim, -1))
-        self.w.bias = nn.Parameter(torch.zeros(time_dim))
-
-        if not parameter_requires_grad:
-            self.w.weight.requires_grad = False
-            self.w.bias.requires_grad = False
-
-    def forward(self, timestamps: torch.Tensor):
-        """
-        compute time encodings of time in timestamps
-        :param timestamps: Tensor, shape (batch_size, seq_len)
-        :return:
-        """
-        # Tensor, shape (batch_size, seq_len, 1)
-        timestamps = timestamps.unsqueeze(dim=2)
-
-        # Tensor, shape (batch_size, seq_len, time_dim)
-        output = torch.cos(self.w(timestamps))
-
-        return output
 
 
 class NeighborhoodProjection(nn.Module):
@@ -201,13 +163,9 @@ class LinkPredHead(nn.Module):
         # Non-geometric feature channel (static node + per-token edge features). feature_dim from config;
         # 0-width (no-op) when the dataset has no node/edge features. Weighted-mean pooled per node -> scorer.
         self.neighbour_feats = NeighborFeatureProjection(d_nf=self.d_nf, d_ef=d_ef, feature_dim=feature_dim)
-        # SHARED recency/hop weight net: [Time2Vec(age), log1p(hop)] -> one per-token weight logit, used to
-        # pool BOTH the geometry tangents (NeighborhoodProjection) and the feature encodings
-        # (NeighborFeatureProjection). One "token relevance" function; each channel softmaxes over its own mask.
-        self.time_encoder = TimeEncoder(time_dim=t2v_dim)
-        w_in = t2v_dim + 1
-        self.weight_net = nn.Sequential(
-            nn.Linear(w_in, w_in), nn.GELU(), nn.Linear(w_in, 1))
+        # Per-token pooling weights are now a FIXED (non-learned) recency/hop prior — see
+        # _token_weight_logits. The old learned weight net (Time2Vec + MLP) is removed; t2v_dim
+        # is retained in the signature only for CLI compatibility and is unused.
 
         # Scorer: MLP over the 4 pairwise GEODESIC DISTANCES between {E[x], P[x]} of u and v, plus each node's
         # static node features nf[·] and its pooled walk-neighbour feature encoding (NeighborFeatureProjection).
@@ -226,12 +184,21 @@ class LinkPredHead(nn.Module):
         self.dist_tau = nn.Parameter(torch.tensor(1.0))
 
     def _token_weight_logits(self, tokens: WalkTokens) -> torch.Tensor:
-        """Shared per-token recency/hop weight logits [N, T] from [Time2Vec(log1p(age)), log1p(hop)].
-        Computed once per bag; each channel softmaxes over its own context mask."""
-        ages = tokens.ages.clamp_min(0).to(self.E.weight.dtype)                       # [N, T]
-        t2v = self.time_encoder(torch.log1p(ages))                                   # [N, T, t2v_dim]
-        log_hop = torch.log1p(tokens.positions.clamp_min(0).to(t2v.dtype)).unsqueeze(-1)  # [N, T, 1]
-        return self.weight_net(torch.cat([t2v, log_hop], dim=-1)).squeeze(-1)         # [N, T]
+        """FIXED (non-learned) shared per-token pooling weights [N, T], mirroring the alignment
+        loss's recency/hop prior:
+
+            log_weight = -( log1p(age) + log1p(hop - 1) )
+
+        These are LOG-weights: each pooling channel masked_fills non-context slots to -inf and
+        softmaxes, so the token with the smallest (age, hop) — most RECENT and CLOSEST to the seed —
+        gets the highest weight. The leading minus is what does that: lower age → smaller log1p(age),
+        lower hop → smaller log1p(hop-1) → larger (less negative) log_weight → larger softmax weight.
+        Convention (WalkTokens): age = 0 at the seed, ≥1 for context; hop = 1 at the seed, 2 for the
+        closest context, so hop-1 = 0 at the seed (masked out) and ≥1 for context."""
+        dtype = self.E.weight.dtype
+        age = tokens.ages.clamp_min(0).to(dtype)                                       # [N, T]  seed=0, ctx≥1
+        hop = tokens.positions.clamp_min(1).to(dtype)                                  # [N, T]  seed=1, ctx≥2
+        return -(torch.log1p(age) + torch.log1p(hop - 1.0))                            # [N, T]  ≤ 0
 
     def _project(self, tokens: WalkTokens, w_logit: torch.Tensor) -> torch.Tensor:
         """Neighbourhood projection P[x] = exp_{E[seed]}(mu) [N, d] — the ball point returned by
