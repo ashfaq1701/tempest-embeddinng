@@ -403,3 +403,48 @@ schedule idea gains weight: it directly throttles the over-clustering and could
 unify wiki-slow-E / review-fast-E into one temporal schedule. Run killed after
 ep3 (shape decided). model.py still holds the temp bare-linear scorer
 (uncommitted) — revert before the next real experiment.
+
+---
+
+### 2026-08-03 — On the record: HARD (historical) negatives were tried and did NOT help
+
+Noting this explicitly because it's easy to forget it was already tested. Early
+this session we tried **hard negatives** — TGB-style **historical negatives**:
+per positive `(u, v, t)`, draw a fraction of the K training negatives from the
+destinations `u` has previously linked to (destinations seen in `u`'s own past =
+genuinely hard negatives, since the model has to distinguish them from the true
+next target), with the remainder uniform-random.
+
+**How we implemented it (on branch `feature/hist-negatives`, commits
+`4398944b` → `0c491445` → `0fc7de72`):**
+- `HistoricalReservoir` — a per-source reservoir of past destinations maintained
+  by **Vitter's Algorithm R** (uniform reservoir sample, O(V·M) memory, not
+  O(t·V·V)). Strictly causal: `observe(src, dst)` is called POST-scoring (so at
+  score time the reservoir holds only strictly-earlier edges), and `reset()` per
+  epoch.
+- `MixedNegativeSampler` — one abstraction that takes `hist_ratio`, splits K into
+  `K_hist` (drawn from the reservoir) + `K_rand` (uniform), backfills invalid /
+  cold-source historical slots with random, and returns the combined `[B, K]`.
+  hist_ratio = 0 → pure uniform (safe default).
+
+**How we ran it:** tgbl-review, `--hist-neg-ratio 0.2 --reservoir-size 64`,
+K=50, manifold_lr 1e-3, dropout 0, bs 1000/1000, patience 5, seed 42.
+
+**Result — same one-epoch collapse, hard negatives changed nothing:**
+
+| variant | ep1 | ep2 | ep3 |
+|---|---|---|---|
+| hist 0.2 (6-dist scorer) | 0.2792 | 0.2777 | **0.2222** |
+| hist 0.2 + no-self-disp (4-dist) | 0.2829 | 0.2830 | **0.2126** |
+
+Both peak early and fall off the same cliff as uniform negatives.
+
+**Why it didn't help (consistent with the E-side diagnosis):** hard negatives
+change *which* negatives the head ranks against, but the collapse is E
+memorising training-specific structure that doesn't transfer (train loss keeps
+crashing regardless). A harder negative distribution doesn't stop that — it
+just gives the head a different (arguably more systematic, thus easier-to-
+memorise) target. Hard negatives are a **head/loss-side** lever, and by now we
+have strong evidence (head ablations, ±tau, learned-vs-fixed weighting,
+E-speed) that the collapse is **not** on the head/loss side. So: **hard
+negatives are ruled out as a fix — already tried, no effect on the curve.**
