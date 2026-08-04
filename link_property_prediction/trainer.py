@@ -256,6 +256,7 @@ class Trainer:
     def _eval(self, evaluator: Evaluator, batches: Iterable[Batch],
               recorder: Any = None) -> float:
         self.model.eval()
+        evaluator.neg_sampler.reset()          # re-seed the eval sampler -> same negatives every epoch
         total, n = 0.0, 0
         with torch.no_grad():
             for batch in batches:

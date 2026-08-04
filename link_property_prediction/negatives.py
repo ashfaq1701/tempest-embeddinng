@@ -56,7 +56,14 @@ class UniformNegativeSampler(NegativeSampler):
     ):
         self.num_neg_per_pos = num_neg_per_pos
         self.dst_pool = np.asarray(dst_pool, dtype=np.int32)
+        self.seed = seed
         self.rng = np.random.default_rng(seed)
+
+    def reset(self) -> None:
+        """Re-seed the RNG to its original seed. Used at eval start so the SAME uniform negatives are
+        drawn every epoch (the eval batches are deterministic) — comparable MRR across epochs. Training
+        never calls reset(), so training negatives stay freshly random per batch."""
+        self.rng = np.random.default_rng(self.seed)
 
     def sample(self, batch: Batch) -> Tuple[np.ndarray, np.ndarray]:
         B = len(batch.src)

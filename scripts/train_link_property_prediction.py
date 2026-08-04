@@ -43,7 +43,7 @@ import torch
 from link_property_prediction.data import Loaded, concat_splits, create_batches, load_tgb
 from link_property_prediction.data_stats import compute_train_stats
 from link_property_prediction.evaluator import Evaluator
-from link_property_prediction.negatives import TGBNegativeSampler
+from link_property_prediction.negatives import UniformNegativeSampler
 from link_property_prediction.trainer import Trainer, TrainerConfig
 from link_property_prediction.utils import seed_all
 
@@ -81,6 +81,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dropout", default=0.2, type=float,
                    help="Scorer-MLP dropout. Breaks head memorisation, turning the post-peak "
                         "overfit cliff into a gentle valley on wiki. 0 = off.")
+    p.add_argument("--eval-k", default=100, type=int,
+                   help="EVAL negatives per positive. On this branch eval uses OUR OWN uniform random "
+                        "negatives (same distribution as training), NOT TGB's pre-generated ones — "
+                        "eval_k of them per positive (100 = TGB's review K). Fixed across epochs.")
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
     p.add_argument(
@@ -251,13 +255,17 @@ def main() -> Dict[str, Any]:
     )
 
     # ─── Build evaluators ──────────────────────────────────────────
+    # NOTE: eval does NOT use TGB's pre-generated negatives on this branch — it uses OUR OWN uniform
+    # random negatives (same distribution as training), eval_k per positive, with a distinct seed per
+    # split. Re-seeded at every eval (UniformNegativeSampler.reset) so the negatives are fixed across
+    # epochs. TGB's MRR scorer (score_to_metric) still ranks the positive among them.
     val_eval = Evaluator(
-        neg_sampler=TGBNegativeSampler(loaded.dataset, split_mode="val"),
+        neg_sampler=UniformNegativeSampler(args.eval_k, dst_pool, seed=args.seed + 1000),
         tgb_dataset_name=loaded.name,
         eval_metric=loaded.eval_metric,
     )
     test_eval = Evaluator(
-        neg_sampler=TGBNegativeSampler(loaded.dataset, split_mode="test"),
+        neg_sampler=UniformNegativeSampler(args.eval_k, dst_pool, seed=args.seed + 2000),
         tgb_dataset_name=loaded.name,
         eval_metric=loaded.eval_metric,
     )
