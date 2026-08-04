@@ -52,6 +52,22 @@ class WalkTokens:
     seed_node_mask: torch.Tensor                    # [Q, T]  bool  True on EVERY slot whose node == seed node
     edge_features: Optional[torch.Tensor] = None    # [Q, T, d_ef]
 
+    @property
+    def weight_logits(self) -> torch.Tensor:
+        """Fixed (non-learned) shared per-token pooling weight LOGITS [Q, T] — the recency/hop prior
+
+            log_weight = -( log1p(age) + log1p(hop - 1) )
+
+        maximal (= 0) for a just-happened, adjacent token, decaying with both age and hop. These are
+        LOG-weights: a pooling channel masked_fills its non-context slots to -inf and softmaxes, so the
+        most RECENT & CLOSEST token gets the highest weight. Convention: age = 0 at the seed / ≥1 for
+        context; hop = 1 at the seed / ≥2 for the closest context (so hop-1 = 0 at the seed, ≥1 for
+        context). Returned in float32 — cast to the head's dtype at the call site if it differs. The
+        SAME prior weights both pooling channels (geometry and features) and the alignment loss."""
+        age = self.ages.clamp_min(0).to(torch.float32)                                 # [Q, T]  seed=0, ctx≥1
+        hop = self.positions.clamp_min(1).to(torch.float32)                            # [Q, T]  seed=1, ctx≥2
+        return -(torch.log1p(age) + torch.log1p(hop - 1.0))                            # [Q, T]  ≤ 0
+
 
 def build_query_walk_tokens(
     walk_gen,

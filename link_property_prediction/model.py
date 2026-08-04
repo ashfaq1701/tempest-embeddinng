@@ -163,9 +163,9 @@ class LinkPredHead(nn.Module):
         # Non-geometric feature channel (static node + per-token edge features). feature_dim from config;
         # 0-width (no-op) when the dataset has no node/edge features. Weighted-mean pooled per node -> scorer.
         self.neighbour_feats = NeighborFeatureProjection(d_nf=self.d_nf, d_ef=d_ef, feature_dim=feature_dim)
-        # Per-token pooling weights are now a FIXED (non-learned) recency/hop prior — see
-        # _token_weight_logits. The old learned weight net (Time2Vec + MLP) is removed; t2v_dim
-        # is retained in the signature only for CLI compatibility and is unused.
+        # Per-token pooling weights are a FIXED (non-learned) recency/hop prior — WalkTokens.weight_logits.
+        # (The old learned weight net (Time2Vec + MLP) is removed; t2v_dim is retained in the signature
+        # only for CLI compatibility and is unused.)
 
         # Scorer: MLP over the 4 pairwise GEODESIC DISTANCES between {E[x], P[x]} of u and v, plus each node's
         # static node features nf[·] and its pooled walk-neighbour feature encoding (NeighborFeatureProjection).
@@ -182,23 +182,6 @@ class LinkPredHead(nn.Module):
         # sit at O(1); one clamped scalar absorbs that global scale so the scorer's first Linear sees
         # comparable channels. Pairs with boundary_penalty (which caps inflation on the E side). Init 1 = no-op.
         self.dist_tau = nn.Parameter(torch.tensor(1.0))
-
-    def _token_weight_logits(self, tokens: WalkTokens) -> torch.Tensor:
-        """FIXED (non-learned) shared per-token pooling weights [N, T], mirroring the alignment
-        loss's recency/hop prior:
-
-            log_weight = -( log1p(age) + log1p(hop - 1) )
-
-        These are LOG-weights: each pooling channel masked_fills non-context slots to -inf and
-        softmaxes, so the token with the smallest (age, hop) — most RECENT and CLOSEST to the seed —
-        gets the highest weight. The leading minus is what does that: lower age → smaller log1p(age),
-        lower hop → smaller log1p(hop-1) → larger (less negative) log_weight → larger softmax weight.
-        Convention (WalkTokens): age = 0 at the seed, ≥1 for context; hop = 1 at the seed, 2 for the
-        closest context, so hop-1 = 0 at the seed (masked out) and ≥1 for context."""
-        dtype = self.E.weight.dtype
-        age = tokens.ages.clamp_min(0).to(dtype)                                       # [N, T]  seed=0, ctx≥1
-        hop = tokens.positions.clamp_min(1).to(dtype)                                  # [N, T]  seed=1, ctx≥2
-        return -(torch.log1p(age) + torch.log1p(hop - 1.0))                            # [N, T]  ≤ 0
 
     def _project(self, tokens: WalkTokens, w_logit: torch.Tensor) -> torch.Tensor:
         """Neighbourhood projection P[x] = exp_{E[seed]}(mu) [N, d] — the ball point returned by
@@ -220,8 +203,8 @@ class LinkPredHead(nn.Module):
         per (u, candidate v). Returns logits [B, C]."""
         emb = self.E.weight                                                   # E trained end-to-end by the link loss
         # Shared per-token weight logits, computed once per bag and used to pool BOTH channels.
-        w_src = self._token_weight_logits(src_tokens)                         # [B, T]
-        w_cand = self._token_weight_logits(cand_tokens)                       # [B*C, T]
+        w_src = src_tokens.weight_logits.to(emb.dtype)                        # [B, T]   fixed recency/hop prior
+        w_cand = cand_tokens.weight_logits.to(emb.dtype)                      # [B*C, T] fixed recency/hop prior
         seed_u = F.embedding(src_tokens.seeds, emb)                           # E[u]   [B, d]
         nbhd_u = self._project(src_tokens, w_src)                             # P[u]   [B, d]
         nf_u = self._node_feats(src_tokens.seeds)                             # nf[u]  [B, d_nf]
