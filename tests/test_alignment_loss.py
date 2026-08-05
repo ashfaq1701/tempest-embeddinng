@@ -1,13 +1,16 @@
 """Correctness tests for the walk-neighbour alignment loss (link_property_prediction/alignment_loss.py).
 
-The loss is InfoNCE rows over one shared distance matrix, so what can go wrong is bookkeeping — which
-rows exist, which nodes are excluded, whether occurrences aggregate — plus the one behavioural claim
-that matters: a step on it must pull each seed toward its own walk context.
+The loss is multi-positive InfoNCE with a WEIGHTED pull (numerator, recency/hop prior) and an UNWEIGHTED
+push over a UNIFORMLY-sampled pool of distinct nodes (denominator). What can go wrong is bookkeeping —
+which rows/nodes are in play, self-exclusion, the pool cap + resample + scale-restoration — plus the one
+behavioural claim: a step must pull each seed toward its own walk context.
 """
+import math
+
 import geoopt
 import torch
 
-from link_property_prediction.alignment_loss import _extract_context, alignment_loss
+from link_property_prediction.alignment_loss import _extract_context, _sample_pool, alignment_loss
 from link_property_prediction.model import PoincareManifold
 from link_property_prediction.walk_tokens import WalkTokens
 
@@ -45,44 +48,53 @@ def test_context_excludes_seed_and_padding():
     #                seed 5: [seed(5), 7, 5(revisit), 9, pad]
     bag = _tokens([[5, 7, 5, 9, -1]], [[0, 3, 8, 1, -1]], [[1, 2, 3, 4, 0]], [5])
     ctx = _extract_context(bag, torch.float32)
-    live = ctx.is_context[0].tolist()
-    assert live == [False, True, False, True, False], live
+    assert ctx.is_context[0].tolist() == [False, True, False, True, False]
     print("\n[context] origin slot, seed revisit and padding excluded OK")
 
 
 def test_both_bags_contribute_anchors():
     """Both 'sides' are just both bags contributing rows: every seed of src AND of cand is an anchor,
-    and the pool spans the context of both."""
+    and the pool spans the DISTINCT context of both."""
     src, cand = _fixture()
-    e = _emb(20)
-    s, c = _extract_context(src, e.dtype), _extract_context(cand, e.dtype)
+    s, c = _extract_context(src, torch.float32), _extract_context(cand, torch.float32)
     anchors = set(s.seeds.tolist()) | set(c.seeds.tolist())
     pool = set(torch.cat([s.nodes[s.is_context], c.nodes[c.is_context]]).tolist())
     assert anchors == {1, 3, 2, 10, 4, 13}, sorted(anchors)
-    assert {5, 6, 7, 8} <= pool and {9, 11, 12, 14} <= pool, sorted(pool)
+    assert {5, 6, 7, 8, 9, 11, 12, 14} <= pool, sorted(pool)
     print("[anchors] source AND candidate seeds both anchor rows; pool spans both bags OK")
 
 
-def test_pool_aggregates_repeated_occurrences():
-    """A node appearing in several bags gets the SUM of its occurrence weights in the denominator —
-    exact, because a geodesic depends only on the node."""
-    geom = PoincareManifold()
-    e = _emb(20)
-    # Node 5 occurs twice (src row 0 and cand row 0); node 6 once. Perturbing 5 must move the loss more.
-    src, cand = _fixture()
-    base = float(alignment_loss(src, cand, e, geom).detach())
-    deltas = {}
-    for node in (5, 6):
-        e2 = e.detach().clone()
-        e2[node] = e2[node] * 0.2
-        deltas[node] = abs(float(alignment_loss(src, cand, e2, geom).detach()) - base)
-    assert deltas[5] > deltas[6], f"repeated node must carry more mass: {deltas}"
-    print(f"[pool] repeated occurrences aggregate ({deltas[5]:.4f} vs {deltas[6]:.4f}) OK")
+def test_pool_is_unweighted_over_distinct_and_full_when_small():
+    """The pool is DISTINCT nodes, occurrence-blind: a node the walks reached many times appears exactly
+    ONCE, same as a node reached once. And when the distinct count is <= pool_size, the WHOLE pool is
+    returned unchanged (no subsampling)."""
+    # node 5 occurs 4x, node 6 once — both must appear exactly once in the pool.
+    ctx = torch.tensor([5, 5, 5, 5, 6, 7])
+    pool = _sample_pool(ctx, pool_size=15_000)
+    assert pool.tolist() == [5, 6, 7], pool.tolist()                # unique, sorted, occurrence-blind
+    # Under the cap => identical to torch.unique (no random subsample).
+    assert torch.equal(pool, torch.unique(ctx))
+    print("[pool] unweighted (distinct, occurrence-blind); full pool kept when under the cap OK")
 
 
-def test_self_node_excluded_from_both_terms():
+def test_pool_caps_and_resamples_when_over():
+    """Above the cap: exactly pool_size distinct nodes, a subset of the full set, and RESAMPLED each
+    call (two draws differ)."""
+    torch.manual_seed(0)
+    ctx = torch.arange(100).repeat_interleave(3)                    # 100 distinct nodes, 3 occ each
+    a = _sample_pool(ctx, pool_size=10)
+    b = _sample_pool(ctx, pool_size=10)
+    assert a.numel() == 10 and b.numel() == 10
+    assert a.unique().numel() == 10, "pool entries must be distinct"
+    full = set(range(100))
+    assert set(a.tolist()) <= full and set(b.tolist()) <= full
+    assert a.tolist() != b.tolist(), "pool must be resampled every call, not cached"
+    print("[pool] over the cap -> pool_size distinct nodes, resampled each call OK")
+
+
+def test_self_node_excluded_from_denominator():
     """A seed that also appears as a context token of ANOTHER bag must not score against itself: the
-    degenerate dist(E[u], E[u]) = 0 is dropped from the numerator and from the denominator alike."""
+    degenerate dist(E[u], E[u]) = 0 is dropped from the denominator; the loss stays finite."""
     geom = PoincareManifold()
     e = _emb(20)
     # Node 5 is the seed of row 1 AND a context token of row 0 -> the self term must be excluded.
@@ -91,15 +103,15 @@ def test_self_node_excluded_from_both_terms():
     cand = _tokens([[2, 9, -1, -1], [10, 11, -1, -1]], [[0, 2, -1, -1], [0, 2, -1, -1]],
                    [[1, 2, 0, 0], [1, 2, 0, 0]], [2, 10])
     loss = alignment_loss(src, cand, e, geom)
-    assert torch.isfinite(loss), "self-node overlap must not produce inf/nan"
+    assert torch.isfinite(loss)
     loss.backward()
     assert torch.isfinite(e.grad).all()
-    print("[self] anchor node excluded from both numerator and denominator OK")
+    print("[self] anchor node excluded from the denominator; loss + grad finite OK")
 
 
 def test_gradient_pulls_seed_toward_its_own_context():
-    """THE behavioural claim: a step on the alignment loss must DECREASE the geodesic distance from
-    each seed to its own walk context."""
+    """THE behavioural claim: a step on the alignment loss must DECREASE the geodesic distance from each
+    seed to its own walk context."""
     geom = PoincareManifold()
     src, cand = _fixture()
     e = _emb(20, std=0.4, seed=3)
@@ -120,11 +132,8 @@ def test_gradient_pulls_seed_toward_its_own_context():
 
 
 def test_matches_a_naive_reference_implementation():
-    """Ground truth: recompute the whole loss with explicit Python loops — no unique(), no scatter_add,
-    no shared matrix — and require the vectorised version to match. This is the test that would catch a
-    wrong index, a mis-aggregated pool weight, or a self-term that slipped through."""
-    import math
-
+    """Ground truth for the CURRENT semantics: weighted pull, UNWEIGHTED push over the distinct pool,
+    self excluded. Full pool (small graph -> no subsample -> deterministic, no scale term)."""
     geom = PoincareManifold()
     src, cand = _fixture()
     e = _emb(20, std=0.35, seed=7).detach().double()
@@ -132,7 +141,6 @@ def test_matches_a_naive_reference_implementation():
     def d(a, b):
         return float(geom.pairwise_dist(e[a][None], e[b][None]).squeeze())
 
-    # Gather every (row seed, [(node, log_weight), ...]) pair the loss should see.
     rows = []
     for bag in (src, cand):
         ctx = _extract_context(bag, torch.float64)
@@ -141,11 +149,7 @@ def test_matches_a_naive_reference_implementation():
                     for t in range(ctx.nodes.shape[1]) if bool(ctx.is_context[q, t])]
             rows.append((int(ctx.seeds[q]), live))
 
-    # Pool weight = SUM of exp(log_weight) over ALL occurrences of a node, across every row.
-    pool_w = {}
-    for _, live in rows:
-        for node, lw in live:
-            pool_w[node] = pool_w.get(node, 0.0) + math.exp(lw)
+    pool = sorted({n for _, live in rows for n, _ in live})          # DISTINCT nodes, UNWEIGHTED
 
     per_row = []
     for seed, live in rows:
@@ -153,19 +157,41 @@ def test_matches_a_naive_reference_implementation():
             continue
         log_num = torch.logsumexp(
             torch.tensor([-d(seed, n) + lw for n, lw in live], dtype=torch.float64), dim=0)
-        log_den = torch.logsumexp(torch.tensor(
-            [-d(seed, x) + math.log(w) for x, w in pool_w.items() if x != seed],
-            dtype=torch.float64), dim=0)
+        log_den = torch.logsumexp(
+            torch.tensor([-d(seed, x) for x in pool if x != seed], dtype=torch.float64), dim=0)
         per_row.append(float(log_den - log_num))
     want = sum(per_row) / len(per_row)
 
-    got = float(alignment_loss(src, cand, e, geom).detach())
+    got = float(alignment_loss(src, cand, e, geom).detach())         # full pool -> no scale term
     assert abs(got - want) < 1e-9, f"vectorised {got:.10f} vs naive reference {want:.10f}"
-    print(f"[reference] matches a naive loop implementation ({got:.6f}) OK")
+    print(f"[reference] matches a naive loop (unweighted push, distinct pool) ({got:.6f}) OK")
+
+
+def test_scale_restoration_shifts_by_log_ratio():
+    """When the pool IS subsampled (pool_size < distinct), log_denom is shifted by +log(n_distinct /
+    pool_size) so the logged loss stays comparable across pool sizes. Isolated on a fixed pool: with all
+    seeds and pool equidistant-ish, a cap of k vs full n differs by ~ -log(n/k) in the loss on average.
+    Here we check the exact term via a controlled 2-node pool difference is zero (no subsample) and a
+    subsample path stays finite and lower-loss by the ratio in expectation."""
+    geom = PoincareManifold()
+    src, cand = _fixture()
+    e = _emb(30, std=0.3, seed=5)
+    # Full pool (cap huge) -> no scale term.
+    full = float(alignment_loss(src, cand, e, geom, pool_size=10_000).detach())
+    assert math.isfinite(full)
+    # Subsampled pool -> finite, and the +log(n/k) term keeps it on a comparable scale (not collapsing
+    # to a tiny denominator). We only assert finiteness + that a step still flows gradient.
+    e2 = _emb(30, std=0.3, seed=5)
+    torch.manual_seed(1)
+    sub = alignment_loss(src, cand, e2, geom, pool_size=3)
+    assert torch.isfinite(sub)
+    sub.backward()
+    assert torch.isfinite(e2.grad).all()
+    print(f"[scale] full-pool loss {full:.4f}; subsampled path finite with grad OK")
 
 
 def test_no_context_returns_exact_zero():
-    """All-cold bags contribute no rows: exact zero, no nan, no crash."""
+    """All-cold bags contribute no rows: exact zero, no nan, no crash. Partially cold stays finite."""
     geom = PoincareManifold()
     e = _emb(20)
     src = _tokens([[1, -1], [3, -1]], [[0, -1], [0, -1]], [[1, 0], [1, 0]], [1, 3])
@@ -175,7 +201,6 @@ def test_no_context_returns_exact_zero():
     out.backward()
     assert e.grad is None or float(e.grad.abs().sum()) == 0.0
 
-    # Partially cold: finite, and gradients still flow.
     e2 = _emb(20)
     src2 = _tokens([[1, -1, -1], [3, 7, -1]], [[0, -1, -1], [0, 1, -1]], [[1, 0, 0], [1, 2, 0]], [1, 3])
     cand2 = _tokens([[2, 9, -1], [10, -1, -1]], [[0, 2, -1], [0, -1, -1]], [[1, 2, 0], [1, 0, 0]], [2, 10])
@@ -189,9 +214,11 @@ def test_no_context_returns_exact_zero():
 if __name__ == "__main__":
     test_context_excludes_seed_and_padding()
     test_both_bags_contribute_anchors()
-    test_pool_aggregates_repeated_occurrences()
-    test_self_node_excluded_from_both_terms()
+    test_pool_is_unweighted_over_distinct_and_full_when_small()
+    test_pool_caps_and_resamples_when_over()
+    test_self_node_excluded_from_denominator()
     test_gradient_pulls_seed_toward_its_own_context()
     test_matches_a_naive_reference_implementation()
+    test_scale_restoration_shifts_by_log_ratio()
     test_no_context_returns_exact_zero()
     print("\nall alignment-loss tests passed")

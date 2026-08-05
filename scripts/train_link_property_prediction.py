@@ -76,6 +76,12 @@ def parse_args() -> argparse.Namespace:
         help="Weight on the walk-neighbour alignment loss (InfoNCE over both token bags, clusters E "
              "by co-occurrence): loss = link_CE + align_coef * alignment_loss. 0 = pure link training.",
     )
+    p.add_argument(
+        "--align-pool-size", type=int, default=15_000,
+        help="Cap on DISTINCT negative nodes in the alignment loss push pool, uniformly resampled each "
+             "call (whole pool used when under the cap). Sets the [S,P] denominator width; cost/memory "
+             "~linear. 15k fits bs 1000/K20 on review (~13 GB peak); lower it if the backward peaks.",
+    )
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
     p.add_argument(
@@ -267,6 +273,7 @@ def main() -> Dict[str, Any]:
 
         K_train=args.k_train,
         align_coef=args.align_coef,
+        align_pool_size=args.align_pool_size,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,

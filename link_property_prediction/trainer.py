@@ -73,6 +73,10 @@ class TrainerConfig:
     # Walk-neighbour alignment loss (InfoNCE over both token bags, clusters E by co-occurrence). Added to
     # the link CE as  loss = link + align_coef * alignment_loss. 0 disables it (pure link training).
     align_coef: float = 1.0
+    # Cap on DISTINCT negative nodes in the alignment loss's push pool, uniformly resampled each call
+    # (the whole pool is used when already under the cap). Sets the [S,P] denominator width, so cost and
+    # peak memory are ~linear in it — 15k fits bs 1000/K20 on review (~13 GB); lower it if the backward peaks.
+    align_pool_size: int = 15_000
 
     # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked, each
     # bounded by the query's own cutoff t_i; both bags flow to the head.
@@ -241,7 +245,8 @@ class Trainer:
         # end-to-end by BOTH (link CE through the monotone head + this directly on E). align_coef scales it;
         # 0 recovers pure link training.
         if self.config.align_coef != 0.0:
-            aloss = alignment_loss(src_tokens, cand_tokens, self.model.E.weight, self.model.geom)
+            aloss = alignment_loss(src_tokens, cand_tokens, self.model.E.weight, self.model.geom,
+                                   pool_size=int(self.config.align_pool_size))
         else:
             aloss = logits.new_zeros(())
         loss = link_loss + float(self.config.align_coef) * aloss
