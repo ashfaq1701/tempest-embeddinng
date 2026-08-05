@@ -8,7 +8,7 @@ repeatedly with different CLI args.
 Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root
   Model:          --d-emb
-  Link/head:      --k-train
+  Link/head:      --k-train, --align-coef
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias, --start-bias
                   (backward-only, undirected; BOTH sides walked under the query's cutoff)
   Optimisation:   --lr, --batch-size, --eval-batch-size,
@@ -70,6 +70,11 @@ def parse_args() -> argparse.Namespace:
              "candidates per query; positive at column 0. Default 10 keeps the "
              "candidate bag (and the alignment [S,P] matrix) small enough to fit "
              "bs 1000 on review / big low-recurrence graphs.",
+    )
+    p.add_argument(
+        "--align-coef", type=float, default=1.0,
+        help="Weight on the walk-neighbour alignment loss (InfoNCE over both token bags, clusters E "
+             "by co-occurrence): loss = link_CE + align_coef * alignment_loss. 0 = pure link training.",
     )
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
@@ -261,6 +266,7 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
 
         K_train=args.k_train,
+        align_coef=args.align_coef,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,

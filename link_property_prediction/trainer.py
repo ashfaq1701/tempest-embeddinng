@@ -42,6 +42,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .alignment_loss import alignment_loss
 from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import LinkPredHead
@@ -68,6 +69,10 @@ class TrainerConfig:
     # Link loss / head.
     K_train: int = 10           # per-query training negatives ([B, 1+K_train]); 10 keeps the candidate
                                 # bag + alignment [S,P] matrix small enough to fit bs 1000 on review
+
+    # Walk-neighbour alignment loss (InfoNCE over both token bags, clusters E by co-occurrence). Added to
+    # the link CE as  loss = link + align_coef * alignment_loss. 0 disables it (pure link training).
+    align_coef: float = 1.0
 
     # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked, each
     # bounded by the query's own cutoff t_i; both bags flow to the head.
@@ -230,12 +235,16 @@ class Trainer:
                 F.embedding(src_t, e).unsqueeze(-2),
                 F.embedding(cand_t[:, 0], e).unsqueeze(-2)).mean()
 
-        # E is trained END-TO-END by the LINK loss (no alignment loss, no E-detach — the head reads E live,
-        # so ranking gradients flow into E). The former boundary prior d_H(0, E)^2 was REMOVED: an A/B on
-        # wiki showed it was over-compressing E toward the origin (inflating community-probe purity) at the
-        # cost of link-prediction MRR — dropping it lifted peak val 0.8048 -> 0.8232 / test 0.7688 -> 0.8005
-        # (E spreads out, commP develops organically, no boundary blow-up under manifold_lr 1e-4).
-        loss = link_loss
+        # WALK-NEIGHBOUR ALIGNMENT LOSS: multi-positive InfoNCE over BOTH token bags (alignment_loss.py) —
+        # an unsupervised co-occurrence objective that pulls each seed toward its own walk context and pushes
+        # off the shared batch pool, clustering E by neighbourhood. Added to the ranking loss; E is trained
+        # end-to-end by BOTH (link CE through the monotone head + this directly on E). align_coef scales it;
+        # 0 recovers pure link training.
+        if self.config.align_coef != 0.0:
+            aloss = alignment_loss(src_tokens, cand_tokens, self.model.E.weight, self.model.geom)
+        else:
+            aloss = logits.new_zeros(())
+        loss = link_loss + float(self.config.align_coef) * aloss
 
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -243,6 +252,7 @@ class Trainer:
 
         return {
             "link": float(link_loss.detach()),
+            "aloss": float(aloss.detach()),
             "align": float(align),
             "lr": float(self.opt.param_groups[0]["lr"]),
         }
@@ -382,10 +392,11 @@ class Trainer:
             self.model.train()
 
             t0 = time.time()
-            link_sum, align_sum, n_batches = 0.0, 0.0, 0
+            link_sum, aloss_sum, align_sum, n_batches = 0.0, 0.0, 0.0, 0
             for batch in train_batches_factory():
                 m = self._train_step(batch)
                 link_sum += m["link"]
+                aloss_sum += m["aloss"]
                 align_sum += m["align"]
                 n_batches += 1
             train_dt = time.time() - t0
@@ -393,6 +404,7 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
+                f"aloss={aloss_sum / max(n_batches, 1):.4f}(x{self.config.align_coef:g})  "
                 f"lr(E/head)={self.opt.param_groups[0]['lr']:.0e}/{self.opt.param_groups[1]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
