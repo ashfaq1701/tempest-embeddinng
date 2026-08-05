@@ -1,21 +1,46 @@
-"""Link head — Poincaré-ball node embeddings + a walk-neighbourhood scoring head, in one module.
+"""Link head — Poincaré-ball node embeddings + a MONOTONE min/mean/max metric score over walk-token bags.
 
-Per (u, candidate v) the logit is an MLP (self.scorer) over:
-  - 6 pairwise GEODESIC DISTANCES between {E[·], P[·]} of u and v:
-        d(E_u,E_v), d(E_u,P_v), d(P_u,E_v), d(P_u,P_v)  (4 cross)  +  d(E_u,P_u), d(E_v,P_v)  (2 self-disp)
-  - each node's per-dim-standardised STATIC node features   nf[u], nf[v]
-  - each node's pooled WALK-NEIGHBOUR feature encoding       nbhd_feat[u], nbhd_feat[v]
-        (NeighborFeatureProjection over the walk tokens' node/edge features, masked-mean pooled)
+There is no scorer MLP, no centroid / P[·] projection, no exp map, no soft order statistics (no kappa),
+and no unbounded per-channel weight. Per (u, candidate v) the logit is the NEGATIVE of a sum of
+geodesic-distance channels:
 
-P[x] = exp_{E[x]}(mu_x) pushes x off E[x] toward mu_x — the ROTATION-INVARIANT weighted mean of x's
-walk-token tangents (NeighborhoodProjection: pure geometry, no learned mixing and no feature gate).
+    s(u, v) = -[ d(E_u, E_v)                                    identity (direct pair distance)
+               + blend( stats(E_v, B_u) )                       v vs u's neighbour bag
+               + blend( stats(E_u, B_v) ) ]                     u vs v's neighbour bag
 
-TWO-SIDED: both the source u AND every candidate v are walked and projected (P[u], P[v] both used).
-The head owns self.E (a ManifoldParameter on a geoopt.PoincareBall, link-trained on it); geometry goes
-through self.geom (PoincareManifold): dist/logmap/expmap all proxy to geoopt (the ball's expmap has a
-finite gradient at the cold-row zero tangent).
+where B_x is x's walk-token bag as a weighted set {(node_p, w_p)} with the fixed recency/hop prior
+w = softmax(-(log1p(age) + log1p(hop-1))), and
+
+    stats(anchor, B) = [ min_p d_p , mean_p d_p , max_p d_p ]   THREE fixed order statistics
+        min  = distance to the NEAREST bag token   (sharp / common-neighbour cue)
+        mean = sum_p w_p d_p  (the weighted average, dense gradient)
+        max  = distance to the FARTHEST bag token  (coverage / all-far signal)
+
+    blend(v3) = < softmax(theta), v3 >                          ONE learnable 1x3 simplex weight
+
+theta is the ONLY head parameter (3 numbers): init equal -> softmax = (1/3, 1/3, 1/3), SHARED across the
+two sides (the task is undirected). softmax keeps the mix >= 0 and summed to 1 — pure relative weighting,
+no hidden temperature.
+
+MONOTONICITY is the load-bearing property. min / mean / max are each non-decreasing in every d_p (min and
+max are selections; mean is a convex combination), and the mix weights softmax(theta) are >= 0 and do NOT
+depend on the distances. Hence ds/dd_p <= 0 EVERYWHERE — moving any neighbour closer can only raise the
+score. The pull direction into E is therefore fixed by construction rather than learned, which is what lets
+the link loss train E end-to-end with no detach and no free-riding readout (there is nothing the head can
+reshape instead of moving E).
+
+WHY no kappa and no alpha: kappa was the temperature that slid a channel along the min->mean sweep; here the
+three statistics are computed OUTRIGHT, so there is nothing to tune. The old per-channel alpha = softplus(.)
+was unbounded and doubled as a hidden logit temperature; the 1x3 softmax is alpha restricted to the simplex
+— it keeps the learnable, monotone channel mixing and drops the scale. (Consequence: the logit carries no
+temperature; its scale is set by the geodesic-distance magnitudes and grows with E over training.)
+
+BAG MASKING: every slot whose node == the bag's own seed is dropped before the statistics (the seed carries
+age 0 / hop 1 => maximal prior weight, and d(E_v, E_u) for u in B_u merely duplicates the identity channel).
+A cold bag (no context slot survives) is the single atom {(seed, w=1)}, so min = mean = max = d(anchor,
+E_seed) exactly and the whole score degrades to the identity distance — branch-free, never log(0).
 """
-from typing import Optional
+from typing import Tuple
 
 import geoopt
 import torch
@@ -24,219 +49,158 @@ import torch.nn.functional as F
 
 from .walk_tokens import WalkTokens
 
+# Numerical floors for the closed-form Poincaré distance.
+_NORM_EPS = 1e-5      # ||x||^2 clamped to <= 1 - _NORM_EPS   (stay strictly inside the ball)
+_ACOSH_EPS = 1e-7     # arcosh argument clamped to >= 1 + _ACOSH_EPS (finite gradient at coincidence)
+
 
 class PoincareManifold:
-    """Poincaré-ball geometry over geoopt.PoincareBall(c=1). dist / logmap / expmap all PROXY straight to
-    geoopt — the ball's expmap already has a FINITE gradient at the zero tangent (the cold-row mu = 0, a
-    node with no walk tokens), so no custom expmap is needed (unlike the sphere). The tangent space at any
-    point is all of R^d — no orthogonal projection. E is kept in the ball by RiemannianAdam."""
+    """Poincaré-ball geometry (c = 1). Exposes `pairwise_dist(X, Y)` — the ONLY geometric primitive the
+    head needs (no centroid / exp-map projection). `manifold` is still the geoopt ball, used for E's init
+    and for RiemannianAdam's retraction (E is a ManifoldParameter)."""
 
     def __init__(self, c: float = 1.0):
         self.manifold = geoopt.PoincareBall(c=c)
 
-    def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Geodesic (hyperbolic) distance on the ball — geoopt.PoincareBall.dist. LOWER = closer."""
-        return self.manifold.dist(x, y)
+    @staticmethod
+    def pairwise_dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Geodesic distance between every row of `x` and every row of `y`.
 
-    def logmap(self, base: torch.Tensor, point: torch.Tensor) -> torch.Tensor:
-        """Log map at `base` of `point` — geoopt.PoincareBall.logmap (finite gradient at coincidence)."""
-        return self.manifold.logmap(base, point)
+        x: [..., n, d], y: [..., m, d] with BROADCASTABLE leading dims -> [..., n, m].
 
-    def expmap(self, base: torch.Tensor, tangent: torch.Tensor) -> torch.Tensor:
-        """Exp map from `base` along `tangent` — geoopt.PoincareBall.expmap. Finite gradient at u = 0, so
-        the cold-row zero tangent is a safe differentiable no-op returning `base`."""
-        return self.manifold.expmap(base, tangent)
+            d(x, y) = arcosh( 1 + 2 ||x-y||^2 / ((1-||x||^2)(1-||y||^2)) )
 
-
-class NeighborhoodProjection(nn.Module):
-    """Weighted-MEAN pooling of a source's walk-token TANGENTS, mapped to the ball point P[u] = exp_{E[u]}(mu_u):
-
-        mu_u = Σ_p softmax(a_p) · g_p,   g_p = Log_{E[u]}(E[token_p])   (raw geometric tangent)
-        P[u] = exp_{E[u]}(mu_u)                                          (back to the ball)
-
-    The per-token weight logits a_p are computed ONCE by LinkPredHead (its shared recency/hop weight net)
-    and passed in; here they are softmaxed over the GEOMETRY context (mask & ~seed_mask & ~seed_node_mask —
-    seed-node revisits are dropped, since Log_{E[u]}(E[u]) = 0 contributes nothing but would dilute). PURE
-    GEOMETRY and PARAMETER-FREE: raw tangents pooled by rotation-invariant scalar weights, so mu_u — and
-    hence P[u] — is ROTATION-INVARIANT. The exp map is applied HERE so forward returns a valid ball POINT
-    directly (not a tangent). Cold rows (no context) -> mu_u = 0 -> exp_{E[u]}(0) = E[u]."""
-
-    def __init__(self):
-        super().__init__()
-        self.geom = PoincareManifold()                 # stateless; used for the token log-map
-
-    def forward(self, walk_bag: WalkTokens, emb: torch.Tensor, w_logit: torch.Tensor) -> torch.Tensor:
-        """walk_bag: flattened WalkTokens. emb: full [num_nodes,d_emb] table in the ball. w_logit: [B,T]
-        shared per-token weight logits. Returns P[u] = exp_{E[u]}(mu_u) [B,d_emb], a POINT in the ball;
-        cold rows (no context) -> mu_u = 0 -> P[u] = E[u]."""
-        node_ids = walk_bag.nodes.clamp_min(0)                                    # [B,T]  (padding → row 0)
-        source = F.embedding(walk_bag.seeds, emb)                                 # E[u]  [B,d_emb]
-        token_tangents = self.geom.logmap(source.unsqueeze(-2), F.embedding(node_ids, emb))  # [B,T,d_emb]
-
-        mask = walk_bag.mask & ~walk_bag.seed_mask & ~walk_bag.seed_node_mask    # [B,T]  geometry context
-        weights = torch.nan_to_num(
-            torch.softmax(w_logit.masked_fill(~mask, float("-inf")), dim=-1), nan=0.0)   # [B,T]; cold row -> 0
-
-        # mu = weighted mean of the RAW token tangents (rotation-invariant); exp_{E[u]}(mu) maps it back to
-        # the ball as P[u]. (Cold rows: mu = 0 -> exp_{E[u]}(0) = E[u], a differentiable no-op.)
-        mu = (weights.unsqueeze(-1) * token_tangents).sum(dim=-2)                 # [B,d]  tangent at E[u]
-        return self.geom.expmap(source, mu)                                      # P[u]  [B,d]  ball point
+        ||x-y||^2 is expanded as ||x||^2 + ||y||^2 - 2<x,y> so the cross term is ONE batched matmul —
+        the [..., n, m, d] difference tensor is never materialised. LOWER = closer."""
+        x2 = (x * x).sum(dim=-1).clamp(max=1.0 - _NORM_EPS)                     # [..., n]
+        y2 = (y * y).sum(dim=-1).clamp(max=1.0 - _NORM_EPS)                     # [..., m]
+        xy = torch.matmul(x, y.transpose(-1, -2))                               # [..., n, m]
+        sq = (x2.unsqueeze(-1) + y2.unsqueeze(-2) - 2.0 * xy).clamp_min(0.0)     # [..., n, m]
+        denom = (1.0 - x2).unsqueeze(-1) * (1.0 - y2).unsqueeze(-2)             # [..., n, m]
+        arg = (1.0 + 2.0 * sq / denom).clamp_min(1.0 + _ACOSH_EPS)
+        return torch.acosh(arg)
 
 
-class NeighborFeatureProjection(nn.Module):
-    """WEIGHTED-mean-pooled encoder for the walk tokens' STATIC node features + per-token edge features —
-    the non-geometric channel, kept separate from the (rotation-invariant) NeighborhoodProjection. Per
-    token: concat [node_feat, edge_feat] -> Linear-GELU-Linear -> LayerNorm. Pooled to one [N, feature_dim]
-    vector by the SAME shared recency/hop weights (passed in as w_logit), softmaxed over (mask & ~seed_mask)
-    — only non-seed tokens carry an edge feature. Returns [N, 0] when d_nf == d_ef == 0."""
+def bag_weights(tokens: WalkTokens, dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reduce a WalkTokens bag to (node ids, LOG pooling weights).
 
-    def __init__(self, d_nf: int, d_ef: int, feature_dim: int = 16):
-        super().__init__()
-        self.d_nf = d_nf
-        self.d_ef = d_ef
-        in_dim = d_nf + d_ef
-        self.feature_dim = feature_dim if in_dim > 0 else 0        # overridden to 0 when no features present
-        if self.feature_dim > 0:
-            self.encode = nn.Sequential(
-                nn.Linear(in_dim, feature_dim), nn.GELU(), nn.Linear(feature_dim, feature_dim))
-            self.out_norm = nn.LayerNorm(feature_dim)
+    Returns (nodes [Q, T] int64, log_w [Q, T] `dtype`) with log_w = -inf on excluded slots and
+    logsumexp(log_w, dim=-1) == 0 on every row.
 
-    def forward(self, walk_bag: WalkTokens, node_features: Optional[torch.Tensor],
-                w_logit: torch.Tensor) -> torch.Tensor:
-        """Returns [N, feature_dim] the recency/hop-weighted mean of the per-token feature encodings, or
-        [N, 0] if the dataset has no node/edge features. w_logit: [N, T] shared per-token weight logits."""
-        node_ids = walk_bag.nodes.clamp_min(0)                                    # [N,T]  (padding → row 0)
-        n, t = node_ids.shape
-        dev = node_ids.device
-        if self.feature_dim == 0:
-            return torch.zeros(n, 0, device=dev)
+    The prior itself is NOT recomputed here — it is `WalkTokens.weight_logits`, the single definition of
+    -(log1p(age) + log1p(hop-1)) shared by every consumer. This function only (a) decides which slots are
+    live and (b) normalises over them.
 
-        if node_features is None or self.d_nf == 0:
-            nf_token = torch.zeros(n, t, self.d_nf, device=dev)
-        else:
-            nf_token = F.embedding(node_ids, node_features)                       # [N,T,d_nf]
+    Context = mask & ~seed_node_mask: real slots that are NOT the bag's own seed node (the origin slot AND
+    any mid-walk revisit). Masking happens BEFORE the softmax so the mean's mass redistributes over the
+    real context, and the min/max range only over it.
 
-        if walk_bag.edge_features is None or self.d_ef == 0:
-            edge_features = torch.zeros(n, t, self.d_ef, device=dev)
-        else:
-            edge_features = walk_bag.edge_features                                # [N,T,d_ef]
+    COLD bag (no context slot survives): slot 0 is overwritten with (seed, log_w = 0) and every other slot
+    excluded, i.e. B = {(seed, 1)}. Downstream this makes min = mean = max = the identity distance
+    d(E_anchor, E_seed) exactly."""
+    nodes = tokens.nodes.clamp_min(0).clone()                                   # [Q, T] padding(-1) -> 0
+    valid = (tokens.mask & ~tokens.seed_node_mask).clone()                      # [Q, T] context slots
 
-        ft = self.out_norm(self.encode(torch.cat([nf_token, edge_features], dim=-1)))    # [N,T,F]  per-token
+    cold = ~valid.any(dim=-1)                                                   # [Q]
+    if bool(cold.any()):
+        nodes[cold, 0] = tokens.seeds[cold]
+        valid[cold, 0] = True                                                   # exactly one live slot
 
-        # Weighted mean via the shared weights, softmaxed over the non-seed real tokens (seed slot / padding
-        # get weight 0 -> excluded; cold rows -> all-0 weights -> 0 vector).
-        mask = walk_bag.mask & ~walk_bag.seed_mask                                # [N,T]
-        weights = torch.nan_to_num(
-            torch.softmax(w_logit.masked_fill(~mask, float("-inf")), dim=-1), nan=0.0)   # [N,T]
-        return (weights.unsqueeze(-1) * ft).sum(dim=-2)                           # [N,F]  weighted mean
+    logits = tokens.weight_logits.to(dtype)                                     # [Q, T] <= 0
+    log_w = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
+    return nodes, log_w
+
+
+def bag_stats(d: torch.Tensor, log_w: torch.Tensor) -> torch.Tensor:
+    """Three FIXED monotone order statistics of anchor-to-bag distances along the last axis.
+
+    d: [..., T] distances from one anchor to a bag's slots. log_w: [..., T] log pooling weights
+    (broadcastable against d; -inf on excluded slots). Returns [..., 3] = [min, mean, max]:
+
+        min  = min over LIVE slots of d_p            nearest token (excluded slots masked to +inf)
+        mean = sum_p exp(log_w_p) * d_p              weighted average (excluded slots have weight 0)
+        max  = max over LIVE slots of d_p            farthest token (excluded slots masked to -inf)
+
+    No temperature (no kappa): these are the exact statistics, not a soft min->mean sweep. Every entry is
+    monotone non-decreasing in each d_p — min/max are selections, mean is a convex combination — which is
+    what keeps the score monotone in the distances. bag_weights guarantees >= 1 live slot per row, so
+    amin/amax are always finite (a cold row's single live slot makes all three equal the identity distance)."""
+    live = torch.isfinite(log_w)                                               # [..., T] real slots
+    mean = (log_w.exp() * d).sum(dim=-1)                                        # [...]  weighted average
+    d_min = d.masked_fill(~live, float("inf")).amin(dim=-1)                     # [...]  nearest live token
+    d_max = d.masked_fill(~live, float("-inf")).amax(dim=-1)                    # [...]  farthest live token
+    return torch.stack([d_min, mean, d_max], dim=-1)                           # [..., 3]
 
 
 class LinkPredHead(nn.Module):
-    def __init__(self, num_nodes: int, d_emb: int,
-                 t2v_dim: int = 16, d_ef: int = 0, feature_dim: int = 16,
-                 node_features: Optional[torch.Tensor] = None, dropout: float = 0.1):
+    """Two-sided monotone min/mean/max metric head. Owns E (a ManifoldParameter on the Poincaré ball,
+    trained end-to-end by the link loss) and ONE simplex weight theta (1x3) that mixes the [min, mean, max]
+    channels, SHARED across the two directions (v vs B_u and u vs B_v): the task is undirected, so the
+    score is symmetrised rather than spending parameters on an asymmetry that is not there."""
+
+    _N_STATS = 3   # min, mean, max
+
+    def __init__(self, num_nodes: int, d_emb: int):
         super().__init__()
-        self.num_nodes = num_nodes
-        self.d_emb = d_emb
-        self.d_ef = d_ef
-        self.d_nf = 0 if node_features is None else int(node_features.shape[1])
-        # Static per-node feature table [num_nodes, d_nf] (dataset-derived, NOT learned). Per-dimension
-        # STANDARDISED (z-score across nodes) so nf[u], nf[v] enter the scorer at ~unit scale — consistent
-        # with the LayerNorm-ed nbhd feats, and well-conditioned for the MLP (raw features can be arbitrary
-        # scale). A buffer so it rides model.to(device) and stays out of the optimizer; non-persistent.
-        if node_features is not None and self.d_nf > 0:
-            mu = node_features.mean(dim=0, keepdim=True)
-            sd = node_features.std(dim=0, keepdim=True).clamp_min(1e-6)
-            node_features = (node_features - mu) / sd                    # [num_nodes, d_nf]  per-dim z-score
-        self.register_buffer("node_features", node_features, persistent=False)
+        self.num_nodes = int(num_nodes)
+        self.d_emb = int(d_emb)
         self.geom = PoincareManifold()
 
-        # E lives in the Poincaré ball: init near the origin (small-std wrapped normal) so the conformal
-        # metric — which blows up near the boundary — stays well-conditioned early; then wrap as a
-        # ManifoldParameter so RiemannianAdam keeps it in the ball.
-        self.E = nn.Embedding(num_nodes, d_emb)
+        # The ONLY head parameter: a length-3 logit vector. softmax(theta) mixes [min, mean, max]; init
+        # zeros => equal mix (1/3, 1/3, 1/3). softmax keeps the weights >= 0 and summed to 1 (a simplex),
+        # so the mix is learnable AND monotone with no scale/temperature. No kappa, no alpha_init.
+        self.theta = nn.Parameter(torch.zeros(self._N_STATS))
+
+        # E lives in the ball: init near the origin (small-std wrapped normal) so the conformal metric —
+        # which blows up near the boundary — stays well-conditioned early; wrapped as a ManifoldParameter
+        # so RiemannianAdam keeps it in the ball.
+        self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            init = self.geom.manifold.random_normal(num_nodes, d_emb, std=1e-2)
+            init = self.geom.manifold.random_normal(self.num_nodes, self.d_emb, std=1e-2)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        self.neighbourhood = NeighborhoodProjection()   # parameter-free tangent pooling (weights passed in)
-        # Non-geometric feature channel (static node + per-token edge features). feature_dim from config;
-        # 0-width (no-op) when the dataset has no node/edge features. Weighted-mean pooled per node -> scorer.
-        self.neighbour_feats = NeighborFeatureProjection(d_nf=self.d_nf, d_ef=d_ef, feature_dim=feature_dim)
-        # Per-token pooling weights are a FIXED (non-learned) recency/hop prior — WalkTokens.weight_logits.
-        # (The old learned weight net (Time2Vec + MLP) is removed; t2v_dim is retained in the signature
-        # only for CLI compatibility and is unused.)
-
-        # Scorer: MLP over the 4 pairwise GEODESIC DISTANCES between {E[x], P[x]} of u and v, plus each node's
-        # static node features nf[·] and its pooled walk-neighbour feature encoding (NeighborFeatureProjection).
-        # Distances are isometry-invariant; nf / nbhd-feats are external, frame-free channels.
-        # 6 dists = 4 cross + 2 self-displacements d(E,P); + nf[u,v] + nbhd_feat[u,v].
-        score_in = 6 + 2 * self.d_nf + 2 * self.neighbour_feats.feature_dim
-        # Dropout on the scorer hidden layer breaks the head's co-adaptation/memorisation — the lever that
-        # converts the post-peak overfit CLIFF into a gentle valley (wiki: dropout 0.1 held a stable
-        # ~0.795-0.805 valley vs a hard -0.066 crash with no dropout). Load-bearing for stability.
-        self.scorer = nn.Sequential(
-            nn.Linear(score_in, 32), nn.GELU(), nn.Dropout(dropout), nn.Linear(32, 1))
-        # Single learned temperature on the whole distance block: distances / tau.clamp(...). The raw
-        # geodesic distances inflate ~77x over training (median ~0.03 early -> ~2.1 late) while nf / nbhd_feat
-        # sit at O(1); one clamped scalar absorbs that global scale so the scorer's first Linear sees
-        # comparable channels. Pairs with boundary_penalty (which caps inflation on the E side). Init 1 = no-op.
-        self.dist_tau = nn.Parameter(torch.tensor(1.0))
-
-    def _project(self, tokens: WalkTokens, w_logit: torch.Tensor) -> torch.Tensor:
-        """Neighbourhood projection P[x] = exp_{E[seed]}(mu) [N, d] — the ball point returned by
-        NeighborhoodProjection (which applies the exp map itself). w_logit: the bag's shared per-token
-        weight logits. E is read LIVE — the link loss trains E end-to-end through the head (no detach)."""
-        return self.neighbourhood(tokens, self.E.weight, w_logit)                    # P[x]  [N, d]
-
-    def _node_feats(self, seeds: torch.Tensor) -> torch.Tensor:
-        """Static node features [N, d_nf] for the given seed ids; a zero-width [N, 0] tensor when the
-        dataset has no node features (so it concatenates as a no-op — no branching at the call site)."""
-        if self.node_features is None:
-            return self.E.weight.new_zeros(seeds.shape[0], 0)
-        return F.embedding(seeds, self.node_features)
+    @property
+    def mix(self) -> torch.Tensor:
+        """Channel mix weights softmax(theta) over [min, mean, max]; >= 0, sum to 1. Exposed for per-epoch
+        logging: it reads out directly WHICH statistic carries the signal (min-side vs mean vs max)."""
+        return F.softmax(self.theta, dim=-1)
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Two-sided scoring. src_tokens: B source queries (seeds = u). cand_tokens: the B*C candidate
-        queries (seeds = v) in query-major order, each walked with its query's cutoff. Logit = MLP over
-        [ d(E_u,E_v), d(E_u,P_v), d(P_u,E_v), d(P_u,P_v), nf[u], nf[v], nbhd_feat[u], nbhd_feat[v] ]
-        per (u, candidate v). Returns logits [B, C]."""
-        emb = self.E.weight                                                   # E trained end-to-end by the link loss
-        # Shared per-token weight logits, computed once per bag and used to pool BOTH channels.
-        w_src = src_tokens.weight_logits.to(emb.dtype)                        # [B, T]   fixed recency/hop prior
-        w_cand = cand_tokens.weight_logits.to(emb.dtype)                      # [B*C, T] fixed recency/hop prior
-        seed_u = F.embedding(src_tokens.seeds, emb)                           # E[u]   [B, d]
-        nbhd_u = self._project(src_tokens, w_src)                             # P[u]   [B, d]
-        nf_u = self._node_feats(src_tokens.seeds)                             # nf[u]  [B, d_nf]
-        nbhd_feat_u = self.neighbour_feats(src_tokens, self.node_features, w_src)   # nbhd_feat[u]  [B, F]
-        seed_v = F.embedding(cand_tokens.seeds, emb)                          # E[v]   [B*C, d]
-        nbhd_v = self._project(cand_tokens, w_cand)                           # P[v]   [B*C, d]
-        nf_v = self._node_feats(cand_tokens.seeds)                            # nf[v]  [B*C, d_nf]
-        nbhd_feat_v = self.neighbour_feats(cand_tokens, self.node_features, w_cand)  # nbhd_feat[v]  [B*C, F]
+        queries (seeds = v) in QUERY-MAJOR order, each walked with its query's cutoff. Returns logits
+        [B, C] (higher = more likely link; the score is the negated distance aggregate)."""
+        emb = self.E.weight                                                     # E trained end-to-end
+        mix = self.mix                                                          # [3] >= 0, sum 1
 
-        b, d = seed_u.shape
-        c = seed_v.shape[0] // b
-        # candidate (v) side -> [B, C, ·]; source (u) side broadcast over the C candidates -> [B, C, ·].
-        seed_v = seed_v.reshape(b, c, d)                                      # [B, C, d]
-        nbhd_v = nbhd_v.reshape(b, c, d)                                      # [B, C, d]
-        nf_v = nf_v.reshape(b, c, self.d_nf)                                  # [B, C, d_nf]
-        seed_u = seed_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
-        nbhd_u = nbhd_u.unsqueeze(1).expand(b, c, d)                          # [B, C, d]
-        nf_u = nf_u.unsqueeze(1).expand(b, c, self.d_nf)                      # [B, C, d_nf]
-        fd = self.neighbour_feats.feature_dim
-        nbhd_feat_v = nbhd_feat_v.reshape(b, c, fd)                                   # [B, C, F]
-        nbhd_feat_u = nbhd_feat_u.unsqueeze(1).expand(b, c, fd)                       # [B, C, F]
+        nodes_u, logw_u = bag_weights(src_tokens, emb.dtype)                    # [B, T]
+        nodes_v, logw_v = bag_weights(cand_tokens, emb.dtype)                   # [B*C, T]
 
-        # Six pairwise geodesic distances (self.geom.dist): the 4 cross distances + the 2 self-displacements
-        # d(E[·], P[·]) that complete the frame-free set (0 exactly for a cold row, where P = E).
-        distances = torch.stack([
-            self.geom.dist(seed_u, seed_v),                                  # d(E[u], E[v])  identity affinity
-            self.geom.dist(seed_u, nbhd_v),                                  # d(E[u], P[v])  is u in v's nbhd
-            self.geom.dist(nbhd_u, seed_v),                                  # d(P[u], E[v])  is v in u's nbhd
-            self.geom.dist(nbhd_u, nbhd_v),                                  # d(P[u], P[v])  nbhd overlap
-            self.geom.dist(seed_u, nbhd_u),                                  # d(E[u], P[u])  u's self-displacement
-            self.geom.dist(seed_v, nbhd_v),                                  # d(E[v], P[v])  v's self-displacement
-        ], dim=-1)                                                            # [B, C, 6]
-        distances = distances / self.dist_tau.clamp(0.05, 20.0)              # learned global scale (conditioning)
-        feats = torch.cat([distances, nf_u, nf_v, nbhd_feat_u, nbhd_feat_v], dim=-1)  # [B, C, 6 + 2*d_nf + 2*F]
-        return self.scorer(feats).squeeze(-1)                                 # [B, C]
+        e_u = F.embedding(src_tokens.seeds, emb)                                # [B, d]
+        x_u = F.embedding(nodes_u, emb)                                         # [B, T, d]
+        e_v = F.embedding(cand_tokens.seeds, emb)                               # [B*C, d]
+        x_v = F.embedding(nodes_v, emb)                                         # [B*C, T, d]
+
+        b, d = e_u.shape
+        c = e_v.shape[0] // b
+        t = nodes_u.shape[1]
+        e_v = e_v.view(b, c, d)                                                 # [B, C, d]
+        x_v = x_v.view(b, c, t, d)                                              # [B, C, T, d]
+        logw_v = logw_v.view(b, c, t)                                           # [B, C, T]
+
+        # Identity channel: d(E_u, E_v) per (query, candidate).
+        d_id = self.geom.pairwise_dist(e_u.unsqueeze(-2), e_v).squeeze(-2)      # [B, C]
+
+        # Candidate seed vs the SOURCE's bag — "is v close to what u recently touched".
+        d_v_bu = self.geom.pairwise_dist(e_v, x_u)                              # [B, C, T]
+        stats_v_bu = bag_stats(d_v_bu, logw_u.unsqueeze(-2))                    # [B, C, 3]
+
+        # Source seed vs each CANDIDATE's bag — "is u close to what v recently touched". u stays in B_v
+        # when the pair has interacted, so its (near-)zero distance IS the recurrence signal, for free.
+        d_u_bv = self.geom.pairwise_dist(e_u[:, None, None, :], x_v).squeeze(-2)  # [B, C, T]
+        stats_u_bv = bag_stats(d_u_bv, logw_v)                                  # [B, C, 3]
+
+        # Sum the two sides' [min, mean, max] then mix once with the shared simplex weight (linear, so
+        # summing-then-mixing == mixing-each-side-then-summing).
+        blend = torch.matmul(stats_v_bu + stats_u_bv, mix)                     # [B, C]
+        raw = d_id + blend                                                      # [B, C]
+        return -raw                                                             # higher = closer = better

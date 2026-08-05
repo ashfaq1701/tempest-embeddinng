@@ -1,4 +1,4 @@
-"""Per-query-causal training + eval loop — link-supervised geometric walk head (REACH).
+"""Per-query-causal training + eval loop — link-supervised MONOTONE metric head over walk bags.
 
 Causality is enforced PER QUERY by Tempest's cutoff, not by ingestion order. The FULL graph
 (train + val + test) is ingested into Tempest ONCE up front (`ingest_full_graph`, a single
@@ -6,9 +6,9 @@ Causality is enforced PER QUERY by Tempest's cutoff, not by ingestion order. The
 (training):
   1. neg = neg_sampler.sample(batch)                 — [B, K_train] uniform negs
   2. candidates = [pos | negs]                       — [B, 1+K_train]
-  3. logits = score(src, candidates)                 — for each query (u_i, t_i) sample K
-       backward walks with cutoff = t_i (→ μ_u), pack to tokens, score with
-       LinkPredHead (identity + velocity-line). Candidate side samples no walks (static E[v]).
+  3. logits = score(src, candidates)                 — TWO-SIDED: K backward walks are sampled for
+       the source u AND for every candidate v, each bounded by the query's own cutoff t_i; both
+       token bags go to LinkPredHead, which returns the negated monotone distance aggregate.
   4. L = cross_entropy(logits, target=0)             — Bruch 2019, upper-bounds 1-MRR
   5. one backward + single optimizer step
 
@@ -21,15 +21,17 @@ sees everything before t. This is exactly TPNet's prebuilt-time-index queried st
 per edge. The analysis-only stores (stratify) have no cutoff, so they are seeded explicitly over
 the causal-past splits.
 
-E (on the unit sphere) and the head are trained together by L (no alignment, no detach)
-by a single RiemannianAdam.
+E (in the Poincare ball) and the head's channel weights are trained TOGETHER by the link CE, with
+NO detach and no auxiliary loss. That is safe here precisely because the score is monotone in the
+geodesic distances (every channel weight is a softplus, hence >= 0): the pull direction into E is
+fixed by construction rather than learned, so there is no readout the head can reshape instead of
+moving E. Intra-bag / cross-bag loss rows are the NEXT step and are not present yet.
 
-TOKEN PREP — the source side (u → μ_u) goes through `walk_tokens.build_query_walk_tokens`:
-walks are generated PER QUERY (no dedup — each row's (node, t) needs its own cutoff) and returned
-ALREADY FLATTENED into a [Q, T] WalkTokens bag (T = K·L): nodes / ages / positions / mask
-/ seed_mask, plus seeds + cutoffs. LinkPredHead reads these flat fields directly — context tokens
-are `mask & ~seed_mask` — and builds μ_u with a per-row softmax (ages = cutoffs − t_edge),
-scoring identity + neighbourhood against E[v].
+TOKEN PREP — both sides go through `walk_tokens.build_query_walk_tokens`: walks are generated PER
+QUERY (no dedup — each row's (node, t) needs its own cutoff) and returned ALREADY FLATTENED into a
+[Q, T] WalkTokens bag (T = K*L). The head reads the flat fields directly, drops every slot whose
+node is the bag's own seed, and softmaxes the fixed -(log1p(age) + log1p(hop-1)) recency/hop prior
+over what remains.
 """
 import time
 from dataclasses import dataclass
@@ -59,26 +61,16 @@ class TrainerConfig:
     # Init only — never a per-step scaler.
     t_train: float = 1.0
 
-    # Model.
+    # Model. The monotone min/mean/max head has NO tunable hyperparameters — the three statistics are
+    # fixed and the only head parameter is the 1x3 softmax mix theta (init equal), learned by the link CE.
     d_emb: int = 128
-    d_ef: int = 0             # per-edge-feature dim (0 = dataset has no edge features); fed into the
-                             # NeighborhoodProjection attention keys. Set from the loaded dataset.
-    node_feat: Optional[np.ndarray] = None   # [num_nodes, d_nf] static node features (None if the dataset
-                                             # has none); fed to the head (d_nf derived). Set from the dataset.
-    feature_dim: int = 16     # NeighborFeatureProjection output width (per-token node+edge feature encoding);
-                             # collapses to 0 when the dataset has neither node nor edge features.
-
-    # NeighborhoodProjection (attention pooling of the source's walk-token offsets -> mu_u).
-    t2v_dim: int = 16         # Time2Vec output dim (16 ties dim100 on wiki: 0.8287/0.8040 vs 0.8289/0.8046)
 
     # Link loss / head.
     K_train: int = 10           # per-query training negatives ([B, 1+K_train]); 10 keeps the candidate
                                 # bag + alignment [S,P] matrix small enough to fit bs 1000 on review
-    dropout: float = 0.2        # scorer-MLP dropout — breaks head memorisation, turns the post-peak overfit
-                                # cliff into a gentle valley (wiki). 0 = off.
 
-    # Walks (BACKWARD only, undirected) for the source side (u → μ_u); the one-sided head samples
-    # walks only for the source, each candidate v enters through its static embedding E[v].
+    # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked, each
+    # bounded by the query's own cutoff t_i; both bags flow to the head.
     num_walks_per_node: int = 5
     max_walk_len: int = 5
     walk_bias: str = "ExponentialWeight"
@@ -114,18 +106,13 @@ class Trainer:
         self.device = device or torch.device(
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
-        # Single module owning the sphere node embeddings AND the velocity head. Node features (if any)
-        # are handed over as a float tensor; the head registers them as a device-resident buffer.
-        node_feats = (torch.from_numpy(np.ascontiguousarray(config.node_feat, dtype=np.float32))
-                      if config.node_feat is not None else None)
+        # Single module owning the Poincare-ball node embeddings AND the monotone metric score. There is
+        # no scorer MLP and no feature channel: the score is -(d_id + softmax-mix of [min, mean, max] over
+        # the two walk bags), so node / edge features have nowhere to enter yet (they return later as a
+        # modulation of the per-slot pooling weights, which preserves monotonicity).
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
-            t2v_dim=int(config.t2v_dim),
-            d_ef=int(config.d_ef),
-            feature_dim=int(config.feature_dim),
-            node_features=node_feats,
-            dropout=float(config.dropout),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.
@@ -184,8 +171,8 @@ class Trainer:
         TWO-SIDED per-query walks: the SOURCE side samples K backward walks for each query (u_i, t_i)
         with cutoff = t_i; the CANDIDATE side samples K backward walks for every candidate v_ij with the
         SAME cutoff t_i (so both sides are causal as of the query time). Both bags flow to the head.
-        (Plumbing scaffold: the current geometric head is a placeholder — only the two-bag sampling
-        matters. Cost: the candidate side is C queries per positive, ~C× the source walks.)"""
+        Cost: the candidate side is C walk queries per positive, i.e. ~C× the source walks. This is
+        already the dominant per-batch cost, and it scales with K_train, NOT with two-sidedness."""
         device = self.device
 
         # SOURCE side: per-query (u_i, t_i) → K cutoff=t_i backward walks → raw [B,K,L] token bag.
@@ -233,6 +220,16 @@ class Trainer:
         target = torch.zeros(B, dtype=torch.long, device=device)
         link_loss = F.cross_entropy(logits, target)
 
+        # ALIGNMENT half of the Wang-Isola (ICML'20) decomposition: the mean geodesic distance between the
+        # POSITIVE pair's embeddings. The head's score is monotone in the distances, so alignment/uniformity
+        # is now measurable on the ACTUAL scoring geometry rather than on a proxy — falling alignment with
+        # falling uniformity is the collapse signature, and it is the reason this is logged from day one.
+        with torch.no_grad():
+            e = self.model.E.weight
+            align = self.model.geom.pairwise_dist(
+                F.embedding(src_t, e).unsqueeze(-2),
+                F.embedding(cand_t[:, 0], e).unsqueeze(-2)).mean()
+
         # E is trained END-TO-END by the LINK loss (no alignment loss, no E-detach — the head reads E live,
         # so ranking gradients flow into E). The former boundary prior d_H(0, E)^2 was REMOVED: an A/B on
         # wiki showed it was over-compressing E toward the origin (inflating community-probe purity) at the
@@ -246,8 +243,33 @@ class Trainer:
 
         return {
             "link": float(link_loss.detach()),
+            "align": float(align),
             "lr": float(self.opt.param_groups[0]["lr"]),
         }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Geometry probe — the collapse / blow-up watch
+    # ──────────────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _geometry_probe(self, n_sample: int = 1024) -> Dict[str, float]:
+        """UNIFORMITY half of the Wang-Isola decomposition plus the boundary watch.
+
+          unif     = log mean exp(-d_H) over random OFF-DIAGONAL pairs of E. RISES toward 0 as E
+                     contracts — read it against the per-epoch `align`: both falling together is healthy
+                     (alignment without collapse); both rising is the over-clustering collapse.
+          max_norm = max ||E||. The uniformity pressure in this design pushes norms outward and the
+                     conformal factor blows up at 1; if this runs, CLAMP the ball radius rather than
+                     adding a penalty term (the old boundary prior over-compressed E).
+        """
+        e = self.model.E.weight.detach()
+        n = e.shape[0]
+        idx = torch.randperm(n, device=e.device)[:min(n_sample, n)]
+        x = e[idx]
+        d = self.model.geom.pairwise_dist(x, x)                     # [n, n]
+        off = ~torch.eye(x.shape[0], dtype=torch.bool, device=e.device)
+        unif = torch.logsumexp(-d[off], dim=0) - torch.log(off.sum().to(d.dtype))
+        return {"unif": float(unif), "max_norm": float(e.norm(dim=-1).max())}
 
     # ──────────────────────────────────────────────────────────────────
     # Eval — strict-causal, no_grad
@@ -360,10 +382,11 @@ class Trainer:
             self.model.train()
 
             t0 = time.time()
-            link_sum, n_batches = 0.0, 0
+            link_sum, align_sum, n_batches = 0.0, 0.0, 0
             for batch in train_batches_factory():
                 m = self._train_step(batch)
                 link_sum += m["link"]
+                align_sum += m["align"]
                 n_batches += 1
             train_dt = time.time() - t0
 
@@ -375,6 +398,15 @@ class Trainer:
             )
             cp = self.comm_probe.measure(self.model.E.weight.detach())     # community-formation probe
             line += f"  commP={cp:.3f}(x{cp / max(self.comm_probe.null, 1e-9):.1f})"
+
+            # Geometry watch: alignment (positive-pair distance) vs uniformity (spread), plus the boundary
+            # and the head's learned channel mix. mix = softmax(theta) over [min, mean, max] reads out
+            # WHICH statistic carries the signal — e.g. min dominating (nearest-neighbour cue) vs mean.
+            g = self._geometry_probe()
+            mix = self.model.mix.detach()
+            line += (f"  align={align_sum / max(n_batches, 1):.3f}  unif={g['unif']:.3f}"
+                     f"  |E|max={g['max_norm']:.3f}"
+                     f"  mix[min/mean/max]=[{' '.join(f'{m:.2f}' for m in mix.tolist())}]")
 
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()

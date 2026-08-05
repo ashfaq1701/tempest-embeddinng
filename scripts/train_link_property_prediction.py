@@ -10,7 +10,7 @@ Hyperparameters exposed at CLI (and their grouping):
   Model:          --d-emb
   Link/head:      --k-train
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias, --start-bias
-                  (backward-only, undirected; source u → μ_u; candidate v via static E[v])
+                  (backward-only, undirected; BOTH sides walked under the query's cutoff)
   Optimisation:   --lr, --batch-size, --eval-batch-size,
                   --num-epochs, --early-stop-patience
                   (constant lr, no schedule)
@@ -59,16 +59,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tgb-root", default="datasets", type=str)
 
 
-    # Model.
+    # Model. The monotone min/mean/max head has NO tunable hyperparameters (the three statistics are
+    # fixed; the only head parameter is the 1x3 softmax mix, learned).
     p.add_argument("--d-emb", default=128, type=int)
-
-    # NeighborhoodProjection — attention pooling of the source's walk-token offsets into mu_u.
-    # (Query/key MLPs project to d_emb — no separate attention dim.)
-    p.add_argument("--t2v-dim", default=16, type=int,
-                   help="Time2Vec output dim (16 ties dim 100 on wiki; TPNet default was 100).")
-    p.add_argument("--feature-dim", default=16, type=int,
-                   help="NeighborFeatureProjection output width (per-token node+edge feature encoding); "
-                        "collapses to 0 when the dataset has neither node nor edge features.")
 
     # Link loss / head.
     p.add_argument(
@@ -78,9 +71,6 @@ def parse_args() -> argparse.Namespace:
              "candidate bag (and the alignment [S,P] matrix) small enough to fit "
              "bs 1000 on review / big low-recurrence graphs.",
     )
-    p.add_argument("--dropout", default=0.2, type=float,
-                   help="Scorer-MLP dropout. Breaks head memorisation, turning the post-peak "
-                        "overfit cliff into a gentle valley on wiki. 0 = off.")
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
     p.add_argument(
@@ -92,10 +82,10 @@ def parse_args() -> argparse.Namespace:
         help="If >0, eval on only the first N official val/test edges (prefix; "
              "keeps TGB pre-generated negatives valid).")
 
-    # Walks (BACKWARD only, undirected) for the source side (u → μ_u). One-sided head: only the
-    # source is walked; each candidate v enters through its static embedding E[v].
+    # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked,
+    # each bounded by the query's own cutoff.
     p.add_argument("--num-walks-per-node", default=5, type=int,
-                   help="K walks per source node u.")
+                   help="K walks per query node (source and candidate alike).")
     p.add_argument("--max-walk-len", default=5, type=int,
                    help="L, max walk length. (Sweep on wiki: shorter is better — 20→5 gave "
                         "+0.006 test, monotone, more stable.)")
@@ -269,14 +259,8 @@ def main() -> Dict[str, Any]:
         t_train=float(stats.T_train),
 
         d_emb=args.d_emb,
-        d_ef=(int(train_sp.edge_feat.shape[1]) if train_sp.edge_feat is not None else 0),
-        node_feat=loaded.node_feat,
-
-        t2v_dim=args.t2v_dim,
-        feature_dim=args.feature_dim,
 
         K_train=args.k_train,
-        dropout=args.dropout,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,
