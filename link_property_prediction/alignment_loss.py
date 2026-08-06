@@ -113,20 +113,27 @@ def _row_token_dist(emb: torch.Tensor, geom, seeds: torch.Tensor,
 
 
 def _log_denom(emb: torch.Tensor, geom, seed_nodes: torch.Tensor,
-               pool_nodes: torch.Tensor) -> torch.Tensor:
-    """UNWEIGHTED push-off term per unique anchor NODE -> [S].
+               pool_nodes: torch.Tensor, pool_count: torch.Tensor = None) -> torch.Tensor:
+    """Push-off term per unique anchor NODE -> [S].
 
     One [S, P] matrix. P is bounded by the caller's `pool_size` cap, which is what keeps this from
     exhausting memory — an uncapped pool on review is ~35k distinct nodes and the backward pass holds
-    several [S, P] intermediates at once."""
+    several [S, P] intermediates at once.
+
+    `pool_count` (VARIANT, off by default): if given, the per-node logit becomes -(count_x * d) rather
+    than -d. A hub (high count) then gets a strongly negative logit -> exp ~ 0 -> drops out of the push,
+    so the repulsion concentrates on the rare/tail nodes. This is the OPPOSITE of frequency weighting."""
     d = geom.pairwise_dist(F.embedding(seed_nodes, emb),
                            F.embedding(pool_nodes, emb))              # [S, P]
+    logit = d.neg()                                                  # -d  [S, P]
+    if pool_count is not None:
+        logit = logit * pool_count[None, :]                          # -(count * d): hubs drop out
     is_self = pool_nodes[None, :] == seed_nodes[:, None]              # [S, P] drop dist(E[a], E[a]) = 0
-    return torch.logsumexp(d.neg().masked_fill(is_self, _NEG_INF), dim=1)   # [S]
+    return torch.logsumexp(logit.masked_fill(is_self, _NEG_INF), dim=1)   # [S]
 
 
 def alignment_loss(src_bag: WalkTokens, cand_bag: WalkTokens, emb: torch.Tensor, geom,
-                   pool_size: int = 15_000) -> torch.Tensor:
+                   pool_size: int = 15_000, count_mult: bool = False) -> torch.Tensor:
     """src_bag / cand_bag: the two flattened WalkTokens (seeds = query sources u / candidates v).
     emb: the full node-embedding table [num_nodes, d] on the manifold. geom: exposes
     `pairwise_dist(X, Y) -> [|X|, |Y|]`.
@@ -135,6 +142,11 @@ def alignment_loss(src_bag: WalkTokens, cand_bag: WalkTokens, emb: torch.Tensor,
                  the [S, P] denominator matrix, so cost and peak memory are linear in it; raise it for
                  a lower-variance push. The whole pool is used when it is already smaller than the cap
                  (wiki's is; review's is not).
+    count_mult:  VARIANT (default off). Keep the UNIFORM pool but multiply each pool node's distance by
+                 its occurrence count in the denominator: logit = -(count_x * d). Hubs (high count) then
+                 drop out of the push and the repulsion concentrates on the rare/tail nodes. The
+                 log(n/pool) scale term is skipped in this mode (it is meaningful only for the unweighted
+                 term-count).
 
     Returns a scalar (exactly 0 if no anchor has a context token)."""
     device = emb.device
@@ -165,11 +177,17 @@ def alignment_loss(src_bag: WalkTokens, cand_bag: WalkTokens, emb: torch.Tensor,
     node_to_row[seed_nodes] = torch.arange(seed_nodes.shape[0], device=device)       # node id -> seed row
 
     # 3. Denominator (push-off) per unique anchor NODE — one [S, P] matrix, P bounded by pool_size.
-    log_denom = _log_denom(emb, geom, seed_nodes, pool_nodes)                        # [S]
+    #    VARIANT count_mult: multiply each pool node's distance by its occurrence count (hubs drop out).
+    pool_count = None
+    if count_mult:
+        counts = torch.bincount(context_nodes, minlength=emb.shape[0])               # [num_nodes]
+        pool_count = counts[pool_nodes].to(emb.dtype)                                # [P] occurrence count
+    log_denom = _log_denom(emb, geom, seed_nodes, pool_nodes, pool_count)            # [S]
     # Uniform sampling makes sum_sampled exp(-d) an unbiased estimate of (n/P_all) * sum_all exp(-d),
     # so this restores the full-pool SCALE. Constant w.r.t. E — zero gradient — and present purely so
-    # the logged loss stays comparable across batches whose pools differ in size.
-    if pool_nodes.numel() < n_distinct:
+    # the logged loss stays comparable across batches whose pools differ in size. Skipped in count_mult
+    # (it is meaningful only for the unweighted term-count denominator).
+    if (not count_mult) and pool_nodes.numel() < n_distinct:
         log_denom = log_denom + math.log(n_distinct / pool_nodes.numel())
 
     # 4. Numerator (pull-in): each anchor ROW toward its OWN walk positives, recency/hop weighted.

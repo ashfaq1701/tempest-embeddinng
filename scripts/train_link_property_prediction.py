@@ -82,6 +82,12 @@ def parse_args() -> argparse.Namespace:
              "call (whole pool used when under the cap). Sets the [S,P] denominator width; cost/memory "
              "~linear. 15k fits bs 1000/K20 on review (~13 GB peak); lower it if the backward peaks.",
     )
+    p.add_argument(
+        "--align-count-mult", action="store_true",
+        help="VARIANT: keep the uniform pool but multiply each pool node's distance by its occurrence "
+             "count in the push (logit = -(count*d)), so hubs drop out and repulsion concentrates on the "
+             "tail. Opposite of frequency weighting. Off = plain unweighted push.",
+    )
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
     p.add_argument(
@@ -274,6 +280,7 @@ def main() -> Dict[str, Any]:
         K_train=args.k_train,
         align_coef=args.align_coef,
         align_pool_size=args.align_pool_size,
+        align_count_mult=args.align_count_mult,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,
