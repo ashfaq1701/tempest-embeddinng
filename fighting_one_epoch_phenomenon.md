@@ -498,3 +498,131 @@ weighting, learnable coeffs) is neutral-or-worse.** The only two things that eve
 changed a curve: E LEARNING RATE (fixes wiki's over-cluster drift; useless on
 review's memorisation cliff) and the ALIGNMENT LOSS (the only lever that made
 review climb).
+
+---
+
+## 2026-08-06 — ★ THE BREAKTHROUGH: the collapse is EXPANSION-driven, and inverting the regime removes it
+
+This is the day the one-epoch phenomenon broke. It is the cleanest, most mechanistically-explainable
+result in the whole effort — the *explanation*, not the number, is the contribution. Recorded in full
+detail (also mirrored in `CLAUDE.md`).
+
+Branch `feature/monotone-alignment`; `tgbl-review`, seed 42 (single seed).
+
+### The diagnosis — `|E|max` is the order parameter
+
+Across EVERY near-origin-init head (min/mean/max, fixed-κ, adaptive-κ, centroid, the alignment
+variants), the val peak-then-drop tracked one quantity exactly: `|E|max`, the max embedding norm.
+Representative collapsing run (min/mean/max head, near-origin init, no boundary, K20):
+
+| ep | val | test | |E|max |
+|---|---|---|---|
+| 1 | 0.2042 | 0.2027 | 0.056 |
+| 2 | **0.2051** | **0.2079** | 0.088 |  ← peak
+| 3 | 0.1943 | — | 0.122 |  ← collapse begins
+| 4 | 0.1954 | — | 0.145 |
+
+The collapse is a **geometric runaway**, not abstract memorisation:
+1. Near-origin init (Nickel & Kiela–style) → all distances ≈ 0 → epoch 1 clustering is TRIVIALLY easy →
+   deceptively high ep1 val, model settles there.
+2. Poincaré training's intrinsic dynamic: E **spreads outward** (InfoNCE uniformity pushes apart; no
+   restoring force; non-compact ball).
+3. Outward spread **inflates all distances at once** → the min-distance ranking signal degrades
+   uniformly → the ep1 clustering is disturbed → **val drops sharply right after the peak.**
+
+So: E migrates toward the boundary, distances blow up, ranking washes out. `|E|max` rises ⟺ val
+collapses.
+
+### The fix — invert the initial conditions so E must CONTRACT
+
+Instead of fighting the outward drift, reverse the starting state so inward is the only way out:
+1. **Spread init** — `geoopt.PoincareBall.random` (default std 1): E starts uniformly throughout the
+   ball, already at max norm (`|E|max ≈ 0.86`), **zero clustering** (commP at the ×1.0 null). The worst
+   possible state.
+2. **Hyperbolic boundary spring** — `mean(d_H(0,E)²)`, so expansion costs. Must be HYPERBOLIC, not
+   Euclidean: the Euclidean `||E||²` penalty's Riemannian gradient VANISHES at the boundary
+   (`rgrad = egrad·(1−||E||²)²/4 → 0`) — it literally could not move the boundary-parked cloud (bc=1.0
+   left |E|max at 0.857, unchanged). The hyperbolic penalty's gradient does not vanish
+   (`d_H(0,E) → ∞` as `||E|| → 1`) and actually contracts it.
+3. **No way out but inward** — starting maximally spread, expansion expensive → contract.
+4. **Alignment loss enforces clustering the whole way** — walk-neighbour multi-positive InfoNCE
+   re-forms communities every step, so E ORGANISES as it contracts rather than merely shrinking.
+5. **Result** — E contracts → radius well-conditioned → clusters form → MRR rises (closeness is what
+   link prediction rewards).
+
+Three forces, separable roles, now summed with **NO coefficients** (`loss = link_CE + alignment +
+boundary`): alignment = local clustering, uniformity = spread, boundary = global radius. The boundary
+spring is ISOTROPIC — pure radial contraction, preserves who-is-near-whom, only rescales radius. So it
+fixes SCALE without fighting the alignment's STRUCTURE.
+
+### The evidence — three coupled curves, all monotone, zero collapse
+
+spread init, hyperbolic boundary, pooled-unweighted alignment (pool 15k), lr 1e-3 (E+head, one group),
+K20, bs 1000, seed 42:
+
+| ep | link | bpen | |E|max | commP (×null) | val | test |
+|---|---|---|---|---|---|---|
+| 1 | 2.609 | 2.933 | 0.805 | 0.110 (×1.0) | 0.0552 | 0.0572 |
+| 2 | 2.329 | 2.031 | 0.782 | 0.113 (×1.0) | 0.0835 | 0.0867 |
+| 3 | 2.241 | 1.505 | 0.759 | 0.117 (×1.0) | 0.1179 | 0.1133 |
+| 4 | 2.226 | 1.148 | 0.734 | 0.122 (×1.1) | 0.1376 | 0.1276 |
+| 5 | 2.234 | 0.911 | 0.707 | 0.126 (×1.1) | 0.1491 | 0.1382 |
+| 6 | 2.248 | 0.752 | 0.680 | 0.135 (×1.2) | 0.1544 | 0.1431 |
+| 7 | 2.262 | 0.646 | 0.652 | 0.146 (×1.3) | 0.1582 | 0.1474 |
+| 8 | 2.273 | 0.575 | 0.624 | 0.149 (×1.3) | 0.1608 | 0.1506 |
+
+The mechanism narrates itself:
+- **|E|max ↓ monotone** (0.805→0.624) — E contracting, exact reverse of the collapsing 0.056→0.145. bpen
+  falls with it (2.93→0.58): the spring WEAKENS as E comes in → approaching an EQUILIBRIUM RADIUS where
+  the inward spring balances alignment's outward push.
+- **commP ↑, crosses the null at ep4** (×1.0→×1.3) — clusters go from at-chance to above-chance exactly
+  as E reaches a well-conditioned radius, then keep sharpening.
+- **val ↑ monotone, NO COLLAPSE** (0.055→0.161 over 8 epochs) — opposite of the ep2-peak baseline.
+
+Causal chain, visible end-to-end: **E contracts → radius well-conditioned → clusters form (commP↑) →
+val climbs.** All three move together, monotonically.
+
+### The commP/val decoupling (localises the remaining work)
+
+From ep6: commP ACCELERATES (×1.1→×1.2→×1.3) while val PLATEAUS (~0.16, +0.003/ep). Community QUALITY
+keeps improving after link-prediction MRR levels off. This splits the problem cleanly:
+- **Collapse — SOLVED** (monotone 8+ ep, no turn).
+- **Readout/peak — OPEN, localised.** Well-formed clusters (commP ×1.3) not fully converting to ranking
+  at the equilibrium radius. The gap to the near-origin peak (0.21) and MLP (0.28) lives HERE — in the
+  geometry→ranking readout, NOT the collapse.
+
+### Honest caveats
+1. Single seed, single config.
+2. CONFOUNDED — spread init + hyperbolic spring + lr 1e-3 + pooled-unweighted alignment all changed at
+   once vs the collapsing baseline. Phenomenon clean; attribution not yet isolated.
+3. Absolute MRR ~0.16 < baseline 0.21 < MLP 0.28 (the readout gap).
+
+### The airtight experiment (next)
+Hold all fixed, flip ONLY the regime — 3 cells:
+(a) near-origin, no spring → collapses (baseline);
+(b) near-origin, + spring → does the spring alone cap expansion?;
+(c) spread, + spring → this run, no collapse.
+If "E contracting not expanding" is the cause, collapse tracks the DIRECTION of |E|max motion, not any
+knob. One figure: |E|max vs val, **collapse iff |E|max rises.** Turns "coolest result" into "proven
+mechanism."
+
+### Config in effect
+Head: monotone min/mean/max (mix went fully to MIN — nearest-neighbour cue). Alignment: InfoNCE,
+weighted pull / unweighted uniform push, pool 15k (memory-flat, ~13 GB vs naive ~44 GB OOM). Boundary:
+hyperbolic mean(d_H(0,E)²), always-on. Loss: clean sum, no coefficients. Opt: one RiemannianAdam group,
+single lr 1e-3, no wd. Init: spread (geoopt random std 1).
+
+Reproduce (current HEAD defaults = clean-sum/single-lr/spread/boundary+align always-on):
+```
+PYTHONUNBUFFERED=1 .venv/bin/python -u scripts/train_link_property_prediction.py \
+  --dataset tgbl-review --batch-size 1000 --eval-batch-size 1000 --k-train 20 \
+  --align-pool-size 15000 --lr 1e-3 --num-walks-per-node 5 --max-walk-len 5 \
+  --early-stop-patience 5 --num-epochs 25 --use-gpu --use-gpu-tempest
+```
+Log: `logs/monotone_boundary/review_align1.0_pool15k_RANDINIT_HYP_bcoef1.0_mlr1e-3_mdlr1e-3_k20_bs1000_*.log`
+
+**This supersedes the prior running conclusion** ("collapse is E-side, every lever neutral-or-worse, only
+the alignment loss ever made review climb"): the alignment loss WAS necessary but not sufficient — the
+missing pieces were the CONTRACTION REGIME (spread init + hyperbolic inward spring) that removes the
+expansion driving the collapse, plus lr 1e-3 to let E actually move. Full write-up in the "Fighting the
+one-epoch phenomenon" doc structure and CLAUDE.md.
