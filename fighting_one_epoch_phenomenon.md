@@ -573,14 +573,36 @@ K20, bs 1000, seed 42:
 
 The mechanism narrates itself:
 - **|E|max ↓ monotone** (0.805→0.624) — E contracting, exact reverse of the collapsing 0.056→0.145. bpen
-  falls with it (2.93→0.58): the spring WEAKENS as E comes in → approaching an EQUILIBRIUM RADIUS where
-  the inward spring balances alignment's outward push.
+  falls with it (2.93→0.58) as the spring weakens with E.
 - **commP ↑, crosses the null at ep4** (×1.0→×1.3) — clusters go from at-chance to above-chance exactly
   as E reaches a well-conditioned radius, then keep sharpening.
 - **val ↑ monotone, NO COLLAPSE** (0.055→0.161 over 8 epochs) — opposite of the ep2-peak baseline.
 
 Causal chain, visible end-to-end: **E contracts → radius well-conditioned → clusters form (commP↑) →
 val climbs.** All three move together, monotonically.
+
+### ⚠ Equilibrium radius — NOT YET DEMONSTRATED (correction, same-day update)
+
+The "approaching an equilibrium radius where the inward spring balances the outward push" reading above
+was **ahead of the evidence** and is corrected here. Through ep9 `|E|max` is **NOT settling** — the
+per-epoch step is flat-to-slightly-ACCELERATING, not decelerating toward zero:
+
+    Δ|E|max (ep2..ep9): -0.023, -0.023, -0.025, -0.027, -0.027, -0.028, -0.028, -0.029
+
+and `bpen` is still dropping steadily (2.93→0.53), not plateauing. So on the current trajectory E is
+contracting at ~0.028/epoch with **no brake** — linearly extrapolated it reaches near-origin (~0.1)
+around ep25–30, i.e. it is heading BACK toward the origin, not stopping at a stable shell. Two endgames,
+indistinguishable from 9 epochs:
+1. **It decelerates later and settles** at a small radius — a true equilibrium, just not reached yet; or
+2. **It contracts all the way to near-origin and the spring pins it there** — which would actually be a
+   *good* end state: near-origin easy-clustering (all points close), but with the outward expansion that
+   caused the original collapse now DISABLED by the spring. You'd end where Nickel–Kiela *starts*, held.
+
+Watch-out: if it over-contracts to a point, all distances → 0 and ranking discrimination eventually
+degrades (val is still rising at ep9, so not yet). **What IS demonstrated: monotone contraction + monotone
+val, no collapse. What is NOT yet demonstrated: a stable equilibrium radius.** Being tested directly with
+a no-early-stop ~40-epoch run watching Δ|E|max bend toward zero (settles) vs stay constant (contracts to
+origin).
 
 ### The commP/val decoupling (localises the remaining work)
 

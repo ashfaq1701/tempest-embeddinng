@@ -1447,15 +1447,33 @@ scale). Optimiser: ONE RiemannianAdam group, single lr. Requires **lr 1e-3** (at
 | 7 | 0.652 | 0.146 (×1.3) | 0.1582 | 0.1474 |
 | 8 | 0.624 | 0.149 (×1.3) | 0.1608 | 0.1506 |
 
-`|E|max` ↓ monotone (E contracting; `bpen` 2.93→0.58 as the spring weakens toward EQUILIBRIUM); commP ↑
-and crosses the null at ep4 (×1.0→×1.3); val ↑ monotone, **no collapse** (0.055→0.161 over 8 epochs).
-Causal chain visible end-to-end: **E contracts → radius conditioned → clusters form (commP↑) → val↑.**
+`|E|max` ↓ monotone (E contracting; `bpen` 2.93→0.58); commP ↑ and crosses the null at ep4 (×1.0→×1.3);
+val ↑ monotone, **no collapse** (0.055→0.161 over 8 epochs). Causal chain visible end-to-end: **E
+contracts → radius conditioned → clusters form (commP↑) → val↑.**
+
+### EQUILIBRIUM RADIUS — NOT YET DEMONSTRATED (open; update 2026-08-06)
+The earlier "approaching an equilibrium radius" framing was **ahead of the evidence** and is corrected
+here. Through ep9 `|E|max` is **NOT settling** — the per-epoch step is flat-to-slightly-ACCELERATING, not
+decelerating toward zero:
+
+    Δ|E|max: -0.023, -0.023, -0.025, -0.027, -0.027, -0.028, -0.028, -0.029   (ep2..ep9)
+
+`bpen` is still dropping steadily (2.93→0.53), not plateauing. So on this trajectory E is contracting at
+~0.028/epoch with no brake — linearly extrapolated it reaches near-origin (~0.1) around ep25–30, i.e. it
+is heading BACK toward the origin, not stopping at a stable shell. Two endgames, indistinguishable from
+9 epochs and both plausible: (i) it decelerates later and settles at a small radius (true equilibrium,
+not yet reached); or (ii) it contracts to near-origin and the spring PINS it there — which would be a
+*good* end state (near-origin easy-clustering, but with the expansion that caused the original collapse
+now disabled). Watch-out: over-contraction to a point would eventually degrade discrimination (val still
+rising at ep9, so not yet). Being tested directly with a no-early-stop ~40-epoch run watching Δ|E|max.
+**What is demonstrated: monotone contraction + monotone val, no collapse. What is NOT yet demonstrated: a
+stable equilibrium radius.**
 
 ### commP/val decoupling (localises the remaining work)
 From ep6 commP ACCELERATES (×1.1→×1.3) while val PLATEAUS (~0.16). Splits the problem:
 - **Collapse — SOLVED** (monotone 8+ ep).
-- **Readout/peak — OPEN, localised** to geometry→ranking at the equilibrium radius. The gap to the
-  near-origin peak 0.21 and MLP 0.28 lives here, NOT in the collapse.
+- **Readout/peak — OPEN, localised** to geometry→ranking at whatever radius E settles/contracts to. The
+  gap to the near-origin peak 0.21 and MLP 0.28 lives here, NOT in the collapse.
 
 ### Caveats (do not overclaim)
 Single seed; CONFOUNDED (spread init + hyp spring + lr 1e-3 + pooled-unweighted align changed together);
