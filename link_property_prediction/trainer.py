@@ -77,10 +77,6 @@ class TrainerConfig:
     # (the whole pool is used when already under the cap). Sets the [S,P] denominator width, so cost and
     # peak memory are ~linear in it — 15k fits bs 1000/K20 on review (~13 GB); lower it if the backward peaks.
     align_pool_size: int = 15_000
-    # VARIANT (default off): keep the uniform pool but multiply each pool node's distance by its
-    # occurrence count in the push (logit = -(count*d)), so hubs drop out and repulsion concentrates on
-    # the tail. Opposite of frequency weighting; an A/B knob against the plain unweighted push.
-    align_count_mult: bool = False
 
     # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked, each
     # bounded by the query's own cutoff t_i; both bags flow to the head.
@@ -250,8 +246,7 @@ class Trainer:
         # 0 recovers pure link training.
         if self.config.align_coef != 0.0:
             aloss = alignment_loss(src_tokens, cand_tokens, self.model.E.weight, self.model.geom,
-                                   pool_size=int(self.config.align_pool_size),
-                                   count_mult=bool(self.config.align_count_mult))
+                                   pool_size=int(self.config.align_pool_size))
         else:
             aloss = logits.new_zeros(())
         loss = link_loss + float(self.config.align_coef) * aloss
