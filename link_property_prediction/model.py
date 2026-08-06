@@ -151,12 +151,12 @@ class LinkPredHead(nn.Module):
         # so the mix is learnable AND monotone with no scale/temperature. No kappa, no alpha_init.
         self.theta = nn.Parameter(torch.zeros(self._N_STATS))
 
-        # E lives in the ball: init near the origin (small-std wrapped normal) so the conformal metric —
-        # which blows up near the boundary — stays well-conditioned early; wrapped as a ManifoldParameter
-        # so RiemannianAdam keeps it in the ball.
+        # E lives in the ball: pure geoopt random init (default std=1, spread across the ball) rather than
+        # the near-origin std=1e-2 wrapped normal; wrapped as a ManifoldParameter so RiemannianAdam keeps
+        # it in the ball.
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            init = self.geom.manifold.random_normal(self.num_nodes, self.d_emb, std=1e-2)
+            init = self.geom.manifold.random(self.num_nodes, self.d_emb)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
     @property
