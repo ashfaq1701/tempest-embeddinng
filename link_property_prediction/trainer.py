@@ -77,9 +77,10 @@ class TrainerConfig:
     # (the whole pool is used when already under the cap). Sets the [S,P] denominator width, so cost and
     # peak memory are ~linear in it — 15k fits bs 1000/K20 on review (~13 GB); lower it if the backward peaks.
     align_pool_size: int = 15_000
-    # Euclidean boundary penalty: loss += boundary_coef * mean(||E||^2). A global isotropic inward spring
-    # (pulls E toward the origin ~linearly in radius) that caps the outward drift / sets an equilibrium
-    # radius while the alignment loss keeps the cluster structure. 0 = off.
+    # Hyperbolic boundary penalty: loss += boundary_coef * mean(d_H(0, E)^2). A global isotropic inward
+    # spring in the ball's metric that caps E's outward drift / sets an equilibrium radius while the
+    # alignment loss keeps the cluster structure. Its gradient does not vanish at the boundary (unlike
+    # Euclidean ||E||^2), so it moves a boundary-parked cloud inward. 0 = off.
     boundary_coef: float = 0.0
 
     # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked, each
@@ -254,12 +255,13 @@ class Trainer:
         else:
             aloss = logits.new_zeros(())
 
-        # EUCLIDEAN BOUNDARY PENALTY: mean ||E||^2 over ALL nodes — a global isotropic inward spring
-        # (grad = 2E, force ~ ||E||) that pulls E toward the origin without touching relative structure,
-        # so the alignment loss keeps the clusters while this sets the equilibrium radius / caps the
-        # outward drift. Soft (does not diverge at the boundary, unlike d_H(0,E)^2). 0 = off.
+        # HYPERBOLIC BOUNDARY PENALTY: mean d_H(0, E)^2 over ALL nodes — a global isotropic inward spring
+        # in the BALL's own metric that pulls E toward the origin without touching relative structure, so
+        # the alignment loss keeps the clusters while this sets the equilibrium radius / caps the outward
+        # drift. Unlike the Euclidean ||E||^2, its Riemannian gradient does NOT vanish at the boundary
+        # (d_H(0,E) diverges as ||E||->1), so it actually moves a boundary-parked cloud inward. 0 = off.
         if self.config.boundary_coef != 0.0:
-            bpen = (self.model.E.weight ** 2).sum(dim=-1).mean()
+            bpen = (self.model.geom.manifold.dist0(self.model.E.weight) ** 2).mean()
         else:
             bpen = logits.new_zeros(())
         loss = link_loss + float(self.config.align_coef) * aloss + float(self.config.boundary_coef) * bpen

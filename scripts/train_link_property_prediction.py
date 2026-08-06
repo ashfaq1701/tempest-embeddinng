@@ -84,9 +84,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--boundary-coef", type=float, default=0.0,
-        help="Euclidean boundary penalty weight: loss += boundary_coef * mean(||E||^2). A global inward "
-             "spring that caps E's outward drift / sets an equilibrium radius while the alignment loss "
-             "keeps cluster structure. 0 = off; start small (~1e-3) and tune to an |E|max plateau.",
+        help="Hyperbolic boundary penalty weight: loss += boundary_coef * mean(d_H(0,E)^2). A global "
+             "inward spring in the ball's metric (gradient does not vanish at the boundary) that caps "
+             "E's outward drift / sets an equilibrium radius while the alignment loss keeps cluster "
+             "structure. 0 = off; tune to an |E|max plateau.",
     )
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
