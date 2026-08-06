@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
              "~linear. 15k fits bs 1000/K20 on review (~13 GB peak); lower it if the backward peaks.",
     )
     p.add_argument(
-        "--boundary-coef", type=float, default=0.0,
+        "--boundary-coef", type=float, default=1.0,
         help="Hyperbolic boundary penalty weight: loss += boundary_coef * mean(d_H(0,E)^2). A global "
              "inward spring in the ball's metric (gradient does not vanish at the boundary) that caps "
              "E's outward drift / sets an equilibrium radius while the alignment loss keeps cluster "
@@ -119,14 +119,10 @@ def parse_args() -> argparse.Namespace:
                         "more outward exploration; p=4,q=0.25 = most diverse backward walks.")
 
 
-    # Optimisation — RiemannianAdam at a CONSTANT lr (no schedule). One group covers E
-    # (a geoopt.ManifoldParameter, Riemannian update) and all Euclidean params.
-    p.add_argument("--lr", default=1e-4, type=float,
-                   help="Legacy single LR (superseded by --manifold-lr / --model-lr).")
-    p.add_argument("--manifold-lr", default=1e-4, type=float,
-                   help="LR for E (manifold param), trained by the alignment loss; governs clustering speed (default 1e-3).")
-    p.add_argument("--model-lr", default=1e-3, type=float,
-                   help="LR for the head (nn params), trained by the link CE reading detached E (default 1e-3).")
+    # Optimisation — RiemannianAdam at a CONSTANT lr (no schedule). ONE param group covers E
+    # (a geoopt.ManifoldParameter, Riemannian update) and all Euclidean head params at the same lr.
+    p.add_argument("--lr", default=1e-3, type=float,
+                   help="Single LR for the whole model (E + head), one RiemannianAdam param group.")
     p.add_argument(
         "--batch-size", default=200, type=int,
         help="Train batch size. Under the per-query ranking link "
@@ -290,8 +286,6 @@ def main() -> Dict[str, Any]:
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
         lr=args.lr,
-        manifold_lr=args.manifold_lr,
-        model_lr=args.model_lr,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 

@@ -81,7 +81,7 @@ class TrainerConfig:
     # spring in the ball's metric that caps E's outward drift / sets an equilibrium radius while the
     # alignment loss keeps the cluster structure. Its gradient does not vanish at the boundary (unlike
     # Euclidean ||E||^2), so it moves a boundary-parked cloud inward. 0 = off.
-    boundary_coef: float = 0.0
+    boundary_coef: float = 1.0
 
     # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked, each
     # bounded by the query's own cutoff t_i; both bags flow to the head.
@@ -92,17 +92,11 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
 
-    # Optimisation — CONSTANT lr (no schedule). RiemannianAdam applies the Riemannian update to E
-    # (a geoopt.ManifoldParameter) and standard Adam to the Euclidean params. NO weight decay: a wiki A/B
-    # (with the boundary prior removed) showed no-wd lets E spread and beats wd 1e-4 on link MRR — wd was
-    # compressing E toward the origin like the old boundary prior.
-    lr: float = 1e-4          # legacy single LR (superseded by the two-group split below; kept for compat)
-    # TWO LR GROUPS. E (the manifold param) and the head (nn params) are BOTH trained by the link CE now —
-    # E end-to-end (no detach, no alignment loss), so ranking gradients flow into E through the head.
-    # manifold_lr is E's Riemannian-update lr; model_lr is the head's Adam lr. RiemannianAdam does the
-    # Riemannian update on E, standard Adam on the head, each under its own group lr.
-    manifold_lr: float = 1e-4
-    model_lr: float = 1e-3
+    # Optimisation — CONSTANT lr (no schedule), ONE param group for everything. RiemannianAdam applies
+    # the Riemannian update to E (a geoopt.ManifoldParameter) and standard Adam to the Euclidean head
+    # params within the single group, so E and the head train at the same lr. NO weight decay: a wiki A/B
+    # (with the boundary prior removed) showed no-wd lets E spread and beats wd 1e-4 on link MRR.
+    lr: float = 1e-3
 
     # Run control.
     num_epochs: int = 25
@@ -143,17 +137,10 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # TWO param groups: E (the geoopt.ManifoldParameter) at manifold_lr (Riemannian update, HIGH lr
-        # so clustering moves fast); the head (Euclidean nn params) at model_lr (standard Adam, LOW lr so
-        # the free-ride/memorisation develops slowly and E can win the race to carry the signal).
-        e_param = self.model.E.weight
-        head_params = [p for p in self.model.parameters() if p is not e_param]
+        # ONE param group at a single lr: RiemannianAdam gives E (the geoopt.ManifoldParameter) the
+        # Riemannian update and the head's Euclidean params standard Adam, all under the same lr.
         self.opt = geoopt.optim.RiemannianAdam(
-            [
-                {"params": [e_param], "lr": float(config.manifold_lr)},
-                {"params": head_params, "lr": float(config.model_lr)},
-            ],
-            stabilize=10,
+            self.model.parameters(), lr=float(config.lr), stabilize=10,
         )
 
     # ──────────────────────────────────────────────────────────────────
@@ -428,7 +415,7 @@ class Trainer:
                 f"link={link_sum / max(n_batches, 1):.4f}  "
                 f"aloss={aloss_sum / max(n_batches, 1):.4f}(x{self.config.align_coef:g})  "
                 f"bpen={bpen_sum / max(n_batches, 1):.4f}(x{self.config.boundary_coef:g})  "
-                f"lr(E/head)={self.opt.param_groups[0]['lr']:.0e}/{self.opt.param_groups[1]['lr']:.0e}  "
+                f"lr={self.opt.param_groups[0]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
             cp = self.comm_probe.measure(self.model.E.weight.detach())     # community-formation probe
