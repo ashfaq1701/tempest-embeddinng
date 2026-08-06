@@ -82,6 +82,12 @@ def parse_args() -> argparse.Namespace:
              "call (whole pool used when under the cap). Sets the [S,P] denominator width; cost/memory "
              "~linear. 15k fits bs 1000/K20 on review (~13 GB peak); lower it if the backward peaks.",
     )
+    p.add_argument(
+        "--boundary-coef", type=float, default=0.0,
+        help="Euclidean boundary penalty weight: loss += boundary_coef * mean(||E||^2). A global inward "
+             "spring that caps E's outward drift / sets an equilibrium radius while the alignment loss "
+             "keeps cluster structure. 0 = off; start small (~1e-3) and tune to an |E|max plateau.",
+    )
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
     p.add_argument(
@@ -274,6 +280,7 @@ def main() -> Dict[str, Any]:
         K_train=args.k_train,
         align_coef=args.align_coef,
         align_pool_size=args.align_pool_size,
+        boundary_coef=args.boundary_coef,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,

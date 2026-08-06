@@ -77,6 +77,10 @@ class TrainerConfig:
     # (the whole pool is used when already under the cap). Sets the [S,P] denominator width, so cost and
     # peak memory are ~linear in it — 15k fits bs 1000/K20 on review (~13 GB); lower it if the backward peaks.
     align_pool_size: int = 15_000
+    # Euclidean boundary penalty: loss += boundary_coef * mean(||E||^2). A global isotropic inward spring
+    # (pulls E toward the origin ~linearly in radius) that caps the outward drift / sets an equilibrium
+    # radius while the alignment loss keeps the cluster structure. 0 = off.
+    boundary_coef: float = 0.0
 
     # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked, each
     # bounded by the query's own cutoff t_i; both bags flow to the head.
@@ -249,7 +253,16 @@ class Trainer:
                                    pool_size=int(self.config.align_pool_size))
         else:
             aloss = logits.new_zeros(())
-        loss = link_loss + float(self.config.align_coef) * aloss
+
+        # EUCLIDEAN BOUNDARY PENALTY: mean ||E||^2 over ALL nodes — a global isotropic inward spring
+        # (grad = 2E, force ~ ||E||) that pulls E toward the origin without touching relative structure,
+        # so the alignment loss keeps the clusters while this sets the equilibrium radius / caps the
+        # outward drift. Soft (does not diverge at the boundary, unlike d_H(0,E)^2). 0 = off.
+        if self.config.boundary_coef != 0.0:
+            bpen = (self.model.E.weight ** 2).sum(dim=-1).mean()
+        else:
+            bpen = logits.new_zeros(())
+        loss = link_loss + float(self.config.align_coef) * aloss + float(self.config.boundary_coef) * bpen
 
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -258,6 +271,7 @@ class Trainer:
         return {
             "link": float(link_loss.detach()),
             "aloss": float(aloss.detach()),
+            "bpen": float(bpen.detach()),
             "align": float(align),
             "lr": float(self.opt.param_groups[0]["lr"]),
         }
@@ -397,11 +411,12 @@ class Trainer:
             self.model.train()
 
             t0 = time.time()
-            link_sum, aloss_sum, align_sum, n_batches = 0.0, 0.0, 0.0, 0
+            link_sum, aloss_sum, bpen_sum, align_sum, n_batches = 0.0, 0.0, 0.0, 0.0, 0
             for batch in train_batches_factory():
                 m = self._train_step(batch)
                 link_sum += m["link"]
                 aloss_sum += m["aloss"]
+                bpen_sum += m["bpen"]
                 align_sum += m["align"]
                 n_batches += 1
             train_dt = time.time() - t0
@@ -410,6 +425,7 @@ class Trainer:
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
                 f"aloss={aloss_sum / max(n_batches, 1):.4f}(x{self.config.align_coef:g})  "
+                f"bpen={bpen_sum / max(n_batches, 1):.4f}(x{self.config.boundary_coef:g})  "
                 f"lr(E/head)={self.opt.param_groups[0]['lr']:.0e}/{self.opt.param_groups[1]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
