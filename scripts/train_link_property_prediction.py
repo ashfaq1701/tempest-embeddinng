@@ -8,7 +8,7 @@ repeatedly with different CLI args.
 Hyperparameters exposed at CLI (and their grouping):
   Dataset:        --dataset, --tgb-root
   Model:          --d-emb
-  Link/head:      --k-train, --align-coef
+  Link/head:      --k-train
   Walks:          --num-walks-per-node, --max-walk-len, --walk-bias, --start-bias
                   (backward-only, undirected; BOTH sides walked under the query's cutoff)
   Optimisation:   --lr, --batch-size, --eval-batch-size,
@@ -72,22 +72,10 @@ def parse_args() -> argparse.Namespace:
              "bs 1000 on review / big low-recurrence graphs.",
     )
     p.add_argument(
-        "--align-coef", type=float, default=1.0,
-        help="Weight on the walk-neighbour alignment loss (InfoNCE over both token bags, clusters E "
-             "by co-occurrence): loss = link_CE + align_coef * alignment_loss. 0 = pure link training.",
-    )
-    p.add_argument(
         "--align-pool-size", type=int, default=15_000,
         help="Cap on DISTINCT negative nodes in the alignment loss push pool, uniformly resampled each "
              "call (whole pool used when under the cap). Sets the [S,P] denominator width; cost/memory "
              "~linear. 15k fits bs 1000/K20 on review (~13 GB peak); lower it if the backward peaks.",
-    )
-    p.add_argument(
-        "--boundary-coef", type=float, default=1.0,
-        help="Hyperbolic boundary penalty weight: loss += boundary_coef * mean(d_H(0,E)^2). A global "
-             "inward spring in the ball's metric (gradient does not vanish at the boundary) that caps "
-             "E's outward drift / sets an equilibrium radius while the alignment loss keeps cluster "
-             "structure. 0 = off; tune to an |E|max plateau.",
     )
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
@@ -275,9 +263,7 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
 
         K_train=args.k_train,
-        align_coef=args.align_coef,
         align_pool_size=args.align_pool_size,
-        boundary_coef=args.boundary_coef,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,

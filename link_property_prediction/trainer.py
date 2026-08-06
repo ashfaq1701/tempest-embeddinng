@@ -70,18 +70,10 @@ class TrainerConfig:
     K_train: int = 10           # per-query training negatives ([B, 1+K_train]); 10 keeps the candidate
                                 # bag + alignment [S,P] matrix small enough to fit bs 1000 on review
 
-    # Walk-neighbour alignment loss (InfoNCE over both token bags, clusters E by co-occurrence). Added to
-    # the link CE as  loss = link + align_coef * alignment_loss. 0 disables it (pure link training).
-    align_coef: float = 1.0
     # Cap on DISTINCT negative nodes in the alignment loss's push pool, uniformly resampled each call
     # (the whole pool is used when already under the cap). Sets the [S,P] denominator width, so cost and
     # peak memory are ~linear in it — 15k fits bs 1000/K20 on review (~13 GB); lower it if the backward peaks.
     align_pool_size: int = 15_000
-    # Hyperbolic boundary penalty: loss += boundary_coef * mean(d_H(0, E)^2). A global isotropic inward
-    # spring in the ball's metric that caps E's outward drift / sets an equilibrium radius while the
-    # alignment loss keeps the cluster structure. Its gradient does not vanish at the boundary (unlike
-    # Euclidean ||E||^2), so it moves a boundary-parked cloud inward. 0 = off.
-    boundary_coef: float = 1.0
 
     # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked, each
     # bounded by the query's own cutoff t_i; both bags flow to the head.
@@ -233,25 +225,20 @@ class Trainer:
 
         # WALK-NEIGHBOUR ALIGNMENT LOSS: multi-positive InfoNCE over BOTH token bags (alignment_loss.py) —
         # an unsupervised co-occurrence objective that pulls each seed toward its own walk context and pushes
-        # off the shared batch pool, clustering E by neighbourhood. Added to the ranking loss; E is trained
-        # end-to-end by BOTH (link CE through the monotone head + this directly on E). align_coef scales it;
-        # 0 recovers pure link training.
-        if self.config.align_coef != 0.0:
-            aloss = alignment_loss(src_tokens, cand_tokens, self.model.E.weight, self.model.geom,
-                                   pool_size=int(self.config.align_pool_size))
-        else:
-            aloss = logits.new_zeros(())
+        # off the shared batch pool, clustering E by neighbourhood. E is trained end-to-end by BOTH (link CE
+        # through the monotone head + this directly on E).
+        aloss = alignment_loss(src_tokens, cand_tokens, self.model.E.weight, self.model.geom,
+                               pool_size=int(self.config.align_pool_size))
 
         # HYPERBOLIC BOUNDARY PENALTY: mean d_H(0, E)^2 over ALL nodes — a global isotropic inward spring
         # in the BALL's own metric that pulls E toward the origin without touching relative structure, so
         # the alignment loss keeps the clusters while this sets the equilibrium radius / caps the outward
         # drift. Unlike the Euclidean ||E||^2, its Riemannian gradient does NOT vanish at the boundary
-        # (d_H(0,E) diverges as ||E||->1), so it actually moves a boundary-parked cloud inward. 0 = off.
-        if self.config.boundary_coef != 0.0:
-            bpen = (self.model.geom.manifold.dist0(self.model.E.weight) ** 2).mean()
-        else:
-            bpen = logits.new_zeros(())
-        loss = link_loss + float(self.config.align_coef) * aloss + float(self.config.boundary_coef) * bpen
+        # (d_H(0,E) diverges as ||E||->1), so it actually moves a boundary-parked cloud inward.
+        bpen = (self.model.geom.manifold.dist0(self.model.E.weight) ** 2).mean()
+
+        # CLEAN SUM — no coefficients. loss = link CE + alignment InfoNCE + boundary spring.
+        loss = link_loss + aloss + bpen
 
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -413,8 +400,8 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
-                f"aloss={aloss_sum / max(n_batches, 1):.4f}(x{self.config.align_coef:g})  "
-                f"bpen={bpen_sum / max(n_batches, 1):.4f}(x{self.config.boundary_coef:g})  "
+                f"aloss={aloss_sum / max(n_batches, 1):.4f}  "
+                f"bpen={bpen_sum / max(n_batches, 1):.4f}  "
                 f"lr={self.opt.param_groups[0]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
