@@ -82,7 +82,7 @@ class TrainerConfig:
     # the Riemannian update to E (a geoopt.ManifoldParameter) and standard Adam to the Euclidean head
     # params within the single group, so E and the head train at the same lr. NO weight decay: a wiki A/B
     # (with the boundary prior removed) showed no-wd lets E spread and beats wd 1e-4 on link MRR.
-    lr: float = 1e-3
+    lr: float = 1e-4
 
     # Run control.
     num_epochs: int = 25

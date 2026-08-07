@@ -103,7 +103,7 @@ def parse_args() -> argparse.Namespace:
 
     # Optimisation — RiemannianAdam at a CONSTANT lr (no schedule). ONE param group covers E
     # (a geoopt.ManifoldParameter, Riemannian update) and all Euclidean head params at the same lr.
-    p.add_argument("--lr", default=1e-3, type=float,
+    p.add_argument("--lr", default=1e-4, type=float,
                    help="Single LR for the whole model (E + head), one RiemannianAdam param group.")
     p.add_argument(
         "--batch-size", default=200, type=int,
