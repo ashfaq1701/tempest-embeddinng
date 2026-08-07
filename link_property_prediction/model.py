@@ -1,7 +1,7 @@
-"""Monotone weighted-mean metric head on the Poincaré ball. E is the only trained tensor; the score is a
-parameter-free distance aggregate  s(u,v) = -[ d(E_u,E_v) + mean(E_v,B_u) + mean(E_u,B_v) ]  where B_x is
-x's walk-token bag. The weighted mean is a convex combination, so ds/dd_p <= 0 and the link CE trains E
-end-to-end with no detach."""
+"""Two-sided CENTROID-distance head on the Poincaré ball. E is the only trained tensor; the score is a
+parameter-free distance aggregate  s(u,v) = -[ d(E_u,E_v) + d(P_u,E_v) + d(E_u,P_v) + d(P_u,P_v) ]  where
+P_x is the weighted gyro-midpoint (geoopt weighted_midpoint) of x's walk-token bag. NOT monotone (distance
+to a centroid can move against a token distance) — the centroid variant of the weighted-mean head."""
 from typing import Tuple
 
 import geoopt
@@ -21,6 +21,10 @@ class PoincareManifold:
     def __init__(self, c: float = 1.0):
         self.manifold = geoopt.PoincareBall(c=c)
 
+    def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Elementwise geodesic distance (geoopt), broadcasting over leading dims. LOWER = closer."""
+        return self.manifold.dist(x, y)
+
     @staticmethod
     def pairwise_dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """arcosh(1 + 2||x-y||^2 / ((1-||x||^2)(1-||y||^2))) for x [...,n,d], y [...,m,d] -> [...,n,m].
@@ -35,8 +39,8 @@ class PoincareManifold:
 
 
 class LinkPredHead(nn.Module):
-    """Two-sided monotone weighted-mean head. Owns E (ManifoldParameter, trained by the link CE); no other
-    parameter. Symmetric across the two directions (v vs B_u, u vs B_v) since the task is undirected."""
+    """Two-sided centroid-distance head. Owns E (ManifoldParameter, trained by the link CE); no other
+    parameter. Score = -(the four E/P geodesic distances)."""
 
     def __init__(self, num_nodes: int, d_emb: int):
         super().__init__()
@@ -75,37 +79,35 @@ class LinkPredHead(nn.Module):
         log_w = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
         return nodes, log_w
 
-    @staticmethod
-    def bag_mean(d: torch.Tensor, log_w: torch.Tensor) -> torch.Tensor:
-        """Weighted mean sum_p exp(log_w_p) * d_p over the last axis (excluded slots have weight 0)."""
-        return (log_w.exp() * d).sum(dim=-1)
+    def bag_centroid(self, nodes: torch.Tensor, log_w: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        """P_x = weighted gyro-midpoint (geoopt weighted_midpoint) of the bag's token embeddings; weights =
+        exp(log_w) (sum to 1, 0 on excluded slots). Cold bag -> single seed atom -> P_x = E[seed]."""
+        x = F.embedding(nodes, emb)                                            # [Q, T, d]
+        weights = log_w.exp()                                                  # [Q, T]  sums to 1
+        return self.geom.manifold.weighted_midpoint(
+            x, weights=weights, reducedim=[-2], dim=-1, keepdim=False)         # [Q, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries (seeds u); cand = B*C candidate queries (seeds v), query-major. -> [B, C]."""
         emb = self.E.weight
 
-        nodes_u, logw_u = self.bag_weights(src_tokens, emb.dtype)               # [B, T]
-        nodes_v, logw_v = self.bag_weights(cand_tokens, emb.dtype)              # [B*C, T]
+        nodes_u, logw_u = self.bag_weights(src_tokens, emb.dtype)              # [B, T]
+        nodes_v, logw_v = self.bag_weights(cand_tokens, emb.dtype)             # [B*C, T]
 
-        e_u = F.embedding(src_tokens.seeds, emb)                                # [B, d]
-        x_u = F.embedding(nodes_u, emb)                                         # [B, T, d]
-        e_v = F.embedding(cand_tokens.seeds, emb)                               # [B*C, d]
-        x_v = F.embedding(nodes_v, emb)                                         # [B*C, T, d]
+        e_u = F.embedding(src_tokens.seeds, emb)                               # E[u]  [B, d]
+        e_v = F.embedding(cand_tokens.seeds, emb)                              # E[v]  [B*C, d]
+        p_u = self.bag_centroid(nodes_u, logw_u, emb)                          # P[u]  [B, d]
+        p_v = self.bag_centroid(nodes_v, logw_v, emb)                          # P[v]  [B*C, d]
 
         b, d = e_u.shape
         c = e_v.shape[0] // b
-        t = nodes_u.shape[1]
-        e_v = e_v.view(b, c, d)                                                 # [B, C, d]
-        x_v = x_v.view(b, c, t, d)                                              # [B, C, T, d]
-        logw_v = logw_v.view(b, c, t)                                           # [B, C, T]
+        e_v = e_v.view(b, c, d)                                                # [B, C, d]
+        p_v = p_v.view(b, c, d)                                                # [B, C, d]
+        e_u = e_u.unsqueeze(1).expand(b, c, d)                                 # [B, C, d]
+        p_u = p_u.unsqueeze(1).expand(b, c, d)                                 # [B, C, d]
 
-        d_id = self.geom.pairwise_dist(e_u.unsqueeze(-2), e_v).squeeze(-2)      # [B, C]  identity: d(E_u,E_v)
-
-        d_v_bu = self.geom.pairwise_dist(e_v, x_u)                              # [B, C, T]  v vs u's bag
-        mean_v_bu = self.bag_mean(d_v_bu, logw_u.unsqueeze(-2))                 # [B, C]
-
-        d_u_bv = self.geom.pairwise_dist(e_u[:, None, None, :], x_v).squeeze(-2)  # [B, C, T]  u vs v's bag
-        mean_u_bv = self.bag_mean(d_u_bv, logw_v)                               # [B, C]
-
-        raw = d_id + mean_v_bu + mean_u_bv                                      # [B, C]
-        return -raw                                                             # higher = closer = better
+        raw = (self.geom.dist(e_u, e_v)                                        # d(E_u, E_v)  identity
+               + self.geom.dist(p_u, e_v)                                      # d(P_u, E_v)
+               + self.geom.dist(e_u, p_v)                                      # d(E_u, P_v)
+               + self.geom.dist(p_u, p_v))                                     # d(P_u, P_v)
+        return -raw                                                            # [B, C] higher = closer
