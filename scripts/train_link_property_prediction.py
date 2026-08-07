@@ -68,14 +68,8 @@ def parse_args() -> argparse.Namespace:
         "--k-train", type=int, default=10,
         help="Per-query training negatives. The head sees [B, 1+K_train] "
              "candidates per query; positive at column 0. Default 10 keeps the "
-             "candidate bag (and the alignment [S,P] matrix) small enough to fit "
-             "bs 1000 on review / big low-recurrence graphs.",
-    )
-    p.add_argument(
-        "--align-pool-size", type=int, default=15_000,
-        help="Cap on DISTINCT negative nodes in the alignment loss push pool, uniformly resampled each "
-             "call (whole pool used when under the cap). Sets the [S,P] denominator width; cost/memory "
-             "~linear. 15k fits bs 1000/K20 on review (~13 GB peak); lower it if the backward peaks.",
+             "candidate bag small enough to fit bs 1000 on review / big "
+             "low-recurrence graphs.",
     )
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
@@ -263,7 +257,6 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
 
         K_train=args.k_train,
-        align_pool_size=args.align_pool_size,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,

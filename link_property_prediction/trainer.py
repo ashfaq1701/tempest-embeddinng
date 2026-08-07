@@ -42,7 +42,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .alignment_loss import alignment_loss
 from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import LinkPredHead
@@ -68,12 +67,7 @@ class TrainerConfig:
 
     # Link loss / head.
     K_train: int = 10           # per-query training negatives ([B, 1+K_train]); 10 keeps the candidate
-                                # bag + alignment [S,P] matrix small enough to fit bs 1000 on review
-
-    # Cap on DISTINCT negative nodes in the alignment loss's push pool, uniformly resampled each call
-    # (the whole pool is used when already under the cap). Sets the [S,P] denominator width, so cost and
-    # peak memory are ~linear in it — 15k fits bs 1000/K20 on review (~13 GB); lower it if the backward peaks.
-    align_pool_size: int = 15_000
+                                # bag small enough to fit bs 1000 on review
 
     # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked, each
     # bounded by the query's own cutoff t_i; both bags flow to the head.
@@ -157,9 +151,8 @@ class Trainer:
 
     def _score(self, src_t: torch.Tensor, cand_t: torch.Tensor,
                t_query_t: torch.Tensor):
-        """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> (logits [B, C], src_tokens,
-        cand_tokens). The two walk bags are returned alongside the logits (the head already consumed them;
-        eval ignores them).
+        """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> logits [B, C]. The head consumes the
+        two walk bags internally; only the logits are returned.
 
         TWO-SIDED per-query walks: the SOURCE side samples K backward walks for each query (u_i, t_i)
         with cutoff = t_i; the CANDIDATE side samples K backward walks for every candidate v_ij with the
@@ -188,7 +181,7 @@ class Trainer:
             start_bias=self.config.start_bias,
             walk_bias=self.config.walk_bias)
 
-        return self.model(src_tokens, cand_tokens), src_tokens, cand_tokens
+        return self.model(src_tokens, cand_tokens)
 
     # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
@@ -209,7 +202,7 @@ class Trainer:
         cand_t = torch.from_numpy(cand_np).to(device)
         t_query_t = torch.from_numpy(batch.ts.astype(np.int64)).to(device)
 
-        logits, src_tokens, cand_tokens = self._score(src_t, cand_t, t_query_t)   # [B, 1+K], both bags
+        logits = self._score(src_t, cand_t, t_query_t)                            # [B, 1+K]
         target = torch.zeros(B, dtype=torch.long, device=device)
         link_loss = F.cross_entropy(logits, target)
 
@@ -223,22 +216,16 @@ class Trainer:
                 F.embedding(src_t, e).unsqueeze(-2),
                 F.embedding(cand_t[:, 0], e).unsqueeze(-2)).mean()
 
-        # WALK-NEIGHBOUR ALIGNMENT LOSS: multi-positive InfoNCE over BOTH token bags (alignment_loss.py) —
-        # an unsupervised co-occurrence objective that pulls each seed toward its own walk context and pushes
-        # off the shared batch pool, clustering E by neighbourhood. E is trained end-to-end by BOTH (link CE
-        # through the monotone head + this directly on E).
-        aloss = alignment_loss(src_tokens, cand_tokens, self.model.E.weight, self.model.geom,
-                               pool_size=int(self.config.align_pool_size))
-
         # HYPERBOLIC BOUNDARY PENALTY: mean d_H(0, E)^2 over ALL nodes — a global isotropic inward spring
         # in the BALL's own metric that pulls E toward the origin without touching relative structure, so
-        # the alignment loss keeps the clusters while this sets the equilibrium radius / caps the outward
-        # drift. Unlike the Euclidean ||E||^2, its Riemannian gradient does NOT vanish at the boundary
+        # the link CE keeps the clusters while this sets the equilibrium radius / caps the outward drift.
+        # Unlike the Euclidean ||E||^2, its Riemannian gradient does NOT vanish at the boundary
         # (d_H(0,E) diverges as ||E||->1), so it actually moves a boundary-parked cloud inward.
         bpen = (self.model.geom.manifold.dist0(self.model.E.weight) ** 2).mean()
 
-        # CLEAN SUM — no coefficients. loss = link CE + alignment InfoNCE + boundary spring.
-        loss = link_loss + aloss + bpen
+        # CLEAN SUM — no coefficients. loss = link CE + boundary spring. E is trained end-to-end by the
+        # link CE through the monotone head (no detach); the spring only conditions the radius.
+        loss = link_loss + bpen
 
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -246,7 +233,6 @@ class Trainer:
 
         return {
             "link": float(link_loss.detach()),
-            "aloss": float(aloss.detach()),
             "bpen": float(bpen.detach()),
             "align": float(align),
             "lr": float(self.opt.param_groups[0]["lr"]),
@@ -311,7 +297,7 @@ class Trainer:
                 src_t = torch.from_numpy(batch.src.astype(np.int64)).to(self.device)
                 cand_t = torch.from_numpy(cand_v_np).to(self.device)
                 t_query_t = torch.from_numpy(batch.ts.astype(np.int64)).to(self.device)
-                logits, _, _ = self._score(src_t, cand_t, t_query_t)
+                logits = self._score(src_t, cand_t, t_query_t)
                 logits = logits.cpu().numpy()
 
                 for i in range(B):
@@ -387,11 +373,10 @@ class Trainer:
             self.model.train()
 
             t0 = time.time()
-            link_sum, aloss_sum, bpen_sum, align_sum, n_batches = 0.0, 0.0, 0.0, 0.0, 0
+            link_sum, bpen_sum, align_sum, n_batches = 0.0, 0.0, 0.0, 0
             for batch in train_batches_factory():
                 m = self._train_step(batch)
                 link_sum += m["link"]
-                aloss_sum += m["aloss"]
                 bpen_sum += m["bpen"]
                 align_sum += m["align"]
                 n_batches += 1
@@ -400,7 +385,6 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
-                f"aloss={aloss_sum / max(n_batches, 1):.4f}  "
                 f"bpen={bpen_sum / max(n_batches, 1):.4f}  "
                 f"lr={self.opt.param_groups[0]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"

@@ -63,7 +63,7 @@ class WalkTokens:
         most RECENT & CLOSEST token gets the highest weight. Convention: age = 0 at the seed / ≥1 for
         context; hop = 1 at the seed / ≥2 for the closest context (so hop-1 = 0 at the seed, ≥1 for
         context). Returned in float32 — cast to the head's dtype at the call site if it differs. The
-        SAME prior weights both pooling channels (geometry and features) and the alignment loss."""
+        SAME prior weights both pooling channels (geometry and features)."""
         age = self.ages.clamp_min(0).to(torch.float32)                                 # [Q, T]  seed=0, ctx≥1
         hop = self.positions.clamp_min(1).to(torch.float32)                            # [Q, T]  seed=1, ctx≥2
         return -(torch.log1p(age) + torch.log1p(hop - 1.0))                            # [Q, T]  ≤ 0
