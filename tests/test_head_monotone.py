@@ -8,8 +8,7 @@ identity distance. The head has NO learnable parameter besides E.
 import geoopt
 import torch
 
-from link_property_prediction.model import (
-    LinkPredHead, PoincareManifold, bag_mean, bag_weights)
+from link_property_prediction.model import LinkPredHead, PoincareManifold
 from link_property_prediction.walk_tokens import WalkTokens
 
 
@@ -63,7 +62,7 @@ def test_score_is_monotone_decreasing_in_every_distance():
     d_bag = (torch.rand(6, 4, 9, dtype=torch.float64) * 3).requires_grad_(True)   # [B, C, T]
     log_w = torch.log_softmax(torch.randn(6, 1, 9, dtype=torch.float64), dim=-1)
 
-    mean = bag_mean(d_bag, log_w)                                               # [B, C]
+    mean = LinkPredHead.bag_mean(d_bag, log_w)                                               # [B, C]
     s = -(d_id + mean)                                                          # [B, C]
     s.sum().backward()
 
@@ -83,7 +82,7 @@ def test_bag_mean_is_weighted():
     raw = torch.tensor([[0.3, 0.5, 0.2, float("-inf")]], dtype=torch.float64)
     log_w = torch.log_softmax(raw, dim=-1)
 
-    mean = bag_mean(d, log_w)[0].item()                                         # scalar
+    mean = LinkPredHead.bag_mean(d, log_w)[0].item()                                         # scalar
     w = log_w.exp()
     want_mean = (w[0, :3] * d[0, :3]).sum().item()
     assert abs(mean - want_mean) < 1e-12, "mean must be the weighted average over live slots"
@@ -98,7 +97,7 @@ def test_bag_weights_mask_and_mass():
     #                seed 5: slots = [seed(5), 7, 5(revisit), 9, pad]
     tokens = _make_tokens(nodes=[[5, 7, 5, 9, -1]], ages=[[0, 3, 8, 1, -1]],
                           positions=[[1, 2, 3, 4, 0]], seeds=[5])
-    nodes, log_w = bag_weights(tokens)
+    nodes, log_w = LinkPredHead.bag_weights(tokens)
     w = log_w.exp()
     assert abs(w.sum().item() - 1.0) < 1e-6, "weights must sum to 1"
     assert w[0, 0].item() == 0.0 and w[0, 2].item() == 0.0, "own-seed slots must carry zero weight"
@@ -113,7 +112,7 @@ def test_cold_bag_falls_back_to_identity():
     two bag means equal to d_id)."""
     tokens = _make_tokens(nodes=[[5, -1, -1], [6, 8, 9]], ages=[[0, -1, -1], [0, 2, 5]],
                           positions=[[1, 0, 0], [1, 2, 3]], seeds=[5, 6])
-    nodes, log_w = bag_weights(tokens)
+    nodes, log_w = LinkPredHead.bag_weights(tokens)
     assert nodes[0, 0].item() == 5 and abs(log_w[0, 0].item()) < 1e-9, "cold row -> slot0 = (seed, w=1)"
     assert bool(torch.isinf(log_w[0, 1:]).all()), "cold row -> every other slot excluded"
 
