@@ -61,8 +61,8 @@ class TrainerConfig:
     # Init only — never a per-step scaler.
     t_train: float = 1.0
 
-    # Model. The monotone min/mean/max head has NO tunable hyperparameters — the three statistics are
-    # fixed and the only head parameter is the 1x3 softmax mix theta (init equal), learned by the link CE.
+    # Model. The monotone weighted-mean head has NO tunable hyperparameters and NO head parameters at all —
+    # the score is a fixed geometric aggregate of distances; E is the only trained tensor.
     d_emb: int = 128
 
     # Link loss / head.
@@ -101,8 +101,8 @@ class Trainer:
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
         # Single module owning the Poincare-ball node embeddings AND the monotone metric score. There is
-        # no scorer MLP and no feature channel: the score is -(d_id + softmax-mix of [min, mean, max] over
-        # the two walk bags), so node / edge features have nowhere to enter yet (they return later as a
+        # no scorer MLP and no feature channel: the score is -(d_id + weighted-mean bag distance over the
+        # two walk bags), so node / edge features have nowhere to enter yet (they return later as a
         # modulation of the per-slot pooling weights, which preserves monotonicity).
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
@@ -393,13 +393,10 @@ class Trainer:
             line += f"  commP={cp:.3f}(x{cp / max(self.comm_probe.null, 1e-9):.1f})"
 
             # Geometry watch: alignment (positive-pair distance) vs uniformity (spread), plus the boundary
-            # and the head's learned channel mix. mix = softmax(theta) over [min, mean, max] reads out
-            # WHICH statistic carries the signal — e.g. min dominating (nearest-neighbour cue) vs mean.
+            # radius. The head has no learnable channel mix — the score is a fixed weighted-mean aggregate.
             g = self._geometry_probe()
-            mix = self.model.mix.detach()
             line += (f"  align={align_sum / max(n_batches, 1):.3f}  unif={g['unif']:.3f}"
-                     f"  |E|max={g['max_norm']:.3f}"
-                     f"  mix[min/mean/max]=[{' '.join(f'{m:.2f}' for m in mix.tolist())}]")
+                     f"  |E|max={g['max_norm']:.3f}")
 
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()

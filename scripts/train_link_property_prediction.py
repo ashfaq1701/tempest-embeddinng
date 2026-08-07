@@ -59,8 +59,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tgb-root", default="datasets", type=str)
 
 
-    # Model. The monotone min/mean/max head has NO tunable hyperparameters (the three statistics are
-    # fixed; the only head parameter is the 1x3 softmax mix, learned).
+    # Model. The monotone weighted-mean head has NO tunable hyperparameters and no head parameter at all —
+    # the score is a fixed geometric distance aggregate; E is the only trained tensor.
     p.add_argument("--d-emb", default=128, type=int)
 
     # Link loss / head.

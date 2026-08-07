@@ -1,15 +1,15 @@
-"""Correctness tests for the monotone min/mean/max metric head (link_property_prediction/model.py).
+"""Correctness tests for the monotone weighted-mean metric head (link_property_prediction/model.py).
 
 The head's whole design rests on ONE property — ds/dd <= 0 for every geodesic distance it consumes — so
 that property is ASSERTED here rather than trusted. The rest pins pairwise_dist against geoopt, the
-[min, mean, max] contents of bag_stats (including exclusion of masked slots), the simplex mix, and the
-cold-bag fallback to the identity distance.
+weighted-mean contents of bag_mean (including exclusion of masked slots), and the cold-bag fallback to the
+identity distance. The head has NO learnable parameter besides E.
 """
 import geoopt
 import torch
 
 from link_property_prediction.model import (
-    LinkPredHead, PoincareManifold, bag_stats, bag_weights)
+    LinkPredHead, PoincareManifold, bag_mean, bag_weights)
 from link_property_prediction.walk_tokens import WalkTokens
 
 
@@ -54,48 +54,43 @@ def test_pairwise_dist_matches_geoopt():
 
 
 def test_score_is_monotone_decreasing_in_every_distance():
-    """THE load-bearing property: ds/dd_p <= 0 for every distance entering the score, at a random mix.
+    """THE load-bearing property: ds/dd_p <= 0 for every distance entering the score.
 
     Differentiates the score aggregate w.r.t. synthetic distance tensors, so the check is on the head's
-    ALGEBRA ([min, mean, max] + simplex softmax mix), independent of the geometry."""
+    ALGEBRA (identity distance + weighted-mean bag distance), independent of the geometry."""
     torch.manual_seed(0)
-    mix = torch.softmax(torch.randn(3, dtype=torch.float64), dim=-1)            # simplex weights
-
     d_id = torch.rand(6, 4, dtype=torch.float64).requires_grad_(True)           # [B, C]
     d_bag = (torch.rand(6, 4, 9, dtype=torch.float64) * 3).requires_grad_(True)   # [B, C, T]
     log_w = torch.log_softmax(torch.randn(6, 1, 9, dtype=torch.float64), dim=-1)
 
-    stats = bag_stats(d_bag, log_w)                                             # [B, C, 3]
-    s = -(d_id + stats @ mix)                                                   # [B, C]
+    mean = bag_mean(d_bag, log_w)                                               # [B, C]
+    s = -(d_id + mean)                                                          # [B, C]
     s.sum().backward()
 
     assert bool((d_id.grad <= 0).all()), "score must be non-increasing in the identity distance"
     assert bool((d_bag.grad <= 1e-12).all()), "score must be non-increasing in every bag distance"
-    # Every bag distance receives SOME non-positive gradient share; total over T equals -(sum of mix) = -1.
+    # The weighted mean's weights sum to 1, so the per-anchor bag gradients sum to -1.
     assert (d_bag.grad.sum(dim=-1) + 1.0).abs().max().item() < 1e-9, \
-        "per-anchor bag gradients must sum to -1 (min+mean+max are convex combinations, mix sums to 1)"
+        "per-anchor bag gradients must sum to -1 (weighted mean is a convex combination)"
     print("[monotone] ds/dd <= 0 everywhere; bag gradients sum to -1 (convex combination) OK")
 
 
-def test_bag_stats_is_min_mean_max():
-    """bag_stats returns exactly [weighted min, weighted mean, weighted max] over the LIVE slots, and a
-    masked (-inf log_w) slot is excluded from all three even if its distance is extreme."""
-    torch.manual_seed(1)
+def test_bag_mean_is_weighted():
+    """bag_mean returns the WEIGHTED mean over the LIVE slots, and a masked (-inf log_w) slot is excluded
+    even if its distance is extreme."""
     d = torch.tensor([[0.2, 0.5, 1.3, 99.0]], dtype=torch.float64)              # slot 3 is an outlier
     # Exclude slot 3 (log_w = -inf); weights over the first three.
     raw = torch.tensor([[0.3, 0.5, 0.2, float("-inf")]], dtype=torch.float64)
     log_w = torch.log_softmax(raw, dim=-1)
 
-    out = bag_stats(d, log_w)                                                   # [1, 3]
-    d_min, mean, d_max = out[0].tolist()
-    assert abs(d_min - 0.2) < 1e-12, "min must be the nearest LIVE token (outlier excluded)"
-    assert abs(d_max - 1.3) < 1e-12, "max must be the farthest LIVE token (99.0 outlier excluded)"
+    mean = bag_mean(d, log_w)[0].item()                                         # scalar
     w = log_w.exp()
     want_mean = (w[0, :3] * d[0, :3]).sum().item()
     assert abs(mean - want_mean) < 1e-12, "mean must be the weighted average over live slots"
+    assert mean < 2.0, "the 99.0 outlier (excluded slot) must not enter the mean"
     # Sanity: unequal weights actually move the mean off the arithmetic mean.
     assert abs(mean - float(d[0, :3].mean())) > 1e-3, "mean must be WEIGHTED, not plain"
-    print("[bag_stats] returns [min, mean, max]; masked slots excluded; mean is weighted OK")
+    print("[bag_mean] weighted average over live slots; masked slot excluded OK")
 
 
 def test_bag_weights_mask_and_mass():
@@ -113,9 +108,9 @@ def test_bag_weights_mask_and_mass():
 
 
 def test_cold_bag_falls_back_to_identity():
-    """A bag with no context -> {(seed, 1)}, so min = mean = max = the identity distance. End to end with
-    BOTH sides cold, the whole score collapses to -3 * d(E_u, E_v) (d_id + [d_id]*3 . mix + [d_id]*3 . mix,
-    mix summing to 1 -> d_id + d_id + d_id)."""
+    """A bag with no context -> {(seed, 1)}, so the mean = the identity distance. End to end with BOTH
+    sides cold, the whole score collapses to -3 * d(E_u, E_v) (d_id + mean_v_bu + mean_u_bv, each of the
+    two bag means equal to d_id)."""
     tokens = _make_tokens(nodes=[[5, -1, -1], [6, 8, 9]], ages=[[0, -1, -1], [0, 2, 5]],
                           positions=[[1, 0, 0], [1, 2, 3]], seeds=[5, 6])
     nodes, log_w = bag_weights(tokens)
@@ -137,18 +132,8 @@ def test_cold_bag_falls_back_to_identity():
     print("[cold bag] both sides cold -> score == -3 * identity distance OK")
 
 
-def test_mix_is_simplex_and_init_equal():
-    """The only head parameter theta inits at zeros, so mix = softmax = (1/3, 1/3, 1/3); >= 0, sums to 1."""
-    head = LinkPredHead(num_nodes=8, d_emb=4)
-    mix = head.mix
-    assert mix.shape == (3,)
-    assert bool((mix >= 0).all()) and abs(mix.sum().item() - 1.0) < 1e-6, "mix must lie on the simplex"
-    assert (mix - 1.0 / 3.0).abs().max().item() < 1e-6, "init must be the equal mix (1/3, 1/3, 1/3)"
-    print("[mix] softmax(theta) is a simplex, init equal (1/3,1/3,1/3) OK")
-
-
 def test_forward_shapes_and_grad_flow():
-    """forward returns [B, C] and backprops into BOTH E and theta (no detach anywhere)."""
+    """forward returns [B, C] and backprops into E (the only parameter; no detach anywhere)."""
     torch.manual_seed(2)
     b, c, t, n = 3, 4, 6, 40
     head = LinkPredHead(num_nodes=n, d_emb=8)
@@ -171,17 +156,15 @@ def test_forward_shapes_and_grad_flow():
     loss = torch.nn.functional.cross_entropy(logits, torch.zeros(b, dtype=torch.long))
     loss.backward()
     assert head.E.weight.grad is not None and torch.isfinite(head.E.weight.grad).all()
-    assert head.theta.grad is not None and torch.isfinite(head.theta.grad).all()
     assert head.E.weight.grad.abs().sum() > 0, "link loss must reach E (end-to-end, no detach)"
-    print("[forward] shape [B,C], finite logits, gradients reach BOTH E and theta OK")
+    print("[forward] shape [B,C], finite logits, gradients reach E OK")
 
 
 if __name__ == "__main__":
     test_pairwise_dist_matches_geoopt()
     test_score_is_monotone_decreasing_in_every_distance()
-    test_bag_stats_is_min_mean_max()
+    test_bag_mean_is_weighted()
     test_bag_weights_mask_and_mass()
     test_cold_bag_falls_back_to_identity()
-    test_mix_is_simplex_and_init_equal()
     test_forward_shapes_and_grad_flow()
     print("\nall head tests passed")
