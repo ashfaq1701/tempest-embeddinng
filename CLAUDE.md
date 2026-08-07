@@ -15,6 +15,15 @@ InfoNCE contrastive loss + a separate BCE link head.
 > tailed live. Example:
 > `PYTHONUNBUFFERED=1 nohup .venv/bin/python -u scripts/train_link_property_prediction.py ... > run.log 2>&1 &`
 
+> **Per-epoch log line — always report at least these four fields:**
+> - **val MRR** — the eval metric (what early-stopping / best-checkpoint selects on)
+> - **training loss** — the link CE (the actual ranking objective; watch it descend vs stall)
+> - **CommP value with its null multiplier** — e.g. `commP=0.105(x1.0)`; the `xN` (community-probe
+>   value ÷ random-neighbour null) is the readable signal, so always show the multiplier
+> - **|E|mean** — the mean Euclidean node-embedding norm (bulk radius). Report it ALONGSIDE `|E|max`:
+>   `|E|max` alone hides bimodal spread (bulk contracts inward while a few nodes pin at the boundary);
+>   `|E|mean` vs `|E|max` makes the split explicit.
+
 ---
 
 ## How to look at this project — the batch-blindness lesson (READ THIS FIRST)

@@ -260,7 +260,8 @@ class Trainer:
         d = self.model.geom.pairwise_dist(x, x)                     # [n, n]
         off = ~torch.eye(x.shape[0], dtype=torch.bool, device=e.device)
         unif = torch.logsumexp(-d[off], dim=0) - torch.log(off.sum().to(d.dtype))
-        return {"unif": float(unif), "max_norm": float(e.norm(dim=-1).max())}
+        norms = e.norm(dim=-1)
+        return {"unif": float(unif), "max_norm": float(norms.max()), "mean_norm": float(norms.mean())}
 
     # ──────────────────────────────────────────────────────────────────
     # Eval — strict-causal, no_grad
@@ -396,7 +397,7 @@ class Trainer:
             # radius. The head has no learnable channel mix — the score is a fixed weighted-mean aggregate.
             g = self._geometry_probe()
             line += (f"  align={align_sum / max(n_batches, 1):.3f}  unif={g['unif']:.3f}"
-                     f"  |E|max={g['max_norm']:.3f}")
+                     f"  |E|mean={g['mean_norm']:.3f}  |E|max={g['max_norm']:.3f}")
 
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()
