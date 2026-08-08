@@ -58,11 +58,12 @@ class LinkPredHead(nn.Module):
 
     @staticmethod
     def bag_weight_logits(tokens: WalkTokens) -> torch.Tensor:
-        """Recency/hop prior LOGITS [Q, T] = -(log1p(age) + log1p(hop-1)); 0 (max) for the seed (age 0,
-        hop 1), decaying with age and hop."""
+        """Recency/hop prior LOGITS [Q, T] = -(log1p(log1p(age)) + log1p(hop-1)); 0 (max) for the seed
+        (age 0, hop 1). Iterated log on age softens the huge raw-age range (~1e7) — plain log1p left old
+        tokens at ~1e-7 weight and the seed swamped the pooling; log1p(log1p(1e7))~2.8 keeps them alive."""
         age = tokens.ages.clamp_min(0).to(torch.float32)                        # [Q, T]  seed=0, ctx>=1
         hop = tokens.positions.clamp_min(1).to(torch.float32)                   # [Q, T]  seed=1, ctx>=2
-        return -(torch.log1p(age) + torch.log1p(hop - 1.0))                     # [Q, T]  <= 0
+        return -(torch.log1p(torch.log1p(age)) + torch.log1p(hop - 1.0))       # [Q, T]  <= 0
 
     @staticmethod
     def bag_weights(tokens: WalkTokens, dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
