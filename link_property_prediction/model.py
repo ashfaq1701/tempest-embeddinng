@@ -1,8 +1,8 @@
-"""Two-sided centroid-vs-token head on the Poincaré ball. E is the only trained tensor. Centroid on the
-probe side, raw tokens on the target side, both directions:
-    s(u,v) = -[ sum_q w_q^v * d(P_u, x_q^v) + sum_p w_p^u * d(P_v, x_p^u) ]
-P_x = weighted gyro-midpoint of x's full bag (seeds included); x_p/x_q = raw token embeddings; w = softmax
-of the -(log1p(age)+log1p(hop-1)) prior. No identity and no centroid-centroid term."""
+"""Two-sided centroid-vs-token head on the Poincaré ball. E is the only trained tensor. The seed is handled
+by an explicit identity term; the centroid + cross terms operate on the NON-seed neighbourhood:
+    s(u,v) = -[ d(E_u,E_v) + sum_q w_q^v * d(P_u, x_q^v) + sum_p w_p^u * d(P_v, x_p^u) ]
+P_x = weighted gyro-midpoint of x's non-seed bag (seed excluded via seed_mask); x_p/x_q = raw non-seed token
+embeddings; w = softmax of the -(log1p(age)+log1p(hop-1)) prior over non-seed slots. No centroid-centroid term."""
 from typing import Tuple
 
 import geoopt
@@ -66,11 +66,11 @@ class LinkPredHead(nn.Module):
 
     @staticmethod
     def bag_weights(tokens: WalkTokens, dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
-        """(nodes [Q,T], w [Q,T]): softmax the recency/hop prior over ALL real slots (seed included), 0 on
-        padding, sums to 1 per row. Cold-bag guard handles a fully-empty walk (all padding) -> falls back to
-        the seed; without it that row's all -inf softmax would be NaN."""
+        """(nodes [Q,T], w [Q,T]): softmax the recency/hop prior over NON-seed context slots
+        (mask & ~seed_mask), 0 on the seed and padding, sums to 1 per row. Cold-bag guard (no context, e.g.
+        a seed-only walk) falls back to the seed; without it that row's all -inf softmax would be NaN."""
         nodes = tokens.nodes.clamp_min(0).clone()                               # [Q, T] padding(-1) -> 0
-        valid = tokens.mask.clone()                                             # [Q, T] real slots (seed incl.)
+        valid = (tokens.mask & ~tokens.seed_mask).clone()                       # [Q, T] non-seed context slots
 
         cold = ~valid.any(dim=-1)                                               # [Q]  fully-empty walk guard
         if bool(cold.any()):
@@ -96,8 +96,10 @@ class LinkPredHead(nn.Module):
 
         x_u = F.embedding(nodes_u, emb)                                        # [B, T, d]
         x_v = F.embedding(nodes_v, emb)                                        # [B*C, T, d]
-        p_u = self.bag_centroid(nodes_u, w_u, emb)                            # [B, d]
+        p_u = self.bag_centroid(nodes_u, w_u, emb)                            # [B, d]  non-seed centroid
         p_v = self.bag_centroid(nodes_v, w_v, emb)                            # [B*C, d]
+        e_u = F.embedding(src_tokens.seeds, emb)                               # [B, d]   E[u]
+        e_v = F.embedding(cand_tokens.seeds, emb)                              # [B*C, d] E[v]
 
         b, d = p_u.shape
         c = p_v.shape[0] // b
@@ -105,12 +107,15 @@ class LinkPredHead(nn.Module):
         p_v = p_v.view(b, c, d)                                                # [B, C, d]
         x_v = x_v.view(b, c, x_u.shape[1], d)                                  # [B, C, T, d]
         w_v = w_v.view(b, c, x_u.shape[1])                                     # [B, C, T]
+        e_v = e_v.view(b, c, d)                                                # [B, C, d]
+        e_u = e_u.unsqueeze(1).expand(b, c, d)                                 # [B, C, d]
 
-        # P_u vs v's tokens, and P_v vs u's tokens.
+        # Identity (seed vs seed) + P_u vs v's non-seed tokens + P_v vs u's non-seed tokens.
+        identity = self.geom.dist(e_u, e_v)                                    # [B, C]  d(E_u, E_v)
         d_pu_xv = self.geom.pairwise_dist(p_u[:, None, None, :], x_v).squeeze(-2)  # [B, C, T]
         term_v = (w_v * d_pu_xv).sum(-1)                                       # [B, C]
         d_pv_xu = self.geom.pairwise_dist(p_v, x_u)                            # [B, C, T]
         term_u = (w_u.unsqueeze(1) * d_pv_xu).sum(-1)                          # [B, C]
 
-        raw = term_v + term_u                                                  # [B, C]
+        raw = identity + term_v + term_u                                       # [B, C]
         return -raw                                                           # [B, C] higher = closer
