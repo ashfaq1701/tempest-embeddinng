@@ -66,9 +66,9 @@ class LinkPredHead(nn.Module):
 
     @staticmethod
     def bag_weights(tokens: WalkTokens, dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
-        """(nodes [Q,T], log_w [Q,T]): softmax the recency/hop prior over ALL real slots (seed included),
-        -inf on padding. Cold-bag guard handles a fully-empty walk (all padding) -> falls back to the seed;
-        without it that row's all -inf softmax would be NaN."""
+        """(nodes [Q,T], w [Q,T]): softmax the recency/hop prior over ALL real slots (seed included), 0 on
+        padding, sums to 1 per row. Cold-bag guard handles a fully-empty walk (all padding) -> falls back to
+        the seed; without it that row's all -inf softmax would be NaN."""
         nodes = tokens.nodes.clamp_min(0).clone()                               # [Q, T] padding(-1) -> 0
         valid = tokens.mask.clone()                                             # [Q, T] real slots (seed incl.)
 
@@ -78,29 +78,26 @@ class LinkPredHead(nn.Module):
             valid[cold, 0] = True
 
         logits = LinkPredHead.bag_weight_logits(tokens).to(dtype)               # [Q, T] <= 0
-        log_w = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
-        return nodes, log_w
+        w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)    # [Q, T] sums to 1
+        return nodes, w
 
-    def bag_centroid(self, nodes: torch.Tensor, log_w: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
-        """P_x = weighted gyro-midpoint of the bag's token embeddings; weights = exp(log_w) (sum to 1)."""
+    def bag_centroid(self, nodes: torch.Tensor, w: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        """P_x = weighted gyro-midpoint of the bag's token embeddings (weights w sum to 1)."""
         x = F.embedding(nodes, emb)                                            # [Q, T, d]
-        weights = log_w.exp()                                                  # [Q, T]  sums to 1
         return self.geom.manifold.weighted_midpoint(
-            x, weights=weights, reducedim=[-2], dim=-1, keepdim=False)         # [Q, d]
+            x, weights=w, reducedim=[-2], dim=-1, keepdim=False)               # [Q, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries (seeds u); cand = B*C candidate queries (seeds v), query-major. -> [B, C]."""
         emb = self.E.weight
 
-        nodes_u, logw_u = self.bag_weights(src_tokens, emb.dtype)              # [B, T]
-        nodes_v, logw_v = self.bag_weights(cand_tokens, emb.dtype)             # [B*C, T]
+        nodes_u, w_u = self.bag_weights(src_tokens, emb.dtype)                 # [B, T]
+        nodes_v, w_v = self.bag_weights(cand_tokens, emb.dtype)               # [B*C, T]
 
         x_u = F.embedding(nodes_u, emb)                                        # [B, T, d]
         x_v = F.embedding(nodes_v, emb)                                        # [B*C, T, d]
-        p_u = self.bag_centroid(nodes_u, logw_u, emb)                          # [B, d]
-        p_v = self.bag_centroid(nodes_v, logw_v, emb)                          # [B*C, d]
-        w_u = logw_u.exp()                                                     # [B, T]
-        w_v = logw_v.exp()                                                     # [B*C, T]
+        p_u = self.bag_centroid(nodes_u, w_u, emb)                            # [B, d]
+        p_v = self.bag_centroid(nodes_v, w_v, emb)                            # [B*C, d]
 
         b, d = p_u.shape
         c = p_v.shape[0] // b
