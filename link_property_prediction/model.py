@@ -2,8 +2,7 @@
 probe side, raw tokens on the target side, both directions:
     s(u,v) = -[ sum_q w_q^v * d(P_u, x_q^v) + sum_p w_p^u * d(P_v, x_p^u) ]
 P_x = weighted gyro-midpoint of x's full bag (seeds included); x_p/x_q = raw token embeddings; w = softmax
-of the -(log1p(age)+log1p(hop-1)) prior. No identity and no centroid-centroid term. `subtract_spread`
-(default off) subtracts v's own dispersion s_v = sum_q w_q^v * d(P_v, x_q^v)."""
+of the -(log1p(age)+log1p(hop-1)) prior. No identity and no centroid-centroid term."""
 from typing import Tuple
 
 import geoopt
@@ -42,13 +41,12 @@ class PoincareManifold:
 
 class LinkPredHead(nn.Module):
     """Two-sided centroid-vs-token head. Owns E (ManifoldParameter, trained by the link CE); no other
-    parameter. `subtract_spread` subtracts v's own dispersion from the score (default off)."""
+    parameter."""
 
-    def __init__(self, num_nodes: int, d_emb: int, subtract_spread: bool = False):
+    def __init__(self, num_nodes: int, d_emb: int):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
-        self.subtract_spread = bool(subtract_spread)
         self.geom = PoincareManifold()
 
         # Spread init: geoopt random (std=1), not the near-origin wrapped normal. ManifoldParameter so
@@ -106,12 +104,6 @@ class LinkPredHead(nn.Module):
         b, d = p_u.shape
         c = p_v.shape[0] // b
 
-        # v's own dispersion (pre-reshape, [B*C, T] -> [B, C]); optional.
-        s_v = None
-        if self.subtract_spread:
-            d_pv_xv = self.geom.pairwise_dist(p_v[:, None, :], x_v).squeeze(-2)  # [B*C, T]
-            s_v = (w_v * d_pv_xv).sum(-1).view(b, c)                            # [B, C]
-
         p_v = p_v.view(b, c, d)                                                # [B, C, d]
         x_v = x_v.view(b, c, x_u.shape[1], d)                                  # [B, C, T, d]
         w_v = w_v.view(b, c, x_u.shape[1])                                     # [B, C, T]
@@ -123,6 +115,4 @@ class LinkPredHead(nn.Module):
         term_u = (w_u.unsqueeze(1) * d_pv_xu).sum(-1)                          # [B, C]
 
         raw = term_v + term_u                                                  # [B, C]
-        if s_v is not None:
-            raw = raw - s_v
         return -raw                                                           # [B, C] higher = closer
