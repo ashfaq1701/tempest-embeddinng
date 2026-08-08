@@ -67,11 +67,12 @@ class LinkPredHead(nn.Module):
     @staticmethod
     def bag_weights(tokens: WalkTokens, dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
         """(nodes [Q,T], log_w [Q,T]): softmax the recency/hop prior over ALL real slots (seed included),
-        -inf on padding. Cold-bag guard (no real slot) is unreachable but kept."""
+        -inf on padding. Cold-bag guard handles a fully-empty walk (all padding) -> falls back to the seed;
+        without it that row's all -inf softmax would be NaN."""
         nodes = tokens.nodes.clamp_min(0).clone()                               # [Q, T] padding(-1) -> 0
         valid = tokens.mask.clone()                                             # [Q, T] real slots (seed incl.)
 
-        cold = ~valid.any(dim=-1)                                               # [Q]  guard (unreachable)
+        cold = ~valid.any(dim=-1)                                               # [Q]  fully-empty walk guard
         if bool(cold.any()):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
