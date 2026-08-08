@@ -1,7 +1,9 @@
-"""Two-sided CENTROID-distance head on the Poincaré ball. E is the only trained tensor; the score is a
-parameter-free distance aggregate  s(u,v) = -[ d(E_u,E_v) + d(P_u,E_v) + d(E_u,P_v) + d(P_u,P_v) ]  where
-P_x is the weighted gyro-midpoint (geoopt weighted_midpoint) of x's walk-token bag. NOT monotone (distance
-to a centroid can move against a token distance) — the centroid variant of the weighted-mean head."""
+"""Two-sided centroid-vs-token head on the Poincaré ball. E is the only trained tensor. Centroid on the
+probe side, raw tokens on the target side, both directions:
+    s(u,v) = -[ sum_q w_q^v * d(P_u, x_q^v) + sum_p w_p^u * d(P_v, x_p^u) ]
+P_x = weighted gyro-midpoint of x's full bag (seeds included); x_p/x_q = raw token embeddings; w = softmax
+of the -(log1p(age)+log1p(hop-1)) prior. No identity and no centroid-centroid term. `subtract_spread`
+(default off) subtracts v's own dispersion s_v = sum_q w_q^v * d(P_v, x_q^v)."""
 from typing import Tuple
 
 import geoopt
@@ -39,13 +41,14 @@ class PoincareManifold:
 
 
 class LinkPredHead(nn.Module):
-    """Two-sided centroid-distance head. Owns E (ManifoldParameter, trained by the link CE); no other
-    parameter. Score = -(the four E/P geodesic distances)."""
+    """Two-sided centroid-vs-token head. Owns E (ManifoldParameter, trained by the link CE); no other
+    parameter. `subtract_spread` subtracts v's own dispersion from the score (default off)."""
 
-    def __init__(self, num_nodes: int, d_emb: int):
+    def __init__(self, num_nodes: int, d_emb: int, subtract_spread: bool = False):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
+        self.subtract_spread = bool(subtract_spread)
         self.geom = PoincareManifold()
 
         # Spread init: geoopt random (std=1), not the near-origin wrapped normal. ManifoldParameter so
@@ -57,20 +60,20 @@ class LinkPredHead(nn.Module):
 
     @staticmethod
     def bag_weight_logits(tokens: WalkTokens) -> torch.Tensor:
-        """Recency/hop prior LOGITS [Q, T] = -(log1p(age) + log1p(hop-1)); 0 (max) for a just-happened
-        adjacent token, decaying with age and hop."""
+        """Recency/hop prior LOGITS [Q, T] = -(log1p(age) + log1p(hop-1)); 0 (max) for the seed (age 0,
+        hop 1), decaying with age and hop."""
         age = tokens.ages.clamp_min(0).to(torch.float32)                        # [Q, T]  seed=0, ctx>=1
         hop = tokens.positions.clamp_min(1).to(torch.float32)                   # [Q, T]  seed=1, ctx>=2
         return -(torch.log1p(age) + torch.log1p(hop - 1.0))                     # [Q, T]  <= 0
 
     @staticmethod
     def bag_weights(tokens: WalkTokens, dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
-        """(nodes [Q,T], log_w [Q,T]): softmax the recency/hop prior over context slots (mask & ~seed_node),
-        -inf elsewhere. A cold bag (no context) falls back to {(seed, w=1)} -> mean = identity distance."""
+        """(nodes [Q,T], log_w [Q,T]): softmax the recency/hop prior over ALL real slots (seed included),
+        -inf on padding. Cold-bag guard (no real slot) is unreachable but kept."""
         nodes = tokens.nodes.clamp_min(0).clone()                               # [Q, T] padding(-1) -> 0
-        valid = (tokens.mask & ~tokens.seed_node_mask).clone()                  # [Q, T] context slots
+        valid = tokens.mask.clone()                                             # [Q, T] real slots (seed incl.)
 
-        cold = ~valid.any(dim=-1)                                               # [Q]
+        cold = ~valid.any(dim=-1)                                               # [Q]  guard (unreachable)
         if bool(cold.any()):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
@@ -80,8 +83,7 @@ class LinkPredHead(nn.Module):
         return nodes, log_w
 
     def bag_centroid(self, nodes: torch.Tensor, log_w: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
-        """P_x = weighted gyro-midpoint (geoopt weighted_midpoint) of the bag's token embeddings; weights =
-        exp(log_w) (sum to 1, 0 on excluded slots). Cold bag -> single seed atom -> P_x = E[seed]."""
+        """P_x = weighted gyro-midpoint of the bag's token embeddings; weights = exp(log_w) (sum to 1)."""
         x = F.embedding(nodes, emb)                                            # [Q, T, d]
         weights = log_w.exp()                                                  # [Q, T]  sums to 1
         return self.geom.manifold.weighted_midpoint(
@@ -94,20 +96,33 @@ class LinkPredHead(nn.Module):
         nodes_u, logw_u = self.bag_weights(src_tokens, emb.dtype)              # [B, T]
         nodes_v, logw_v = self.bag_weights(cand_tokens, emb.dtype)             # [B*C, T]
 
-        e_u = F.embedding(src_tokens.seeds, emb)                               # E[u]  [B, d]
-        e_v = F.embedding(cand_tokens.seeds, emb)                              # E[v]  [B*C, d]
-        p_u = self.bag_centroid(nodes_u, logw_u, emb)                          # P[u]  [B, d]
-        p_v = self.bag_centroid(nodes_v, logw_v, emb)                          # P[v]  [B*C, d]
+        x_u = F.embedding(nodes_u, emb)                                        # [B, T, d]
+        x_v = F.embedding(nodes_v, emb)                                        # [B*C, T, d]
+        p_u = self.bag_centroid(nodes_u, logw_u, emb)                          # [B, d]
+        p_v = self.bag_centroid(nodes_v, logw_v, emb)                          # [B*C, d]
+        w_u = logw_u.exp()                                                     # [B, T]
+        w_v = logw_v.exp()                                                     # [B*C, T]
 
-        b, d = e_u.shape
-        c = e_v.shape[0] // b
-        e_v = e_v.view(b, c, d)                                                # [B, C, d]
+        b, d = p_u.shape
+        c = p_v.shape[0] // b
+
+        # v's own dispersion (pre-reshape, [B*C, T] -> [B, C]); optional.
+        s_v = None
+        if self.subtract_spread:
+            d_pv_xv = self.geom.pairwise_dist(p_v[:, None, :], x_v).squeeze(-2)  # [B*C, T]
+            s_v = (w_v * d_pv_xv).sum(-1).view(b, c)                            # [B, C]
+
         p_v = p_v.view(b, c, d)                                                # [B, C, d]
-        e_u = e_u.unsqueeze(1).expand(b, c, d)                                 # [B, C, d]
-        p_u = p_u.unsqueeze(1).expand(b, c, d)                                 # [B, C, d]
+        x_v = x_v.view(b, c, x_u.shape[1], d)                                  # [B, C, T, d]
+        w_v = w_v.view(b, c, x_u.shape[1])                                     # [B, C, T]
 
-        raw = (self.geom.dist(e_u, e_v)                                        # d(E_u, E_v)  identity
-               + self.geom.dist(p_u, e_v)                                      # d(P_u, E_v)
-               + self.geom.dist(e_u, p_v)                                      # d(E_u, P_v)
-               + self.geom.dist(p_u, p_v))                                     # d(P_u, P_v)
-        return -raw                                                            # [B, C] higher = closer
+        # P_u vs v's tokens, and P_v vs u's tokens.
+        d_pu_xv = self.geom.pairwise_dist(p_u[:, None, None, :], x_v).squeeze(-2)  # [B, C, T]
+        term_v = (w_v * d_pu_xv).sum(-1)                                       # [B, C]
+        d_pv_xu = self.geom.pairwise_dist(p_v, x_u)                            # [B, C, T]
+        term_u = (w_u.unsqueeze(1) * d_pv_xu).sum(-1)                          # [B, C]
+
+        raw = term_v + term_u                                                  # [B, C]
+        if s_v is not None:
+            raw = raw - s_v
+        return -raw                                                           # [B, C] higher = closer
