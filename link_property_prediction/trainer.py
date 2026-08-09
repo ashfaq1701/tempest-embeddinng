@@ -216,16 +216,12 @@ class Trainer:
                 F.embedding(src_t, e).unsqueeze(-2),
                 F.embedding(cand_t[:, 0], e).unsqueeze(-2)).mean()
 
-        # HYPERBOLIC BOUNDARY PENALTY: mean d_H(0, E)^2 over ALL nodes — a global isotropic inward spring
-        # in the BALL's own metric that pulls E toward the origin without touching relative structure, so
-        # the link CE keeps the clusters while this sets the equilibrium radius / caps the outward drift.
-        # Unlike the Euclidean ||E||^2, its Riemannian gradient does NOT vanish at the boundary
-        # (d_H(0,E) diverges as ||E||->1), so it actually moves a boundary-parked cloud inward.
-        bpen = (self.model.geom.manifold.dist0(self.model.E.weight) ** 2).mean()
-
-        # CLEAN SUM — no coefficients. loss = link CE + boundary spring. E is trained end-to-end by the
-        # link CE through the monotone head (no detach); the spring only conditions the radius.
-        loss = link_loss + bpen
+        # loss = link CE ONLY. E is trained end-to-end by the link CE through the monotone head (no detach).
+        # No boundary penalty: an inward hyperbolic spring was tried and removed — on spread init it strangled
+        # E's radius and capped MRR well below the unpenalised basin, and every boundary control (spring,
+        # projection cap, learnable curvature) failed to stop the fast-lr collapse anyway. The radius is left
+        # to the optimiser; |E|mean / |E|max are still logged as the geometry watch.
+        loss = link_loss
 
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -233,7 +229,6 @@ class Trainer:
 
         return {
             "link": float(link_loss.detach()),
-            "bpen": float(bpen.detach()),
             "align": float(align),
             "lr": float(self.opt.param_groups[0]["lr"]),
         }
@@ -374,11 +369,10 @@ class Trainer:
             self.model.train()
 
             t0 = time.time()
-            link_sum, bpen_sum, align_sum, n_batches = 0.0, 0.0, 0.0, 0
+            link_sum, align_sum, n_batches = 0.0, 0.0, 0
             for batch in train_batches_factory():
                 m = self._train_step(batch)
                 link_sum += m["link"]
-                bpen_sum += m["bpen"]
                 align_sum += m["align"]
                 n_batches += 1
             train_dt = time.time() - t0
@@ -386,7 +380,6 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
-                f"bpen={bpen_sum / max(n_batches, 1):.4f}  "
                 f"lr={self.opt.param_groups[0]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
