@@ -1,0 +1,8 @@
+[MIDDIAG] train batch 1: d(P_u,E_u) max=1.141e-04 mean=5.040e-06 seed_w_u min=0.0000000 | d(P_v,E_v) max=1.337e-04 mean=7.170e-07 seed_w_v min=0.0000000
+[MIDDIAG] train batch 50: d(P_u,E_u) max=1.128e-04 mean=3.322e-06 seed_w_u min=0.0000000 | d(P_v,E_v) max=1.280e-04 mean=1.026e-06 seed_w_v min=0.0000000
+[MIDDIAG] train batch 100: d(P_u,E_u) max=1.275e-04 mean=3.756e-06 seed_w_u min=0.0000000 | d(P_v,E_v) max=1.371e-04 mean=1.268e-06 seed_w_v min=0.0000000
+[MIDDIAG] train batch 150: d(P_u,E_u) max=1.009e-04 mean=4.631e-06 seed_w_u min=0.0000000 | d(P_v,E_v) max=1.308e-04 mean=1.369e-06 seed_w_v min=0.0000000
+[MIDDIAG] train batch 200: d(P_u,E_u) max=1.159e-04 mean=4.777e-06 seed_w_u min=0.0000000 | d(P_v,E_v) max=1.633e-04 mean=1.233e-06 seed_w_v min=0.0000000
+[MIDDIAG] train batch 250: d(P_u,E_u) max=1.090e-04 mean=4.156e-06 seed_w_u min=0.0000000 | d(P_v,E_v) max=1.464e-04 mean=1.460e-06 seed_w_v min=0.0000000
+[MIDDIAG] train batch 300: d(P_u,E_u) max=1.123e-04 mean=4.205e-06 seed_w_u min=0.0000000 | d(P_v,E_v) max=1.364e-04 mean=1.548e-06 seed_w_v min=0.0000000
+[MIDDIAG] dumped 1-batch evidence to /its/home/ms2420/tempest-wt-ctc-poin/diagnostics/midpoint_collapse_dump.pt at train batch 300

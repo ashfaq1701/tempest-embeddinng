@@ -3,6 +3,7 @@ probe side, raw tokens on the target side, both directions:
     s(u,v) = -[ sum_q w_q^v * d(P_u, x_q^v) + sum_p w_p^u * d(P_v, x_p^u) ]
 P_x = weighted gyro-midpoint of x's full bag (seeds included); x_p/x_q = raw token embeddings; w = softmax
 of the -(log1p(age)+log1p(hop-1)) prior. No identity and no centroid-centroid term."""
+import os
 from typing import Tuple
 
 import geoopt
@@ -56,14 +57,22 @@ class LinkPredHead(nn.Module):
             init = self.geom.manifold.random(self.num_nodes, self.d_emb)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
+        # --- TEMPORARY DIAGNOSTIC (diagnostic/weighted-midpoint-diagnosis) ---
+        # Track, on TRAINING batches, how far the weighted gyro-midpoint P collapses onto E[seed].
+        self._diag_dump_at = int(os.environ.get("MID_DIAG_DUMP_AT", "300"))    # which train batch to dump
+        self._diag_path = os.environ.get("MID_DIAG_PATH", "midpoint_collapse_dump.pt")
+        self._diag_count = 0
+        self._diag_dumped = False
+
     @staticmethod
     def bag_weight_logits(tokens: WalkTokens) -> torch.Tensor:
-        """Recency/hop prior LOGITS [Q, T] = -(log1p(log1p(age)) + log1p(hop-1)); 0 (max) for the seed
-        (age 0, hop 1). Iterated log on age softens the huge raw-age range (~1e7) — plain log1p left old
-        tokens at ~1e-7 weight and the seed swamped the pooling; log1p(log1p(1e7))~2.8 keeps them alive."""
+        """Recency/hop prior LOGITS [Q, T] = -(log1p(age) + log1p(hop-1)); 0 (max) for the seed (age 0,
+        hop 1). DIAGNOSTIC BRANCH: PLAIN log1p(age) (no iterated log). With review ages ~1e7 the seed logit
+        (0) beats context logits (~-16) by ~e^16, so the softmax puts ~1.0 on the seed and the gyro-midpoint
+        collapses onto E[seed]: P_u == E[u], P_v == E[v]. Instrumented below to prove it on real batches."""
         age = tokens.ages.clamp_min(0).to(torch.float32)                        # [Q, T]  seed=0, ctx>=1
         hop = tokens.positions.clamp_min(1).to(torch.float32)                   # [Q, T]  seed=1, ctx>=2
-        return -(torch.log1p(torch.log1p(age)) + torch.log1p(hop - 1.0))       # [Q, T]  <= 0
+        return -(torch.log1p(age) + torch.log1p(hop - 1.0))                    # [Q, T]  <= 0  PLAIN log
 
     @staticmethod
     def bag_weights(tokens: WalkTokens, dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -88,6 +97,53 @@ class LinkPredHead(nn.Module):
         return self.geom.manifold.weighted_midpoint(
             x, weights=w, reducedim=[-2], dim=-1, keepdim=False)               # [Q, d]
 
+    @torch.no_grad()
+    def _diag_midpoint_collapse(self, src_tokens: WalkTokens, cand_tokens: WalkTokens,
+                                emb: torch.Tensor, w_u: torch.Tensor, w_v: torch.Tensor,
+                                p_u: torch.Tensor, p_v: torch.Tensor) -> None:
+        """TEMPORARY: measure how far the gyro-midpoint P collapses onto E[seed] on a training batch, and
+        dump one batch of raw evidence at MID_DIAG_DUMP_AT. seed_w = softmax weight summed over the age-0
+        seed slots; d(P, E[seed]) is the geodesic gap. With plain log1p(age) + review ages ~1e7, seed_w -> 1
+        and d(P, E[seed]) -> 0 (P == E[seed] to float precision)."""
+        self._diag_count += 1
+        e_u = F.embedding(src_tokens.seeds, emb)                               # [B, d]     E[u]
+        e_v = F.embedding(cand_tokens.seeds, emb)                              # [B*C, d]   E[v]
+        d_pu = self.geom.dist(p_u, e_u)                                        # [B]     d(P_u, E[u])
+        d_pv = self.geom.dist(p_v, e_v)                                        # [B*C]   d(P_v, E[v])
+        sw_u = (w_u * src_tokens.seed_mask.to(w_u.dtype)).sum(-1)              # [B]     seed weight
+        sw_v = (w_v * cand_tokens.seed_mask.to(w_v.dtype)).sum(-1)             # [B*C]
+
+        if self._diag_count == 1 or self._diag_count % 50 == 0 or self._diag_count >= self._diag_dump_at:
+            print(f"[MIDDIAG] train batch {self._diag_count}: "
+                  f"d(P_u,E_u) max={float(d_pu.max()):.3e} mean={float(d_pu.mean()):.3e} "
+                  f"seed_w_u min={float(sw_u.min()):.7f} | "
+                  f"d(P_v,E_v) max={float(d_pv.max()):.3e} mean={float(d_pv.mean()):.3e} "
+                  f"seed_w_v min={float(sw_v.min()):.7f}", flush=True)
+
+        if self._diag_count >= self._diag_dump_at:
+            k = min(8, e_u.shape[0])                                           # limit the raw dump
+            torch.save({
+                "note": "ctc centroid head, PLAIN log1p(age) weights, tgbl-review ages ~1e7 -> P collapses onto E[seed]",
+                "train_batch_index": self._diag_count,
+                "src_seeds": src_tokens.seeds[:k].cpu(),
+                "d_Pu_Eu": d_pu[:k].cpu(),                                     # geodesic gap per query
+                "seed_w_u": sw_u[:k].cpu(),                                    # ~1.0 => collapse
+                "P_u_first4dims": p_u[:k, :4].cpu(),                           # side-by-side proof
+                "E_u_first4dims": e_u[:k, :4].cpu(),
+                "d_Pv_Ev": d_pv[:k].cpu(),
+                "seed_w_v": sw_v[:k].cpu(),
+                "P_v_first4dims": p_v[:k, :4].cpu(),
+                "E_v_first4dims": e_v[:k, :4].cpu(),
+                "batch_summary": {
+                    "d_Pu_Eu_max": float(d_pu.max()), "d_Pu_Eu_mean": float(d_pu.mean()),
+                    "d_Pv_Ev_max": float(d_pv.max()), "d_Pv_Ev_mean": float(d_pv.mean()),
+                    "seed_w_u_min": float(sw_u.min()), "seed_w_v_min": float(sw_v.min()),
+                    "n_src": int(d_pu.numel()), "n_cand": int(d_pv.numel()),
+                },
+            }, self._diag_path)
+            print(f"[MIDDIAG] dumped 1-batch evidence to {self._diag_path} at train batch {self._diag_count}", flush=True)
+            self._diag_dumped = True
+
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries (seeds u); cand = B*C candidate queries (seeds v), query-major. -> [B, C]."""
         emb = self.E.weight
@@ -99,6 +155,10 @@ class LinkPredHead(nn.Module):
         x_v = F.embedding(nodes_v, emb)                                        # [B*C, T, d]
         p_u = self.bag_centroid(nodes_u, w_u, emb)                            # [B, d]
         p_v = self.bag_centroid(nodes_v, w_v, emb)                            # [B*C, d]
+
+        # TEMPORARY DIAGNOSTIC: prove the midpoint collapse P == E[seed] on real TRAINING batches.
+        if self.training and not self._diag_dumped:
+            self._diag_midpoint_collapse(src_tokens, cand_tokens, emb, w_u, w_v, p_u, p_v)
 
         b, d = p_u.shape
         c = p_v.shape[0] // b
