@@ -2,8 +2,7 @@
 probe side, raw tokens on the target side, both directions:
     s(u,v) = -[ sum_q w_q^v * d(P_u, x_q^v) + sum_p w_p^u * d(P_v, x_p^u) ]
 P_x = weighted gyro-midpoint of x's full bag (seeds included); x_p/x_q = raw token embeddings; w = softmax
-of the -(log1p(age)+log1p(hop-1)) prior, divided per-bag by its own std (self-normalising temperature, so
-the pooling is invariant to the age scale). No identity and no centroid-centroid term."""
+of the -(log1p(age)+log1p(hop-1)) prior. No identity and no centroid-centroid term."""
 from typing import Tuple
 
 import geoopt
@@ -59,12 +58,12 @@ class LinkPredHead(nn.Module):
 
     @staticmethod
     def bag_weight_logits(tokens: WalkTokens) -> torch.Tensor:
-        """Recency/hop prior LOGITS [Q, T] = -(log1p(age) + log1p(hop-1)); 0 (max) for the seed (age 0,
-        hop 1). PLAIN log1p on age (the inner log is gone) — the huge raw-age range is handled downstream by
-        the per-bag std normalisation in bag_weights (self-normalising temperature), not by the transform."""
+        """Recency/hop prior LOGITS [Q, T] = -(log1p(log1p(age)) + log1p(hop-1)); 0 (max) for the seed
+        (age 0, hop 1). Iterated log on age softens the huge raw-age range (~1e7) — plain log1p left old
+        tokens at ~1e-7 weight and the seed swamped the pooling; log1p(log1p(1e7))~2.8 keeps them alive."""
         age = tokens.ages.clamp_min(0).to(torch.float32)                        # [Q, T]  seed=0, ctx>=1
         hop = tokens.positions.clamp_min(1).to(torch.float32)                   # [Q, T]  seed=1, ctx>=2
-        return -(torch.log1p(age) + torch.log1p(hop - 1.0))                    # [Q, T]  <= 0
+        return -(torch.log1p(torch.log1p(age)) + torch.log1p(hop - 1.0))       # [Q, T]  <= 0
 
     @staticmethod
     def bag_weights(tokens: WalkTokens, dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -80,17 +79,7 @@ class LinkPredHead(nn.Module):
             valid[cold, 0] = True
 
         logits = LinkPredHead.bag_weight_logits(tokens).to(dtype)               # [Q, T] <= 0
-
-        # SELF-NORMALISING TEMPERATURE: divide each bag's logits by their own std over the valid slots, so
-        # the softmax is invariant to the age SCALE (review ~1e7 vs wiki ~1e4). Without it, plain log1p(age)
-        # gives the seed (age 0) ~all the weight and the gyro-midpoint collapses onto E[seed]; dividing by the
-        # per-bag std leaves the seed ~3/4 of the mass regardless of scale, with NO tuned temperature. (A
-        # learnable scale k, init 0, can be added on top later.)
-        vf = valid.to(logits.dtype)                                            # [Q, T]
-        cnt = vf.sum(-1, keepdim=True).clamp_min(1.0)                          # [Q, 1]  valid-slot count
-        mean = (logits * vf).sum(-1, keepdim=True) / cnt                       # [Q, 1]  over valid slots
-        std = ((((logits - mean) ** 2) * vf).sum(-1, keepdim=True) / cnt).sqrt().clamp_min(1e-6)  # [Q, 1]
-        w = torch.softmax((logits / std).masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T] sums to 1
+        w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)    # [Q, T] sums to 1
         return nodes, w
 
     def bag_centroid(self, nodes: torch.Tensor, w: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
