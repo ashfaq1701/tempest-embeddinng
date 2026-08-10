@@ -206,7 +206,7 @@ def main() -> Dict[str, Any]:
     test_sp = _trunc(loaded.test, args.max_eval_edges, tail=False)
 
     dst_pool = np.unique(train_sp.destinations).astype(np.int32)
-    stats = compute_train_stats(train_sp.timestamps)
+    stats = compute_train_stats(train_sp.timestamps, train_sp.sources, train_sp.destinations)
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  dst_pool:      {len(dst_pool):,} unique destinations")
