@@ -61,6 +61,10 @@ class TrainerConfig:
     # Init only — never a per-step scaler.
     t_train: float = 1.0
 
+    # data_stats: mean-field per-node inter-event time T_train*N/(2E) — the characteristic AGE scale
+    # a walk sees. Plumbed to the head for a future recency-temperature init; NOT used yet.
+    mean_node_inter_arrival: float = 1.0
+
     # Model. The monotone weighted-mean head has NO tunable hyperparameters and NO head parameters at all —
     # the score is a fixed geometric aggregate of distances; E is the only trained tensor.
     d_emb: int = 64
@@ -107,6 +111,7 @@ class Trainer:
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
+            mean_node_inter_arrival=float(config.mean_node_inter_arrival),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.
