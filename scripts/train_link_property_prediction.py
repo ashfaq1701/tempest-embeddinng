@@ -206,7 +206,7 @@ def main() -> Dict[str, Any]:
     test_sp = _trunc(loaded.test, args.max_eval_edges, tail=False)
 
     dst_pool = np.unique(train_sp.destinations).astype(np.int32)
-    stats = compute_train_stats(train_sp.timestamps)
+    stats = compute_train_stats(train_sp.timestamps, train_sp.sources, train_sp.destinations)
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  dst_pool:      {len(dst_pool):,} unique destinations")
@@ -215,6 +215,7 @@ def main() -> Dict[str, Any]:
     print(f"  T_train:       {stats.T_train:.0f}")
     print(f"  median_inter_arrival: {stats.median_inter_arrival:.1f}")
     print(f"  mean_inter_arrival:   {stats.mean_inter_arrival:.1f}")
+    print(f"  mean_node_inter_arrival: {stats.mean_node_inter_arrival}")
     print(f"  train edges:   {len(train_sp.sources):,}")
     print(f"  val edges:     {len(val_sp.sources):,}")
     print(f"  test edges:    {len(test_sp.sources):,}")
@@ -253,6 +254,7 @@ def main() -> Dict[str, Any]:
         num_nodes=num_nodes,
         dst_pool=dst_pool,
         t_train=float(stats.T_train),
+        mean_node_inter_arrival=float(stats.mean_node_inter_arrival),
 
         d_emb=args.d_emb,
 

@@ -12,6 +12,9 @@ Today's fields:
     T_train                     — span (t_max - t_min), > 0
     median_inter_arrival        — median Δt between consecutive events
     mean_inter_arrival          — mean   Δt between consecutive events
+    mean_node_inter_arrival     — T_train*N/(2E): mean-field per-node inter-event
+                                  time (characteristic age scale). Over-estimates
+                                  on degree-skewed graphs.
 
 Recipe to add a new field:
     1. Extend `TrainStats` dataclass with the new field.
@@ -41,13 +44,16 @@ class TrainStats:
     T_train: float
     median_inter_arrival: float
     mean_inter_arrival: float
+    mean_node_inter_arrival: float
 
 
 def compute_train_stats(
     timestamps: np.ndarray,
+    sources: np.ndarray,
+    destinations: np.ndarray,
 ) -> TrainStats:
-    """Compute every derived constant from the training-split timestamp
-    array (`loaded.train.timestamps`). Called once at data load.
+    """Compute every derived constant from the training-split arrays
+    (`loaded.train.{timestamps,sources,destinations}`). Called once at data load.
 
     Inter-arrival statistics: Δt between sorted consecutive events,
     excluding zero gaps (multiple events sharing a timestamp are
@@ -74,10 +80,23 @@ def compute_train_stats(
         median_ia = float(np.median(gaps))
         mean_ia = float(np.mean(gaps))
 
+    # Mean-field per-node inter-event time = T_train / avg-degree = T_train * N / (2E),
+    # where N = distinct nodes (as src or dst), E = edges (2E = total endpoint-events).
+    # The node-level counterpart of `mean_inter_arrival` (= mean_inter_arrival * N/2): a
+    # node fires ~N/2x less often than the graph as a whole, so its gaps are ~N/2x longer.
+    # This is the characteristic AGE scale a per-query walk sees. UNIFORM-DEGREE estimate —
+    # it OVER-estimates on degree-skewed graphs (coin/comment), where a few hyper-active
+    # nodes fire far more often than the average. Exact only when activity is even.
+    n_edges = int(ts.size)
+    n_nodes = int(np.unique(np.concatenate([
+        np.asarray(sources).ravel(), np.asarray(destinations).ravel()])).size)
+    mean_node_ia = float(T_train * n_nodes / (2.0 * n_edges)) if n_edges > 0 else 1.0
+
     return TrainStats(
         t_min=t_min,
         t_max=t_max,
         T_train=T_train,
         median_inter_arrival=median_ia,
         mean_inter_arrival=mean_ia,
+        mean_node_inter_arrival=mean_node_ia,
     )

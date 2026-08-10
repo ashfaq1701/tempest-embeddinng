@@ -38,10 +38,17 @@ class LinkPredHead(nn.Module):
     """Two-sided monotone weighted-mean head. Owns E (ManifoldParameter, trained by the link CE); no other
     parameter. Symmetric across the two directions (v vs B_u, u vs B_v) since the task is undirected."""
 
-    def __init__(self, num_nodes: int, d_emb: int):
+    def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float = 1.0):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
+        # Scale-normalise the age term of the pooling recency weight by the dataset's mean-field per-node
+        # inter-event time (T_train*N/2E, the characteristic age scale). Makes the pooling softmax
+        # timestamp-scale-neutral across datasets (log(c*age)=log(age)+log(c) is a softmax-invariant shift).
+        # Verified on tgbl-review lr1e-4: a real, growing val lift over the un-normalised log1p(age) weight
+        # (~+0.008 by ep8), even though this head excludes the seed (so it is not fixing a seed-collapse —
+        # purely sharper recency resolution among context tokens).
+        self.mean_node_inter_arrival = float(mean_node_inter_arrival)
         self.geom = PoincareManifold()
 
         # Spread init: geoopt random (std=1), not the near-origin wrapped normal. ManifoldParameter so
@@ -51,16 +58,15 @@ class LinkPredHead(nn.Module):
             init = self.geom.manifold.random(self.num_nodes, self.d_emb)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-    @staticmethod
-    def bag_weight_logits(tokens: WalkTokens) -> torch.Tensor:
-        """Recency/hop prior LOGITS [Q, T] = -(log1p(age) + log1p(hop-1)); 0 (max) for a just-happened
-        adjacent token, decaying with age and hop."""
+    def bag_weight_logits(self, tokens: WalkTokens) -> torch.Tensor:
+        """Recency/hop prior LOGITS [Q, T] = -(log1p(age / mean_node_inter_arrival) + log1p(hop-1)); 0 (max)
+        for a just-happened adjacent token, decaying with age and hop. Age normalised by the dataset's
+        characteristic per-node inter-event time so the softmax is timestamp-scale-neutral."""
         age = tokens.ages.clamp_min(0).to(torch.float32)                        # [Q, T]  seed=0, ctx>=1
         hop = tokens.positions.clamp_min(1).to(torch.float32)                   # [Q, T]  seed=1, ctx>=2
-        return -(torch.log1p(age) + torch.log1p(hop - 1.0))                     # [Q, T]  <= 0
+        return -(torch.log1p(age / self.mean_node_inter_arrival) + torch.log1p(hop - 1.0))  # [Q, T]  <= 0
 
-    @staticmethod
-    def bag_weights(tokens: WalkTokens, dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
+    def bag_weights(self, tokens: WalkTokens, dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
         """(nodes [Q,T], log_w [Q,T]): softmax the recency/hop prior over context slots (mask & ~seed_node),
         -inf elsewhere. A cold bag (no context) falls back to {(seed, w=1)} -> mean = identity distance."""
         nodes = tokens.nodes.clamp_min(0).clone()                               # [Q, T] padding(-1) -> 0
@@ -71,7 +77,7 @@ class LinkPredHead(nn.Module):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
 
-        logits = LinkPredHead.bag_weight_logits(tokens).to(dtype)               # [Q, T] <= 0
+        logits = self.bag_weight_logits(tokens).to(dtype)                       # [Q, T] <= 0
         log_w = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
         return nodes, log_w
 
