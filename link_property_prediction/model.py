@@ -38,13 +38,10 @@ class LinkPredHead(nn.Module):
     """Two-sided monotone weighted-mean head. Owns E (ManifoldParameter, trained by the link CE); no other
     parameter. Symmetric across the two directions (v vs B_u, u vs B_v) since the task is undirected."""
 
-    def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float = 1.0):
+    def __init__(self, num_nodes: int, d_emb: int):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
-        # data_stats mean-field per-node inter-event time (characteristic age scale). Stored for a
-        # future recency-temperature init; NOT used in the score yet.
-        self.mean_node_inter_arrival = float(mean_node_inter_arrival)
         self.geom = PoincareManifold()
 
         # Spread init: geoopt random (std=1), not the near-origin wrapped normal. ManifoldParameter so
