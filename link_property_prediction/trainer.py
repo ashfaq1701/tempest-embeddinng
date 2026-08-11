@@ -67,10 +67,10 @@ class TrainerConfig:
 
     # Model. The monotone weighted-mean head has NO tunable hyperparameters and NO head parameters at all —
     # the score is a fixed geometric aggregate of distances; E is the only trained tensor.
-    d_emb: int = 128
+    d_emb: int = 64
 
     # Link loss / head.
-    K_train: int = 10           # per-query training negatives ([B, 1+K_train]); 10 keeps the candidate
+    K_train: int = 20           # per-query training negatives ([B, 1+K_train]); 20 keeps the candidate
                                 # bag small enough to fit bs 1000 on review
     hist_neg_ratio: float = 0.0  # fraction of training negatives drawn from the source's PAST destinations
                                  # (per-source reservoir), rest random — mirrors TGB eval's hist/rnd mix.
