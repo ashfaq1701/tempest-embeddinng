@@ -78,6 +78,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reservoir-size", default=256, type=int,
                    help="Per-source historical reservoir depth M (only used when --hist-neg-ratio>0). "
                         "Size ~ typical per-source history; under-fill dilutes the historical fraction.")
+    p.add_argument("--is-bipartite", action="store_true",
+                   help="Treat the graph as bipartite (src and dst are disjoint node roles).")
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
     p.add_argument(
@@ -212,11 +214,21 @@ def main() -> Dict[str, Any]:
     val_sp = _trunc(loaded.val, args.max_eval_edges, tail=False)
     test_sp = _trunc(loaded.test, args.max_eval_edges, tail=False)
 
-    dst_pool = np.unique(train_sp.destinations).astype(np.int32)
+    # Negative-sampling pool. Bipartite -> destination side only (sampling over all
+    # nodes would make the trivial "is this ever a destination?" task and not transfer
+    # to eval). Non-bipartite -> all unique train nodes (src ∪ dst), since any node can
+    # legitimately be a destination.
+    if args.is_bipartite:
+        dst_pool = np.unique(train_sp.destinations).astype(np.int32)
+    else:
+        dst_pool = np.unique(
+            np.concatenate([train_sp.sources, train_sp.destinations])
+        ).astype(np.int32)
     stats = compute_train_stats(train_sp.timestamps, train_sp.sources, train_sp.destinations)
 
     print(f"  num_nodes:     {num_nodes:,}")
-    print(f"  dst_pool:      {len(dst_pool):,} unique destinations")
+    _pool_kind = "destinations (bipartite)" if args.is_bipartite else "nodes (non-bipartite)"
+    print(f"  neg_pool:      {len(dst_pool):,} unique {_pool_kind}")
     print(f"  t_min:         {stats.t_min}")
     print(f"  t_max:         {stats.t_max}")
     print(f"  T_train:       {stats.T_train:.0f}")
