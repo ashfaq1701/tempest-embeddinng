@@ -1,22 +1,23 @@
 """Negative samplers.
 
-Two flavours:
-  - UniformNegativeSampler  : random over a destination pool. The
-                              training-side sampler (the only one).
-  - TGBNegativeSampler      : eval-time. Routes through
-                              dataset.negative_sampler.query_batch — the
-                              TGB-prescribed protocol.
+  - NegativeSampler         : the ABC (`sample(batch) → (neg_src, neg_tgt)`).
+  - UniformNegativeSampler  : random over a destination pool. Used for TRAINING
+                              on every suite, and reused to build TGB-Seq's fixed
+                              eval negatives one-shot (see tgb_seq_eval.py).
+
+Eval-time, suite-native samplers live with their suite: TGB's per-positive
+pre-generated negatives are `TGBNegativeSampler` in `tgb_eval.py`; TGB-Seq's
+fixed negatives are served by `TGBSeqEvaluator` in `tgb_seq_eval.py`.
 
 The Historical (per-source reservoir + Vitter R) sampler was dropped:
 on recurrence-dominated datasets like tgbl-wiki it actively trained
 the model AGAINST the eval signal — most eval positives are nodes
 the source has previously interacted with, and historical negatives
-push E[u] away from exactly those. Removed wholesale (class +
-TrainerConfig fields + CLI args + reservoir-uniformity test).
+push E[u] away from exactly those.
 """
 
 import abc
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -66,28 +67,3 @@ class UniformNegativeSampler(NegativeSampler):
         idx = self.rng.integers(0, len(self.dst_pool), (B, self.num_neg_per_pos))
         neg_tgt = self.dst_pool[idx]
         return neg_src, neg_tgt
-
-
-class TGBNegativeSampler(NegativeSampler):
-    """Eval-time sampler. Wraps `dataset.negative_sampler.query_batch`,
-    which serves TGB's pre-generated per-positive negatives. Variable-K
-    per positive — returns list-of-arrays."""
-
-    def __init__(self, dataset: object, split_mode: str):
-        if split_mode not in ("val", "test"):
-            raise ValueError(f"split_mode must be 'val' or 'test', got {split_mode!r}")
-        self.dataset = dataset
-        self.split_mode = split_mode
-        self._sampler = dataset.negative_sampler
-
-    def sample(self, batch: Batch) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        neg_dst_list = self._sampler.query_batch(
-            batch.src, batch.tgt, batch.ts, split_mode=self.split_mode,
-        )
-        neg_src_list: List[np.ndarray] = []
-        neg_tgt_list: List[np.ndarray] = []
-        for s, neg_dsts in zip(batch.src, neg_dst_list):
-            arr = np.asarray(neg_dsts, dtype=np.int32)
-            neg_src_list.append(np.full(len(arr), s, dtype=np.int32))
-            neg_tgt_list.append(arr)
-        return neg_src_list, neg_tgt_list
