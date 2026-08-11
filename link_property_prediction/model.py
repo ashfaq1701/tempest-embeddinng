@@ -18,36 +18,46 @@ _ACOSH_EPS = 1e-7     # arcosh arg clamp: finite gradient at coincidence
 
 
 class BagWeights(nn.Module):
-    """Learned recency/hop pooling weights. Two scalars: the age and hop decay rates, both forced negative
-    via -exp(.). At init both are -1, reproducing the fixed -(log1p(age/mnia) + log1p(hop-1)) prior exactly."""
+    """Learned pooling weights over a walk-token bag. Two scalars: tau, the characteristic age scale inside
+    the log (init at the dataset's mean-field per-node inter-event time), and the hop decay rate, forced
+    negative via -exp(.). At init this reproduces the fixed -(log1p(age/mnia) + log1p(hop-1)) prior exactly."""
 
     def __init__(self, mnia: float):
         super().__init__()
-        self.mnia = float(mnia)
-        self.log_c_age = nn.Parameter(torch.zeros(()))     # c_age = -exp(.) = -1 at init
-        self.log_c_hop = nn.Parameter(torch.zeros(()))     # c_hop = -exp(.) = -1 at init
+        self.log_tau = nn.Parameter(torch.log(torch.tensor(float(mnia))))   # tau = mnia at init
+        self.log_c_hop = nn.Parameter(torch.zeros(()))                      # c_hop = -exp(.) = -1 at init
 
     def logits(self, tokens: WalkTokens) -> torch.Tensor:
-        """[Q, T] pooling logit; softmax'd in forward. Higher = more weight."""
-        age = tokens.ages.clamp_min(0).float()                                  # [Q, T]  seed=0
-        hop = tokens.positions.clamp_min(1).float()                             # [Q, T]  seed=1
-        a = torch.log1p(age / self.mnia)                                        # [Q, T]
-        h = torch.log1p(hop - 1.0)                                              # [Q, T]
-        return -(self.log_c_age.exp() * a + self.log_c_hop.exp() * h)           # [Q, T]
+        """[Q, T] pooling logit; softmax'd in forward. Higher = more weight. Seed (age 0, hop 1) is always 0,
+        the max, so tau sets how far the context falls below it."""
+        age = tokens.ages.clamp_min(0).float()                              # [Q, T]  seed=0
+        hop = tokens.positions.clamp_min(1).float()                         # [Q, T]  seed=1
+        a = torch.log1p(age / self.log_tau.exp())                           # [Q, T]
+        h = torch.log1p(hop - 1.0)                                          # [Q, T]
+        return -(a + self.log_c_hop.exp() * h)                              # [Q, T]
 
     def forward(self, tokens: WalkTokens, dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
-        """(nodes [Q,T], w [Q,T]): softmax over real slots (seed included), 0 on padding, sums to 1."""
-        nodes = tokens.nodes.clamp_min(0).clone()
-        valid = tokens.mask.clone()
+        """(nodes [Q,T], w [Q,T]): softmax over real slots (seed included), 0 on padding, sums to 1 per row.
+        Cold-bag guard handles a fully-empty walk -> falls back to the seed (all -inf would be NaN)."""
+        nodes = tokens.nodes.clamp_min(0).clone()                           # [Q, T] padding(-1) -> 0
+        valid = tokens.mask.clone()                                         # [Q, T] real slots (seed incl.)
 
-        cold = ~valid.any(dim=-1)
+        cold = ~valid.any(dim=-1)                                           # [Q]
         if bool(cold.any()):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
 
-        z = self.logits(tokens).to(dtype)
-        w = torch.softmax(z.masked_fill(~valid, float("-inf")), dim=-1)
+        z = self.logits(tokens).to(dtype)                                   # [Q, T]
+        w = torch.softmax(z.masked_fill(~valid, float("-inf")), dim=-1)     # [Q, T] sums to 1
         return nodes, w
+
+    @property
+    def tau(self) -> float:
+        return float(self.log_tau.exp())
+
+    @property
+    def c_hop(self) -> float:
+        return -float(self.log_c_hop.exp())
 
 
 class PoincareManifold:
@@ -75,7 +85,7 @@ class PoincareManifold:
 
 class LinkPredHead(nn.Module):
     """Two-sided centroid-vs-token head. Owns E (ManifoldParameter) plus the small BagWeights pooling
-    parameters (log_c_age, log_c_hop); all trained by the link CE under one RiemannianAdam group."""
+    parameters (log_tau, log_c_hop); all trained by the link CE under one RiemannianAdam group."""
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float):
         super().__init__()

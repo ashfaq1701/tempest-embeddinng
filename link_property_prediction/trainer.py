@@ -400,6 +400,9 @@ class Trainer:
             g = self._geometry_probe()
             line += (f"  align={align_sum / max(n_batches, 1):.3f}  unif={g['unif']:.3f}"
                      f"  |E|mean={g['mean_norm']:.3f}  |E|max={g['max_norm']:.3f}")
+            # Learned pooling readout: tau (age scale inside the log) and the hop decay coefficient.
+            bw = self.model.bag_weights
+            line += f"  tau={bw.tau:.4g}  c_hop={bw.c_hop:.4f}"
 
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()
