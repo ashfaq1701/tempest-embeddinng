@@ -111,7 +111,6 @@ class Trainer:
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
-            max_walk_len=int(config.max_walk_len),
             mean_node_inter_arrival=float(config.mean_node_inter_arrival),
         ).to(self.device)
 
