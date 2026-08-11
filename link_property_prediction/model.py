@@ -18,31 +18,33 @@ _ACOSH_EPS = 1e-7     # arcosh arg clamp: finite gradient at coincidence
 
 
 class BagWeights(nn.Module):
-    """Learned recency/hop pooling weights: log-form age and hop with learned negative coefficients,
-    plus a global temperature. No hop table, so hop is unbounded."""
+    """Learned recency/hop pooling weights. Two scalars: the age and hop decay rates, both forced negative
+    via -exp(.). At init both are -1, reproducing the fixed -(log1p(age/mnia) + log1p(hop-1)) prior exactly."""
 
     def __init__(self, mnia: float):
         super().__init__()
         self.mnia = float(mnia)
         self.log_c_age = nn.Parameter(torch.zeros(()))     # c_age = -exp(.) = -1 at init
         self.log_c_hop = nn.Parameter(torch.zeros(()))     # c_hop = -exp(.) = -1 at init
-        self.log_tau = nn.Parameter(torch.zeros(()))       # tau = 1 at init
 
     def logits(self, tokens: WalkTokens) -> torch.Tensor:
-        age = tokens.ages.clamp_min(0).float()
-        hop = tokens.positions.clamp_min(1).float()
-        a = torch.log1p(age / self.mnia)
-        h = torch.log1p(hop - 1.0)
-        z = -(self.log_c_age.exp() * a + self.log_c_hop.exp() * h)
-        return self.log_tau.exp() * z
+        """[Q, T] pooling logit; softmax'd in forward. Higher = more weight."""
+        age = tokens.ages.clamp_min(0).float()                                  # [Q, T]  seed=0
+        hop = tokens.positions.clamp_min(1).float()                             # [Q, T]  seed=1
+        a = torch.log1p(age / self.mnia)                                        # [Q, T]
+        h = torch.log1p(hop - 1.0)                                              # [Q, T]
+        return -(self.log_c_age.exp() * a + self.log_c_hop.exp() * h)           # [Q, T]
 
     def forward(self, tokens: WalkTokens, dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(nodes [Q,T], w [Q,T]): softmax over real slots (seed included), 0 on padding, sums to 1."""
         nodes = tokens.nodes.clamp_min(0).clone()
         valid = tokens.mask.clone()
+
         cold = ~valid.any(dim=-1)
         if bool(cold.any()):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
+
         z = self.logits(tokens).to(dtype)
         w = torch.softmax(z.masked_fill(~valid, float("-inf")), dim=-1)
         return nodes, w
@@ -73,7 +75,7 @@ class PoincareManifold:
 
 class LinkPredHead(nn.Module):
     """Two-sided centroid-vs-token head. Owns E (ManifoldParameter) plus the small BagWeights pooling
-    parameters (log_c_age, log_c_hop, log_tau); all trained by the link CE under one RiemannianAdam group."""
+    parameters (log_c_age, log_c_hop); all trained by the link CE under one RiemannianAdam group."""
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float):
         super().__init__()
