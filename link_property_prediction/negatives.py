@@ -8,34 +8,30 @@ Interface (one seam for training AND eval):
   - NegativeSampler.reset() -> None             (no-op default; called at the
                                                  start of every epoch)
 
-Because `observe` / `reset` are no-ops on the base, the trainer/evaluator call
-them unconditionally on whatever sampler they hold — the training mix, a pure
-uniform sampler, or the TGB eval sampler — with no `isinstance` branching. That
-is what keeps EVAL seamless: the eval sampler satisfies the same contract.
+Because `observe` / `reset` are no-ops on the base, the trainer calls them
+unconditionally on whatever training sampler it holds — the historical/random
+mix or a pure uniform sampler — with no `isinstance` branching.
 
-Samplers:
+Training samplers (this file):
   - UniformNegativeSampler   : random destinations from a pool (a provider; also
-                               usable standalone). Dense [B, K].
-  - HistoricalReservoir: per-source reservoir (Vitter R) of PAST
-                               destinations — a PROVIDER, not a standalone
-                               sampler. Exposes observe()/reset()/draw(); the
-                               random fallback for cold sources is the MIXER's
-                               job, not its own.
-  - MixedNegativeSampler     : THE training entry point. Takes `hist_ratio`,
-                               splits K into K_hist/K_rand, delegates each
+                               usable standalone). Dense [B, K]. Reused to build
+                               TGB-Seq's fixed eval negatives one-shot (see
+                               tgb_seq_eval.py).
+  - HistoricalReservoir      : per-source reservoir (Vitter R) of PAST
+                               destinations — a PROVIDER for the mixer, not a
+                               standalone sampler. Exposes observe()/reset()/
+                               draw(); the random fallback for cold sources is
+                               the MIXER's job.
+  - MixedNegativeSampler     : THE training entry point. Splits K into
+                               K_hist/K_rand at `hist_ratio`, delegates each
                                portion to the historical / uniform providers,
                                backfills invalid historical slots with random,
                                returns the combined [B, K]. hist_ratio=0 ->
                                pure uniform (no reservoir allocated).
-  - TGBNegativeSampler       : eval-time. Routes through
-                               dataset.negative_sampler.query_batch — the
-                               TGB-prescribed protocol. Ragged list-of-arrays
-                               (TGB's per-positive negative count varies).
 
-Return-type contract: fixed-K samplers (Uniform / Mixed) return dense
-`(neg_src, neg_tgt)` of shape [B, K]; TGBNegativeSampler returns ragged
-list-of-arrays. Callers that need a fixed matrix use the training samplers;
-the eval path already handles the ragged form.
+Eval-time, suite-native samplers live with their suite: TGB's per-positive
+pre-generated negatives are `TGBNegativeSampler` in `tgb_eval.py`; TGB-Seq's
+fixed negatives are served by `TGBSeqEvaluator` in `tgb_seq_eval.py`.
 
 Historical negatives are NOT for tgbl-wiki: on recurrence-dominated datasets
 most eval positives ARE historical, so training against them pushes E[u] away
@@ -44,7 +40,7 @@ from the eval signal and collapses MRR. Intended for low-recurrence datasets
 """
 
 import abc
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -252,28 +248,3 @@ class MixedNegativeSampler(NegativeSampler):
     def reset(self) -> None:
         if self.historical is not None:
             self.historical.reset()
-
-
-class TGBNegativeSampler(NegativeSampler):
-    """Eval-time sampler. Wraps `dataset.negative_sampler.query_batch`,
-    which serves TGB's pre-generated per-positive negatives. Variable-K
-    per positive — returns list-of-arrays."""
-
-    def __init__(self, dataset: object, split_mode: str):
-        if split_mode not in ("val", "test"):
-            raise ValueError(f"split_mode must be 'val' or 'test', got {split_mode!r}")
-        self.dataset = dataset
-        self.split_mode = split_mode
-        self._sampler = dataset.negative_sampler
-
-    def sample(self, batch: Batch) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        neg_dst_list = self._sampler.query_batch(
-            batch.src, batch.tgt, batch.ts, split_mode=self.split_mode,
-        )
-        neg_src_list: List[np.ndarray] = []
-        neg_tgt_list: List[np.ndarray] = []
-        for s, neg_dsts in zip(batch.src, neg_dst_list):
-            arr = np.asarray(neg_dsts, dtype=np.int32)
-            neg_src_list.append(np.full(len(arr), s, dtype=np.int32))
-            neg_tgt_list.append(arr)
-        return neg_src_list, neg_tgt_list
