@@ -75,11 +75,11 @@ def parse_args() -> argparse.Namespace:
 
     # Link loss / head.
     p.add_argument(
-        "--k-train", type=int, default=10,
+        "--k-train", type=int, default=20,
         help="Per-query training negatives. The head sees [B, 1+K_train] "
-             "candidates per query; positive at column 0. Default 10 keeps the "
+             "candidates per query; positive at column 0. Default 20; keep the "
              "candidate bag small enough to fit bs 1000 on review / big "
-             "low-recurrence graphs.",
+             "low-recurrence graphs (d-emb 64 fits K=20 there).",
     )
     p.add_argument("--is-bipartite", action="store_true",
                    help="Treat the graph as bipartite (src and dst are disjoint node roles).")
