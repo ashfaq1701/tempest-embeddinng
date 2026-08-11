@@ -73,7 +73,9 @@ def load_tgb(name: str, root: str = "datasets") -> Loaded:
             edge_feat=ef,
         )
 
-    node_feat = getattr(dataset, "node_feat", None) or full.get("node_feat", None)
+    node_feat = getattr(dataset, "node_feat", None)
+    if node_feat is None:
+        node_feat = full.get("node_feat", None)
     if node_feat is not None:
         node_feat = np.asarray(node_feat, dtype=np.float32)
 
