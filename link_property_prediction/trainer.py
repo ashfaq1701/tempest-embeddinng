@@ -289,6 +289,10 @@ class Trainer:
     def _eval(self, evaluator: Evaluator, batches: Iterable[Batch],
               recorder: Any = None) -> float:
         self.model.eval()
+        # Rewind any fixed-negative cursor (TGB-Seq) so every pass scores against
+        # the same negatives in split order; a no-op for content-addressed
+        # samplers (TGB). Must precede the first sample_negatives call.
+        evaluator.reset()
         total, n = 0.0, 0
         with torch.no_grad():
             for batch in batches:

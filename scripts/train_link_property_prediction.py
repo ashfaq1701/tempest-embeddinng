@@ -40,10 +40,9 @@ if str(_PROJECT_ROOT) not in sys.path:
 import numpy as np
 import torch
 
-from link_property_prediction.data import Loaded, concat_splits, create_batches, load_tgb
+from link_property_prediction.data import Loaded, concat_splits, create_batches
 from link_property_prediction.data_stats import compute_train_stats
-from link_property_prediction.evaluator import Evaluator
-from link_property_prediction.negatives import TGBNegativeSampler
+from link_property_prediction.evaluator import make_suite
 from link_property_prediction.trainer import Trainer, TrainerConfig
 from link_property_prediction.utils import seed_all
 
@@ -54,9 +53,20 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Dataset.
+    p.add_argument("--data-suite", default="tgb", choices=["tgb", "tgb-seq"],
+                   help="Benchmark suite: 'tgb' (tgb.linkproppred) or 'tgb-seq' "
+                        "(tgb_seq.LinkPred). Selects the native loader + evaluator.")
     p.add_argument("--dataset", required=True, type=str,
-                   help="TGB dataset name, e.g. tgbl-wiki, tgbl-review")
-    p.add_argument("--tgb-root", default="datasets", type=str)
+                   help="Dataset name within the suite, e.g. tgbl-wiki (tgb) "
+                        "or GoogleLocal (tgb-seq)")
+    p.add_argument("--tgb-root", default="datasets", type=str,
+                   help="Data root for whichever suite is selected.")
+    p.add_argument(
+        "--k-eval", default=100, type=int,
+        help="Eval negatives per positive. Used ONLY on --data-suite tgb-seq, "
+             "to build its (unshipped) validation negatives one-shot from our "
+             "sampler; TGB-Seq test uses its shipped negatives. Ignored for "
+             "--data-suite tgb, which uses TGB's pre-generated negatives.")
 
 
     # Model. The monotone weighted-mean head has NO tunable hyperparameters and no head parameter at all —
@@ -184,15 +194,15 @@ def main() -> Dict[str, Any]:
     print(f"device:  {device}")
     print(f"seed:    {args.seed}")
 
-    # ─── Load dataset ──────────────────────────────────────────────
+    # ─── Load dataset (native to the chosen suite) ─────────────────
     t0 = time.time()
-    loaded: Loaded = load_tgb(name=args.dataset, root=args.tgb_root)
-    print(f"loaded in {time.time() - t0:.1f}s")
-
-    # TGB requires negative-sampler files to be loaded before val/test
-    # negatives can be queried. They're cached on disk after first call.
-    loaded.dataset.load_val_ns()
-    loaded.dataset.load_test_ns()
+    suite = make_suite(
+        args.data_suite,
+        name=args.dataset, root=args.tgb_root,
+        is_bipartite=args.is_bipartite, k_eval=args.k_eval, seed=args.seed,
+    )
+    loaded: Loaded = suite.load()
+    print(f"loaded ({args.data_suite}) in {time.time() - t0:.1f}s")
 
     # Derived dataset constants.
     num_nodes = loaded.max_node_count
@@ -214,16 +224,11 @@ def main() -> Dict[str, Any]:
     val_sp = _trunc(loaded.val, args.max_eval_edges, tail=False)
     test_sp = _trunc(loaded.test, args.max_eval_edges, tail=False)
 
-    # Negative-sampling pool. Bipartite -> destination side only (sampling over all
-    # nodes would make the trivial "is this ever a destination?" task and not transfer
-    # to eval). Non-bipartite -> all unique train nodes (src ∪ dst), since any node can
-    # legitimately be a destination.
-    if args.is_bipartite:
-        dst_pool = np.unique(train_sp.destinations).astype(np.int32)
-    else:
-        dst_pool = np.unique(
-            np.concatenate([train_sp.sources, train_sp.destinations])
-        ).astype(np.int32)
+    # Negative-sampling pool: the suite computes it from the FULL train split,
+    # driven by --is-bipartite (destination side only vs all train nodes). The
+    # SAME pool feeds the training negatives here and any eval negatives the
+    # suite builds from our sampler (TGB-Seq val), so both draw one universe.
+    dst_pool = suite.dst_pool()
     stats = compute_train_stats(train_sp.timestamps, train_sp.sources, train_sp.destinations)
 
     print(f"  num_nodes:     {num_nodes:,}")
@@ -255,17 +260,12 @@ def main() -> Dict[str, Any]:
         lambda: create_batches(test_sp, args.eval_batch_size)
     )
 
-    # ─── Build evaluators ──────────────────────────────────────────
-    val_eval = Evaluator(
-        neg_sampler=TGBNegativeSampler(loaded.dataset, split_mode="val"),
-        tgb_dataset_name=loaded.name,
-        eval_metric=loaded.eval_metric,
-    )
-    test_eval = Evaluator(
-        neg_sampler=TGBNegativeSampler(loaded.dataset, split_mode="test"),
-        tgb_dataset_name=loaded.name,
-        eval_metric=loaded.eval_metric,
-    )
+    # ─── Build evaluators (native to the suite) ────────────────────
+    # Each is the suite's own negatives + native metric; the trainer only sees
+    # the Evaluator interface. TGB serves pre-generated per-positive negatives;
+    # TGB-Seq builds val negatives once from our sampler and uses shipped test.
+    val_eval = suite.make_evaluator("val")
+    test_eval = suite.make_evaluator("test")
 
     # ─── Build TrainerConfig ───────────────────────────────────────
     config = TrainerConfig(
