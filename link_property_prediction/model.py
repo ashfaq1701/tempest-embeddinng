@@ -1,10 +1,13 @@
 """Centroid-to-centroid head on the Poincaré ball. Each side's walk-token bag (seeds included) is pooled to a
-single gyro-midpoint and the score is the geodesic between them:
+single point and the score is the geodesic between them:
     s(u,v) = -d(P_u, P_v)
-Same as master except the pooling weights are LEARNED: instead of the fixed -(log1p(age/mnia)+log1p(hop-1))
-prior, a small MLP maps (fixed cos/sin age encoding, learned hop embedding) -> one logit per token, softmaxed
-over the bag. The weights depend only on (age, hop) — not on E — so there is no feedback loop between the
-embedding and its own pooling weight, and the learned function is a strict generalisation of the prior."""
+Two changes from master. (1) The pooling weights are LEARNED: instead of the fixed
+-(log1p(age/mnia)+log1p(hop-1)) prior, a small MLP maps (fixed cos/sin age encoding, learned hop embedding)
+-> one logit per token, softmaxed over the bag. Weights depend only on (age, hop), not on E, so there is no
+feedback loop between an embedding and its own pooling weight. (2) Pooling is the TANGENT MEAN at the origin,
+expmap0(sum_p w_p logmap0(x_p)), not the gyro-midpoint: weighted_midpoint reweights each token by its
+conformal factor 2/(1-||x||^2), which with learned weights gives two coupled reweighting mechanisms chasing
+each other as E moves. The tangent mean uses w exactly as computed."""
 from typing import Tuple
 
 import geoopt
@@ -27,6 +30,14 @@ class PoincareManifold:
     def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Elementwise geodesic distance (geoopt), broadcasting over leading dims. LOWER = closer."""
         return self.manifold.dist(x, y)
+
+    def logmap0(self, x: torch.Tensor) -> torch.Tensor:
+        """Manifold -> tangent at the origin. One global chart, so all queries stay comparable."""
+        return self.manifold.logmap0(x)
+
+    def expmap0(self, v: torch.Tensor) -> torch.Tensor:
+        """Tangent at the origin -> manifold. geoopt clamps ||out|| to 1-4e-3 (fp32); never hits the boundary."""
+        return self.manifold.expmap0(v)
 
     @staticmethod
     def pairwise_dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -53,7 +64,6 @@ class BagWeights(nn.Module):
         self.hop_emb = nn.Embedding(self.max_hop, d_hop)
         d_feat = d_time + 1 + d_hop
         self.net = nn.Sequential(
-            nn.LayerNorm(d_feat),
             nn.Linear(d_feat, hidden),
             nn.GELU(),
             nn.Linear(hidden, 1),
@@ -84,7 +94,8 @@ class BagWeights(nn.Module):
 
 
 class LinkPredHead(nn.Module):
-    """Centroid-to-centroid head. E is a ManifoldParameter; BagWeights is the only other trained module."""
+    """Centroid-to-centroid head with tangent-mean pooling. E is a ManifoldParameter; BagWeights is the only
+    other trained module."""
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float, max_walk_length: int,
                  d_time: int = 32, d_hop: int = 16):
@@ -103,10 +114,10 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
     def bag_centroid(self, nodes: torch.Tensor, w: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
-        """P_x = weighted gyro-midpoint of the bag's token embeddings (weights w sum to 1)."""
+        """P_x = expmap0(sum_p w_p logmap0(x_p)) — tangent mean at the origin, no conformal reweighting."""
         x = F.embedding(nodes, emb)                                             # [Q, T, d]
-        return self.geom.manifold.weighted_midpoint(
-            x, weights=w, reducedim=[-2], dim=-1, keepdim=False)                # [Q, d]
+        z = self.geom.logmap0(x)                                                # [Q, T, d]
+        return self.geom.expmap0((w.unsqueeze(-1) * z).sum(dim=-2))             # [Q, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries (seeds u); cand = B*C candidate queries (seeds v), query-major. -> [B, C]."""
