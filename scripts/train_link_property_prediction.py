@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
 
     # Model. The monotone weighted-mean head has NO tunable hyperparameters and no head parameter at all —
     # the score is a fixed geometric distance aggregate; E is the only trained tensor.
-    p.add_argument("--d-emb", default=128, type=int)
+    p.add_argument("--d-emb", default=64, type=int)
 
     # Link loss / head.
     p.add_argument(
