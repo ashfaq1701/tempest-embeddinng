@@ -112,6 +112,7 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             mean_node_inter_arrival=float(config.mean_node_inter_arrival),
+            max_walk_length=int(config.max_walk_len),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.
