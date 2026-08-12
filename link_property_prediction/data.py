@@ -1,4 +1,9 @@
-"""TGB dataset bridge + fixed-size (TGB-identical) batch iterator."""
+"""Suite-agnostic data structures + fixed-size (TGB-identical) batch iterator.
+
+Benchmark-specific loading lives in the suite modules (`tgb_eval.py`,
+`tgb_seq_eval.py`), each of which returns the `Loaded` defined here. This file
+only holds the shared containers (`SplitData`, `Batch`, `Loaded`) and the
+chronological batcher used by both training and eval on every suite."""
 
 from typing import Iterator, NamedTuple, Optional
 
@@ -28,68 +33,6 @@ class Loaded(NamedTuple):
     eval_metric: str            # e.g. "mrr"
     max_node_count: int
     node_feat: Optional[np.ndarray]
-
-
-def _strip_version_suffix(name: str) -> str:
-    """Drop trailing '-v<digits>' from a TGB dataset name. Used to
-    convert user-facing names ('tgbl-review-v2') into the TGB
-    registry key ('tgbl-review'); the unstripped form raises 'Dataset
-    not supported' inside TGB."""
-    # E.g., 'tgbl-wiki-v2' -> 'tgbl-wiki'; 'tgbl-coin' unchanged.
-    import re
-    return re.sub(r"-v\d+$", "", name)
-
-
-def load_tgb(name: str, root: str = "datasets") -> Loaded:
-    """Load a TGB link-property-prediction dataset using only TGB's APIs.
-
-    `-vN` suffixes (e.g. tgbl-review-v2) are stripped before the call —
-    TGB's registry uses bare names ("tgbl-review") and serves the
-    current version internally; passing "tgbl-review-v2" raises
-    "Dataset not supported" because the suffixed key isn't registered.
-    """
-    from tgb.linkproppred.dataset import LinkPropPredDataset
-
-    tgb_name = _strip_version_suffix(name)
-    dataset = LinkPropPredDataset(name=tgb_name, root=root, preprocess=True)
-    full = dataset.full_data
-    sources = np.asarray(full["sources"], dtype=np.int64)
-    destinations = np.asarray(full["destinations"], dtype=np.int64)
-    timestamps = np.asarray(full["timestamps"], dtype=np.int64)
-    edge_feat = full.get("edge_feat", None)
-    if edge_feat is not None:
-        edge_feat = np.asarray(edge_feat, dtype=np.float32)
-
-    train_mask = np.asarray(dataset.train_mask, dtype=bool)
-    val_mask = np.asarray(dataset.val_mask, dtype=bool)
-    test_mask = np.asarray(dataset.test_mask, dtype=bool)
-
-    def _apply(mask: np.ndarray) -> SplitData:
-        ef = edge_feat[mask] if edge_feat is not None else None
-        return SplitData(
-            sources=sources[mask],
-            destinations=destinations[mask],
-            timestamps=timestamps[mask],
-            edge_feat=ef,
-        )
-
-    node_feat = getattr(dataset, "node_feat", None) or full.get("node_feat", None)
-    if node_feat is not None:
-        node_feat = np.asarray(node_feat, dtype=np.float32)
-
-    return Loaded(
-        train=_apply(train_mask),
-        val=_apply(val_mask),
-        test=_apply(test_mask),
-        dataset=dataset,
-        # Store the TGB-canonical name (suffix stripped). Downstream
-        # consumers (Evaluator) pass this back to TGB and must use
-        # the registry key, not the user's input suffix.
-        name=tgb_name,
-        eval_metric=str(dataset.eval_metric),
-        max_node_count=int(max(sources.max(), destinations.max())) + 1,
-        node_feat=node_feat,
-    )
 
 
 def concat_splits(*splits: SplitData) -> SplitData:

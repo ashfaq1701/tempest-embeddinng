@@ -61,8 +61,8 @@ class TrainerConfig:
     # Init only — never a per-step scaler.
     t_train: float = 1.0
 
-    # data_stats mean-field per-node inter-event time T_train*N/(2E) — the characteristic age scale used
-    # to scale-normalise the pooling recency weight (log1p(age / mnia)), making it timestamp-scale-neutral.
+    # data_stats mean-field per-node inter-event time T_train*N/(2E) — the characteristic AGE scale a
+    # walk sees; used to scale-normalise the pooling recency weight (log1p(age / mean_node_inter_arrival)).
     mean_node_inter_arrival: float = 1.0
 
     # Model. The monotone weighted-mean head has NO tunable hyperparameters and NO head parameters at all —
@@ -70,12 +70,12 @@ class TrainerConfig:
     d_emb: int = 64
 
     # Link loss / head.
-    K_train: int = 10           # per-query training negatives ([B, 1+K_train]); 10 keeps the candidate
+    K_train: int = 20           # per-query training negatives ([B, 1+K_train]); 20 keeps the candidate
                                 # bag small enough to fit bs 1000 on review
 
     # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked, each
     # bounded by the query's own cutoff t_i; both bags flow to the head.
-    num_walks_per_node: int = 5
+    num_walks_per_node: int = 10
     max_walk_len: int = 5
     walk_bias: str = "ExponentialWeight"
     start_bias: str = "ExponentialWeight"
@@ -270,6 +270,10 @@ class Trainer:
     def _eval(self, evaluator: Evaluator, batches: Iterable[Batch],
               recorder: Any = None) -> float:
         self.model.eval()
+        # Rewind any fixed-negative cursor (TGB-Seq) so every pass scores against
+        # the same negatives in split order; a no-op for content-addressed
+        # samplers (TGB). Must precede the first sample_negatives call.
+        evaluator.reset()
         total, n = 0.0, 0
         with torch.no_grad():
             for batch in batches:

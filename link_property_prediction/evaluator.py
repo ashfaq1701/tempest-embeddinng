@@ -1,70 +1,116 @@
-"""TGB Evaluator wrapper — architecture-agnostic.
+"""Evaluation interface + data-suite factory — benchmark-agnostic.
 
-Wraps `tgb.linkproppred.evaluate.Evaluator` and a `NegativeSampler` so a
-training loop can request per-positive negatives, score them with its
-own model, and feed the resulting (pos, neg-array) pair into TGB's
-official MRR scorer.
+Two abstractions the trainer and the training script build on. The concrete,
+NATIVE implementations for each benchmark live in `tgb_eval.py` (TGB) and
+`tgb_seq_eval.py` (TGB-Seq); this module holds only the interfaces and the
+`make_suite` dispatch, so the two paths never interleave.
 
-The new design supplies its own scoring loop; this module exists only
-to (a) load TGB's per-positive negatives via the injected sampler, and
-(b) call `tgb_eval.eval(...)` per positive for leaderboard-identical
-metrics. No knowledge of the model architecture lives here.
+  Evaluator  — the trainer's ONLY eval dependency. Given a batch it yields
+               per-positive negatives, and given one positive's scores it
+               returns that suite's NATIVE metric. Nothing about the model
+               architecture lives behind this seam.
+
+  DataSuite  — one cohesive object per benchmark that owns its NATIVE load and
+               NATIVE evaluator construction. `--data-suite` picks one; after
+               that single dispatch every downstream call routes through the
+               chosen suite object, with no per-suite branching anywhere else.
 """
+import abc
+from typing import List, Optional, Tuple
 
 import numpy as np
 
-from .data import Batch
-from .negatives import NegativeSampler
+from .data import Batch, Loaded
 
 
-class Evaluator:
-    """Thin wrapper around TGB's `Evaluator.eval(...)` plus a NegativeSampler.
+class Evaluator(abc.ABC):
+    """Per-positive negatives + per-positive metric — the trainer's eval seam.
 
-    Usage (from a training loop):
-
-        evaluator = Evaluator(
-            neg_sampler=TGBNegativeSampler(loaded.dataset, split_mode="val"),
-            tgb_dataset_name=loaded.name,
-            eval_metric=loaded.eval_metric,
-        )
-        for batch in val_batches:
-            neg_src_list, neg_tgt_list = evaluator.sample_negatives(batch)
-            # score(u, v) is the caller's responsibility — model-specific.
-            pos_scores = score(batch.src, batch.tgt, batch.ts)
-            neg_scores = [score(np.full_like(nt, s), nt, np.full_like(nt, t))
-                          for s, nt, t in zip(batch.src, neg_tgt_list, batch.ts)]
-            for pos, neg in zip(pos_scores, neg_scores):
-                m = evaluator.score_to_metric(pos, neg)
-                ...
+    A training loop asks this evaluator for a batch's negatives, scores them
+    with its own model, and folds each (positive, negative-array) pair through
+    `score_to_metric`. The suite decides where the negatives come from and which
+    metric is applied; the trainer stays architecture- and benchmark-agnostic.
     """
 
-    def __init__(
-        self,
-        neg_sampler: NegativeSampler,
-        tgb_dataset_name: str,
-        eval_metric: str,
-    ):
-        from tgb.linkproppred.evaluate import Evaluator as TGBEvaluator
+    @abc.abstractmethod
+    def sample_negatives(self, batch: Batch) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        """`(neg_src_list, neg_tgt_list)` — one variable-length negative array
+        per positive in `batch` (K may differ per positive across suites)."""
 
-        self.neg_sampler = neg_sampler
-        self.eval_metric = eval_metric
-        self.tgb_eval = TGBEvaluator(name=tgb_dataset_name)
-
-    def sample_negatives(self, batch: Batch):
-        """Forwards to the injected sampler. Most useful for eval-time
-        samplers that return per-positive variable-K negative arrays
-        (TGB's pre-generated lists)."""
-        return self.neg_sampler.sample(batch)
-
+    @abc.abstractmethod
     def score_to_metric(self, pos_score: float, neg_scores: np.ndarray) -> float:
-        """Run TGB's official scorer on a single positive plus its
-        per-positive negative scores. Returns the metric value
-        (`self.eval_metric` from the dataset)."""
-        pos = np.asarray([pos_score], dtype=np.float64)
-        neg = np.asarray(neg_scores, dtype=np.float64)
-        res = self.tgb_eval.eval({
-            "y_pred_pos": pos,
-            "y_pred_neg": neg,
-            "eval_metric": [self.eval_metric],
-        })
-        return float(res[self.eval_metric])
+        """The suite's NATIVE metric for a single positive scored against its
+        negatives (e.g. reciprocal rank → MRR)."""
+
+    def reset(self) -> None:
+        """Called by the trainer at the START of every eval pass. Stateless
+        evaluators (TGB, whose negatives are content-addressed) no-op. The
+        fixed-negative TGB-Seq evaluator rewinds its per-positive cursor so the
+        same negatives are served every epoch, in split order."""
+        return None
+
+
+class DataSuite(abc.ABC):
+    """A benchmark adapter: NATIVE load + NATIVE evaluator construction.
+
+    One instance per run, selected by `--data-suite`. `load()` returns the
+    suite-agnostic `Loaded` the trainer consumes (cached — evaluators reuse it);
+    `make_evaluator(split_mode)` returns that split's native `Evaluator`.
+
+    `dst_pool()` is shared: the `--is-bipartite` arg drives it, and the SAME
+    pool feeds both the training negatives and any eval negatives a suite builds
+    from our sampler, so training and evaluation draw from one destination
+    universe.
+    """
+
+    def __init__(self, name: str, root: str, is_bipartite: bool,
+                 k_eval: int, seed: int):
+        self.name = name
+        self.root = root
+        self.is_bipartite = bool(is_bipartite)
+        self.k_eval = int(k_eval)
+        self.seed = seed
+        self._loaded: Optional[Loaded] = None
+
+    def load(self) -> Loaded:
+        """Native load, cached so `make_evaluator`/`dst_pool` reuse one copy."""
+        if self._loaded is None:
+            self._loaded = self._load()
+        return self._loaded
+
+    @abc.abstractmethod
+    def _load(self) -> Loaded:
+        """Do the suite's native load and return a `Loaded`."""
+
+    @abc.abstractmethod
+    def make_evaluator(self, split_mode: str) -> Evaluator:
+        """Native evaluator for `split_mode` in {'val', 'test'}."""
+
+    def dst_pool(self) -> np.ndarray:
+        """Negative-destination universe (int32), from the TRAIN split.
+
+        Bipartite -> unique train DESTINATIONS (keep negatives on the
+        destination side; sampling all nodes would make the trivial "is this
+        ever a destination?" task that doesn't transfer to eval). Non-bipartite
+        -> all unique train nodes (src ∪ dst), since any node can be a target.
+        """
+        train = self.load().train
+        if self.is_bipartite:
+            pool = np.unique(train.destinations)
+        else:
+            pool = np.unique(np.concatenate([train.sources, train.destinations]))
+        return pool.astype(np.int32)
+
+
+def make_suite(data_suite: str, **kwargs) -> DataSuite:
+    """Dispatch `--data-suite` to its native suite. Concrete suites are imported
+    lazily HERE (not at module top) so this interface module carries no import
+    cycle with the suite modules that import it back."""
+    if data_suite == "tgb":
+        from .tgb_eval import TGBSuite
+        return TGBSuite(**kwargs)
+    if data_suite == "tgb-seq":
+        from .tgb_seq_eval import TGBSeqSuite
+        return TGBSeqSuite(**kwargs)
+    raise ValueError(
+        f"unknown --data-suite {data_suite!r} (expected 'tgb' or 'tgb-seq')")

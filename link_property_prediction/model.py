@@ -1,7 +1,8 @@
-"""Monotone weighted-mean metric head on the Poincaré ball. E is the only trained tensor; the score is a
-parameter-free distance aggregate  s(u,v) = -[ d(E_u,E_v) + mean(E_v,B_u) + mean(E_u,B_v) ]  where B_x is
-x's walk-token bag. The weighted mean is a convex combination, so ds/dd_p <= 0 and the link CE trains E
-end-to-end with no detach."""
+"""Centroid-to-centroid head on the Poincaré ball. E is the only trained tensor. Each side's walk-token bag
+is pooled to a single gyro-midpoint and the score is the geodesic between them:
+    s(u,v) = -d(P_u, P_v)
+P_x = weighted gyro-midpoint of x's full bag (seeds included); w = softmax of the -(log1p(age)+log1p(hop-1))
+prior. No per-token terms."""
 from typing import Tuple
 
 import geoopt
@@ -21,6 +22,10 @@ class PoincareManifold:
     def __init__(self, c: float = 1.0):
         self.manifold = geoopt.PoincareBall(c=c)
 
+    def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Elementwise geodesic distance (geoopt), broadcasting over leading dims. LOWER = closer."""
+        return self.manifold.dist(x, y)
+
     @staticmethod
     def pairwise_dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """arcosh(1 + 2||x-y||^2 / ((1-||x||^2)(1-||y||^2))) for x [...,n,d], y [...,m,d] -> [...,n,m].
@@ -35,19 +40,18 @@ class PoincareManifold:
 
 
 class LinkPredHead(nn.Module):
-    """Two-sided monotone weighted-mean head. Owns E (ManifoldParameter, trained by the link CE); no other
-    parameter. Symmetric across the two directions (v vs B_u, u vs B_v) since the task is undirected."""
+    """Two-sided centroid-vs-token head. Owns E (ManifoldParameter, trained by the link CE); no other
+    parameter."""
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float = 1.0):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
-        # Scale-normalise the age term of the pooling recency weight by the dataset's mean-field per-node
-        # inter-event time (T_train*N/2E, the characteristic age scale). Makes the pooling softmax
-        # timestamp-scale-neutral across datasets (log(c*age)=log(age)+log(c) is a softmax-invariant shift).
-        # Verified on tgbl-review lr1e-4: a real, growing val lift over the un-normalised log1p(age) weight
-        # (~+0.008 by ep8), even though this head excludes the seed (so it is not fixing a seed-collapse —
-        # purely sharper recency resolution among context tokens).
+        # data_stats mean-field per-node inter-event time (T_train*N/2E) — the characteristic AGE scale.
+        # The pooling recency weight normalises age by it: log1p(age / mean_node_inter_arrival), which makes
+        # the softmax scale-invariant across datasets (review ~1e7 vs wiki ~1e4) and stops the huge age range
+        # from collapsing the gyro-midpoint onto E[seed]. A single dataset constant (not per-node, not
+        # per-bag), so between-bag differences are preserved.
         self.mean_node_inter_arrival = float(mean_node_inter_arrival)
         self.geom = PoincareManifold()
 
@@ -60,58 +64,51 @@ class LinkPredHead(nn.Module):
 
     def bag_weight_logits(self, tokens: WalkTokens) -> torch.Tensor:
         """Recency/hop prior LOGITS [Q, T] = -(log1p(age / mean_node_inter_arrival) + log1p(hop-1)); 0 (max)
-        for a just-happened adjacent token, decaying with age and hop. Age normalised by the dataset's
-        characteristic per-node inter-event time so the softmax is timestamp-scale-neutral."""
+        for the seed (age 0, hop 1). Age is normalised by the dataset's mean-field per-node inter-event time
+        (the characteristic age scale), so the softmax is scale-invariant: measured in node-timescale units
+        the seed-vs-context gap is bounded (~log of a small ratio) on any dataset, which stops the huge raw
+        age range from collapsing the gyro-midpoint onto E[seed]. One dataset constant → between-bag structure
+        is preserved (a staler bag keeps larger age/scale)."""
         age = tokens.ages.clamp_min(0).to(torch.float32)                        # [Q, T]  seed=0, ctx>=1
         hop = tokens.positions.clamp_min(1).to(torch.float32)                   # [Q, T]  seed=1, ctx>=2
         return -(torch.log1p(age / self.mean_node_inter_arrival) + torch.log1p(hop - 1.0))  # [Q, T]  <= 0
 
     def bag_weights(self, tokens: WalkTokens, dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
-        """(nodes [Q,T], log_w [Q,T]): softmax the recency/hop prior over context slots (mask & ~seed_node),
-        -inf elsewhere. A cold bag (no context) falls back to {(seed, w=1)} -> mean = identity distance."""
+        """(nodes [Q,T], w [Q,T]): softmax the recency/hop prior over ALL real slots (seed included), 0 on
+        padding, sums to 1 per row. Cold-bag guard handles a fully-empty walk (all padding) -> falls back to
+        the seed; without it that row's all -inf softmax would be NaN."""
         nodes = tokens.nodes.clamp_min(0).clone()                               # [Q, T] padding(-1) -> 0
-        valid = (tokens.mask & ~tokens.seed_node_mask).clone()                  # [Q, T] context slots
+        valid = tokens.mask.clone()                                             # [Q, T] real slots (seed incl.)
 
-        cold = ~valid.any(dim=-1)                                               # [Q]
+        cold = ~valid.any(dim=-1)                                               # [Q]  fully-empty walk guard
         if bool(cold.any()):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
 
         logits = self.bag_weight_logits(tokens).to(dtype)                       # [Q, T] <= 0
-        log_w = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
-        return nodes, log_w
+        w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)    # [Q, T] sums to 1
+        return nodes, w
 
-    @staticmethod
-    def bag_mean(d: torch.Tensor, log_w: torch.Tensor) -> torch.Tensor:
-        """Weighted mean sum_p exp(log_w_p) * d_p over the last axis (excluded slots have weight 0)."""
-        return (log_w.exp() * d).sum(dim=-1)
+    def bag_centroid(self, nodes: torch.Tensor, w: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        """P_x = weighted gyro-midpoint of the bag's token embeddings (weights w sum to 1)."""
+        x = F.embedding(nodes, emb)                                            # [Q, T, d]
+        return self.geom.manifold.weighted_midpoint(
+            x, weights=w, reducedim=[-2], dim=-1, keepdim=False)               # [Q, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries (seeds u); cand = B*C candidate queries (seeds v), query-major. -> [B, C]."""
         emb = self.E.weight
 
-        nodes_u, logw_u = self.bag_weights(src_tokens, emb.dtype)               # [B, T]
-        nodes_v, logw_v = self.bag_weights(cand_tokens, emb.dtype)              # [B*C, T]
+        nodes_u, w_u = self.bag_weights(src_tokens, emb.dtype)                 # [B, T]
+        nodes_v, w_v = self.bag_weights(cand_tokens, emb.dtype)               # [B*C, T]
 
-        e_u = F.embedding(src_tokens.seeds, emb)                                # [B, d]
-        x_u = F.embedding(nodes_u, emb)                                         # [B, T, d]
-        e_v = F.embedding(cand_tokens.seeds, emb)                               # [B*C, d]
-        x_v = F.embedding(nodes_v, emb)                                         # [B*C, T, d]
+        p_u = self.bag_centroid(nodes_u, w_u, emb)                            # [B, d]
+        p_v = self.bag_centroid(nodes_v, w_v, emb)                            # [B*C, d]
 
-        b, d = e_u.shape
-        c = e_v.shape[0] // b
-        t = nodes_u.shape[1]
-        e_v = e_v.view(b, c, d)                                                 # [B, C, d]
-        x_v = x_v.view(b, c, t, d)                                              # [B, C, T, d]
-        logw_v = logw_v.view(b, c, t)                                           # [B, C, T]
+        b, d = p_u.shape
+        c = p_v.shape[0] // b
+        p_v = p_v.view(b, c, d)                                                # [B, C, d]
 
-        d_id = self.geom.pairwise_dist(e_u.unsqueeze(-2), e_v).squeeze(-2)      # [B, C]  identity: d(E_u,E_v)
-
-        d_v_bu = self.geom.pairwise_dist(e_v, x_u)                              # [B, C, T]  v vs u's bag
-        mean_v_bu = self.bag_mean(d_v_bu, logw_u.unsqueeze(-2))                 # [B, C]
-
-        d_u_bv = self.geom.pairwise_dist(e_u[:, None, None, :], x_v).squeeze(-2)  # [B, C, T]  u vs v's bag
-        mean_u_bv = self.bag_mean(d_u_bv, logw_v)                               # [B, C]
-
-        raw = d_id + mean_v_bu + mean_u_bv                                      # [B, C]
-        return -raw                                                             # higher = closer = better
+        # Centroid-to-centroid geodesic: s(u,v) = -d(P_u, P_v).
+        raw = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C]
+        return -raw                                                           # [B, C] higher = closer
