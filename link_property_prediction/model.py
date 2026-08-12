@@ -1,8 +1,8 @@
-"""Two-sided centroid-vs-token head on the Poincaré ball. E is the only trained tensor. Centroid on the
-probe side, raw tokens on the target side, both directions:
-    s(u,v) = -[ sum_q w_q^v * d(P_u, x_q^v) + sum_p w_p^u * d(P_v, x_p^u) ]
-P_x = weighted gyro-midpoint of x's full bag (seeds included); x_p/x_q = raw token embeddings; w = softmax
-of the -(log1p(age)+log1p(hop-1)) prior. No identity and no centroid-centroid term."""
+"""Centroid-to-centroid head on the Poincaré ball. E is the only trained tensor. Each side's walk-token bag
+is pooled to a single gyro-midpoint and the score is the geodesic between them:
+    s(u,v) = -d(P_u, P_v)
+P_x = weighted gyro-midpoint of x's full bag (seeds included); w = softmax of the -(log1p(age)+log1p(hop-1))
+prior. No per-token terms."""
 from typing import Tuple
 
 import geoopt
@@ -102,23 +102,13 @@ class LinkPredHead(nn.Module):
         nodes_u, w_u = self.bag_weights(src_tokens, emb.dtype)                 # [B, T]
         nodes_v, w_v = self.bag_weights(cand_tokens, emb.dtype)               # [B*C, T]
 
-        x_u = F.embedding(nodes_u, emb)                                        # [B, T, d]
-        x_v = F.embedding(nodes_v, emb)                                        # [B*C, T, d]
         p_u = self.bag_centroid(nodes_u, w_u, emb)                            # [B, d]
         p_v = self.bag_centroid(nodes_v, w_v, emb)                            # [B*C, d]
 
         b, d = p_u.shape
         c = p_v.shape[0] // b
-
         p_v = p_v.view(b, c, d)                                                # [B, C, d]
-        x_v = x_v.view(b, c, x_u.shape[1], d)                                  # [B, C, T, d]
-        w_v = w_v.view(b, c, x_u.shape[1])                                     # [B, C, T]
 
-        # P_u vs v's tokens, and P_v vs u's tokens.
-        d_pu_xv = self.geom.pairwise_dist(p_u[:, None, None, :], x_v).squeeze(-2)  # [B, C, T]
-        term_v = (w_v * d_pu_xv).sum(-1)                                       # [B, C]
-        d_pv_xu = self.geom.pairwise_dist(p_v, x_u)                            # [B, C, T]
-        term_u = (w_u.unsqueeze(1) * d_pv_xu).sum(-1)                          # [B, C]
-
-        raw = term_v + term_u                                                  # [B, C]
+        # Centroid-to-centroid geodesic: s(u,v) = -d(P_u, P_v).
+        raw = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C]
         return -raw                                                           # [B, C] higher = closer
