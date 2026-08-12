@@ -65,9 +65,12 @@ class TrainerConfig:
     # walk sees; used to scale-normalise the pooling recency weight (log1p(age / mean_node_inter_arrival)).
     mean_node_inter_arrival: float = 1.0
 
-    # Model. The monotone weighted-mean head has NO tunable hyperparameters and NO head parameters at all —
-    # the score is a fixed geometric aggregate of distances; E is the only trained tensor.
+    # Model. The cross-bag head has NO head parameters at all — the score is a fixed geometric aggregate of
+    # distances; E is the only trained tensor.
     d_emb: int = 64
+
+    # cross_only=True -> s = -X (cross term only); False -> s = -(X + A + B) (add the two centroid probes).
+    cross_only: bool = True
 
     # Link loss / head.
     K_train: int = 20           # per-query training negatives ([B, 1+K_train]); 20 keeps the candidate
@@ -112,6 +115,7 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             mean_node_inter_arrival=float(config.mean_node_inter_arrival),
+            cross_only=bool(config.cross_only),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.

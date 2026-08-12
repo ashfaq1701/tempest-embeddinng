@@ -83,6 +83,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--is-bipartite", action="store_true",
                    help="Treat the graph as bipartite (src and dst are disjoint node roles).")
+    p.add_argument("--cross-only", action=argparse.BooleanOptionalAction, default=True,
+                   help="Score with the cross-bag term X only (default). --no-cross-only adds back the "
+                        "two centroid-probe terms A and B (s = -(X + A + B)).")
 
     # Chronological subsample (wiki-sized window on big datasets, e.g. review).
     p.add_argument(
@@ -268,6 +271,7 @@ def main() -> Dict[str, Any]:
         mean_node_inter_arrival=float(stats.mean_node_inter_arrival),
 
         d_emb=args.d_emb,
+        cross_only=args.cross_only,
 
         K_train=args.k_train,
 
