@@ -112,7 +112,6 @@ def parse_args() -> argparse.Namespace:
                    help="node2vec in-out param q (TemporalNode2Vec bias only). Lower q/p => "
                         "more outward exploration; p=4,q=0.25 = most diverse backward walks.")
 
-
     # Optimisation — RiemannianAdam at a CONSTANT lr (no schedule). ONE param group covers E
     # (a geoopt.ManifoldParameter, Riemannian update) and all Euclidean head params at the same lr.
     p.add_argument("--lr", default=1e-4, type=float,

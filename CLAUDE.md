@@ -1498,3 +1498,55 @@ The old note ("collapse is E-side; every head/loss/pooling lever neutral-or-wors
 loss ever made review climb") is superseded: the alignment loss was NECESSARY but not SUFFICIENT. The
 missing pieces were the CONTRACTION REGIME (spread init + hyperbolic inward spring, removing the
 expansion that drives the collapse) and lr 1e-3 to let E move.
+
+---
+
+## Learned-weight tangent-mean head + overnight tgb-seq sweep, and the Flickr grad-overshoot collapse (2026-08-13)
+
+Branch `feature/learned-weight`. Head = centroid-to-centroid `s = -d(P_u,P_v)` with:
+- **Tangent-mean pooling** `expmap0(sum_p w_p logmap0(x_p))` (NOT gyro-midpoint `weighted_midpoint` —
+  its conformal reweighting `2/(1-||x||^2)` fought the learned weights and caused an ep1-peak-then-drift;
+  tangent-mean cured that, +0.014/+0.014 on Flickr).
+- **Learned pooling weights** from (age cos/sin + log1p, learned hop embedding) via a small MLP -> softmax.
+- **Relative distance-to-centre spread feature** `||z_p-c|| / mean_q||z_q-c||` (mean-normalised to strip the
+  degree/popularity level; keeps within-bag outlier structure). NON-detached (backprops into E); an A/B vs
+  the detached form was a dead tie on Flickr (peak 0.403/0.392 both).
+- **No LayerNorm** (accuracy-neutral on this head, ~26% faster per epoch), **leaner pooler** d_time=16,
+  d_hop=8, hidden=2*d_feat=52 (head params ~1.5k). **NO grad-clip.**
+
+### Overnight tgb-seq sweep (K20, d-emb 64, wpn 10, mwl 5, patience 3, 50ep, lr 1e-4, bs 1000)
+2-slot pool, smallest->largest. Taobao excluded (manual Aliyun download only). Yelp/WikiLink stopped
+manually (still climbing). Best val / best test @ peak epoch:
+
+| dataset | edges | bip | best val | best test | peak ep | shape |
+|---|---|---|---|---|---|---|
+| GoogleLocal | 1.9M  | y | 0.1620 | 0.1367 | 12 | slow climber |
+| YouTube     | 3.3M  | n | 0.4760 | 0.4434 | 5  | clean climb (best result) |
+| Flickr      | 7.2M  | n | 0.3904 | 0.3822 | 1  | ep1 then COLLAPSED (see below) |
+| Patent      | 10.8M | n | 0.1502 | 0.1041 | 6  | slow climb, val/test diverge |
+| ML-20M      | 14.5M | y | 0.2036 | 0.1392 | 1  | genuine ep1 peak (Q=0.27, no structure) |
+| Yelp        | 19.8M | y | 0.2656 | 0.2550 | 3+ | still climbing when stopped (Q=0.81) |
+| WikiLink    | 34.2M | n | 0.2914 | 0.2950 | 1+ | one epoch, still climbing when stopped |
+
+Reads: YouTube is the standout (0.476/0.443, recurrence-heavy). GoogleLocal/Patent are hard structure-less
+floors (~0.15). commP sat at the null (x1.0) on nearly all — MRR is HEAD-driven, not community-driven, and
+E EXPANDS during the climb (Emean 0.77->0.82, Emax->0.98) without collapse (the pool-then-single-distance
+design tolerates expansion; the Flickr spread run peaked as Emax hit the boundary ~0.98).
+
+### ★ The Flickr grad-overshoot collapse (leaner pooler, no grad-clip)
+The dedicated Flickr spread run (FULL-SIZE d_time32/d_hop16) climbed cleanly, link loss falling every epoch:
+`ep1 .3926/.3854 (link 2.51) -> ep6 .4032/.3922 (link 2.28) peak`.
+The overnight Flickr run (LEANER d_time16/d_hop8) started IDENTICALLY then collapsed:
+`ep1 .3904/.3822 (link 2.524) -> ep2 0.2780 (link 2.533 ROSE) -> .2856 -> .2896`.
+Smoking gun: **link loss ROSE at ep2** (2.524->2.533) = a single-batch unbounded-gradient overshoot that
+wrecked E; val crashed 0.39->0.28 and only partially recovered. Same pattern the projection-norm sweep
+flagged (2026-05-28 grad-clip ablation): clip is load-bearing against exactly this spike.
+- Only config diff vs the climbing run: the leaner pooler (d_time/d_hop halved). The full-size NO-detach run
+  also climbed, so no-detach is NOT the cause. Leaner-pooler either is less stable or hit a stochastic
+  overshoot once — a re-run tells which.
+- **The overnight Flickr 0.39 is an artifact of an unclipped overshoot, NOT the head's real Flickr ceiling
+  (0.403).** FIX: add `clip_grad_norm_(max_norm=1.0)` (currently absent on this head) and re-run leaner-Flickr.
+
+### Caveats
+Single seed throughout. Yelp/WikiLink numbers are partial (stopped mid-climb, so their finals would be
+higher). The leaner-vs-full pooler and the collapse are one-run-each — not yet A/B'd with grad-clip.
