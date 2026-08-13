@@ -58,13 +58,14 @@ class BagWeights(nn.Module):
     """Per-token logits -> softmax over the bag. Inputs: fixed cos/sin age encoding + log1p(age/mnia),
     learned hop embedding, and the detached relative distance-to-centre."""
 
-    def __init__(self, mnia: float, max_hop: int, d_time: int = 32, d_hop: int = 16, hidden: int = 64):
+    def __init__(self, mnia: float, max_hop: int, d_time: int = 16, d_hop: int = 8):
         super().__init__()
         self.mnia = float(mnia)
         self.max_hop = int(max_hop)
         self.register_buffer("freqs", 1.0 / (10.0 ** torch.linspace(0.0, 3.0, d_time // 2)))
         self.hop_emb = nn.Embedding(self.max_hop, d_hop)
         d_feat = d_time + 1 + d_hop + 1
+        hidden = d_feat * 2
         self.net = nn.Sequential(nn.Linear(d_feat, hidden), nn.GELU(), nn.Linear(hidden, 1))
 
     @staticmethod
@@ -99,7 +100,7 @@ class LinkPredHead(nn.Module):
     other trained module."""
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float, max_walk_length: int,
-                 d_time: int = 32, d_hop: int = 16):
+                 d_time: int = 16, d_hop: int = 8):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
