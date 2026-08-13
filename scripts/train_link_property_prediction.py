@@ -72,6 +72,9 @@ def parse_args() -> argparse.Namespace:
     # Model. The monotone weighted-mean head has NO tunable hyperparameters and no head parameter at all —
     # the score is a fixed geometric distance aggregate; E is the only trained tensor.
     p.add_argument("--d-emb", default=64, type=int)
+    p.add_argument("--scorer", default="geodesic", choices=["geodesic", "cosine", "geo_cos"],
+                   help="Head scorer: geodesic (-d_H, baseline) | cosine (direction + per-node b_v) | "
+                        "geo_cos (-d_H + direction + b_v).")
 
     # Link loss / head.
     p.add_argument(
@@ -267,6 +270,7 @@ def main() -> Dict[str, Any]:
         mean_node_inter_arrival=float(stats.mean_node_inter_arrival),
 
         d_emb=args.d_emb,
+        scorer=args.scorer,
 
         K_train=args.k_train,
 

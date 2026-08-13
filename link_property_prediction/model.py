@@ -96,12 +96,22 @@ class LinkPredHead(nn.Module):
     """Centroid-to-centroid head with tangent-mean pooling. E is a ManifoldParameter; BagWeights is the only
     other trained module."""
 
-    def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float):
+    def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float, scorer: str = "geodesic"):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
+        self.scorer = str(scorer)                                              # geodesic | cosine | geo_cos
         self.geom = PoincareManifold()
         self.bag_weights = BagWeights(mean_node_inter_arrival)
+
+        # Angular-scoring extras (scorer in {cosine, geo_cos}). Decouple the relational signal (direction of
+        # the pooled tangent) from the popularity prior (radius, which the geodesic confounds): score the
+        # DIRECTION via cosine, and give popularity its own explicit per-node scalar b_v (init 0). cos is
+        # bounded [-1,1]; the learned scale lifts it to a usable logit range (init ~10; random directions in
+        # high-d start with cos std ~1/sqrt(d), so a scale is needed for early signal).
+        self.pop_bias = nn.Embedding(self.num_nodes, 1)
+        nn.init.zeros_(self.pop_bias.weight)
+        self.log_cos_scale = nn.Parameter(torch.log(torch.tensor(10.0)))
 
         # Spread init: geoopt random (std=1), not the near-origin wrapped normal. ManifoldParameter so
         # RiemannianAdam keeps E in the ball.
@@ -111,8 +121,9 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
-        """Bag -> one manifold point [Q, d]. Cold-bag guard falls back to the seed so an all -inf softmax row
-        can't go NaN."""
+        """Bag -> pooled TANGENT vector t [Q, d] (the origin-tangent weighted mean; expmap0(t) is the manifold
+        point, ||t|| its hyperbolic radius, t/||t|| its direction). Cold-bag guard falls back to the seed so an
+        all -inf softmax row can't go NaN."""
         nodes = tokens.nodes.clamp_min(0).clone()                               # [Q, T] padding(-1) -> 0
         valid = tokens.mask.clone()                                             # [Q, T] real slots (seed incl.)
         cold = ~valid.any(dim=-1)
@@ -122,13 +133,30 @@ class LinkPredHead(nn.Module):
 
         z = self.geom.logmap0(F.embedding(nodes, emb))                          # [Q, T, d]
         w = self.bag_weights(tokens, z, valid)                                  # [Q, T]
-        return self.geom.expmap0((w.unsqueeze(-1) * z).sum(dim=-2))             # [Q, d]
+        return (w.unsqueeze(-1) * z).sum(dim=-2)                                # [Q, d] pooled tangent
+
+    def score(self, t_u: torch.Tensor, t_v: torch.Tensor, v_nodes: torch.Tensor) -> torch.Tensor:
+        """t_u [B, d], t_v [B, C, d] pooled tangents, v_nodes [B, C] candidate node ids -> logits [B, C].
+        geodesic: -d_H(P_u, P_v)  (baseline, radius-confounded).
+        cosine:    scale*cos(t_u, t_v) + b_v   (direction only + explicit popularity; radius removed).
+        geo_cos:   -d_H + scale*cos + b_v       (keep geodesic, add explicit cosine; b_v frees radius)."""
+        s = t_u.new_zeros(t_v.shape[:-1])                                       # [B, C]
+        if self.scorer in ("geodesic", "geo_cos"):
+            p_u = self.geom.expmap0(t_u)
+            p_v = self.geom.expmap0(t_v)
+            s = s - self.geom.dist(p_u.unsqueeze(1), p_v)
+        if self.scorer in ("cosine", "geo_cos"):
+            cos = F.cosine_similarity(t_u.unsqueeze(1), t_v, dim=-1, eps=1e-6)  # [B, C]
+            s = s + torch.exp(self.log_cos_scale) * cos + self.pop_bias(v_nodes).squeeze(-1)
+        return s
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries (seeds u); cand = B*C candidate queries (seeds v), query-major. -> [B, C]."""
         emb = self.E.weight
-        p_u = self.pool(src_tokens, emb)                                        # [B, d]
-        p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
-        b, d = p_u.shape
-        p_v = p_v.view(b, p_v.shape[0] // b, d)                                 # [B, C, d]
-        return -self.geom.dist(p_u.unsqueeze(1), p_v)                           # [B, C] higher = closer
+        t_u = self.pool(src_tokens, emb)                                        # [B, d] tangent
+        t_v = self.pool(cand_tokens, emb)                                       # [B*C, d] tangent
+        b, d = t_u.shape
+        c = t_v.shape[0] // b
+        t_v = t_v.view(b, c, d)                                                 # [B, C, d]
+        v_nodes = cand_tokens.seeds.view(b, c)                                  # [B, C] candidate node ids
+        return self.score(t_u, t_v, v_nodes)                                    # [B, C] higher = closer

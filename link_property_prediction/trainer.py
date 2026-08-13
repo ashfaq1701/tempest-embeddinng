@@ -68,6 +68,7 @@ class TrainerConfig:
     # Model. The monotone weighted-mean head has NO tunable hyperparameters and NO head parameters at all —
     # the score is a fixed geometric aggregate of distances; E is the only trained tensor.
     d_emb: int = 64
+    scorer: str = "geodesic"    # geodesic (baseline -d_H) | cosine (dir + b_v) | geo_cos (-d_H + dir + b_v)
 
     # Link loss / head.
     K_train: int = 20           # per-query training negatives ([B, 1+K_train]); 20 keeps the candidate
@@ -112,6 +113,7 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             mean_node_inter_arrival=float(config.mean_node_inter_arrival),
+            scorer=str(config.scorer),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.
@@ -308,14 +310,11 @@ class Trainer:
                 self.walk_gen, self.device, cand_seeds, cand_cut, max_walk_len=self.config.max_walk_len,
                 num_walks_per_node=self.config.num_walks_per_node,
                 start_bias=self.config.start_bias, walk_bias=self.config.walk_bias)
-            P_u = self.model.pool(src_tokens, emb)                       # [B, d]
-            P_v = self.model.pool(cand_tokens, emb).view(B, C, -1)       # [B, C, d]
-            nu = P_u.norm(dim=-1).clamp(max=1.0 - 1e-5)                  # [B]
-            nv = P_v.norm(dim=-1).clamp(max=1.0 - 1e-5)                  # [B, C]
-            r_Pv = 2.0 * torch.atanh(nv)                                 # [B, C] hyperbolic radius
-            s = -self.model.geom.dist(P_u.unsqueeze(1), P_v)            # [B, C] full score (= model score)
-            cos = (P_u.unsqueeze(1) * P_v).sum(-1) / (nu.unsqueeze(1) * nv + eps)
-            logsin = torch.log(torch.sin(torch.acos(cos.clamp(-1 + 1e-6, 1 - 1e-6)) / 2) + eps)
+            t_u = self.model.pool(src_tokens, emb)                       # [B, d] pooled tangent
+            t_v = self.model.pool(cand_tokens, emb).view(B, C, -1)       # [B, C, d] pooled tangent
+            r_Pv = 2.0 * t_v.norm(dim=-1)                                # [B, C] hyperbolic radius (= 2||t||)
+            s = self.model.score(t_u, t_v, cand_t)                       # [B, C] the MODEL's actual score
+            cos = F.cosine_similarity(t_u.unsqueeze(1), t_v, dim=-1, eps=eps)  # [B, C] angular channel
 
             def rc(a, b):                                                # per-row Pearson corr -> [B]
                 a = a - a.mean(1, keepdim=True); b = b - b.mean(1, keepdim=True)
@@ -326,9 +325,9 @@ class Trainer:
                 return (1.0 / rank.float()).mean().item()
 
             out = dict(
-                radR2=float((rc(s, r_Pv) ** 2).mean()), angR2=float((rc(s, -logsin) ** 2).mean()),
+                radR2=float((rc(s, r_Pv) ** 2).mean()), angR2=float((rc(s, cos) ** 2).mean()),
                 corr=float(rc(s, r_Pv).mean()), gap=float(r_Pv[:, 0].mean() - r_Pv[:, 1:].mean()),
-                mrrF=mrr(s), mrrRad=mrr(-r_Pv), mrrAng=mrr(-logsin),
+                mrrF=mrr(s), mrrRad=mrr(-r_Pv), mrrAng=mrr(cos),
                 rPmean=float(r_Pv.mean()), rPmax=float(r_Pv.max()), degCorr=float("nan"), mrrDeg=float("nan"))
             if hasattr(self, "_node_degree"):
                 cand_deg = self._node_degree[cand_t].float()               # [B, C] train degree of candidates
