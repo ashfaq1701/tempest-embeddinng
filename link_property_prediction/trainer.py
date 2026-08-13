@@ -263,6 +263,80 @@ class Trainer:
         norms = e.norm(dim=-1)
         return {"unif": float(unif), "max_norm": float(norms.max()), "mean_norm": float(norms.mean())}
 
+    def _radial_probe(self, val_batches_factory, n_queries: int = 512, K: int = 100) -> Dict[str, float]:
+        """DIAGNOSTIC: decompose the per-query score on POOLED points into radial vs angular structure.
+
+        Fixes a set of val positives once; scores each against K uniform-random negatives (uniform, not the
+        official popularity-biased set, to isolate the GEOMETRIC confound). Reports, per query, averaged:
+          radR2  = corr(s, r_Pv)^2      — variance share explained by candidate pooled RADIUS alone
+          angR2  = corr(s, -logsin)^2   — variance share explained by the ANGULAR term alone
+          corr   = corr(s, r_Pv)        — sign: <0 means bigger radius -> lower score (the confound)
+          gap    = r_Pv[pos] - r_Pv[neg] mean — is the positive systematically at smaller pooled radius?
+          mrrF/mrrRad/mrrAng = MRR using the FULL score / -r_Pv only (u-INDEPENDENT) / -logsin only.
+        The decisive read: if mrrRad ~= mrrF, the model ranks by candidate radius (a popularity proxy),
+        not by the u-v relation. rP mean/max are the pooled radii (compare to |E| mean/max)."""
+        if not hasattr(self, "_diag_qs"):
+            srcs, tgts, tss, got = [], [], [], 0
+            for b in val_batches_factory():
+                srcs.append(np.asarray(b.src)); tgts.append(np.asarray(b.tgt)); tss.append(np.asarray(b.ts))
+                got += len(b.src)
+                if got >= n_queries:
+                    break
+            s = np.concatenate(srcs)[:n_queries].astype(np.int64)
+            t = np.concatenate(tgts)[:n_queries].astype(np.int64)
+            ts = np.concatenate(tss)[:n_queries].astype(np.int64)
+            rng = np.random.default_rng(1234)
+            negs = rng.choice(self.config.dst_pool, size=(len(s), K)).astype(np.int64)
+            self._diag_qs = (s, t, ts, negs)
+        src_np, tgt_np, ts_np, negs = self._diag_qs
+        B = len(src_np); C = 1 + negs.shape[1]
+        cand = np.concatenate([tgt_np[:, None], negs], axis=1)          # [B, C], positive at col 0
+        src_t = torch.from_numpy(src_np).to(self.device)
+        cand_t = torch.from_numpy(cand).to(self.device)
+        tq = torch.from_numpy(ts_np).to(self.device)
+        eps = 1e-6
+        self.model.eval()
+        with torch.no_grad():
+            emb = self.model.E.weight.detach()
+            src_tokens = build_query_walk_tokens(
+                self.walk_gen, self.device, src_t, tq, max_walk_len=self.config.max_walk_len,
+                num_walks_per_node=self.config.num_walks_per_node,
+                start_bias=self.config.start_bias, walk_bias=self.config.walk_bias)
+            cand_seeds = cand_t.reshape(-1)
+            cand_cut = tq.unsqueeze(1).expand(B, C).reshape(-1)
+            cand_tokens = build_query_walk_tokens(
+                self.walk_gen, self.device, cand_seeds, cand_cut, max_walk_len=self.config.max_walk_len,
+                num_walks_per_node=self.config.num_walks_per_node,
+                start_bias=self.config.start_bias, walk_bias=self.config.walk_bias)
+            P_u = self.model.pool(src_tokens, emb)                       # [B, d]
+            P_v = self.model.pool(cand_tokens, emb).view(B, C, -1)       # [B, C, d]
+            nu = P_u.norm(dim=-1).clamp(max=1.0 - 1e-5)                  # [B]
+            nv = P_v.norm(dim=-1).clamp(max=1.0 - 1e-5)                  # [B, C]
+            r_Pv = 2.0 * torch.atanh(nv)                                 # [B, C] hyperbolic radius
+            s = -self.model.geom.dist(P_u.unsqueeze(1), P_v)            # [B, C] full score (= model score)
+            cos = (P_u.unsqueeze(1) * P_v).sum(-1) / (nu.unsqueeze(1) * nv + eps)
+            logsin = torch.log(torch.sin(torch.acos(cos.clamp(-1 + 1e-6, 1 - 1e-6)) / 2) + eps)
+
+            def rc(a, b):                                                # per-row Pearson corr -> [B]
+                a = a - a.mean(1, keepdim=True); b = b - b.mean(1, keepdim=True)
+                return (a * b).sum(1) / (a.norm(dim=1) * b.norm(dim=1) + eps)
+
+            def mrr(score):                                             # positive at col 0, higher=better
+                rank = 1 + (score[:, 1:] > score[:, :1]).sum(1)
+                return (1.0 / rank.float()).mean().item()
+
+            out = dict(
+                radR2=float((rc(s, r_Pv) ** 2).mean()), angR2=float((rc(s, -logsin) ** 2).mean()),
+                corr=float(rc(s, r_Pv).mean()), gap=float(r_Pv[:, 0].mean() - r_Pv[:, 1:].mean()),
+                mrrF=mrr(s), mrrRad=mrr(-r_Pv), mrrAng=mrr(-logsin),
+                rPmean=float(r_Pv.mean()), rPmax=float(r_Pv.max()), degCorr=float("nan"), mrrDeg=float("nan"))
+            if hasattr(self, "_node_degree"):
+                cand_deg = self._node_degree[cand_t].float()               # [B, C] train degree of candidates
+                out["degCorr"] = float(rc(r_Pv, torch.log1p(cand_deg)).mean())  # r_Pv vs log-degree; <0 = radius encodes popularity
+                out["mrrDeg"] = mrr(cand_deg)                              # rank positive by RAW degree (pure popularity baseline, model-free)
+        self.model.train()
+        return out
+
     # ──────────────────────────────────────────────────────────────────
     # Eval — strict-causal, no_grad
     # ──────────────────────────────────────────────────────────────────
@@ -365,6 +439,11 @@ class Trainer:
             batches_per_epoch += 1
         self.comm_probe = CommunityProbe(
             np.concatenate(src_all), np.concatenate(dst_all), self.config.num_nodes)
+        # DIAGNOSTIC: per-node TRAIN degree (src+dst incidence) for the radial-probe degree check.
+        _deg = np.bincount(
+            np.concatenate([np.concatenate(src_all), np.concatenate(dst_all)]),
+            minlength=self.config.num_nodes).astype(np.float32)
+        self._node_degree = torch.from_numpy(_deg).to(self.device)
         print(f"  CommunityProbe: {self.comm_probe.n_comms} Louvain communities "
               f"(Q={self.comm_probe.q:.3f}); random-neighbour null purity={self.comm_probe.null:.3f}")
 
@@ -400,6 +479,14 @@ class Trainer:
             g = self._geometry_probe()
             line += (f"  align={align_sum / max(n_batches, 1):.3f}  unif={g['unif']:.3f}"
                      f"  |E|mean={g['mean_norm']:.3f}  |E|max={g['max_norm']:.3f}")
+
+            if val_batches_factory is not None:
+                rp = self._radial_probe(val_batches_factory)
+                line += (f"\n   [RADIAL radR2={rp['radR2']:.2f} angR2={rp['angR2']:.2f}"
+                         f" corr(s,r_Pv)={rp['corr']:+.2f} posNegGap={rp['gap']:+.3f}"
+                         f" | MRR full={rp['mrrF']:.3f} radiusOnly={rp['mrrRad']:.3f} angleOnly={rp['mrrAng']:.3f}"
+                         f" degBaseline={rp['mrrDeg']:.3f} corr(r_Pv,logdeg)={rp['degCorr']:+.2f}"
+                         f" | r_P mean/max={rp['rPmean']:.2f}/{rp['rPmax']:.2f}]")
 
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()
