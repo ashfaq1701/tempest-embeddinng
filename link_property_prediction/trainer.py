@@ -46,7 +46,6 @@ from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import LinkPredHead
 from .negatives import UniformNegativeSampler
-from .probes import CommunityProbe
 from .walk_tokens import build_query_walk_tokens
 from .walks import WalkGenerator
 
@@ -356,18 +355,6 @@ class Trainer:
         n_epochs = self.config.num_epochs
         patience = self.config.early_stop_patience
 
-        # One pass over the train batches: count them AND collect the full edge set (for the
-        # community probe's fixed Louvain graph — built once).
-        src_all, dst_all, batches_per_epoch = [], [], 0
-        for b in train_batches_factory():
-            src_all.append(np.asarray(b.src))
-            dst_all.append(np.asarray(b.tgt))
-            batches_per_epoch += 1
-        self.comm_probe = CommunityProbe(
-            np.concatenate(src_all), np.concatenate(dst_all), self.config.num_nodes)
-        print(f"  CommunityProbe: {self.comm_probe.n_comms} Louvain communities "
-              f"(Q={self.comm_probe.q:.3f}); random-neighbour null purity={self.comm_probe.null:.3f}")
-
         best_val, best_test, best_epoch = -1.0, -1.0, -1
         best_snap: Optional[Dict[str, Any]] = None
         no_improve = 0
@@ -392,8 +379,6 @@ class Trainer:
                 f"lr={self.opt.param_groups[0]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
-            cp = self.comm_probe.measure(self.model.E.weight.detach())     # community-formation probe
-            line += f"  commP={cp:.3f}(x{cp / max(self.comm_probe.null, 1e-9):.1f})"
 
             # Geometry watch: alignment (positive-pair distance) vs uniformity (spread), plus the boundary
             # radius. The head has no learnable channel mix — the score is a fixed weighted-mean aggregate.
