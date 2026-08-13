@@ -4,13 +4,15 @@ single point and the score is the geodesic between them:
 Pooling is the TANGENT MEAN at the origin, expmap0(sum_p w_p logmap0(x_p)) — not the gyro-midpoint, whose
 conformal reweighting 2/(1-||x||^2) would fight the learned weights as E moves.
 
-The weights are LEARNED, from three per-token signals: a fixed cos/sin encoding of age, a learned hop
-embedding, and the token's distance from its own bag's unweighted centre RELATIVE to the bag's mean such
-distance. The relative form is deliberate: raw distance-to-centre carries the bag's spread, which tracks node
-degree and would leak a popularity signal, whereas dividing by the bag mean removes the per-bag level exactly
-and leaves only within-bag outlier structure. The feature backprops into E (a second gradient path via the
-spread); an A/B against the detached form was a dead tie (Flickr peak val 0.403 / test 0.392 both), so the
-simpler non-detached form is kept."""
+The weights are LEARNED from three raw per-token scalars — recency -log1p(age/mnia), position -(pos-1), and
+the token's distance from its own bag's unweighted centre RELATIVE to the bag's mean such distance — with NO
+frequency encoding. The logit is a linear base w·[rec, pos, spr] plus a zero-init MLP correction, and w is
+init (1, 1, 0) so at step 0 the head is exactly the recency+position prior; training starts there and learns
+a smooth correction. Three smooth low-dim features plus prior-init avoid the random-init pooler instability
+that collapsed the encoded (cos/sin + hop-embedding) head. The relative form of the spread is deliberate: raw
+distance-to-centre carries the bag's spread, which tracks node degree and would leak a popularity signal,
+whereas dividing by the bag mean removes the per-bag level exactly and leaves only within-bag outlier
+structure. The spread is detached (no second gradient path into E); a detach-vs-not A/B was a dead tie."""
 from typing import Tuple
 
 import geoopt
@@ -55,18 +57,20 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """Per-token logits -> softmax over the bag. Inputs: fixed cos/sin age encoding + log1p(age/mnia),
-    learned hop embedding, and the detached relative distance-to-centre."""
+    """Per-token softmax weights from three raw scalars — recency, position, distance-to-centre — with no
+    frequency encoding. logit = w·[rec, pos, spr] + MLP([rec, pos, spr]); w is init (1, 1, 0) so at step 0
+    the head is exactly the recency+position prior and the MLP contributes nothing. Training starts at that
+    known-stable point and learns a smooth correction, avoiding the random-init pooler instability of the
+    encoded head."""
 
-    def __init__(self, mnia: float, max_hop: int, d_time: int = 16, d_hop: int = 8):
+    def __init__(self, mnia: float, hidden: int = 32):
         super().__init__()
         self.mnia = float(mnia)
-        self.max_hop = int(max_hop)
-        self.register_buffer("freqs", 1.0 / (10.0 ** torch.linspace(0.0, 3.0, d_time // 2)))
-        self.hop_emb = nn.Embedding(self.max_hop, d_hop)
-        d_feat = d_time + 1 + d_hop + 1
-        hidden = d_feat * 2
-        self.net = nn.Sequential(nn.Linear(d_feat, hidden), nn.GELU(), nn.Linear(hidden, 1))
+        # (recency, position, spread) base coefficients; init reproduces the recency+position prior, spread off.
+        self.w = nn.Parameter(torch.tensor([1.0, 1.0, 0.0]))
+        self.net = nn.Sequential(nn.Linear(3, hidden), nn.GELU(), nn.Linear(hidden, 1))
+        nn.init.zeros_(self.net[-1].weight)    # nonlinear correction starts at 0 -> logit == prior at step 0
+        nn.init.zeros_(self.net[-1].bias)
 
     @staticmethod
     def relative_spread(z: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
@@ -80,18 +84,11 @@ class BagWeights(nn.Module):
 
     def forward(self, tokens: WalkTokens, z: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """tokens, z [Q,T,d] tangent coords, valid [Q,T] -> w [Q,T] summing to 1 (0 on padding)."""
-        a = tokens.ages.clamp_min(0).float() / self.mnia                        # [Q, T]  seed = 0
-        hop_idx = tokens.positions.clamp_min(1).long().clamp_max(self.max_hop) - 1
-        ang = a.unsqueeze(-1) * self.freqs                                      # [Q, T, d_time/2]
-        rel = self.relative_spread(z, valid)                                    # [Q, T]
-        feat = torch.cat([
-            torch.cos(ang), torch.sin(ang),
-            torch.log1p(a).unsqueeze(-1),
-            self.hop_emb(hop_idx),
-            rel.unsqueeze(-1),
-        ], dim=-1).to(z.dtype)                                                  # [Q, T, d_feat]
-
-        logits = self.net(feat).squeeze(-1)                                     # [Q, T]
+        rec = -torch.log1p(tokens.ages.clamp_min(0).float() / self.mnia)        # [Q, T]  0 at seed (age 0)
+        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                    # [Q, T]  0 at seed, linear
+        spr = self.relative_spread(z.detach(), valid)                          # [Q, T]  detached
+        feat = torch.stack([rec, pos, spr], dim=-1).to(z.dtype)                # [Q, T, 3]
+        logits = (feat * self.w).sum(dim=-1) + self.net(feat).squeeze(-1)      # [Q, T]  base + correction
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T]
 
 
@@ -99,14 +96,12 @@ class LinkPredHead(nn.Module):
     """Centroid-to-centroid head with tangent-mean pooling. E is a ManifoldParameter; BagWeights is the only
     other trained module."""
 
-    def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float, max_walk_length: int,
-                 d_time: int = 16, d_hop: int = 8):
+    def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.geom = PoincareManifold()
-        # walk length counts the seed, so positions run 1..max_walk_length -> that IS the hop cardinality.
-        self.bag_weights = BagWeights(mean_node_inter_arrival, max_walk_length, d_time, d_hop)
+        self.bag_weights = BagWeights(mean_node_inter_arrival)
 
         # Spread init: geoopt random (std=1), not the near-origin wrapped normal. ManifoldParameter so
         # RiemannianAdam keeps E in the ball.

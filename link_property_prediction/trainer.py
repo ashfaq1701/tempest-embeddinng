@@ -82,10 +82,6 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
 
-    # Pooler feature dims (BagWeights): age cos/sin encoding width and hop-embedding width. Rarely tuned.
-    d_time: int = 16
-    d_hop: int = 8
-
     # Optimisation — CONSTANT lr (no schedule), ONE param group for everything. RiemannianAdam applies
     # the Riemannian update to E (a geoopt.ManifoldParameter) and standard Adam to the Euclidean head
     # params within the single group, so E and the head train at the same lr. NO weight decay: a wiki A/B
@@ -116,9 +112,6 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             mean_node_inter_arrival=float(config.mean_node_inter_arrival),
-            max_walk_length=int(config.max_walk_len),
-            d_time=int(config.d_time),
-            d_hop=int(config.d_hop),
         ).to(self.device)
 
         # One generator, configured QUERY-side; only the source side samples walks.
