@@ -8,8 +8,9 @@ The weights are LEARNED, from three per-token signals: a fixed cos/sin encoding 
 embedding, and the token's distance from its own bag's unweighted centre RELATIVE to the bag's mean such
 distance. The relative form is deliberate: raw distance-to-centre carries the bag's spread, which tracks node
 degree and would leak a popularity signal, whereas dividing by the bag mean removes the per-bag level exactly
-and leaves only within-bag outlier structure. That feature is detached, so it informs the weights without
-opening a second gradient path into E."""
+and leaves only within-bag outlier structure. The feature backprops into E (a second gradient path via the
+spread); an A/B against the detached form was a dead tie (Flickr peak val 0.403 / test 0.392 both), so the
+simpler non-detached form is kept."""
 from typing import Tuple
 
 import geoopt
@@ -81,7 +82,7 @@ class BagWeights(nn.Module):
         a = tokens.ages.clamp_min(0).float() / self.mnia                        # [Q, T]  seed = 0
         hop_idx = tokens.positions.clamp_min(1).long().clamp_max(self.max_hop) - 1
         ang = a.unsqueeze(-1) * self.freqs                                      # [Q, T, d_time/2]
-        rel = self.relative_spread(z.detach(), valid)                           # [Q, T]
+        rel = self.relative_spread(z, valid)                                    # [Q, T]
         feat = torch.cat([
             torch.cos(ang), torch.sin(ang),
             torch.log1p(a).unsqueeze(-1),
