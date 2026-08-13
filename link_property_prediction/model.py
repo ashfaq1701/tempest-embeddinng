@@ -4,11 +4,12 @@ radius-confounded (radius encodes a u-independent popularity prior); the explici
 cos(P_u, P_v) carries the relation and the per-node bias b_v carries popularity, so radius is freed and
 E stops expanding. (Diagnosis + A/B: see the diag/radial-confound and experiment/angular-scoring branches.)
 
-Pooling weights are learned from three per-token scalars: recency, position, and the token's geodesic
-distance from its bag's unweighted midpoint relative to the bag's mean such distance. The relative form is
-deliberate — raw distance-to-centre carries bag spread, which tracks node degree and would leak a popularity
-signal. The logit is a linear base w·[rec, pos, spr] plus a zero-init MLP correction, with w init (1, 1, 0),
-so step 0 is exactly the recency+position prior; a random-init pooler collapsed at ep2 where this does not."""
+Pooling weights are learned from four per-token scalars: recency, position, and the token's geodesic distance
+and cosine alignment relative to its bag's unweighted midpoint. Both centre features have the per-bag level
+removed — bag spread and mean alignment track node degree and would leak a popularity signal, so only
+within-bag structure survives. The logit is a linear base w·[rec, pos, spr, ang] plus a zero-init MLP
+correction, with w init (1, 1, 0, 0), so step 0 is exactly the recency+position prior; a random-init pooler
+collapsed at ep2 where this does not."""
 from typing import Tuple
 
 import geoopt
@@ -48,33 +49,37 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """logit = w·[rec, pos, spr] + MLP([rec, pos, spr]); w init (1, 1, 0) and the MLP zero-init, so step 0
-    reproduces the recency+position prior exactly."""
+    """logit = w·[rec, pos, spr, ang] + MLP([rec, pos, spr, ang]); w init (1, 1, 0, 0) and the MLP zero-init,
+    so step 0 reproduces the recency+position prior exactly."""
 
     def __init__(self, mnia: float, hidden: int = 32):
         super().__init__()
         self.mnia = float(mnia)
-        self.w = nn.Parameter(torch.tensor([1.0, 1.0, 0.0]))
-        self.net = nn.Sequential(nn.Linear(3, hidden), nn.GELU(), nn.Linear(hidden, 1))
+        self.w = nn.Parameter(torch.tensor([1.0, 1.0, 0.0, 0.0]))
+        self.net = nn.Sequential(nn.Linear(4, hidden), nn.GELU(), nn.Linear(hidden, 1))
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
     @staticmethod
-    def relative_spread(geom: PoincareManifold, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        """d(x_p, C) / mean_q d(x_q, C) over valid slots, C = unweighted midpoint -> [Q, T]."""
+    def centre_feats(geom: PoincareManifold, x: torch.Tensor,
+                     valid: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Token geometry relative to the bag's unweighted midpoint C, per-bag level removed from both:
+        spr = d(x_p, C) / mean_q d(x_q, C),  ang = cos(x_p, C) - mean_q cos(x_q, C).  Each -> [Q, T]."""
         vf = valid.to(x.dtype)
         n = vf.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        c = geom.midpoint(x, vf / n)
-        dc = geom.dist(c.unsqueeze(-2), x) * vf
-        return dc / (dc.sum(dim=-1, keepdim=True) / n).clamp_min(1e-6)
+        c = geom.midpoint(x, vf / n).unsqueeze(-2)                              # [Q, 1, d]
+        dc = geom.dist(c, x) * vf
+        spr = dc / (dc.sum(dim=-1, keepdim=True) / n).clamp_min(1e-6)
+        cs = F.cosine_similarity(c, x, dim=-1, eps=1e-6) * vf
+        return spr, (cs - cs.sum(dim=-1, keepdim=True) / n) * vf
 
     def forward(self, geom: PoincareManifold, tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
         rec = -torch.log1p(tokens.ages.clamp_min(0).float() / self.mnia)
         pos = -(tokens.positions.clamp_min(1).float() - 1.0)
-        spr = self.relative_spread(geom, x.detach(), valid)
-        feat = torch.stack([rec, pos, spr], dim=-1).to(x.dtype)                 # [Q, T, 3]
+        spr, ang = self.centre_feats(geom, x.detach(), valid)
+        feat = torch.stack([rec, pos, spr, ang], dim=-1).to(x.dtype)            # [Q, T, 4]
         logits = (feat * self.w).sum(dim=-1) + self.net(feat).squeeze(-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
@@ -89,10 +94,8 @@ class LinkPredHead(nn.Module):
         self.geom = PoincareManifold()
         self.bag_weights = BagWeights(mean_node_inter_arrival)
 
-        # geo_cos scoring extras: an explicit per-node popularity bias b_v (init 0) and a learned cosine
-        # scale (init ~10; ball-point directions in high-d start with cos std ~1/sqrt(d)). Decouple the
-        # popularity prior (which the geodesic smuggles through radius) into b_v, freeing radius, and add an
-        # explicit angular channel cos(P_u, P_v) on top of the geodesic.
+        # geo_cos scoring extras: a per-node popularity bias b_v (init 0) and a learned cosine scale
+        # (init ~10; ball-point directions in high-d start with cos std ~1/sqrt(d)).
         self.pop_bias = nn.Embedding(self.num_nodes, 1)
         nn.init.zeros_(self.pop_bias.weight)
         self.log_cos_scale = nn.Parameter(torch.log(torch.tensor(10.0)))
@@ -126,6 +129,6 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         v_nodes = cand_tokens.seeds.view(b, c)                                  # [B, C] candidate node ids
-        geo = -self.geom.dist(p_u.unsqueeze(1), p_v)                           # [B, C] geodesic
+        geo = -self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic
         cos = F.cosine_similarity(p_u.unsqueeze(1), p_v, dim=-1, eps=1e-6)      # [B, C] direction agreement
         return geo + torch.exp(self.log_cos_scale) * cos + self.pop_bias(v_nodes).squeeze(-1)
