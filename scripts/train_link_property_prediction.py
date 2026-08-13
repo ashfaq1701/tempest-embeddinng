@@ -111,6 +111,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--t2nv-q", default=0.25, type=float,
                    help="node2vec in-out param q (TemporalNode2Vec bias only). Lower q/p => "
                         "more outward exploration; p=4,q=0.25 = most diverse backward walks.")
+    # Pooler feature dims (BagWeights). Rarely tuned — the pooling weights barely change with these.
+    p.add_argument("--d-time", default=16, type=int,
+                   help="Width of the fixed cos/sin age encoding in the pooler. Rarely changed.")
+    p.add_argument("--d-hop", default=8, type=int,
+                   help="Hop-embedding width in the pooler. Rarely changed.")
 
 
     # Optimisation — RiemannianAdam at a CONSTANT lr (no schedule). ONE param group covers E
@@ -277,6 +282,8 @@ def main() -> Dict[str, Any]:
         start_bias=args.start_bias,
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
+        d_time=args.d_time,
+        d_hop=args.d_hop,
         lr=args.lr,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
