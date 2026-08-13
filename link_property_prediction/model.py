@@ -1,5 +1,8 @@
-"""Centroid-to-centroid head on the Poincaré ball:  s(u,v) = -d(P_u, P_v), where P_x is the weighted
-gyro-midpoint of x's walk-token bag (seeds included).
+"""Centroid-to-centroid head on the Poincaré ball:  s(u,v) = -d(P_u, P_v) + scale*cos(P_u, P_v) + b_v,
+where P_x is the weighted gyro-midpoint of x's walk-token bag (seeds included). The geodesic term is
+radius-confounded (radius encodes a u-independent popularity prior); the explicit angular channel
+cos(P_u, P_v) carries the relation and the per-node bias b_v carries popularity, so radius is freed and
+E stops expanding. (Diagnosis + A/B: see the diag/radial-confound and experiment/angular-scoring branches.)
 
 Pooling weights are learned from three per-token scalars: recency, position, and the token's geodesic
 distance from its bag's unweighted midpoint relative to the bag's mean such distance. The relative form is
@@ -86,6 +89,14 @@ class LinkPredHead(nn.Module):
         self.geom = PoincareManifold()
         self.bag_weights = BagWeights(mean_node_inter_arrival)
 
+        # geo_cos scoring extras: an explicit per-node popularity bias b_v (init 0) and a learned cosine
+        # scale (init ~10; ball-point directions in high-d start with cos std ~1/sqrt(d)). Decouple the
+        # popularity prior (which the geodesic smuggles through radius) into b_v, freeing radius, and add an
+        # explicit angular channel cos(P_u, P_v) on top of the geodesic.
+        self.pop_bias = nn.Embedding(self.num_nodes, 1)
+        nn.init.zeros_(self.pop_bias.weight)
+        self.log_cos_scale = nn.Parameter(torch.log(torch.tensor(10.0)))
+
         # spread init (geoopt random, std=1), not the near-origin wrapped normal
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
@@ -106,10 +117,15 @@ class LinkPredHead(nn.Module):
         return self.geom.midpoint(x, w)
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C]."""
+        """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
+        geo_cos score: -d_H(P_u, P_v) + scale*cos(P_u, P_v) + b_v."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
         b, d = p_u.shape
-        p_v = p_v.view(b, p_v.shape[0] // b, d)                                 # [B, C, d]
-        return -self.geom.dist(p_u.unsqueeze(1), p_v)                           # higher = closer
+        c = p_v.shape[0] // b
+        p_v = p_v.view(b, c, d)                                                 # [B, C, d]
+        v_nodes = cand_tokens.seeds.view(b, c)                                  # [B, C] candidate node ids
+        geo = -self.geom.dist(p_u.unsqueeze(1), p_v)                           # [B, C] geodesic
+        cos = F.cosine_similarity(p_u.unsqueeze(1), p_v, dim=-1, eps=1e-6)      # [B, C] direction agreement
+        return geo + torch.exp(self.log_cos_scale) * cos + self.pop_bias(v_nodes).squeeze(-1)
