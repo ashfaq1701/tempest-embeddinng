@@ -88,8 +88,8 @@ class TrainerConfig:
     lr: float = 1e-3
 
     # Run control.
-    num_epochs: int = 25
-    early_stop_patience: int = 10
+    num_epochs: int = 50
+    early_stop_patience: int = 3
 
     # System.
     seed: int = 42

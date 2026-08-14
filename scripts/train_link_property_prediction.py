@@ -131,8 +131,8 @@ def parse_args() -> argparse.Namespace:
              "coin/comment ~2000+. Default 200 fits review/coin/comment; "
              "wiki needs --eval-batch-size 25-50 explicitly.",
     )
-    p.add_argument("--num-epochs", default=25, type=int)
-    p.add_argument("--early-stop-patience", default=10, type=int)
+    p.add_argument("--num-epochs", default=50, type=int)
+    p.add_argument("--early-stop-patience", default=3, type=int)
 
     # System.
     p.add_argument("--seed", default=42, type=int)
