@@ -94,11 +94,13 @@ class LinkPredHead(nn.Module):
         self.geom = PoincareManifold()
         self.bag_weights = BagWeights(mean_node_inter_arrival)
 
-        # geo_cos scoring extras: a per-node popularity bias b_v (init 0) and a learned cosine scale
-        # (init ~10; ball-point directions in high-d start with cos std ~1/sqrt(d)).
+        # geo_cos scoring extras: a per-node popularity bias b_v (init 0) and a learned cosine scale.
+        # Init the scale at sqrt(d): cos of ball-point directions in d dims has std ~1/sqrt(d), so sqrt(d)*cos
+        # is O(1) and the angular channel starts on equal footing with the geodesic (which has O(1) spread).
+        # Self-calibrates with d (~11.3 at d=128) instead of a hardcoded 10; the param is learned from there.
         self.pop_bias = nn.Embedding(self.num_nodes, 1)
         nn.init.zeros_(self.pop_bias.weight)
-        self.log_cos_scale = nn.Parameter(torch.log(torch.tensor(10.0)))
+        self.log_cos_scale = nn.Parameter(torch.log(torch.tensor(float(self.d_emb) ** 0.5)))
 
         # spread init (geoopt random, std=1), not the near-origin wrapped normal
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
