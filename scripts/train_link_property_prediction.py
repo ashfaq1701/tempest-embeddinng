@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
 
     # Model. The monotone weighted-mean head has NO tunable hyperparameters and no head parameter at all —
     # the score is a fixed geometric distance aggregate; E is the only trained tensor.
-    p.add_argument("--d-emb", default=64, type=int)
+    p.add_argument("--d-emb", default=128, type=int)
 
     # Link loss / head.
     p.add_argument(
@@ -96,7 +96,7 @@ def parse_args() -> argparse.Namespace:
 
     # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked,
     # each bounded by the query's own cutoff.
-    p.add_argument("--num-walks-per-node", default=10, type=int,
+    p.add_argument("--num-walks-per-node", default=5, type=int,
                    help="K walks per query node (source and candidate alike).")
     p.add_argument("--max-walk-len", default=5, type=int,
                    help="L, max walk length. (Sweep on wiki: shorter is better — 20→5 gave "
@@ -114,7 +114,7 @@ def parse_args() -> argparse.Namespace:
 
     # Optimisation — RiemannianAdam at a CONSTANT lr (no schedule). ONE param group covers E
     # (a geoopt.ManifoldParameter, Riemannian update) and all Euclidean head params at the same lr.
-    p.add_argument("--lr", default=1e-4, type=float,
+    p.add_argument("--lr", default=1e-3, type=float,
                    help="Single LR for the whole model (E + head), one RiemannianAdam param group.")
     p.add_argument(
         "--batch-size", default=200, type=int,

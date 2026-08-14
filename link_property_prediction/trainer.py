@@ -66,7 +66,7 @@ class TrainerConfig:
 
     # Model. The monotone weighted-mean head has NO tunable hyperparameters and NO head parameters at all —
     # the score is a fixed geometric aggregate of distances; E is the only trained tensor.
-    d_emb: int = 64
+    d_emb: int = 128
 
     # Link loss / head.
     K_train: int = 20           # per-query training negatives ([B, 1+K_train]); 20 keeps the candidate
@@ -74,7 +74,7 @@ class TrainerConfig:
 
     # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked, each
     # bounded by the query's own cutoff t_i; both bags flow to the head.
-    num_walks_per_node: int = 10
+    num_walks_per_node: int = 5
     max_walk_len: int = 5
     walk_bias: str = "ExponentialWeight"
     start_bias: str = "ExponentialWeight"
@@ -85,7 +85,7 @@ class TrainerConfig:
     # the Riemannian update to E (a geoopt.ManifoldParameter) and standard Adam to the Euclidean head
     # params within the single group, so E and the head train at the same lr. NO weight decay: a wiki A/B
     # (with the boundary prior removed) showed no-wd lets E spread and beats wd 1e-4 on link MRR.
-    lr: float = 1e-4
+    lr: float = 1e-3
 
     # Run control.
     num_epochs: int = 25
