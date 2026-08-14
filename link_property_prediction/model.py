@@ -74,26 +74,34 @@ class BagWeights(nn.Module):
 class LinkPredHead(nn.Module):
     """E is a ManifoldParameter; BagWeights is the only other trained module."""
 
-    def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float):
+    def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float,
+                 init_irange: float = 1e-3):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.geom = PoincareManifold()
         self.bag_weights = BagWeights(mean_node_inter_arrival)
 
-        # geo_cos scoring extras: a per-node popularity bias b_v (init 0) and a learned cosine scale.
-        # Init the scale at sqrt(d): cos of ball-point directions in d dims has std ~1/sqrt(d), so sqrt(d)*cos
-        # is O(1) and the angular channel starts on equal footing with the geodesic (which has O(1) spread).
-        # Self-calibrates with d (~11.3 at d=128) instead of a hardcoded 10; the param is learned from there.
-        self.pop_bias = nn.Embedding(self.num_nodes, 1)
-        nn.init.zeros_(self.pop_bias.weight)
-        self.log_cos_scale = nn.Parameter(torch.log(torch.tensor(float(self.d_emb) ** 0.5)))
-
-        # spread init (geoopt random, std=1), not the near-origin wrapped normal
+        # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            init = self.geom.manifold.random(self.num_nodes, self.d_emb)
+            init = self.geom.manifold.projx(
+                (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
+
+        self.pop_bias = nn.Embedding(self.num_nodes, 1)
+        nn.init.zeros_(self.pop_bias.weight)
+        # Radius-aware cos scale: balance scale*cos against the geodesic's per-pair spread at init
+        # (sqrt(d) assumes O(1) geodesic spread, which is false near the origin).
+        self.log_cos_scale = nn.Parameter(torch.log(self.channel_scale(self.geom, init)))
+
+    @staticmethod
+    @torch.no_grad()
+    def channel_scale(geom: PoincareManifold, points: torch.Tensor, n_pairs: int = 4096) -> torch.Tensor:
+        """Scalar putting scale*cos on the same per-pair spread as the geodesic, measured on `points`."""
+        i, j = torch.randint(0, points.shape[0], (2, n_pairs), device=points.device)
+        return (geom.dist(points[i], points[j]).std()
+                / F.cosine_similarity(points[i], points[j], dim=-1).std().clamp_min(1e-8)).clamp_min(1e-8)
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> one manifold point [Q, d]."""
