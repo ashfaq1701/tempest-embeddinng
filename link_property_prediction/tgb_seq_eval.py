@@ -39,9 +39,19 @@ def load_tgb_seq(name: str, root: str = "datasets") -> Loaded:
     """Native TGB-Seq load → suite-agnostic `Loaded`. Splits come from the CSV's
     `split` column (0=train, 1=val, 2=test); the live `TGBSeqLoader` is kept on
     `Loaded.dataset` so the test evaluator can read its shipped negatives."""
+    import os
+
     from tgb_seq.LinkPred.dataloader import TGBSeqLoader
 
     ds = TGBSeqLoader(name=name, root=root)
+    # Self-heal a half-downloaded dataset. TGBSeqLoader auto-downloads only when the dataset dir or the
+    # edgelist CSV is missing; a MISSING test_ns raises a Warning it silently swallows (see its _load_file),
+    # then the run dies later at eval-setup. So check BOTH files and, if either is absent, trigger the
+    # loader's own download (fetches CSV + test_ns from HF, idempotent for files already present) and reload.
+    if not (os.path.exists(ds._edgelist_path) and os.path.exists(ds._test_ns_path)):
+        ds._download()
+        ds._load_file()
+
     src = np.asarray(ds.src_node_ids, dtype=np.int64)
     dst = np.asarray(ds.dst_node_ids, dtype=np.int64)
     ts = _to_int64_time(ds.node_interact_times)
