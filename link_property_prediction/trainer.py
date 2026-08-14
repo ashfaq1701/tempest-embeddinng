@@ -210,16 +210,6 @@ class Trainer:
         target = torch.zeros(B, dtype=torch.long, device=device)
         link_loss = F.cross_entropy(logits, target)
 
-        # ALIGNMENT half of the Wang-Isola (ICML'20) decomposition: the mean geodesic distance between the
-        # POSITIVE pair's embeddings. The head's score is monotone in the distances, so alignment/uniformity
-        # is now measurable on the ACTUAL scoring geometry rather than on a proxy — falling alignment with
-        # falling uniformity is the collapse signature, and it is the reason this is logged from day one.
-        with torch.no_grad():
-            e = self.model.E.weight
-            align = self.model.geom.pairwise_dist(
-                F.embedding(src_t, e).unsqueeze(-2),
-                F.embedding(cand_t[:, 0], e).unsqueeze(-2)).mean()
-
         # loss = link CE ONLY. E is trained end-to-end by the link CE through the monotone head (no detach).
         # No boundary penalty: an inward hyperbolic spring was tried and removed — on spread init it strangled
         # E's radius and capped MRR well below the unpenalised basin, and every boundary control (spring,
@@ -233,7 +223,6 @@ class Trainer:
 
         return {
             "link": float(link_loss.detach()),
-            "align": float(align),
             "lr": float(self.opt.param_groups[0]["lr"]),
         }
 
@@ -242,25 +231,12 @@ class Trainer:
     # ──────────────────────────────────────────────────────────────────
 
     @torch.no_grad()
-    def _geometry_probe(self, n_sample: int = 1024) -> Dict[str, float]:
-        """UNIFORMITY half of the Wang-Isola decomposition plus the boundary watch.
-
-          unif     = log mean exp(-d_H) over random OFF-DIAGONAL pairs of E. RISES toward 0 as E
-                     contracts — read it against the per-epoch `align`: both falling together is healthy
-                     (alignment without collapse); both rising is the over-clustering collapse.
-          max_norm = max ||E||. The uniformity pressure in this design pushes norms outward and the
-                     conformal factor blows up at 1; if this runs, CLAMP the ball radius rather than
-                     adding a penalty term (the old boundary prior over-compressed E).
-        """
-        e = self.model.E.weight.detach()
-        n = e.shape[0]
-        idx = torch.randperm(n, device=e.device)[:min(n_sample, n)]
-        x = e[idx]
-        d = self.model.geom.pairwise_dist(x, x)                     # [n, n]
-        off = ~torch.eye(x.shape[0], dtype=torch.bool, device=e.device)
-        unif = torch.logsumexp(-d[off], dim=0) - torch.log(off.sum().to(d.dtype))
-        norms = e.norm(dim=-1)
-        return {"unif": float(unif), "max_norm": float(norms.max()), "mean_norm": float(norms.mean())}
+    def _geometry_probe(self) -> Dict[str, float]:
+        """Boundary watch: mean/max Euclidean norm of E. This design's uniformity pressure pushes norms
+        outward and the conformal factor blows up at 1; report |E|mean ALONGSIDE |E|max so the bulk-vs-tail
+        split is explicit (the bulk can contract inward while a few nodes pin at the boundary)."""
+        norms = self.model.E.weight.detach().norm(dim=-1)
+        return {"max_norm": float(norms.max()), "mean_norm": float(norms.mean())}
 
     # ──────────────────────────────────────────────────────────────────
     # Eval — strict-causal, no_grad
@@ -365,11 +341,10 @@ class Trainer:
             self.model.train()
 
             t0 = time.time()
-            link_sum, align_sum, n_batches = 0.0, 0.0, 0
+            link_sum, n_batches = 0.0, 0
             for batch in train_batches_factory():
                 m = self._train_step(batch)
                 link_sum += m["link"]
-                align_sum += m["align"]
                 n_batches += 1
             train_dt = time.time() - t0
 
@@ -380,11 +355,9 @@ class Trainer:
                 f"train {train_dt:.1f}s"
             )
 
-            # Geometry watch: alignment (positive-pair distance) vs uniformity (spread), plus the boundary
-            # radius. The head has no learnable channel mix — the score is a fixed weighted-mean aggregate.
+            # Geometry watch: boundary radius (|E|mean vs |E|max — bulk vs tail).
             g = self._geometry_probe()
-            line += (f"  align={align_sum / max(n_batches, 1):.3f}  unif={g['unif']:.3f}"
-                     f"  |E|mean={g['mean_norm']:.3f}  |E|max={g['max_norm']:.3f}")
+            line += f"  |E|mean={g['mean_norm']:.3f}  |E|max={g['max_norm']:.3f}"
 
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()

@@ -19,9 +19,6 @@ import torch.nn.functional as F
 
 from .walk_tokens import WalkTokens
 
-_NORM_EPS = 1e-5
-_ACOSH_EPS = 1e-7
-
 
 class PoincareManifold:
     """Poincaré-ball geometry (c=1). `manifold` is kept for E's init + RiemannianAdam."""
@@ -36,16 +33,6 @@ class PoincareManifold:
     def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """Weighted gyro-midpoint: x [Q,T,d], w [Q,T] -> [Q,d]."""
         return self.manifold.weighted_midpoint(x, weights=w, reducedim=[-2], dim=-1, keepdim=False)
-
-    @staticmethod
-    def pairwise_dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """x [...,n,d], y [...,m,d] -> [...,n,m]. Not used by forward; kept for external probes."""
-        x2 = (x * x).sum(dim=-1).clamp(max=1.0 - _NORM_EPS)
-        y2 = (y * y).sum(dim=-1).clamp(max=1.0 - _NORM_EPS)
-        xy = torch.matmul(x, y.transpose(-1, -2))
-        sq = (x2.unsqueeze(-1) + y2.unsqueeze(-2) - 2.0 * xy).clamp_min(0.0)
-        denom = (1.0 - x2).unsqueeze(-1) * (1.0 - y2).unsqueeze(-2)
-        return torch.acosh((1.0 + 2.0 * sq / denom).clamp_min(1.0 + _ACOSH_EPS))
 
 
 class BagWeights(nn.Module):
