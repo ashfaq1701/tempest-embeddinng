@@ -12,8 +12,9 @@ InfoNCE contrastive loss + a separate BCE link head.
 > val/test lines do not appear until ~4 KB has accumulated — a backgrounded run
 > looks dead (empty log) for many minutes even while healthy. Set
 > `PYTHONUNBUFFERED=1` so epoch lines stream as they print and the log can be
-> tailed live. Example:
-> `PYTHONUNBUFFERED=1 nohup .venv/bin/python -u scripts/train_link_property_prediction.py ... > run.log 2>&1 &`
+> tailed live. Use the project venv interpreter explicitly (the bare `python`
+> on PATH is a bare pyenv with no numpy/torch and will fail on import). Example:
+> `PYTHONUNBUFFERED=1 nohup /its/home/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py ... > run.log 2>&1 &`
 
 > **Per-epoch log line — always report at least these three fields:**
 > - **val MRR** — the eval metric (what early-stopping / best-checkpoint selects on)
