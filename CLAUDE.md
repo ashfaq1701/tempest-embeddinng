@@ -1383,6 +1383,26 @@ fetches the missing test_ns from `TGB-Seq/<name>` on HF).
 
 ---
 
+## NEXT TASK — LR scheduling (planned; apply after all 1e-3 + 1e-4 evidence is in)
+
+Constant lr is not uniform across datasets: 1e-3 is too warm for some, 1e-4 too cold for those. Fixed/cosine
+schedules can't work — the optimal span (epochs-to-peak) differs per dataset and is unknown. **Reduce-LR-on-
+plateau is the one schedule needing no pre-known span** (adapts per dataset).
+
+**Plan:** start warm (1e-3); `ReduceLROnPlateau(monitor=val_mrr, mode=max, factor=0.1, patience≈1–2, min_lr)`;
+cascade 1e-3→1e-4→1e-5 to the true val tail. Set **early-stop patience > reduce patience** (e.g. stop 5,
+reduce 2) so it decays before it stops.
+
+**Rewind-to-best enhancement (the non-standard piece):** on each lr reduction, `_restore(best_snap)` BEFORE
+cutting lr. Post-peak dynamics DRIFT (E expands, train/val gradient pulls off the optimum), so decaying from
+the current point won't climb back — rewinding to best lets val exceed the old peak. `_snapshot`/`_restore`
+already exist but (a) restore only at END and (b) save model weights only — must wire restore into the reduce
+event and extend the snapshot to include RiemannianAdam moments (snapshot cost is negligible, <2s/run).
+Validate with plain ReduceLROnPlateau first; add rewind only if val DECAYS (not just flattens) after a
+reduction. NOTE: this maximizes VAL; the val≠test leaky-early-stop problem is separate.
+
+---
+
 ## TGB dataset stats: node counts + historical-negative % (2026-08-02)
 
 Per-dataset statistics for the four link-property datasets, computed directly from the
