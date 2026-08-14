@@ -1346,6 +1346,42 @@ full trace in `logs/OVERNIGHT_PAIR_FEATURES.md`.
 
 ---
 
+## TGB-Seq datasets — sizes, bipartite flags, run order + results (2026-08-14)
+
+The suite we target (link prediction, MRR on TGB-Seq's shipped TEST negatives). Ascending by edge count —
+run smallest→largest. **Taobao excluded** (manual Aliyun download, not on HuggingFace). **Bipartite**
+datasets (GoogleLocal, ML-20M, Yelp) need `--is-bipartite`. A bare `train_link_property_prediction.py
+--data-suite tgb-seq --dataset <name> --batch-size 1000 --eval-batch-size 1000 [--is-bipartite]
+--use-gpu --use-gpu-tempest` uses the mainline defaults below.
+
+| # | dataset | edges | bipartite | new recipe val / test | note |
+|---|---|---|---|---|---|
+| 1 | GoogleLocal | 1.91M | yes | 0.195 / 0.174 | converged (peak ep4) |
+| 2 | YouTube     | 3.29M | no  | 0.556 / 0.501 | test peaks ep4; val over-runs to 0.560 while test decays (val/test drift) |
+| 3 | Flickr      | 7.22M | no  | 0.617 / 0.575 | stopped mid-climb, NOT converged (would go higher) |
+| 4 | Patent      | 10.8M | no  | (running) | |
+| 5 | ML-20M      | 14.5M | yes | — | not yet run |
+| 6 | Yelp        | 19.8M | yes | — | not yet run |
+| 7 | WikiLink    | 34.2M | no  | — | not yet run |
+
+**Mainline defaults (master):** d_emb 128, lr 1e-3, num_walks_per_node 5, K_train 20, num_epochs 50,
+early_stop_patience 3, cos scale init √d. Head = geo_cos on the gyro-midpoint: `s = -d_H(P_u,P_v) +
+scale·cos(P_u,P_v) + b_v`, 4-scalar pooler.
+
+**Old config (d64/lr1e-4/wpn10) for reference:** GoogleLocal 0.162/0.137, YouTube 0.476/0.443, Flickr
+~0.39/0.38, Patent 0.150/0.104. The new recipe lifts every dataset run so far by ~+13–50% test.
+
+**Config lessons (Flickr + YouTube A/Bs):** lr 1e-3 ≫ lr 1e-4 (1e-4 freezes E, crawls). wpn 5 ≥ wpn 10
+(doubling walks: no gain, 1.5× cost, E runs to the boundary). K_train 10 ≈ 20 (tied on YouTube). On these
+CHRONOLOGICAL splits, **val is a leaky early-stop signal** — it keeps improving past the test peak while
+test decays with E-expansion, so val-selection over-runs the true (test) optimum by several epochs.
+
+**Dataset download:** TGBSeqLoader auto-downloads on a fresh dir; a half-downloaded dataset (CSV present,
+test_ns missing — an interrupted fetch) is self-healed by `load_tgb_seq`'s preflight (checks both files,
+fetches the missing test_ns from `TGB-Seq/<name>` on HF).
+
+---
+
 ## TGB dataset stats: node counts + historical-negative % (2026-08-02)
 
 Per-dataset statistics for the four link-property datasets, computed directly from the
