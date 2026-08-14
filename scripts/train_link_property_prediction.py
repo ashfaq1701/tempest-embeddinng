@@ -117,18 +117,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", default=1e-3, type=float,
                    help="Single LR for the whole model (E + head), one RiemannianAdam param group.")
     p.add_argument(
-        "--batch-size", default=200, type=int,
+        "--batch-size", default=1000, type=int,
         help="Train batch size. Under the per-query ranking link "
              "loss each batch does B*(1+K_train) link_head forwards.",
     )
     p.add_argument(
-        "--eval-batch-size", default=20, type=int,
+        "--eval-batch-size", default=1000, type=int,
         help="Batch size for val/test eval batches. The link head "
              "materialises tensors of shape [eval_batch_size, 1+K_eval, "
              "d_emb] where K_eval is TGB's per-positive negative count "
              "(wiki=999, review=100, coin=20, comment=20). Comfortable "
              "values at d_emb=128 on 8 GB: wiki ~25-50, review ~200-500, "
-             "coin/comment ~2000+. Default 200 fits review/coin/comment; "
+             "coin/comment ~2000+. Default 1000 fits review/coin/comment; "
              "wiki needs --eval-batch-size 25-50 explicitly.",
     )
     p.add_argument("--num-epochs", default=50, type=int)
