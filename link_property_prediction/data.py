@@ -1,9 +1,5 @@
-"""Suite-agnostic data structures + fixed-size (TGB-identical) batch iterator.
-
-Benchmark-specific loading lives in the suite modules (`tgb_eval.py`,
-`tgb_seq_eval.py`), each of which returns the `Loaded` defined here. This file
-only holds the shared containers (`SplitData`, `Batch`, `Loaded`) and the
-chronological batcher used by both training and eval on every suite."""
+"""Suite-agnostic data containers (`SplitData`, `Batch`, `Loaded`) and the fixed-size
+(TGB-identical) chronological batch iterator. Suite modules do the loading."""
 
 from typing import Iterator, NamedTuple, Optional
 
@@ -36,8 +32,8 @@ class Loaded(NamedTuple):
 
 
 def concat_splits(*splits: SplitData) -> SplitData:
-    """Concatenate splits into ONE SplitData — the full graph as a single set of arrays, for a
-    one-shot Tempest ingest. edge_feat is concatenated only when every split has it (else None)."""
+    """Concatenate splits into ONE SplitData for a one-shot ingest. edge_feat is
+    concatenated only when every split has it (else None)."""
     src = np.concatenate([s.sources for s in splits])
     dst = np.concatenate([s.destinations for s in splits])
     ts = np.concatenate([s.timestamps for s in splits])
@@ -47,27 +43,11 @@ def concat_splits(*splits: SplitData) -> SplitData:
 
 
 def create_batches(split: SplitData, batch_size: int) -> Iterator[Batch]:
-    """TGB-identical fixed-size chronological batches (train AND eval).
-
-    Consecutive fixed-size chunks of exactly `batch_size` events over the
-    already-time-sorted stream; timestamps are split freely across batch
-    boundaries — byte-for-byte the partition produced by
-    ``torch_geometric.TemporalDataLoader`` and by TPNet's
-    ``DataLoader(range(n), batch_size, shuffle=False, drop_last=False)``, which
-    every TGB leaderboard baseline uses, so our `batch_size` means exactly what
-    theirs does. The final partial batch is kept (drop_last=False) so every eval
-    positive is scored.
-
-    Strict-causality consequence (intentional — this is what the stateful TGB
-    baselines do): with timestamps now splittable, two edges sharing a timestamp
-    can land in different batches, so the later batch sees the earlier edge's
-    ingested graph state. Same-timestamp edges that land in
-    the SAME batch still don't inform each other (ingest is post-batch). Per-edge
-    quantities (t_query, the head's tok_age) are
-    computed element-wise from `batch.ts` and are unaffected. Eval MRR is
-    identical regardless of batching — TGB negatives are keyed per positive edge,
-    not per batch — only causal-state freshness changes.
-    """
+    """TGB-identical fixed-size chronological batches (train and eval): consecutive
+    `batch_size` chunks over the time-sorted stream. The final partial batch is kept
+    (drop_last=False). Timestamps split freely across boundaries, so same-timestamp
+    edges in different batches see each other's ingested state; within one batch they
+    don't (ingest is post-batch)."""
     n = int(split.sources.shape[0])
     for start in range(0, n, batch_size):
         yield _slice(split, start, min(start + batch_size, n))

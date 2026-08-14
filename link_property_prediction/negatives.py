@@ -1,19 +1,11 @@
 """Negative samplers.
 
-  - NegativeSampler         : the ABC (`sample(batch) → (neg_src, neg_tgt)`).
-  - UniformNegativeSampler  : random over a destination pool. Used for TRAINING
-                              on every suite, and reused to build TGB-Seq's fixed
-                              eval negatives one-shot (see tgb_seq_eval.py).
+  - NegativeSampler         : ABC (`sample(batch) → (neg_src, neg_tgt)`).
+  - UniformNegativeSampler  : random over a destination pool; used for training on
+                              every suite and to build TGB-Seq's fixed eval negatives.
 
-Eval-time, suite-native samplers live with their suite: TGB's per-positive
-pre-generated negatives are `TGBNegativeSampler` in `tgb_eval.py`; TGB-Seq's
-fixed negatives are served by `TGBSeqEvaluator` in `tgb_seq_eval.py`.
-
-The Historical (per-source reservoir + Vitter R) sampler was dropped:
-on recurrence-dominated datasets like tgbl-wiki it actively trained
-the model AGAINST the eval signal — most eval positives are nodes
-the source has previously interacted with, and historical negatives
-push E[u] away from exactly those.
+Eval-time suite-native samplers live in their suite modules (`tgb_eval.py`,
+`tgb_seq_eval.py`).
 """
 
 import abc
@@ -25,12 +17,8 @@ from .data import Batch
 
 
 class NegativeSampler(abc.ABC):
-    """All samplers expose `sample(batch) → (neg_src, neg_tgt)`.
-
-    `reset()` is called by the trainer at the start of every epoch.
-    Stateless samplers (everything we have now) rely on the no-op
-    default.
-    """
+    """All samplers expose `sample(batch) → (neg_src, neg_tgt)`. `reset()` is called
+    at the start of every epoch; stateless samplers use the no-op default."""
 
     @abc.abstractmethod
     def sample(self, batch: Batch):
@@ -41,13 +29,7 @@ class NegativeSampler(abc.ABC):
 
 
 class UniformNegativeSampler(NegativeSampler):
-    """Random destinations from a pool, keeping the positive's source.
-
-    `dst_pool` is required for bipartite datasets (tgbl-wiki / -review etc.)
-    so training negatives stay on the destination side of the bipartite —
-    sampling over the full node set would create the trivially easy task
-    of "is this node ever a destination?" and won't transfer to eval.
-    """
+    """Random destinations from `dst_pool`, keeping the positive's source."""
 
     def __init__(
         self,

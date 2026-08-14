@@ -1,17 +1,9 @@
-"""Strict-causal test-set MRR stratification — gated behind train.py's --stratify.
+"""Strict-causal test-set MRR stratification (gated behind train.py's --stratify).
 
-After a normal training run, this re-seeds the trainer's causal stores over
-train+val and RE-RUNS the strict-causal test eval (`Trainer._eval` via its optional
-`recorder` hook — no separate scoring loop), capturing per-positive reciprocal rank +
-causal metadata (endpoint-seen, pair ever-bit/count, source degree). It then writes
-stratum tables + headroom sizing to localize where the model's MRR is lost.
-
-The recorder uses DEDICATED analysis counters (a per-node degree array; a dedicated
-PairRecencyStore) seeded by the same update-only train+val pass that re-seeds the
-trainer's real stores, then updated AFTER each test batch — mirroring `_eval`'s
-strict-causal order exactly. Training is untouched; nothing here feeds gradients.
-
-Public entry point: ``run_stratification(...)``.
+Re-runs the strict-causal test eval via `Trainer._eval`'s `recorder` hook,
+capturing per-positive reciprocal rank + causal metadata (endpoint-seen, pair
+ever-bit/count, source degree), then writes stratum tables + headroom sizing.
+Training is untouched. Public entry point: ``run_stratification(...)``.
 """
 import json
 import pathlib
@@ -22,7 +14,7 @@ import torch
 
 from link_property_prediction.pair_store import PairRecencyStore
 
-# Published leaderboard refs, by dataset — only used to print a "gap" line.
+# Published leaderboard refs, by dataset — used only to print a "gap" line.
 LEADERBOARD_REF = {
     "tgbl-wiki": {"name": "TPNet", "test": 0.827, "val": 0.842},
 }
@@ -52,7 +44,7 @@ class TestStratRecorder:
         ts = np.asarray(batch.ts, np.int64)
         _, count_log = self.pair.query(
             torch.from_numpy(src), torch.from_numpy(tgt)[:, None], torch.from_numpy(ts))
-        ever = count_log > 0   # ever-seen ⟺ count>0 ⟺ log1p(count)>0 (PairRecencyStore dropped the ever bit)
+        ever = count_log > 0   # ever-seen ⟺ log1p(count) > 0
         self._m = {
             "u_deg": self.deg[src].copy(),
             "v_deg": self.deg[tgt].copy(),
@@ -220,18 +212,13 @@ seed {meta['seed']}, d_emb {meta['d_emb']}, train bs {meta['batch_size']}
 # ──────────────────────────────────────────────────────────────────────────
 def run_stratification(trainer, train_f, val_f, test_eval, test_f,
                        num_nodes, meta, out_dir="logs/stratify"):
-    """Seed the recorder's analysis stores over train+val, then run the stratified
-    strict-causal test eval and write tables. Returns (strata, headroom).
+    """Seed the recorder's analysis stores over train+val, run the stratified
+    strict-causal test eval, write tables. Returns (strata, headroom).
 
-    Call AFTER `trainer.train(...)` (which restores best-val weights). Tempest already holds the
-    full graph (ingested once up front), so this does NOT touch walk_gen — it only seeds the
-    recorder's OWN dedicated PairRecencyStore/degree counters (separate from Tempest) for the
-    new-pair/repeat-pair analysis; the per-query cutoff keeps the test walks causal.
+    Call AFTER `trainer.train(...)` (best-val weights restored). Seeds only the
+    recorder's OWN stores (separate from Tempest), not walk_gen.
     """
     print("\n=== Re-seeding train+val, then stratified test eval ===")
-    # Tempest already holds the FULL graph (ingested once in the training script); no re-ingest.
-    # Only the recorder's OWN analysis stores (separate from Tempest) need seeding over the
-    # causal-past splits — the per-query cutoff keeps the test walks causal against the full index.
     rec = TestStratRecorder(num_nodes)
     rec.reset()
     for fac in (train_f, val_f):

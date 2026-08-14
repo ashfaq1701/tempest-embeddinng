@@ -1,33 +1,12 @@
-"""Data-driven training-set statistics, computed once at data load.
+"""Immutable bundle of data-driven training-set constants, computed once at data load.
 
-Bundles every derived constant the loss / sampler / scheduling code
-needs into a single immutable object so the same numbers are computed
-in one place and consumed consistently downstream. Add new fields here
-when a new data-driven constant is needed; downstream code reads from
-the bundle by name and doesn't recompute from raw timestamps.
-
-Today's fields:
-    t_min                       — min training timestamp
-    t_max                       — max training timestamp
+Fields:
+    t_min, t_max                — min/max training timestamp
     T_train                     — span (t_max - t_min), > 0
     median_inter_arrival        — median Δt between consecutive events
-    mean_inter_arrival          — mean   Δt between consecutive events
-    mean_node_inter_arrival     — T_train*N/(2E): mean-field per-node inter-event
-                                  time (characteristic age scale). Over-estimates
-                                  on degree-skewed graphs.
-
-Recipe to add a new field:
-    1. Extend `TrainStats` dataclass with the new field.
-    2. Compute it inside `compute_train_stats()` from the timestamp
-       array (or, if it needs more than timestamps, change the
-       signature to take a `SplitData` and update callers).
-    3. Reference it by name from train.py / trainer.py.
-
-Why a dataclass instead of more loose function args:
-    - Adding a new constant only touches this file and its callers,
-      not every config layer in between.
-    - Read-only (`frozen=True`) prevents drift between "what was
-      derived once" and "what gets used downstream".
+    mean_inter_arrival          — mean Δt between consecutive events
+    mean_node_inter_arrival     — T_train*N/(2E): mean-field per-node inter-event time
+                                  (over-estimates on degree-skewed graphs)
 """
 
 from dataclasses import dataclass
@@ -52,12 +31,10 @@ def compute_train_stats(
     sources: np.ndarray,
     destinations: np.ndarray,
 ) -> TrainStats:
-    """Compute every derived constant from the training-split arrays
-    (`loaded.train.{timestamps,sources,destinations}`). Called once at data load.
+    """Compute every derived constant from the training-split arrays.
 
-    Inter-arrival statistics: Δt between sorted consecutive events,
-    excluding zero gaps (multiple events sharing a timestamp are
-    common in TGB datasets and would skew the central tendency).
+    Inter-arrival stats use Δt between sorted consecutive events, excluding zero gaps
+    (same-timestamp events are common and would skew the central tendency).
     """
     ts = np.asarray(timestamps).astype(np.int64)
     if ts.size == 0:
@@ -72,21 +49,15 @@ def compute_train_stats(
     gaps = np.diff(np.sort(ts))
     gaps = gaps[gaps > 0]
     if gaps.size == 0:
-        # Pathological: all events share one timestamp. Fall back to
-        # a tiny scale so downstream exp(-gap/scale) is well-defined.
+        # All events share one timestamp: fall back to a tiny scale.
         median_ia = 1.0
         mean_ia = 1.0
     else:
         median_ia = float(np.median(gaps))
         mean_ia = float(np.mean(gaps))
 
-    # Mean-field per-node inter-event time = T_train / avg-degree = T_train * N / (2E),
-    # where N = distinct nodes (as src or dst), E = edges (2E = total endpoint-events).
-    # The node-level counterpart of `mean_inter_arrival` (= mean_inter_arrival * N/2): a
-    # node fires ~N/2x less often than the graph as a whole, so its gaps are ~N/2x longer.
-    # This is the characteristic AGE scale a per-query walk sees. UNIFORM-DEGREE estimate —
-    # it OVER-estimates on degree-skewed graphs (coin/comment), where a few hyper-active
-    # nodes fire far more often than the average. Exact only when activity is even.
+    # Mean-field per-node inter-event time = T_train * N / (2E); N = distinct nodes,
+    # E = edges. Uniform-degree estimate — over-estimates on degree-skewed graphs.
     n_edges = int(ts.size)
     n_nodes = int(np.unique(np.concatenate([
         np.asarray(sources).ravel(), np.asarray(destinations).ravel()])).size)

@@ -1,15 +1,8 @@
-"""Centroid-to-centroid head on the Poincaré ball:  s(u,v) = -d(P_u, P_v) + scale*cos(P_u, P_v) + b_v,
-where P_x is the weighted gyro-midpoint of x's walk-token bag (seeds included). The geodesic term is
-radius-confounded (radius encodes a u-independent popularity prior); the explicit angular channel
-cos(P_u, P_v) carries the relation and the per-node bias b_v carries popularity, so radius is freed and
-E stops expanding. (Diagnosis + A/B: see the diag/radial-confound and experiment/angular-scoring branches.)
-
-Pooling weights are learned from four per-token scalars: recency, position, and the token's geodesic distance
-and cosine alignment relative to its bag's unweighted midpoint. Both centre features have the per-bag level
-removed — bag spread and mean alignment track node degree and would leak a popularity signal, so only
-within-bag structure survives. The logit is a linear base w·[rec, pos, spr, ang] plus a zero-init MLP
-correction, with w init (1, 1, 0, 0), so step 0 is exactly the recency+position prior; a random-init pooler
-collapsed at ep2 where this does not."""
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = -d(P_u, P_v) + scale*cos(P_u, P_v) + b_v,
+where P_x is the weighted gyro-midpoint of x's walk-token bag (seeds included). Pooling weights come from
+four per-token scalars (recency, position, and geodesic distance and cosine alignment to the bag's
+unweighted midpoint, both centre features with the per-bag level removed) via w·[rec, pos, spr, ang] plus a
+zero-init MLP correction, w init (1, 1, 0, 0)."""
 from typing import Tuple
 
 import geoopt
@@ -36,8 +29,7 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """logit = w·[rec, pos, spr, ang] + MLP([rec, pos, spr, ang]); w init (1, 1, 0, 0) and the MLP zero-init,
-    so step 0 reproduces the recency+position prior exactly."""
+    """logit = w·[rec, pos, spr, ang] + MLP([rec, pos, spr, ang]); w init (1, 1, 0, 0), MLP zero-init."""
 
     def __init__(self, mnia: float, hidden: int = 32):
         super().__init__()
@@ -91,8 +83,7 @@ class LinkPredHead(nn.Module):
 
         self.pop_bias = nn.Embedding(self.num_nodes, 1)
         nn.init.zeros_(self.pop_bias.weight)
-        # Radius-aware cos scale: balance scale*cos against the geodesic's per-pair spread at init
-        # (sqrt(d) assumes O(1) geodesic spread, which is false near the origin).
+        # cos scale init to the geodesic's per-pair spread at init.
         self.log_cos_scale = nn.Parameter(torch.log(self.channel_scale(self.geom, init)))
 
     @staticmethod

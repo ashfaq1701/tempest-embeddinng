@@ -1,18 +1,9 @@
-"""Reusable sparse streaming key->value store (pandas-backed, vectorized).
+"""Reusable sparse streaming int64 key->value store over a pandas ``Index`` hash table.
+Maps keys to named integer columns, each with its own batch-reducer (``max`` / ``min`` /
+``add`` / ``last``). Memory is O(#distinct keys); all ops vectorized over numpy arrays.
 
-A thin wrapper over a pandas ``Index`` hash table: maps int64 keys to one or more
-named integer value columns, each with its own batch-reducer (``max`` / ``min`` /
-``add`` / ``last``). Memory is O(#distinct keys) — sparse, never O(key-space) — so it
-scales from tens of thousands to tens of millions of keys without blowing up.
-
-This is the shared substrate for every pairwise/per-node streaming feature (the
-recurrence store keys on canonical node pairs; a degree store would key on nodes).
-It replaces the hand-written open-addressing hash table — pandas' C hash table does
-the probing, so there is no bespoke collision code to carry per feature.
-
-Lifecycle mirrors the Tempest walk graph: ``reset()`` per epoch, ``upsert()`` AFTER
-scoring a batch (strict-causal), ``get()`` at scoring time. Everything is vectorized
-over numpy arrays; nothing loops in Python over individual keys.
+Lifecycle: ``reset()`` per epoch, ``upsert()`` AFTER scoring a batch, ``get()`` at
+scoring time.
 """
 from typing import Dict, Tuple
 

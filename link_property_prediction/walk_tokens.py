@@ -1,6 +1,6 @@
-"""Per-query FLATTENED backward-walk tensors from Tempest. A query is a (seed, cutoff t) pair;
-`build_query_walk_tokens` runs K walks per query (each bounded by cutoff = t, strict causal past) and
-returns them already flattened to one [Q, T] bag per query (T = K·L). Requires shuffle_walk_order=False."""
+"""Per-query FLATTENED backward-walk tensors from Tempest. A query is a (seed,
+cutoff t) pair; K walks per query (each bounded by cutoff = t) are flattened to
+one [Q, T] bag (T = K·L). Requires shuffle_walk_order=False."""
 from dataclasses import dataclass
 from typing import Optional
 

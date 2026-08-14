@@ -1,18 +1,9 @@
-"""Streaming pairwise-interaction store (exact, strict-causal, sparse).
+"""Streaming exact per-undirected-pair last-interaction time and count, over a sparse
+:class:`SparseStreamStore` keyed on the canonical pair ``min(u,v)*N + max(u,v)``.
+Memory is O(#distinct pairs).
 
-Holds, for every UNDIRECTED node pair seen so far, the most recent interaction time
-and an interaction count — the exact ``A^(1)_{u,v}`` recurrence signal TPNet
-approximates with its random-feature Gram (``pair-feature-integration.md`` #1/#2).
-
-A thin feature-specific view over the reusable :class:`SparseStreamStore`: the key is
-the canonical pair ``min(u,v)*N + max(u,v)``; columns are ``last_ts`` (reduce=max) and
-``count`` (reduce=add). Memory is O(#distinct pairs), so it scales from tgbl-wiki
-(13 k pairs) to tgbl-comment (tens of millions) without the dense ``[N*N]`` blow-up.
-
-Lifecycle mirrors the Tempest walk graph: ``reset()`` per epoch, ``update()`` AFTER
-scoring a batch, ``query()`` at scoring time (pre-ingest state). Timestamps are
-monotone non-decreasing across chronological batches, so ``last_ts`` = amax is the
-last interaction time.
+Lifecycle: ``reset()`` per epoch, ``update()`` AFTER scoring a batch, ``query()`` at
+scoring time (pre-ingest state).
 """
 import numpy as np
 import torch
@@ -21,11 +12,8 @@ from .sparse_store import SparseStreamStore
 
 
 class PairRecencyStore:
-    """Streaming exact last-interaction time + count per undirected node pair.
-
-    Used ONLY by the stratification analysis (`stratify.py`) — there is no model pair
-    channel. stratify queries `count` to split test edges into repeat-pair (count>0) vs
-    new-pair (count==0) and localize where MRR is lost; the `pair_dt` return is vestigial."""
+    """Streaming exact last-interaction time + count per undirected node pair. Used only
+    by the stratification analysis (`stratify.py`); the `pair_dt` return is vestigial."""
 
     def __init__(self, num_nodes: int):
         self.N = int(num_nodes)
@@ -51,11 +39,10 @@ class PairRecencyStore:
 
     @torch.no_grad()
     def query(self, src: torch.Tensor, cand: torch.Tensor, t_query: torch.Tensor):
-        """src [B] long, cand [B, C] long, t_query [B] long ->
-        (pair_dt [B, C], pair_count_log [B, C]) on cand.device.
-          pair_dt        : RAW Δt_uv = t_query − t_last[(u,v)] (clamped ≥0; → ExpDecayBasis).
-                           NEVER-seen (count==0) ⇒ Δt = +inf (1e18) ⇒ φ → 0 (clean baseline).
-          pair_count_log : log1p(#(u,v) interactions) (0 for never-seen → no count term)."""
+        """src [B], cand [B, C], t_query [B] (long) -> (pair_dt [B, C], pair_count_log [B, C])
+        on cand.device.
+          pair_dt        : Δt_uv = t_query − t_last[(u,v)] (clamped ≥0); never-seen ⇒ 1e18.
+          pair_count_log : log1p(#(u,v) interactions) (0 for never-seen)."""
         device = cand.device
         B, C = cand.shape
         s = src.detach().to("cpu", torch.int64).numpy()

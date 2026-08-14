@@ -1,26 +1,8 @@
 """Embedding-table diagnostic analysis.
 
-Reads a dumped embedding table (.npy) and produces a quantitative
-report covering six tiers of behaviour we expect a well-trained
-temporal embedding to exhibit.
-
-Usage:
-    python scripts/analyze_embedding.py \
-        --emb-path logs/embeddings/tgbl-wiki_seed42_demb128_ep45.npy \
-        --dataset tgbl-wiki
-
-Tier overview:
-  Tier 1 — Basic geometry            (norms, intrinsic dim, isotropy)
-  Tier 2 — Pair-level closeness      (interaction, recency, count, per-anchor)
-  Tier 3 — Network-structural        (common neighbour, Jaccard, triangle)
-  Tier 4 — Strength gradient         (count quantile monotonicity, burstiness)
-  Tier 5 — Sanity / negatives        (far-pair asymptote, cold-start)
-  Tier 6 — Temporal probes           (per-anchor recency, time prediction)
-
-All metrics are computed on the L2-normalised embedding (cosine =
-inner product). For each test the report quotes a single quantitative
-summary plus a pass/fail/inconclusive interpretation against a
-configurable noise band.
+Reads a dumped embedding table (.npy) and reports six tiers of
+geometric/structural/temporal metrics. All metrics use the
+L2-normalised embedding (cosine = inner product).
 """
 
 import argparse
@@ -277,8 +259,7 @@ def tier2_pair_closeness(E_norm, G, n_sample, rng):
         pairs_l = list(pair_count.keys())
         counts = np.asarray([pair_count[p] for p in pairs_l])
         q = np.unique(np.percentile(counts, [25, 50, 75]))
-        # If counts are very degenerate (most pairs have count 1) the
-        # quartile cuts may collapse; we use unique cut points instead.
+        # Unique cut points, robust to degenerate quartiles.
         cuts = [0] + list(q) + [counts.max() + 1]
         cos_by_count = []
         labels = []
@@ -308,7 +289,6 @@ def tier2_pair_closeness(E_norm, G, n_sample, rng):
             [pair_last[(min(a, b), max(a, b))] for b in partners],
         )
         cos_vals = (E_norm[a] * E_norm[partners]).sum(axis=1)
-        # Spearman = Pearson on rank-transformed.
         if len(partners) < 2:
             continue
         from scipy.stats import spearmanr
@@ -389,8 +369,7 @@ def tier3_structural(E_norm, G, n_sample, rng):
         c_ab = float((E_norm[a] * E_norm[b]).sum())
         c_bc = float((E_norm[b] * E_norm[c]).sum())
         c_ac = float((E_norm[a] * E_norm[c]).sum())
-        # Passes if cos(a, c) is between random baseline (≈0) and the
-        # minimum of the direct edges.
+        # Pass if cos(a,c) in (0, min(cos(a,b), cos(b,c))].
         if 0.0 < c_ac < min(c_ab, c_bc) + 0.01:
             triangle_hits += 1
 
@@ -435,8 +414,7 @@ def tier4_strength(E_norm, G, n_sample, rng):
         bin_cos, bin_labels = [], []
         monotone = float("nan")
 
-    # (xii) Burstiness vs sustained, at matched total count.
-    # Define burstiness B(p) = std(times) / mean(times) for pairs with >= 4 ts.
+    # (xii) Burstiness vs sustained, over pairs with >= 4 timestamps.
     bursty_pairs, sustained_pairs = [], []
     for pair, ts_list in pair_times.items():
         if pair_count[pair] < 4:
@@ -515,12 +493,9 @@ def tier5_sanity(E_norm, G, n_sample, rng):
 
 
 def tier7_link_prediction(E_norm, G, loaded, n_test_edges, n_negs, rng):
-    """Raw-E link prediction signal (no LinkHead).
-
-    For each test edge (u, v⁺), sample K random negatives v⁻ from the
-    train destination pool and rank v⁺ against them by cos(E[u], E[·]).
-    Reports overall MRR, plus MRR stratified by target degree (cold-start
-    sensitivity) and by edge time (temporal robustness).
+    """Raw-E link prediction MRR (no LinkHead): rank each test target
+    against K random negatives by cos(E[u], E[·]); stratified by target
+    degree and edge time.
     """
     test = loaded.test
     src = np.asarray(test.sources, dtype=np.int64)

@@ -1,16 +1,8 @@
-"""TGB-Seq (`tgb_seq.LinkPred`) — native load, negatives, and metric.
+"""TGB-Seq (`tgb_seq.LinkPred`) — native load, negatives, and MRR metric.
 
-Everything TGB-Seq lives here and nothing else: the `TGBSeqLoader` (src/dst/
-time/split CSV), TGB-Seq's own batched-MRR `Evaluator`, and its shipped
-per-positive TEST negatives (`test_ns.npy`).
-
-Two suite-native decisions are encoded here:
-  * TGB-Seq ships TEST negatives but NO validation negatives, so the VAL set is
-    built ONCE from our `UniformNegativeSampler` at `k_eval` (fixed & seeded, so
-    eval is identical every epoch). TEST uses the shipped `test_ns` verbatim.
-  * TGB-Seq timestamps are float64; Tempest's per-query cutoff needs a monotone
-    int64, so `_to_int64_time` casts them (integral floats cast directly; the
-    rare non-integral case is order-preserving dense-ranked).
+VAL negatives are built once from `UniformNegativeSampler` at `k_eval` (fixed &
+seeded); TEST uses the shipped `test_ns` verbatim. Timestamps are cast to
+monotone int64 for Tempest's per-query cutoff.
 """
 from typing import List, Tuple
 
@@ -22,12 +14,8 @@ from .negatives import UniformNegativeSampler
 
 
 def _to_int64_time(time: np.ndarray) -> np.ndarray:
-    """Monotone int64 timestamps for Tempest cutoffs.
-
-    Integral floats (the common case — TGB-Seq times are typically unix seconds)
-    cast directly, preserving the true gaps the age features read. Non-integral
-    inputs fall back to an order-preserving dense rank (equal times → equal
-    ranks); this keeps cutoff ordering exact but flattens absolute gaps."""
+    """Monotone int64 timestamps for Tempest cutoffs. Integral floats cast
+    directly; non-integral inputs fall back to an order-preserving dense rank."""
     t = np.asarray(time)
     if np.isfinite(t).all() and np.array_equal(t, np.floor(t)):
         return t.astype(np.int64)
@@ -36,18 +24,15 @@ def _to_int64_time(time: np.ndarray) -> np.ndarray:
 
 
 def load_tgb_seq(name: str, root: str = "datasets") -> Loaded:
-    """Native TGB-Seq load → suite-agnostic `Loaded`. Splits come from the CSV's
-    `split` column (0=train, 1=val, 2=test); the live `TGBSeqLoader` is kept on
+    """Native TGB-Seq load → suite-agnostic `Loaded`. Splits from the CSV's
+    `split` column (0=train, 1=val, 2=test); live `TGBSeqLoader` kept on
     `Loaded.dataset` so the test evaluator can read its shipped negatives."""
     import os
 
     from tgb_seq.LinkPred.dataloader import TGBSeqLoader
 
     ds = TGBSeqLoader(name=name, root=root)
-    # Self-heal a half-downloaded dataset. TGBSeqLoader auto-downloads only when the dataset dir or the
-    # edgelist CSV is missing; a MISSING test_ns raises a Warning it silently swallows (see its _load_file),
-    # then the run dies later at eval-setup. So check BOTH files and, if either is absent, trigger the
-    # loader's own download (fetches CSV + test_ns from HF, idempotent for files already present) and reload.
+    # Self-heal a half-downloaded dataset: if either the edgelist CSV or test_ns is missing, re-download.
     if not (os.path.exists(ds._edgelist_path) and os.path.exists(ds._test_ns_path)):
         ds._download()
         ds._load_file()
@@ -80,9 +65,8 @@ def load_tgb_seq(name: str, root: str = "datasets") -> Loaded:
 
 def build_eval_negatives(split: SplitData, dst_pool: np.ndarray,
                          k_eval: int, seed: int) -> np.ndarray:
-    """One-shot fixed `[N_pos, k_eval]` negatives for a split, drawn once from
-    our `UniformNegativeSampler` over `dst_pool` (seeded → deterministic across
-    epochs). The whole split is one sampler call; row i are positive i's negs."""
+    """Fixed `[N_pos, k_eval]` negatives for a split, drawn once from
+    `UniformNegativeSampler` over `dst_pool` (seeded). Row i are positive i's negs."""
     sampler = UniformNegativeSampler(num_neg_per_pos=k_eval, dst_pool=dst_pool, seed=seed)
     whole = Batch(src=split.sources, tgt=split.destinations,
                   ts=split.timestamps, edge_feat=None)
@@ -91,13 +75,10 @@ def build_eval_negatives(split: SplitData, dst_pool: np.ndarray,
 
 
 class TGBSeqEvaluator(Evaluator):
-    """Fixed per-positive negatives (a `[N_pos, K]` array, row-aligned to the
-    split's chronological order) + TGB-Seq's native batched-MRR `Evaluator`.
-
-    Eval batches are contiguous chronological slices, so a cursor walks the
-    negative array in lockstep; `reset()` rewinds it at the start of each eval
-    pass so every epoch scores against the same negatives. (Split truncation is
-    a prefix, so a negatives array built over the full split stays aligned.)"""
+    """Fixed per-positive negatives (`[N_pos, K]`, row-aligned to the split's
+    chronological order) + TGB-Seq's native batched-MRR `Evaluator`. A cursor
+    walks the negative array in lockstep with contiguous eval batches; `reset()`
+    rewinds it at the start of each eval pass."""
 
     def __init__(self, neg_dst: np.ndarray):
         from tgb_seq.LinkPred.evaluator import Evaluator as TGBSeqOfficialEvaluator

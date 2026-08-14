@@ -1,37 +1,14 @@
-"""Per-query-causal training + eval loop — link-supervised MONOTONE metric head over walk bags.
+"""Per-query-causal training + eval loop with a monotone metric head over walk bags.
 
-Causality is enforced PER QUERY by Tempest's cutoff, not by ingestion order. The FULL graph
-(train + val + test) is ingested into Tempest ONCE up front (`ingest_full_graph`, a single
-`add_edges` call); there is no per-epoch reset and no per-batch ingestion. Per-batch ordering
-(training):
-  1. neg = neg_sampler.sample(batch)                 — [B, K_train] uniform negs
-  2. candidates = [pos | negs]                       — [B, 1+K_train]
-  3. logits = score(src, candidates)                 — TWO-SIDED: K backward walks are sampled for
-       the source u AND for every candidate v, each bounded by the query's own cutoff t_i; both
-       token bags go to LinkPredHead, which returns the negated monotone distance aggregate.
-  4. L = cross_entropy(logits, target=0)             — Bruch 2019, upper-bounds 1-MRR
-  5. one backward + single optimizer step
+The full graph (train + val + test) is ingested into Tempest once up front; causality is enforced
+per query by the walk cutoff, not by ingestion order. A walk for (u, t) uses cutoff = t, which is
+EXCLUSIVE: it traverses only edges with t_edge < t, so the target edge at t and any
+simultaneous/future edge are never seen. TGB splits are chronological (train < val < test).
 
-Why one full graph is valid (and == TPNet): a walk for (u, t) with cutoff = t traverses only
-edges with t_edge < t (EXCLUSIVE), so the target edge at t — and any simultaneous/future edge —
-is never seen. Because the TGB splits are chronological (train < val < test), a TRAIN query at
-time t sees only edges before t: every val/test edge is later and the cutoff excludes it, so
-training is causally identical to having ingested train-only. VAL sees train + earlier val; TEST
-sees everything before t. This is exactly TPNet's prebuilt-time-index queried strictly-before-t
-per edge. The analysis-only stores (stratify) have no cutoff, so they are seeded explicitly over
-the causal-past splits.
-
-E (in the Poincare ball) and the head's channel weights are trained TOGETHER by the link CE, with
-NO detach and no auxiliary loss. That is safe here precisely because the score is monotone in the
-geodesic distances (every channel weight is a softplus, hence >= 0): the pull direction into E is
-fixed by construction rather than learned, so there is no readout the head can reshape instead of
-moving E. Intra-bag / cross-bag loss rows are the NEXT step and are not present yet.
-
-TOKEN PREP — both sides go through `walk_tokens.build_query_walk_tokens`: walks are generated PER
-QUERY (no dedup — each row's (node, t) needs its own cutoff) and returned ALREADY FLATTENED into a
-[Q, T] WalkTokens bag (T = K*L). The head reads the flat fields directly, drops every slot whose
-node is the bag's own seed, and softmaxes the fixed -(log1p(age) + log1p(hop-1)) recency/hop prior
-over what remains.
+Training per batch: sample K_train uniform negatives, form candidates [pos | negs], score them
+TWO-SIDED (walks for the source u and for every candidate v, each cut off at the query time t_i),
+then cross-entropy with target 0 and a single optimizer step. E and the head train together under
+the link CE with no detach.
 """
 import time
 from dataclasses import dataclass
@@ -56,35 +33,27 @@ class TrainerConfig:
     num_nodes: int
     dst_pool: np.ndarray
 
-    # Frozen train-split span. Sets the log-spaced init of the μ recency λ (init ≈ 10/t_train).
-    # Init only — never a per-step scaler.
+    # Train-split span; sets the init of the recency scale.
     t_train: float = 1.0
 
-    # data_stats mean-field per-node inter-event time T_train*N/(2E) — the characteristic AGE scale a
-    # walk sees; used to scale-normalise the pooling recency weight (log1p(age / mean_node_inter_arrival)).
+    # Mean-field per-node inter-event time; AGE scale for the pooling recency weight.
     mean_node_inter_arrival: float = 1.0
 
-    # Model. The monotone weighted-mean head has NO tunable hyperparameters and NO head parameters at all —
-    # the score is a fixed geometric aggregate of distances; E is the only trained tensor.
+    # Embedding dimension.
     d_emb: int = 128
 
-    # Link loss / head.
-    K_train: int = 20           # per-query training negatives ([B, 1+K_train]); 20 keeps the candidate
-                                # bag small enough to fit bs 1000 on review
+    # Per-query training negatives ([B, 1+K_train]).
+    K_train: int = 20
 
-    # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked, each
-    # bounded by the query's own cutoff t_i; both bags flow to the head.
+    # Walks: BACKWARD only, undirected; two-sided (source and every candidate).
     num_walks_per_node: int = 5
     max_walk_len: int = 5
     walk_bias: str = "ExponentialWeight"
     start_bias: str = "ExponentialWeight"
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
-    t2nv_q: float = 0.25   # node2vec in-out param; low q/p = most diverse backward walks
+    t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Optimisation — CONSTANT lr (no schedule), ONE param group for everything. RiemannianAdam applies
-    # the Riemannian update to E (a geoopt.ManifoldParameter) and standard Adam to the Euclidean head
-    # params within the single group, so E and the head train at the same lr. NO weight decay: a wiki A/B
-    # (with the boundary prior removed) showed no-wd lets E spread and beats wd 1e-4 on link MRR.
+    # Constant lr, one RiemannianAdam param group, no weight decay.
     lr: float = 1e-3
 
     # Run control.
@@ -103,17 +72,13 @@ class Trainer:
         self.device = device or torch.device(
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
-        # Single module owning the Poincare-ball node embeddings AND the monotone metric score. There is
-        # no scorer MLP and no feature channel: the score is -(d_id + weighted-mean bag distance over the
-        # two walk bags), so node / edge features have nowhere to enter yet (they return later as a
-        # modulation of the per-slot pooling weights, which preserves monotonicity).
+        # Owns the Poincare-ball node embeddings and the monotone metric score.
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             mean_node_inter_arrival=float(config.mean_node_inter_arrival),
         ).to(self.device)
 
-        # One generator, configured QUERY-side; only the source side samples walks.
         self.walk_gen = WalkGenerator(
             use_gpu=config.use_gpu_tempest,
             walk_bias=config.walk_bias,
@@ -127,45 +92,32 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # ONE param group at a single lr: RiemannianAdam gives E (the geoopt.ManifoldParameter) the
-        # Riemannian update and the head's Euclidean params standard Adam, all under the same lr.
+        # One param group at a single lr: Riemannian update for E, standard Adam for the head.
         self.opt = geoopt.optim.RiemannianAdam(
             self.model.parameters(), lr=float(config.lr), stabilize=10,
         )
 
-    # ──────────────────────────────────────────────────────────────────
     # Full-graph ingestion (once, up front)
-    # ──────────────────────────────────────────────────────────────────
 
     def ingest_full_graph(self, src: np.ndarray, tgt: np.ndarray, ts: np.ndarray,
                           edge_feat: Optional[np.ndarray] = None) -> None:
-        """Ingest the ENTIRE graph (all splits, concatenated) into Tempest in ONE add_edges call.
-        The per-query cutoff (t_edge < t_query, EXCLUSIVE) then enforces causality: a train query at
-        t sees only edges before t — every val/test edge is chronologically later (TGB splits are
-        causal: train < val < test), so the cutoff excludes it; val sees train + earlier val; test
-        sees everything before t. Call once before train()/eval; there is no per-epoch reset and no
-        per-batch ingestion. Capacity is unbounded — the whole timeline must stay resident."""
+        """Ingest the entire graph (all splits) into Tempest in one add_edges call, once before
+        train()/eval. The per-query cutoff (t_edge < t_query, EXCLUSIVE) enforces causality.
+        Capacity is unbounded."""
         self.walk_gen.add_edges(src, tgt, ts, edge_feat)
         print(f"  Ingested full graph into Tempest: {len(src):,} edges "
               f"(once; per-query cutoff enforces causality)")
 
-    # ──────────────────────────────────────────────────────────────────
     # Scoring — shared by train + eval
-    # ──────────────────────────────────────────────────────────────────
 
     def _score(self, src_t: torch.Tensor, cand_t: torch.Tensor,
                t_query_t: torch.Tensor):
-        """src_t [B] long, cand_t [B, C] long, t_query_t [B] long -> logits [B, C]. The head consumes the
-        two walk bags internally; only the logits are returned.
-
-        TWO-SIDED per-query walks: the SOURCE side samples K backward walks for each query (u_i, t_i)
-        with cutoff = t_i; the CANDIDATE side samples K backward walks for every candidate v_ij with the
-        SAME cutoff t_i (so both sides are causal as of the query time). Both bags flow to the head.
-        Cost: the candidate side is C walk queries per positive, i.e. ~C× the source walks. This is
-        already the dominant per-batch cost, and it scales with K_train, NOT with two-sidedness."""
+        """src_t [B], cand_t [B, C], t_query_t [B] (all long) -> logits [B, C]. Two-sided per-query
+        walks: K backward walks for the source and for every candidate, each cut off at t_i. Both
+        bags go to the head; only the logits are returned."""
         device = self.device
 
-        # SOURCE side: per-query (u_i, t_i) → K cutoff=t_i backward walks → raw [B,K,L] token bag.
+        # Source side: K backward walks for each query (u_i, t_i), cutoff = t_i.
         src_tokens = build_query_walk_tokens(
             self.walk_gen, device, src_t, t_query_t,
             max_walk_len=self.config.max_walk_len,
@@ -173,8 +125,8 @@ class Trainer:
             start_bias=self.config.start_bias,
             walk_bias=self.config.walk_bias)
 
-        # CANDIDATE side: walk every candidate v with its query's cutoff t_i. Flatten [B,C] → [B*C]
-        # query-major; each candidate inherits its query's cutoff so its walk is causal.
+        # Candidate side: walk every candidate v with its query's cutoff t_i. Flatten [B,C] → [B*C]
+        # query-major; each candidate inherits its query's cutoff.
         b, c = cand_t.shape
         cand_seeds = cand_t.reshape(-1)                                  # [B*C]
         cand_cutoffs = t_query_t.unsqueeze(1).expand(b, c).reshape(-1)   # [B*C]
@@ -187,17 +139,13 @@ class Trainer:
 
         return self.model(src_tokens, cand_tokens)
 
-    # ──────────────────────────────────────────────────────────────────
     # Per-batch training step
-    # ──────────────────────────────────────────────────────────────────
 
     def _train_step(self, batch: Batch) -> Dict[str, float]:
         device = self.device
         B = len(batch.src)
 
-        # No ingestion here: the full graph is already in Tempest (ingest_full_graph, once).
-        # Each query (u, t) walks with cutoff = t (EXCLUSIVE), so it only traverses edges with
-        # t_edge < t — every val/test edge is chronologically later and is never seen.
+        # Full graph already ingested; each query walks with cutoff = t (EXCLUSIVE).
         _, neg_tgt = self.neg_sampler_train.sample(batch)              # [B, K_train]
         src_t = torch.from_numpy(batch.src.astype(np.int64)).to(device)
         cand_np = np.concatenate(
@@ -210,11 +158,7 @@ class Trainer:
         target = torch.zeros(B, dtype=torch.long, device=device)
         link_loss = F.cross_entropy(logits, target)
 
-        # loss = link CE ONLY. E is trained end-to-end by the link CE through the monotone head (no detach).
-        # No boundary penalty: an inward hyperbolic spring was tried and removed — on spread init it strangled
-        # E's radius and capped MRR well below the unpenalised basin, and every boundary control (spring,
-        # projection cap, learnable curvature) failed to stop the fast-lr collapse anyway. The radius is left
-        # to the optimiser; |E|mean / |E|max are still logged as the geometry watch.
+        # loss = link CE only; E trained end-to-end through the monotone head (no detach).
         loss = link_loss
 
         self.opt.zero_grad(set_to_none=True)
@@ -226,28 +170,21 @@ class Trainer:
             "lr": float(self.opt.param_groups[0]["lr"]),
         }
 
-    # ──────────────────────────────────────────────────────────────────
-    # Geometry probe — the collapse / blow-up watch
-    # ──────────────────────────────────────────────────────────────────
+    # Geometry probe
 
     @torch.no_grad()
     def _geometry_probe(self) -> Dict[str, float]:
-        """Boundary watch: mean/max Euclidean norm of E. This design's uniformity pressure pushes norms
-        outward and the conformal factor blows up at 1; report |E|mean ALONGSIDE |E|max so the bulk-vs-tail
-        split is explicit (the bulk can contract inward while a few nodes pin at the boundary)."""
+        """Boundary watch: mean and max Euclidean norm of E (bulk vs tail radius)."""
         norms = self.model.E.weight.detach().norm(dim=-1)
         return {"max_norm": float(norms.max()), "mean_norm": float(norms.mean())}
 
-    # ──────────────────────────────────────────────────────────────────
     # Eval — strict-causal, no_grad
-    # ──────────────────────────────────────────────────────────────────
 
     def _eval(self, evaluator: Evaluator, batches: Iterable[Batch],
               recorder: Any = None) -> float:
         self.model.eval()
-        # Rewind any fixed-negative cursor (TGB-Seq) so every pass scores against
-        # the same negatives in split order; a no-op for content-addressed
-        # samplers (TGB). Must precede the first sample_negatives call.
+        # Rewind any fixed-negative cursor (TGB-Seq); no-op for content-addressed samplers (TGB).
+        # Must precede the first sample_negatives call.
         evaluator.reset()
         total, n = 0.0, 0
         with torch.no_grad():
@@ -256,9 +193,7 @@ class Trainer:
                 if recorder is not None:
                     recorder.before_batch(batch)
 
-                # No ingestion: the full graph (incl. val/test) is already in Tempest. The
-                # per-query cutoff keeps every walk causal (t_edge < t_query), so future eval
-                # edges in the index never leak.
+                # Full graph already in Tempest; per-query cutoff keeps every walk causal.
                 if B == 0:
                     if recorder is not None:
                         recorder.after_batch(batch)
@@ -292,9 +227,7 @@ class Trainer:
                     recorder.after_batch(batch)
         return total / max(n, 1)
 
-    # ──────────────────────────────────────────────────────────────────
     # Snapshot / restore (early-stop)
-    # ──────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _cpu_state_dict(module: torch.nn.Module) -> Dict[str, torch.Tensor]:
@@ -308,9 +241,7 @@ class Trainer:
     def _restore(self, snap: Dict[str, Any]) -> None:
         self.model.load_state_dict(snap["model"])
 
-    # ──────────────────────────────────────────────────────────────────
     # Train loop
-    # ──────────────────────────────────────────────────────────────────
 
     def train(
         self,
@@ -321,9 +252,7 @@ class Trainer:
         test_evaluator: Optional[Evaluator] = None,
         test_batches_factory=None,
     ) -> Dict[str, Any]:
-        # Ingest the FULL graph (train + val + test) into Tempest ONCE, up front. Per-query cutoffs
-        # then keep every walk causal (TGB splits are chronological: train < val < test), so there is
-        # no per-epoch reset and no per-batch ingestion.
+        # Ingest the full graph (train + val + test) into Tempest once, up front.
         self.ingest_full_graph(
             full_graph.sources, full_graph.destinations,
             full_graph.timestamps, full_graph.edge_feat)
@@ -355,7 +284,7 @@ class Trainer:
                 f"train {train_dt:.1f}s"
             )
 
-            # Geometry watch: boundary radius (|E|mean vs |E|max — bulk vs tail).
+            # Geometry watch: boundary radius (|E|mean vs |E|max).
             g = self._geometry_probe()
             line += f"  |E|mean={g['mean_norm']:.3f}  |E|max={g['max_norm']:.3f}"
 

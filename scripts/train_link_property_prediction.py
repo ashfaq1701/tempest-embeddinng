@@ -1,27 +1,6 @@
 """CLI entry point for tempest-embedding training.
 
-Single-binary training script. Loads a TGB dataset via data.py,
-constructs a Trainer, runs training, prints results. No experiment-
-management logic — for parameter sweeps, invoke this script
-repeatedly with different CLI args.
-
-Hyperparameters exposed at CLI (and their grouping):
-  Dataset:        --dataset, --tgb-root
-  Model:          --d-emb
-  Link/head:      --k-train
-  Walks:          --num-walks-per-node, --max-walk-len, --walk-bias, --start-bias
-                  (backward-only, undirected; BOTH sides walked under the query's cutoff)
-  Optimisation:   --lr, --batch-size, --eval-batch-size,
-                  --num-epochs, --early-stop-patience
-                  (constant lr, no schedule)
-  System:         --seed, --use-gpu, --use-gpu-tempest
-  Analysis:       --stratify (post-train per-slice test-MRR stratification)
-
-Derived from the dataset (not exposed): num_nodes, dst_pool, and the
-train-split span (TrainStats) for the μ recency-λ init.
-
-The full graph (train + val + test) is ingested into Tempest ONCE before
-training; per-query cutoffs keep every walk causal (see Trainer.ingest_full_graph).
+Loads a dataset, constructs a Trainer, runs training, prints results.
 """
 
 import argparse
@@ -30,9 +9,7 @@ import sys
 import time
 from typing import Any, Dict
 
-# Allow direct invocation (`python scripts/train_link_property_prediction.py ...`) by putting
-# the project root on sys.path. `python -m scripts.train_link_property_prediction ...` works
-# without this; the bootstrap is for the spec's first invocation form.
+# Put the project root on sys.path so direct invocation can import the package.
 _PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -54,120 +31,85 @@ def parse_args() -> argparse.Namespace:
 
     # Dataset.
     p.add_argument("--data-suite", default="tgb", choices=["tgb", "tgb-seq"],
-                   help="Benchmark suite: 'tgb' (tgb.linkproppred) or 'tgb-seq' "
-                        "(tgb_seq.LinkPred). Selects the native loader + evaluator.")
+                   help="Benchmark suite to load from.")
     p.add_argument("--dataset", required=True, type=str,
-                   help="Dataset name within the suite, e.g. tgbl-wiki (tgb) "
-                        "or GoogleLocal (tgb-seq)")
+                   help="Dataset name within the suite.")
     p.add_argument("--tgb-root", default="datasets", type=str,
-                   help="Data root for whichever suite is selected.")
+                   help="Data root directory.")
     p.add_argument(
         "--k-eval", default=100, type=int,
-        help="Eval negatives per positive. Used ONLY on --data-suite tgb-seq, "
-             "to build its (unshipped) validation negatives one-shot from our "
-             "sampler; TGB-Seq test uses its shipped negatives. Ignored for "
-             "--data-suite tgb, which uses TGB's pre-generated negatives.")
+        help="Eval negatives per positive (tgb-seq val only).")
 
 
-    # Model. The monotone weighted-mean head has NO tunable hyperparameters and no head parameter at all —
-    # the score is a fixed geometric distance aggregate; E is the only trained tensor.
-    p.add_argument("--d-emb", default=128, type=int)
+    # Model.
+    p.add_argument("--d-emb", default=128, type=int,
+                   help="Embedding dimension.")
 
     # Link loss / head.
     p.add_argument(
         "--k-train", type=int, default=20,
-        help="Per-query training negatives. The head sees [B, 1+K_train] "
-             "candidates per query; positive at column 0. Default 20; keep the "
-             "candidate bag small enough to fit bs 1000 on review / big "
-             "low-recurrence graphs (d-emb 64 fits K=20 there).",
+        help="Per-query training negatives.",
     )
     p.add_argument("--is-bipartite", action="store_true",
-                   help="Treat the graph as bipartite (src and dst are disjoint node roles).")
+                   help="Treat the graph as bipartite.")
 
-    # Chronological subsample (wiki-sized window on big datasets, e.g. review).
+    # Chronological subsample.
     p.add_argument(
         "--max-train-edges", default=0, type=int,
-        help="If >0, train on only the most-recent N train edges (fixed "
-             "chronological suffix) — a wiki-sized subsample of big datasets.")
+        help="If >0, train on only the most-recent N train edges.")
     p.add_argument(
         "--max-eval-edges", default=0, type=int,
-        help="If >0, eval on only the first N official val/test edges (prefix; "
-             "keeps TGB pre-generated negatives valid).")
+        help="If >0, eval on only the first N val/test edges.")
 
-    # Walks (BACKWARD only, undirected). TWO-SIDED: the source u AND every candidate v are walked,
-    # each bounded by the query's own cutoff.
+    # Walks.
     p.add_argument("--num-walks-per-node", default=5, type=int,
-                   help="K walks per query node (source and candidate alike).")
+                   help="Walks per query node.")
     p.add_argument("--max-walk-len", default=5, type=int,
-                   help="L, max walk length. (Sweep on wiki: shorter is better — 20→5 gave "
-                        "+0.006 test, monotone, more stable.)")
+                   help="Max walk length.")
     p.add_argument("--walk-bias", default="ExponentialWeight", type=str,
-                   help="Per-hop edge bias for the backward walks.")
+                   help="Per-hop edge bias for the walks.")
     p.add_argument("--start-bias", default="ExponentialWeight", type=str,
-                   help="Initial-edge bias for the backward walks.")
+                   help="Initial-edge bias for the walks.")
     p.add_argument("--t2nv-p", default=4.0, type=float,
-                   help="node2vec return param p (only used when the walk bias is "
-                        "TemporalNode2Vec). Higher p => less immediate backtrack.")
+                   help="node2vec return param p (TemporalNode2Vec bias only).")
     p.add_argument("--t2nv-q", default=0.25, type=float,
-                   help="node2vec in-out param q (TemporalNode2Vec bias only). Lower q/p => "
-                        "more outward exploration; p=4,q=0.25 = most diverse backward walks.")
+                   help="node2vec in-out param q (TemporalNode2Vec bias only).")
 
-    # Optimisation — RiemannianAdam at a CONSTANT lr (no schedule). ONE param group covers E
-    # (a geoopt.ManifoldParameter, Riemannian update) and all Euclidean head params at the same lr.
+    # Optimisation.
     p.add_argument("--lr", default=1e-3, type=float,
-                   help="Single LR for the whole model (E + head), one RiemannianAdam param group.")
+                   help="Learning rate.")
     p.add_argument(
         "--batch-size", default=1000, type=int,
-        help="Train batch size. Under the per-query ranking link "
-             "loss each batch does B*(1+K_train) link_head forwards.",
+        help="Train batch size.",
     )
     p.add_argument(
         "--eval-batch-size", default=1000, type=int,
-        help="Batch size for val/test eval batches. The link head "
-             "materialises tensors of shape [eval_batch_size, 1+K_eval, "
-             "d_emb] where K_eval is TGB's per-positive negative count "
-             "(wiki=999, review=100, coin=20, comment=20). Comfortable "
-             "values at d_emb=128 on 8 GB: wiki ~25-50, review ~200-500, "
-             "coin/comment ~2000+. Default 1000 fits review/coin/comment; "
-             "wiki needs --eval-batch-size 25-50 explicitly.",
+        help="Val/test eval batch size.",
     )
-    p.add_argument("--num-epochs", default=50, type=int)
-    p.add_argument("--early-stop-patience", default=3, type=int)
+    p.add_argument("--num-epochs", default=50, type=int,
+                   help="Max training epochs.")
+    p.add_argument("--early-stop-patience", default=3, type=int,
+                   help="Early-stop patience in epochs.")
 
     # System.
-    p.add_argument("--seed", default=42, type=int)
+    p.add_argument("--seed", default=42, type=int,
+                   help="Random seed.")
     p.add_argument("--use-gpu", action="store_true",
-                   help="Move PyTorch tensors (E, projections, link head, "
-                        "losses) to CUDA. Does NOT affect Tempest.")
+                   help="Place PyTorch tensors on CUDA.")
     p.add_argument(
         "--use-gpu-tempest",
         action="store_true",
-        help="Run Tempest's walk sampler in GPU mode. Independent from "
-             "--use-gpu, which controls PyTorch tensor placement. "
-             "Tempest GPU mode allocates a multi-GB arena that may "
-             "collide with PyTorch's allocator on small GPUs; default "
-             "off, enable only if you have headroom.",
+        help="Run Tempest's walk sampler in GPU mode.",
     )
     p.add_argument(
         "--stratify",
         action="store_true",
-        help="After training, re-run the strict-causal TEST eval on the best-val "
-             "model and stratify per-positive MRR by pair-recurrence, "
-             "transductivity (endpoint-seen), and source-degree — localizing where "
-             "MRR is lost. Writes logs/stratify/<dataset>_seed<seed>_strata.{md,json}. "
-             "Re-seeds the trainer's causal stores over train+val first; training is "
-             "untouched. Off by default.",
+        help="After training, stratify best-val test MRR by slice.",
     )
     p.add_argument(
         "--export-best-embedding-table",
         action="store_true",
-        help="After training, dump the best-val-restored embedding-table "
-             "weights to logs/embeddings/<dataset>_seed<seed>_demb<d_emb>"
-             "_ep<stopped_at_epoch>.npy. Raw float32 [num_nodes, d_emb] "
-             "array; node ids follow TGB's contiguous integer ordering. "
-             "NOTE: rows are now UNIT-NORM (sphere-constrained E) — analyse "
-             "by direction (cosine), not magnitude. "
-             "Off by default.",
+        help="After training, dump the best-val embedding table to disk.",
     )
 
     return p.parse_args()
@@ -199,10 +141,7 @@ def main() -> Dict[str, Any]:
     # Derived dataset constants.
     num_nodes = loaded.max_node_count
 
-    # Optional chronological subsample: recent suffix of train (so the graph the
-    # walks see stays causal), official prefix of val/test (keeps TGB's
-    # pre-generated negatives valid). Used to run a wiki-sized window on big
-    # datasets (e.g. review) that otherwise OOM an 8 GB GPU at full size.
+    # Optional chronological subsample: recent suffix of train, prefix of val/test.
     def _trunc(split, n, tail):
         if n <= 0 or n >= int(split.sources.shape[0]):
             return split
@@ -216,10 +155,7 @@ def main() -> Dict[str, Any]:
     val_sp = _trunc(loaded.val, args.max_eval_edges, tail=False)
     test_sp = _trunc(loaded.test, args.max_eval_edges, tail=False)
 
-    # Negative-sampling pool: the suite computes it from the FULL train split,
-    # driven by --is-bipartite (destination side only vs all train nodes). The
-    # SAME pool feeds the training negatives here and any eval negatives the
-    # suite builds from our sampler (TGB-Seq val), so both draw one universe.
+    # Negative-sampling pool, computed by the suite from the full train split.
     dst_pool = suite.dst_pool()
     stats = compute_train_stats(train_sp.timestamps, train_sp.sources, train_sp.destinations)
 
@@ -236,12 +172,7 @@ def main() -> Dict[str, Any]:
     print(f"  test edges:    {len(test_sp.sources):,}")
 
     # ─── Build batch factories ─────────────────────────────────────
-    # create_batches consumes a SplitData and yields Batches in
-    # chronological order. We wrap it in a lambda so the trainer can
-    # re-iterate the split each epoch. Eval uses a separate batch
-    # size from train — the eval-side per-batch pair count blows up
-    # as eval_batch_size * (1 + K) for TGB's pregenerated negatives,
-    # so it's a memory-fitting knob distinct from train.
+    # Wrapped in lambdas so the trainer can re-iterate each split every epoch.
     train_batches_factory = (
         lambda: create_batches(train_sp, args.batch_size)
     )
@@ -253,9 +184,6 @@ def main() -> Dict[str, Any]:
     )
 
     # ─── Build evaluators (native to the suite) ────────────────────
-    # Each is the suite's own negatives + native metric; the trainer only sees
-    # the Evaluator interface. TGB serves pre-generated per-positive negatives;
-    # TGB-Seq builds val negatives once from our sampler and uses shipped test.
     val_eval = suite.make_evaluator("val")
     test_eval = suite.make_evaluator("test")
 
@@ -335,10 +263,7 @@ def main() -> Dict[str, Any]:
             trainer, train_batches_factory, val_batches_factory,
             test_eval, test_batches_factory, num_nodes, meta)
 
-    # Optional: dump best-val-restored embedding table for downstream
-    # analysis. Raw [num_nodes, d_emb] float32 array; node ids follow
-    # TGB's contiguous integer ordering. Gated by --export-best-
-    # embedding-table; off by default to keep runs side-effect-free.
+    # Optional: dump best-val embedding table for downstream analysis.
     if args.export_best_embedding_table:
         emb_dir = pathlib.Path("logs/embeddings")
         emb_dir.mkdir(parents=True, exist_ok=True)

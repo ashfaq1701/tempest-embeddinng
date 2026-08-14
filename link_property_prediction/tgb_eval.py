@@ -1,9 +1,8 @@
 """TGB (`tgb.linkproppred`) — native load, negatives, and metric.
 
-Everything TGB lives here and nothing else: the `LinkPropPredDataset` loader,
-the eval-time per-positive negative sampler (TGB's pre-generated lists, served
-via `negative_sampler.query_batch`), the official-Evaluator wrapper, and the
-`DataSuite` that wires them together. No TGB-Seq symbol is imported.
+The `LinkPropPredDataset` loader, the eval-time per-positive negative sampler
+(TGB's pre-generated lists via `negative_sampler.query_batch`), the official
+Evaluator wrapper, and the `DataSuite` that wires them together.
 """
 import re
 from typing import List, Optional, Tuple
@@ -16,17 +15,14 @@ from .negatives import NegativeSampler
 
 
 def _strip_version_suffix(name: str) -> str:
-    """Drop a trailing '-v<digits>' so user-facing names map to the TGB registry
-    key ('tgbl-review-v2' -> 'tgbl-review'); the suffixed form raises inside TGB."""
+    """Drop a trailing '-v<digits>' to map to the TGB registry key
+    ('tgbl-review-v2' -> 'tgbl-review'); the suffixed form raises inside TGB."""
     return re.sub(r"-v\d+$", "", name)
 
 
 def load_tgb(name: str, root: str = "datasets") -> Loaded:
-    """Load a TGB link-property-prediction dataset using only TGB's APIs.
-
-    `-vN` suffixes are stripped before the call — TGB's registry uses bare names
-    and serves the current version internally; the suffixed key isn't registered.
-    """
+    """Load a TGB link-property-prediction dataset. `-vN` suffixes are stripped
+    before the call — TGB's registry uses bare names."""
     from tgb.linkproppred.dataset import LinkPropPredDataset
 
     tgb_name = _strip_version_suffix(name)
@@ -63,8 +59,7 @@ def load_tgb(name: str, root: str = "datasets") -> Loaded:
         val=_apply(val_mask),
         test=_apply(test_mask),
         dataset=dataset,
-        # Store the TGB-canonical (suffix-stripped) name — the Evaluator passes
-        # it back to TGB and must use the registry key, not the user's suffix.
+        # TGB-canonical (suffix-stripped) name — the Evaluator passes it back to TGB.
         name=tgb_name,
         eval_metric=str(dataset.eval_metric),
         max_node_count=int(max(sources.max(), destinations.max())) + 1,
@@ -74,8 +69,8 @@ def load_tgb(name: str, root: str = "datasets") -> Loaded:
 
 class TGBNegativeSampler(NegativeSampler):
     """Eval-time sampler wrapping `dataset.negative_sampler.query_batch`, which
-    serves TGB's pre-generated per-positive negatives (variable-K → list-of-
-    arrays). Content-addressed by (src, tgt, ts), so it is order-independent."""
+    serves TGB's pre-generated per-positive negatives (variable-K → list-of-arrays).
+    Content-addressed by (src, tgt, ts), so it is order-independent."""
 
     def __init__(self, dataset: object, split_mode: str):
         if split_mode not in ("val", "test"):
@@ -99,8 +94,7 @@ class TGBNegativeSampler(NegativeSampler):
 
 class TGBEvaluator(Evaluator):
     """TGB's native evaluation: pre-generated per-positive negatives + the
-    official `tgb…evaluate.Evaluator` metric. Stateless (negatives are content-
-    addressed), so `reset()` is a no-op."""
+    official `tgb…evaluate.Evaluator` metric. Stateless, so `reset()` is a no-op."""
 
     def __init__(self, dataset: object, split_mode: str,
                  tgb_dataset_name: str, eval_metric: str):
