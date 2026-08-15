@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
 
     # Link loss / head.
     p.add_argument(
-        "--k-train", type=int, default=20,
+        "--k-train", type=int, default=5,
         help="Per-query training negatives.",
     )
     p.add_argument("--is-bipartite", action="store_true",

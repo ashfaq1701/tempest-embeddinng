@@ -43,7 +43,7 @@ class TrainerConfig:
     d_emb: int = 128
 
     # Per-query training negatives ([B, 1+K_train]).
-    K_train: int = 20
+    K_train: int = 5
 
     # Walks: BACKWARD only, undirected; two-sided (source and every candidate).
     num_walks_per_node: int = 5
