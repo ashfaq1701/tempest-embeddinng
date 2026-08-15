@@ -9,6 +9,10 @@ Training per batch: sample K_train uniform negatives, form candidates [pos | neg
 TWO-SIDED (walks for the source u and for every candidate v, each cut off at the query time t_i),
 then cross-entropy with target 0 and a single optimizer step. E and the head train together under
 the link CE with no detach.
+
+On a val plateau (early_stop_patience epochs without improvement) a torch ReduceLROnPlateau scales lr
+by lr_reduce_factor; training stops once a plateau persists at min_lr. Set lr_reduce_factor = 1.0 for
+plain early-stop.
 """
 import time
 from dataclasses import dataclass
@@ -60,6 +64,12 @@ class TrainerConfig:
     num_epochs: int = 50
     early_stop_patience: int = 3
 
+    # Reduce-LR-on-plateau (torch ReduceLROnPlateau on the val metric): scale lr by lr_reduce_factor
+    # after early_stop_patience epochs without improvement; stop once a plateau persists at min_lr.
+    # lr_reduce_factor = 1.0 disables it -> plain early-stop.
+    lr_reduce_factor: float = 0.1
+    min_lr: float = 1e-6
+
     # System.
     seed: int = 42
     use_gpu: bool = False
@@ -95,6 +105,16 @@ class Trainer:
         # One param group at a single lr: Riemannian update for E, standard Adam for the head.
         self.opt = geoopt.optim.RiemannianAdam(
             self.model.parameters(), lr=float(config.lr), stabilize=10,
+        )
+
+        # Reduce lr when the val metric (higher = better) plateaus; None when disabled (factor >= 1).
+        # threshold=0 (abs) so any improvement counts, matching the loop's strict best-val tracking.
+        self.scheduler: Optional[torch.optim.lr_scheduler.ReduceLROnPlateau] = (
+            torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.opt, mode="max", factor=float(config.lr_reduce_factor),
+                patience=config.early_stop_patience, min_lr=float(config.min_lr),
+                threshold=0.0, threshold_mode="abs")
+            if config.lr_reduce_factor < 1.0 else None
         )
 
     # Full-graph ingestion (once, up front)
@@ -308,9 +328,21 @@ class Trainer:
                     no_improve += 1
                     line += f"  val {val_metric:.4f}  patience {no_improve}/{patience}"
                 line += f"  eval {eval_dt:.1f}s"
+
+                # Reduce lr on plateau; a reduction opens a fresh patience window at the lower lr.
+                if self.scheduler is not None:
+                    prev_lr = self.opt.param_groups[0]["lr"]
+                    self.scheduler.step(val_metric)
+                    new_lr = self.opt.param_groups[0]["lr"]
+                    if new_lr < prev_lr:
+                        no_improve = 0
+                        line += f"  | plateau lr {prev_lr:.1e} -> {new_lr:.1e}"
             print(line)
 
-            if patience > 0 and no_improve >= patience:
+            # Stop once val has plateaued and lr can no longer be reduced (or reduction is disabled).
+            cur_lr = self.opt.param_groups[0]["lr"]
+            at_floor = self.scheduler is None or cur_lr <= self.config.min_lr * (1.0 + 1e-9)
+            if patience > 0 and no_improve >= patience and at_floor:
                 break
 
         if best_snap is not None:
