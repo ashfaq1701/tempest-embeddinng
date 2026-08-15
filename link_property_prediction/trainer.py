@@ -9,7 +9,12 @@ Training per batch: sample K_train uniform negatives, form candidates [pos | neg
 TWO-SIDED (walks for the source u and for every candidate v, each cut off at the query time t_i),
 then cross-entropy with target 0 and a single optimizer step. E and the head train together under
 the link CE with no detach.
+
+On a val plateau (early_stop_patience epochs without improvement) the loop rewinds to the best
+snapshot (model + optimizer) and scales lr by lr_reduce_factor, stopping once a plateau persists at
+min_lr. Set lr_reduce_factor = 1.0 for plain early-stop.
 """
+import copy
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
@@ -59,6 +64,11 @@ class TrainerConfig:
     # Run control.
     num_epochs: int = 50
     early_stop_patience: int = 3
+
+    # Reduce-LR-on-plateau: on a val plateau, rewind to the best snapshot and scale lr by
+    # lr_reduce_factor (1.0 disables it -> plain early-stop); stop once a plateau persists at min_lr.
+    lr_reduce_factor: float = 0.1
+    min_lr: float = 1e-6
 
     # System.
     seed: int = 42
@@ -233,13 +243,33 @@ class Trainer:
     def _cpu_state_dict(module: torch.nn.Module) -> Dict[str, torch.Tensor]:
         return {k: v.detach().to("cpu", copy=True) for k, v in module.state_dict().items()}
 
+    @staticmethod
+    def _cpu_optim_state(opt: torch.optim.Optimizer) -> Dict[str, Any]:
+        sd = opt.state_dict()
+        state = {i: {k: (v.detach().to("cpu", copy=True) if torch.is_tensor(v) else v)
+                     for k, v in st.items()}
+                 for i, st in sd["state"].items()}
+        return {"state": state, "param_groups": copy.deepcopy(sd["param_groups"])}
+
     def _snapshot(self) -> Dict[str, Any]:
+        """Full training state (model + optimizer moments) on CPU — the rewind target on plateau."""
         return {
             "model": self._cpu_state_dict(self.model),
+            "optim": self._cpu_optim_state(self.opt),
         }
 
     def _restore(self, snap: Dict[str, Any]) -> None:
+        """Restore model + optimizer. The snapshot's lr is stale, so callers set lr afterwards."""
         self.model.load_state_dict(snap["model"])
+        self.opt.load_state_dict(snap["optim"])
+        for st in self.opt.state.values():           # snapshot tensors are on CPU; move to device
+            for k, v in st.items():
+                if torch.is_tensor(v):
+                    st[k] = v.to(self.device)
+
+    def _set_lr(self, lr: float) -> None:
+        for pg in self.opt.param_groups:
+            pg["lr"] = float(lr)
 
     # Train loop
 
@@ -311,7 +341,20 @@ class Trainer:
             print(line)
 
             if patience > 0 and no_improve >= patience:
-                break
+                cur_lr = self.opt.param_groups[0]["lr"]
+                can_reduce = (self.config.lr_reduce_factor < 1.0
+                              and best_snap is not None
+                              and cur_lr > self.config.min_lr * (1.0 + 1e-9))
+                if can_reduce:
+                    # Rewind to the best epoch (model + optimizer), then reduce lr and continue.
+                    self._restore(best_snap)
+                    new_lr = max(cur_lr * self.config.lr_reduce_factor, self.config.min_lr)
+                    self._set_lr(new_lr)
+                    no_improve = 0
+                    print(f"  plateau: rewind to epoch {best_epoch} (val {best_val:.4f}), "
+                          f"lr {cur_lr:.1e} -> {new_lr:.1e}")
+                else:
+                    break                            # plain early-stop, or plateau at min_lr
 
         if best_snap is not None:
             self._restore(best_snap)
