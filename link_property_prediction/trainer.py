@@ -271,6 +271,21 @@ class Trainer:
         for pg in self.opt.param_groups:
             pg["lr"] = float(lr)
 
+    def _rewind_and_reduce(self, best_snap: Dict[str, Any], best_epoch: int, best_val: float) -> bool:
+        """Plateau policy: rewind to the best snapshot and scale lr by lr_reduce_factor.
+        Returns True if it reduced (keep training), False if the caller should stop — i.e. reduction
+        is disabled (factor >= 1) or lr is already at min_lr."""
+        cur_lr = self.opt.param_groups[0]["lr"]
+        if (self.config.lr_reduce_factor >= 1.0 or best_snap is None
+                or cur_lr <= self.config.min_lr * (1.0 + 1e-9)):
+            return False
+        self._restore(best_snap)
+        new_lr = max(cur_lr * self.config.lr_reduce_factor, self.config.min_lr)
+        self._set_lr(new_lr)
+        print(f"  plateau: rewind to epoch {best_epoch} (val {best_val:.4f}), "
+              f"lr {cur_lr:.1e} -> {new_lr:.1e}")
+        return True
+
     # Train loop
 
     def train(
@@ -341,20 +356,10 @@ class Trainer:
             print(line)
 
             if patience > 0 and no_improve >= patience:
-                cur_lr = self.opt.param_groups[0]["lr"]
-                can_reduce = (self.config.lr_reduce_factor < 1.0
-                              and best_snap is not None
-                              and cur_lr > self.config.min_lr * (1.0 + 1e-9))
-                if can_reduce:
-                    # Rewind to the best epoch (model + optimizer), then reduce lr and continue.
-                    self._restore(best_snap)
-                    new_lr = max(cur_lr * self.config.lr_reduce_factor, self.config.min_lr)
-                    self._set_lr(new_lr)
+                if self._rewind_and_reduce(best_snap, best_epoch, best_val):
                     no_improve = 0
-                    print(f"  plateau: rewind to epoch {best_epoch} (val {best_val:.4f}), "
-                          f"lr {cur_lr:.1e} -> {new_lr:.1e}")
                 else:
-                    break                            # plain early-stop, or plateau at min_lr
+                    break                            # reduction disabled, or plateau at min_lr
 
         if best_snap is not None:
             self._restore(best_snap)
