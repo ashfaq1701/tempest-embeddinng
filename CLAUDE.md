@@ -1383,6 +1383,27 @@ test decays with E-expansion, so val-selection over-runs the true (test) optimum
 test_ns missing — an interrupted fetch) is self-healed by `load_tgb_seq`'s preflight (checks both files,
 fetches the missing test_ns from `TGB-Seq/<name>` on HF).
 
+### Eval protocol — VERIFIED exact-match to TGB-Seq (so our MRRs are leaderboard-comparable, 2026-08-16)
+
+We evaluate EXACTLY as TGB-Seq does. Aggressively verified (source-read + on real data, GoogleLocal/YouTube/
+Flickr) — keep this invariant; any eval refactor must preserve it:
+- **Their evaluator, called directly.** `TGBSeqEvaluator` imports `tgb_seq.LinkPred.evaluator.Evaluator` and
+  calls its `.eval()` — we do NOT reimplement MRR. Metric = OGB-style tie-averaged rank
+  `0.5*(#neg>pos + #neg>=pos)+1`, `mrr=1/rank`.
+- **Their shipped TEST negatives, verbatim.** TEST uses `dataset.negative_samples` (`test_ns.npy`), K=100
+  per positive; VAL uses our own seeded sampler (TGB-Seq ships no val negatives). We rank the true dst vs
+  exactly those negatives; verified 0/N test_ns rows contain the true dst.
+- **Row alignment exact.** Our test split == raw CSV test src AND dst in order (`array_equal`), split is
+  boolean-mask (no re-sort), `create_batches` yields in-order contiguous chunks (drop_last=False), a cursor
+  walks test_ns in lockstep; a hard shape-check (`test_ns rows == n_test`) aborts on any mismatch.
+- **Per-positive == batched.** We call `eval()` per positive; TGB-Seq's `eval()` is row-independent
+  (`.sum(axis=1)`, no cross-row term), so per-positive is bit-identical to their batched call (the mean can
+  differ only at ~1e-7 float32-vs-float64 accumulation — not scoring).
+- **Causality.** Strict per-query cutoff `t_edge < t_query` (EXCLUSIVE): the test edge and future never seen;
+  earlier test edges ARE visible (correct streaming, same as TGN/DyGFormer).
+- **Only caveat is statistical:** our numbers are single-seed vs the leaderboard's mean±std — multi-seed
+  needed to place precisely; large margins (GoogleLocal/Flickr, +13-14 pts) are beyond seed noise.
+
 ---
 
 ## NEXT TASK — LR scheduling (planned; apply after all 1e-3 + 1e-4 evidence is in)
