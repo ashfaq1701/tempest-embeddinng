@@ -1,5 +1,5 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = -d(P_u, P_v) + scale*cos(P_u, P_v) + b_v,
-where P_x is the weighted gyro-midpoint of x's walk-token bag (seeds included). Pooling weights come from
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w_g*(-d(P_u,P_v)) + w_c*cos(P_u,P_v) + b_v,
+learnable [w_g, w_c] init (1, geo/cos spread); P_x is the weighted gyro-midpoint of x's walk-token bag. Pooling weights come from
 four per-token scalars (recency, position, and geodesic distance and cosine alignment to the bag's
 unweighted midpoint, both centre features with the per-bag level removed) via w·[rec, pos, spr, ang] plus a
 zero-init MLP correction, w init (1, 1, 0, 0)."""
@@ -83,8 +83,9 @@ class LinkPredHead(nn.Module):
 
         self.pop_bias = nn.Embedding(self.num_nodes, 1)
         nn.init.zeros_(self.pop_bias.weight)
-        # cos scale init to the geodesic's per-pair spread at init.
-        self.log_cos_scale = nn.Parameter(torch.log(self.channel_scale(self.geom, init)))
+        # Learnable [geo, cos] channel weights, init to the calibrated linear head (geo 1, cos = geo/cos spread).
+        self.score_w = nn.Parameter(torch.stack([
+            torch.ones((), dtype=init.dtype), self.channel_scale(self.geom, init)]))
 
     @staticmethod
     @torch.no_grad()
@@ -109,7 +110,7 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        geo_cos score: -d_H(P_u, P_v) + scale*cos(P_u, P_v) + b_v."""
+        score: w_g*geo + w_c*cos + b_v."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -119,4 +120,4 @@ class LinkPredHead(nn.Module):
         v_nodes = cand_tokens.seeds.view(b, c)                                  # [B, C] candidate node ids
         geo = -self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic
         cos = F.cosine_similarity(p_u.unsqueeze(1), p_v, dim=-1, eps=1e-6)      # [B, C] direction agreement
-        return geo + torch.exp(self.log_cos_scale) * cos + self.pop_bias(v_nodes).squeeze(-1)
+        return self.score_w[0] * geo + self.score_w[1] * cos + self.pop_bias(v_nodes).squeeze(-1)
