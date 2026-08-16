@@ -1350,8 +1350,9 @@ full trace in `logs/OVERNIGHT_PAIR_FEATURES.md`.
 ## TGB-Seq datasets — sizes, bipartite flags, run order + results (2026-08-14)
 
 The suite we target (link prediction, MRR on TGB-Seq's shipped TEST negatives). Ascending by edge count —
-run smallest→largest. **Taobao excluded** (manual Aliyun download, not on HuggingFace). **Bipartite**
-datasets (GoogleLocal, ML-20M, Yelp) need `--is-bipartite`. A bare `train_link_property_prediction.py
+run smallest→largest. **Taobao DOES auto-download from HuggingFace** and runs like the others (an earlier
+note claiming "Aliyun-only, not on HF" was WRONG): ~18.85M edges, 1.62M nodes, bipartite. **Bipartite**
+datasets (GoogleLocal, ML-20M, Yelp, Taobao) need `--is-bipartite`. A bare `train_link_property_prediction.py
 --data-suite tgb-seq --dataset <name> --batch-size 1000 --eval-batch-size 1000 [--is-bipartite]
 --use-gpu --use-gpu-tempest` uses the mainline defaults below.
 
@@ -1362,8 +1363,9 @@ datasets (GoogleLocal, ML-20M, Yelp) need `--is-bipartite`. A bare `train_link_p
 | 3 | Flickr      | 7.22M | no  | 0.617 / 0.575 | stopped mid-climb, NOT converged (would go higher) |
 | 4 | Patent      | 10.8M | no  | (running) | |
 | 5 | ML-20M      | 14.5M | yes | — | not yet run |
-| 6 | Yelp        | 19.8M | yes | — | not yet run |
-| 7 | WikiLink    | 34.2M | no  | — | not yet run |
+| 6 | Taobao      | 18.85M| yes | — | auto-loads from HF (13.98M train edges, 863K dst) |
+| 7 | Yelp        | 19.8M | yes | — | not yet run |
+| 8 | WikiLink    | 34.2M | no  | — | not yet run |
 
 **Mainline defaults (master):** d_emb 128, lr 1e-3, num_walks_per_node 5, K_train 20, num_epochs 50,
 early_stop_patience 3, cos scale init √d. Head = geo_cos on the gyro-midpoint: `s = -d_H(P_u,P_v) +
@@ -1570,7 +1572,7 @@ Branch `feature/learned-weight`. Head = centroid-to-centroid `s = -d(P_u,P_v)` w
   d_hop=8, hidden=2*d_feat=52 (head params ~1.5k). **NO grad-clip.**
 
 ### Overnight tgb-seq sweep (K20, d-emb 64, wpn 10, mwl 5, patience 3, 50ep, lr 1e-4, bs 1000)
-2-slot pool, smallest->largest. Taobao excluded (manual Aliyun download only). Yelp/WikiLink stopped
+2-slot pool, smallest->largest. (Taobao auto-loads from HF — earlier "Aliyun-only" note was wrong.) Yelp/WikiLink stopped
 manually (still climbing). Best val / best test @ peak epoch:
 
 | dataset | edges | bip | best val | best test | peak ep | shape |
