@@ -89,9 +89,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-epochs", default=50, type=int,
                    help="Max training epochs.")
     p.add_argument("--early-stop-patience", default=3, type=int,
-                   help="Plateau patience in epochs (triggers an LR reduction, or stop at min_lr).")
+                   help="Non-improving epochs at min_lr before stopping.")
     p.add_argument("--lr-reduce-factor", default=0.1, type=float,
                    help="LR multiplier applied on each val plateau (ReduceLROnPlateau); 1.0 disables.")
+    p.add_argument("--lr-patience", default=0, type=int,
+                   help="Non-improving epochs before an LR reduction (0 = reduce on the first val drop).")
     p.add_argument("--min-lr", default=1e-6, type=float,
                    help="LR floor; stop once a plateau persists at this lr.")
 
@@ -212,6 +214,7 @@ def main() -> Dict[str, Any]:
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
         lr_reduce_factor=args.lr_reduce_factor,
+        lr_patience=args.lr_patience,
         min_lr=args.min_lr,
 
         seed=args.seed,

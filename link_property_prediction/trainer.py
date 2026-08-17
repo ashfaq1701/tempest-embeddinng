@@ -10,8 +10,8 @@ TWO-SIDED (walks for the source u and for every candidate v, each cut off at the
 then cross-entropy with target 0 and a single optimizer step. E and the head train together under
 the link CE with no detach.
 
-On a val plateau (early_stop_patience epochs without improvement) a torch ReduceLROnPlateau scales lr
-by lr_reduce_factor; training stops once a plateau persists at min_lr. Set lr_reduce_factor = 1.0 for
+On a val plateau (lr_patience epochs without improvement; 0 = the first drop) a torch ReduceLROnPlateau
+scales lr by lr_reduce_factor; training stops once a plateau persists at min_lr. Set lr_reduce_factor = 1.0 for
 plain early-stop.
 """
 import time
@@ -65,9 +65,11 @@ class TrainerConfig:
     early_stop_patience: int = 3
 
     # Reduce-LR-on-plateau (torch ReduceLROnPlateau on the val metric): scale lr by lr_reduce_factor
-    # after early_stop_patience epochs without improvement; stop once a plateau persists at min_lr.
-    # lr_reduce_factor = 1.0 disables it -> plain early-stop.
+    # after lr_patience epochs without improvement (0 = reduce on the first val drop); once lr hits
+    # min_lr, stop after early_stop_patience further non-improving epochs. lr_reduce_factor = 1.0
+    # disables it -> plain early-stop.
     lr_reduce_factor: float = 0.1
+    lr_patience: int = 0
     min_lr: float = 1e-6
 
     # System.
@@ -112,7 +114,7 @@ class Trainer:
         self.scheduler: Optional[torch.optim.lr_scheduler.ReduceLROnPlateau] = (
             torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.opt, mode="max", factor=float(config.lr_reduce_factor),
-                patience=config.early_stop_patience, min_lr=float(config.min_lr),
+                patience=int(config.lr_patience), min_lr=float(config.min_lr),
                 threshold=0.0, threshold_mode="abs")
             if config.lr_reduce_factor < 1.0 else None
         )
