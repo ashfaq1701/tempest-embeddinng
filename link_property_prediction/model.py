@@ -1,5 +1,8 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w_g*(-d(P_u,P_v)) + w_c*cos(P_u,P_v) + b_v,
-learnable [w_g, w_c] init (1, geo/cos spread); P_x is the weighted gyro-midpoint of x's walk-token bag. Pooling weights come from
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f + b_v, f = [geo, cos, geo_spread_v,
+cos_spread_v, coh_v] (geo=-d(P_u,P_v), cos=cos(P_u,P_v); the spreads are the candidate cloud's
+pooling-weighted mean geo/cos to its centroid; coh_v is the candidate cloud's (w*r)-weighted mean
+off-diagonal cosine coherence), learnable w init [1,1,0,0,0]; P_x is the weighted gyro-midpoint of x's
+walk-token bag. Pooling weights come from
 four per-token scalars (recency, position, and geodesic distance and cosine alignment to the bag's
 unweighted midpoint, both centre features with the per-bag level removed) via w·[rec, pos, spr, ang] plus a
 zero-init MLP correction, w init (1, 1, 0, 0)."""
@@ -22,6 +25,10 @@ class PoincareManifold:
     def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Elementwise geodesic distance, broadcasting over leading dims. LOWER = closer."""
         return self.manifold.dist(x, y)
+
+    def dist0(self, x: torch.Tensor) -> torch.Tensor:
+        """Hyperbolic radius (geodesic distance from the origin)."""
+        return self.manifold.dist0(x)
 
     def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """Weighted gyro-midpoint: x [Q,T,d], w [Q,T] -> [Q,d]."""
@@ -83,20 +90,14 @@ class LinkPredHead(nn.Module):
 
         self.pop_bias = nn.Embedding(self.num_nodes, 1)
         nn.init.zeros_(self.pop_bias.weight)
-        # Learnable [geo, cos] channel weights, init to the calibrated linear head (geo 1, cos = geo/cos spread).
-        self.score_w = nn.Parameter(torch.stack([
-            torch.ones((), dtype=init.dtype), self.channel_scale(self.geom, init)]))
+        # Learnable channel weights [geo, cos, geo_spread_v, cos_spread_v], no calibration; init 1,1,0,0
+        # (the candidate cloud-spread channels are off at step 0).
+        self.score_w = nn.Parameter(torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0]))
 
-    @staticmethod
-    @torch.no_grad()
-    def channel_scale(geom: PoincareManifold, points: torch.Tensor, n_pairs: int = 4096) -> torch.Tensor:
-        """Scalar putting scale*cos on the same per-pair spread as the geodesic, measured on `points`."""
-        i, j = torch.randint(0, points.shape[0], (2, n_pairs), device=points.device)
-        return (geom.dist(points[i], points[j]).std()
-                / F.cosine_similarity(points[i], points[j], dim=-1).std().clamp_min(1e-8)).clamp_min(1e-8)
-
-    def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
-        """Bag -> one manifold point [Q, d]."""
+    def pool(self, tokens: WalkTokens, emb: torch.Tensor):
+        """Bag -> (P [Q,d], geo_spread [Q], cos_spread [Q], coherence [Q]): spreads are the pooling-weighted
+        mean geodesic distance / cosine of the cloud tokens to their centroid P; coherence is the
+        (w*r)-weighted mean off-diagonal cosine within the cloud (r = token hyperbolic radius)."""
         nodes = tokens.nodes.clamp_min(0).clone()
         valid = tokens.mask.clone()
         cold = ~valid.any(dim=-1)                                               # all-padding walk -> use seed
@@ -105,19 +106,33 @@ class LinkPredHead(nn.Module):
             valid[cold, 0] = True
 
         x = F.embedding(nodes, emb)                                             # [Q, T, d]
-        w = self.bag_weights(self.geom, tokens, x, valid)                       # [Q, T]
-        return self.geom.midpoint(x, w)
+        w = self.bag_weights(self.geom, tokens, x, valid)                       # [Q, T] sums to 1, 0 on padding
+        p = self.geom.midpoint(x, w)                                            # [Q, d]
+        pe = p.unsqueeze(-2)                                                    # [Q, 1, d]
+        geo_sp = (w * self.geom.dist(pe, x)).sum(dim=-1)                        # [Q] weighted mean geo to P
+        cos_sp = (w * F.cosine_similarity(pe, x, dim=-1, eps=1e-6)).sum(dim=-1) # [Q] weighted mean cos to P
+        r = self.geom.dist0(x) * valid.to(x.dtype)                             # [Q, T] token radii
+        wr = w * r
+        lo2 = (wr ** 2).sum(dim=-1)
+        hi2 = wr.sum(dim=-1) ** 2
+        rp = self.geom.dist0(p)
+        coh = (rp ** 2 - lo2) / (hi2 - lo2).clamp_min(1e-9)                     # [Q]
+        return p, geo_sp, cos_sp, coh
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score: w_g*geo + w_c*cos + b_v."""
+        score = w . [geo, cos, geo_spread_v, cos_spread_v] + b_v."""
         emb = self.E.weight
-        p_u = self.pool(src_tokens, emb)                                        # [B, d]
-        p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
+        p_u, _, _, _ = self.pool(src_tokens, emb)                               # [B, d]
+        p_v, sg_v, sc_v, coh_v = self.pool(cand_tokens, emb)                    # [B*C,d] + 3x [B*C]
         b, d = p_u.shape
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         v_nodes = cand_tokens.seeds.view(b, c)                                  # [B, C] candidate node ids
         geo = -self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic
         cos = F.cosine_similarity(p_u.unsqueeze(1), p_v, dim=-1, eps=1e-6)      # [B, C] direction agreement
-        return self.score_w[0] * geo + self.score_w[1] * cos + self.pop_bias(v_nodes).squeeze(-1)
+        w = self.score_w
+        return (w[0] * geo + w[1] * cos
+                + w[2] * sg_v.view(b, c) + w[3] * sc_v.view(b, c)               # candidate cloud spreads
+                + w[4] * coh_v.view(b, c)                                       # candidate cloud coherence
+                + self.pop_bias(v_nodes).squeeze(-1))
