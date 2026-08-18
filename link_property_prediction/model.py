@@ -31,15 +31,12 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """logit = w·[rec, pos, spr, ang] + MLP([rec, pos, spr, ang]); w init (1, 1, 0, 0), MLP zero-init."""
+    """logit = w·[rec, pos, spr, ang]; w init (1, 1, 0, 0)."""
 
-    def __init__(self, mnia: float, hidden: int = 32):
+    def __init__(self, mnia: float):
         super().__init__()
         self.mnia = float(mnia)
         self.w = nn.Parameter(torch.tensor([1.0, 1.0, 0.0, 0.0]))
-        self.net = nn.Sequential(nn.Linear(4, hidden), nn.GELU(), nn.Linear(hidden, 1))
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
 
     @staticmethod
     def centre_feats(geom: PoincareManifold, x: torch.Tensor,
@@ -61,7 +58,7 @@ class BagWeights(nn.Module):
         pos = -(tokens.positions.clamp_min(1).float() - 1.0)
         spr, ang = self.centre_feats(geom, x.detach(), valid)
         feat = torch.stack([rec, pos, spr, ang], dim=-1).to(x.dtype)            # [Q, T, 4]
-        logits = (feat * self.w).sum(dim=-1) + self.net(feat).squeeze(-1)
+        logits = (feat * self.w).sum(dim=-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
 
