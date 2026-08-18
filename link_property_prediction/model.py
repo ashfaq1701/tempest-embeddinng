@@ -1,7 +1,8 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f + b_v, f = [geo, cos, geo_spread_v,
-cos_spread_v] (geo=-d(P_u,P_v), cos=cos(P_u,P_v); the spreads are the candidate cloud's pooling-weighted
-mean geo/cos to its centroid), learnable w init [1,1,0,0]; P_x is the weighted gyro-midpoint of x's
-walk-token bag. Pooling weights come from
+"""Centroid-to-centroid head on the Poincaré ball with an inductive AUGMENT path: s(u,v) = w . f + b_v,
+f = [geo, cos, geo_spread_v, cos_spread_v, geo(C_u,P_v), cos(C_u,P_v)] (geo=-d(P_u,P_v), cos=cos(P_u,P_v);
+the spreads are the candidate cloud's pooling-weighted mean geo/cos to its centroid; C_u is the SEED-FREE
+source centroid and its two terms are the inductive path), learnable w init [1,1,0,0,0,0] so step 0 == the
+folded additive head. P_x is the weighted gyro-midpoint of x's walk-token bag. Pooling weights come from
 four per-token scalars (recency, position, and geodesic distance and cosine alignment to the bag's
 unweighted midpoint, both centre features with the per-bag level removed) via w·[rec, pos, spr, ang] plus a
 zero-init MLP correction, w init (1, 1, 0, 0)."""
@@ -85,9 +86,10 @@ class LinkPredHead(nn.Module):
 
         self.pop_bias = nn.Embedding(self.num_nodes, 1)
         nn.init.zeros_(self.pop_bias.weight)
-        # Learnable channel weights [geo, cos, geo_spread_v, cos_spread_v], no calibration; init 1,1,0,0
-        # (the candidate cloud-spread channels are off at step 0).
-        self.score_w = nn.Parameter(torch.tensor([1.0, 1.0, 0.0, 0.0]))
+        # Channel weights [geo, cos, geo_spread_v, cos_spread_v, geo(C_u,P_v), cos(C_u,P_v)]; init 1,1,0,0,0,0.
+        # The last two are the inductive SEED-FREE source path (C_u), off at init -> step 0 == the additive
+        # head; per-dataset training can turn them on (Patent) or leave them off (the warm wins).
+        self.score_w = nn.Parameter(torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0]))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Bag -> (P [Q,d], geo_spread [Q], cos_spread [Q]): the spreads are the pooling-weighted mean
@@ -107,19 +109,38 @@ class LinkPredHead(nn.Module):
         cos_sp = (w * F.cosine_similarity(pe, x, dim=-1, eps=1e-6)).sum(dim=-1) # [Q] weighted mean cos to P
         return p, geo_sp, cos_sp
 
+    def context_centroid(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
+        """Seed-EXCLUDED inductive centroid C [Q,d] (neighbours only, via seed_mask). Empty-neighbour bag
+        -> fall back to the seed (=> C=E, no NaN). No spreads needed for the inductive path."""
+        nodes = tokens.nodes.clamp_min(0).clone()
+        valid = tokens.mask & ~tokens.seed_mask                                 # drop the seed's own slot
+        cold = ~valid.any(dim=-1)
+        if bool(cold.any()):
+            nodes[cold, 0] = tokens.seeds[cold]
+            valid[cold, 0] = True
+        x = F.embedding(nodes, emb)
+        w = self.bag_weights(self.geom, tokens, x, valid)
+        return self.geom.midpoint(x, w)
+
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = w . [geo, cos, geo_spread_v, cos_spread_v] + b_v."""
+        score = w . [geo, cos, geo_spread_v, cos_spread_v, geo(C_u,P_v), cos(C_u,P_v)] + b_v.
+        C_u is the seed-free (inductive) source centroid; the candidate stays folded P_v."""
         emb = self.E.weight
-        p_u, _, _ = self.pool(src_tokens, emb)                                  # [B, d]
-        p_v, sg_v, sc_v = self.pool(cand_tokens, emb)                           # [B*C,d] + 2x [B*C]
+        p_u, _, _ = self.pool(src_tokens, emb)                                  # folded source [B, d]
+        c_u = self.context_centroid(src_tokens, emb)                            # seed-free source [B, d]
+        p_v, sg_v, sc_v = self.pool(cand_tokens, emb)                           # folded candidate [B*C,d]+spreads
         b, d = p_u.shape
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         v_nodes = cand_tokens.seeds.view(b, c)                                  # [B, C] candidate node ids
-        geo = -self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic
-        cos = F.cosine_similarity(p_u.unsqueeze(1), p_v, dim=-1, eps=1e-6)      # [B, C] direction agreement
-        w = self.score_w
-        return (w[0] * geo + w[1] * cos
-                + w[2] * sg_v.view(b, c) + w[3] * sc_v.view(b, c)               # candidate cloud spreads
-                + self.pop_bias(v_nodes).squeeze(-1))
+        pu = p_u.unsqueeze(1); cu = c_u.unsqueeze(1)                            # [B, 1, d]
+        geo = -self.geom.dist(pu, p_v)                                          # [B, C] folded source geodesic
+        cos = F.cosine_similarity(pu, p_v, dim=-1, eps=1e-6)                    # [B, C] folded source cosine
+        geo_c = -self.geom.dist(cu, p_v)                                        # [B, C] inductive source geodesic
+        cos_c = F.cosine_similarity(cu, p_v, dim=-1, eps=1e-6)                  # [B, C] inductive source cosine
+        feats = torch.stack([
+            geo, cos, sg_v.view(b, c), sc_v.view(b, c),                         # folded main path + spreads
+            geo_c, cos_c,                                                       # seed-free inductive source path
+        ], dim=-1)                                                             # [B, C, 6]
+        return (feats * self.score_w).sum(dim=-1) + self.pop_bias(v_nodes).squeeze(-1)  # [B, C]
