@@ -6,7 +6,7 @@ P_s is an inductive neighbourhood centroid). The scorer sees 11 features per (u,
   centroid), and the candidate popularity bias b_v.
 The P_u spreads are source-constant, so in a LINEAR head they cancel under the row-softmax; the MLP is not
 additively separable, so it can use them to modulate the candidate-varying terms (non-cancelling here).
-These 13 are reduced by a 2-layer MLP (13->5->1, random init). P_x is the weighted gyro-midpoint of x's
+These 13 are reduced by a 2-layer MLP (N -> N//2 -> 1, random init). P_x is the weighted gyro-midpoint of x's
 walk-token bag (seed excluded; a bag with no neighbours falls back to the seed). Pooling weights come from
 four per-token scalars (recency, position, and geodesic distance and cosine alignment to the bag's
 unweighted midpoint, both centre features with the per-bag level removed) via w·[rec, pos, spr, ang] plus a
@@ -95,9 +95,10 @@ class LinkPredHead(nn.Module):
         # init would inject a spurious bias for nodes the training never updates.
         self.pop_bias = nn.Embedding(self.num_nodes, 1)
         nn.init.zeros_(self.pop_bias.weight)
-        # Scorer: reduce the 11 pair/spread/bias features -> scalar. Randomly initialised (default),
-        # so unlike the additive head there is no privileged channel at step 0.
-        self.scorer = nn.Sequential(nn.Linear(self.NUM_FEATS, 5), nn.GELU(), nn.Linear(5, 1))
+        # Scorer: reduce the pair/spread/bias features -> scalar via a 2-layer MLP (N -> N//2 -> 1).
+        # Randomly initialised (default), so unlike the additive head there is no privileged channel.
+        _h = self.NUM_FEATS // 2
+        self.scorer = nn.Sequential(nn.Linear(self.NUM_FEATS, _h), nn.GELU(), nn.Linear(_h, 1))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Neighbour-only bag -> (P [Q,d], geo_spread [Q], cos_spread [Q]): the seed's own walk-origin slot
