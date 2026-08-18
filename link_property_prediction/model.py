@@ -2,9 +2,11 @@
 embedding E_s) and CONTEXT (P_s = gyro-midpoint of the walk bag with the seed EXCLUDED via seed_mask, so
 P_s is an inductive neighbourhood centroid). The scorer sees 11 features per (u,v):
   the 4 pairs <P_u,E_v>, <E_u,P_v>, <E_u,E_v>, <P_u,P_v> each as geodesic (-d_H) and cosine (=8),
-  the two cloud spreads P_u-spread and P_v-spread (pooling-weighted mean geo-dist to the centroid),
-  and the candidate popularity bias b_v.
-These 11 are reduced by a 2-layer MLP (11->5->1, random init). P_x is the weighted gyro-midpoint of x's
+  the four cloud spreads (geodesic and cosine, for P_u and P_v; pooling-weighted mean dist/cos to the
+  centroid), and the candidate popularity bias b_v.
+The P_u spreads are source-constant, so in a LINEAR head they cancel under the row-softmax; the MLP is not
+additively separable, so it can use them to modulate the candidate-varying terms (non-cancelling here).
+These 13 are reduced by a 2-layer MLP (13->5->1, random init). P_x is the weighted gyro-midpoint of x's
 walk-token bag (seed excluded; a bag with no neighbours falls back to the seed). Pooling weights come from
 four per-token scalars (recency, position, and geodesic distance and cosine alignment to the bag's
 unweighted midpoint, both centre features with the per-bag level removed) via w·[rec, pos, spr, ang] plus a
@@ -72,7 +74,7 @@ class BagWeights(nn.Module):
 class LinkPredHead(nn.Module):
     """E is a ManifoldParameter; BagWeights and the scorer MLP are the other trained modules."""
 
-    NUM_FEATS = 11   # 4 pairs x {geo, cos} + P_u-spread + P_v-spread + pop-bias
+    NUM_FEATS = 13   # 4 pairs x {geo, cos} + {geo,cos}-spread for P_u and P_v + pop-bias
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float,
                  init_irange: float = 1e-3):
@@ -97,10 +99,11 @@ class LinkPredHead(nn.Module):
         # so unlike the additive head there is no privileged channel at step 0.
         self.scorer = nn.Sequential(nn.Linear(self.NUM_FEATS, 5), nn.GELU(), nn.Linear(5, 1))
 
-    def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Neighbour-only bag -> (P [Q,d], geo_spread [Q]): the seed's own walk-origin slot is EXCLUDED
-        (seed_mask), so P is an inductive context centroid; a bag with no neighbours falls back to the
-        seed. geo_spread is the pooling-weighted mean geodesic distance of the cloud to its centroid P."""
+    def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Neighbour-only bag -> (P [Q,d], geo_spread [Q], cos_spread [Q]): the seed's own walk-origin slot
+        is EXCLUDED (seed_mask), so P is an inductive context centroid; a bag with no neighbours falls back
+        to the seed. The spreads are the pooling-weighted mean geodesic distance / cosine of the cloud to
+        its centroid P (same definition as the previous additive head)."""
         nodes = tokens.nodes.clamp_min(0).clone()
         valid = tokens.mask & ~tokens.seed_mask                                 # neighbours only (drop seed)
         cold = ~valid.any(dim=-1)                                               # no neighbours -> use the seed
@@ -111,22 +114,26 @@ class LinkPredHead(nn.Module):
         x = F.embedding(nodes, emb)                                             # [Q, T, d]
         w = self.bag_weights(self.geom, tokens, x, valid)                       # [Q, T] sums to 1, 0 on padding
         p = self.geom.midpoint(x, w)                                            # [Q, d]
-        geo_sp = (w * self.geom.dist(p.unsqueeze(-2), x)).sum(dim=-1)           # [Q] weighted mean geo to P
-        return p, geo_sp
+        pe = p.unsqueeze(-2)                                                    # [Q, 1, d]
+        geo_sp = (w * self.geom.dist(pe, x)).sum(dim=-1)                        # [Q] weighted mean geo to P
+        cos_sp = (w * F.cosine_similarity(pe, x, dim=-1, eps=1e-6)).sum(dim=-1) # [Q] weighted mean cos to P
+        return p, geo_sp, cos_sp
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
         11 features (identity/context pairs, spreads, pop-bias) reduced by the scorer MLP."""
         emb = self.E.weight
-        p_u, sp_u = self.pool(src_tokens, emb)                                  # context [B,d], spread [B]
-        p_v, sp_v = self.pool(cand_tokens, emb)                                 # context [B*C,d], spread [B*C]
+        p_u, gsp_u, csp_u = self.pool(src_tokens, emb)                          # context [B,d], spreads [B]
+        p_v, gsp_v, csp_v = self.pool(cand_tokens, emb)                         # context [B*C,d], spreads [B*C]
         e_u = F.embedding(src_tokens.seeds, emb)                                # identity [B, d]
-        e_v = F.embedding(cand_tokens.seeds, emb)                               # identity [B*C, d]
+        e_v = F.embedding(cand_tokens.seeds, emb)                              # identity [B*C, d]
         b, d = p_u.shape
         c = p_v.shape[0] // b
-        p_v = p_v.view(b, c, d); e_v = e_v.view(b, c, d); sp_v = sp_v.view(b, c)
+        p_v = p_v.view(b, c, d); e_v = e_v.view(b, c, d)
+        gsp_v = gsp_v.view(b, c); csp_v = csp_v.view(b, c)
         v_nodes = cand_tokens.seeds.view(b, c)                                  # [B, C] candidate node ids
         pu = p_u.unsqueeze(1); eu = e_u.unsqueeze(1)                            # [B, 1, d] broadcast over C
+        gsp_u = gsp_u.unsqueeze(1).expand(b, c); csp_u = csp_u.unsqueeze(1).expand(b, c)  # source-constant
 
         def gd(a, x): return -self.geom.dist(a, x)                             # geodesic, higher = closer [B,C]
         def cs(a, x): return F.cosine_similarity(a, x, dim=-1, eps=1e-6)       # cosine [B, C]
@@ -136,8 +143,8 @@ class LinkPredHead(nn.Module):
             gd(eu, p_v), cs(eu, p_v),                                          # <E_u, P_v>  identity->context
             gd(eu, e_v), cs(eu, e_v),                                          # <E_u, E_v>  identity->identity
             gd(pu, p_v), cs(pu, p_v),                                          # <P_u, P_v>  context->context
-            sp_u.unsqueeze(1).expand(b, c),                                     # P_u spread
-            sp_v,                                                              # P_v spread
+            gsp_u, csp_u,                                                       # P_u geo + cos spread (source-const)
+            gsp_v, csp_v,                                                       # P_v geo + cos spread
             self.pop_bias(v_nodes).squeeze(-1),                                # popularity bias
-        ], dim=-1)                                                             # [B, C, 11]
+        ], dim=-1)                                                             # [B, C, 13]
         return self.scorer(feats).squeeze(-1)                                  # [B, C]
