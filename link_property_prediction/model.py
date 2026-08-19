@@ -1,10 +1,10 @@
 """Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f + b_v, f = [geo, cos, geo_spread_v,
 cos_spread_v] (geo=-d(P_u,P_v), cos=cos(P_u,P_v); the spreads are the candidate cloud's pooling-weighted
 mean geo/cos to its centroid), learnable w init [1,1,0,0]; P_x is the weighted gyro-midpoint of x's
-walk-token bag. Pooling weights come from a small MLP over four per-token scalars (recency, position, and
-geodesic distance and cosine alignment to the bag's unweighted midpoint — the last two are centre features
-with the per-bag level removed); the age scale tau is learned (init at the mean node inter-arrival) and the
-MLP is initialised to reproduce the recency/position prior with the spatial pair off (see BagWeights)."""
+walk-token bag. Pooling weights come from a small MLP (hidden = 8*N_FEAT, random init) over four per-token
+scalars: -(age/mnia), -pos, and the geodesic distance / cosine alignment to the bag's unweighted midpoint
+(the last two are centre features with the per-bag level removed). mnia (mean node inter-arrival) is a fixed
+age scale. On Yelp this matched the previous linear-prior + zero-init-MLP-correction pooling."""
 from typing import Tuple
 
 import geoopt
@@ -31,20 +31,17 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
+    """Pooling weights = softmax(MLP([-(age/mnia), -pos, spr, ang])); hidden = 8*N_FEAT, random init,
+    fixed age scale mnia (no learnable tau, no linear residual). The softmax over tokens dampens the
+    random init, so unlike a score-level MLP the prior/residual are not needed here."""
 
     N_FEAT = 4
 
     def __init__(self, mnia: float):
         super().__init__()
-        self.log_tau = nn.Parameter(torch.log(torch.tensor(float(mnia))))
-        hidden = self.N_FEAT // 2
+        self.mnia = float(mnia)                 # fixed age scale
+        hidden = 8 * self.N_FEAT                # 8x expansion, random init
         self.net = nn.Sequential(nn.Linear(self.N_FEAT, hidden), nn.GELU(), nn.Linear(hidden, 1))
-        with torch.no_grad():
-            self.net[0].weight.copy_(torch.tensor([[1., 1., 0., 0.],
-                                                   [0., 0., 1., 1.]]))
-            self.net[0].bias.zero_()
-            self.net[-1].weight.copy_(torch.tensor([[-1., 0.]]))
-            self.net[-1].bias.zero_()
 
     @staticmethod
     def centre_feats(geom: PoincareManifold, x: torch.Tensor,
@@ -62,8 +59,8 @@ class BagWeights(nn.Module):
     def forward(self, geom: PoincareManifold, tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
-        rec = torch.log1p(tokens.ages.clamp_min(0).float() / self.log_tau.exp())
-        pos = tokens.positions.clamp_min(1).float() - 1.0
+        rec = -(tokens.ages.clamp_min(0).float() / self.mnia)                   # -(age/mnia)
+        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                    # -pos
         spr, ang = self.centre_feats(geom, x.detach(), valid)
         feat = torch.stack([rec, pos, spr, ang], dim=-1).to(x.dtype)            # [Q, T, 4]
         logits = self.net(feat).squeeze(-1)
