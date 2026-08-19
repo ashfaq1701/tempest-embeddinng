@@ -137,7 +137,13 @@ class Trainer:
             start_bias=self.config.start_bias,
             walk_bias=self.config.walk_bias)
 
-        return self.model(src_tokens, cand_tokens)
+        # Online candidate degree (as-of-t): inductive, drift-aware replacement for the frozen pop_bias.
+        cand_deg = torch.as_tensor(
+            self.walk_gen.participation_counts(
+                cand_seeds.detach().cpu().numpy(), cand_cutoffs.detach().cpu().numpy()),
+            dtype=torch.float32, device=device).view(b, c)                  # [B, C]
+
+        return self.model(src_tokens, cand_tokens, cand_deg)
 
     # Per-batch training step
 

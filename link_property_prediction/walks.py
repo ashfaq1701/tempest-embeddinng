@@ -63,6 +63,18 @@ class WalkGenerator:
         """Ingest edges into Tempest (indexed by time; ingestion order is irrelevant)."""
         self.tempest.add_multiple_edges(src, tgt, ts, edge_features=edge_feat)
 
+    def participation_counts(self, nodes: np.ndarray, cutoffs: np.ndarray) -> np.ndarray:
+        """Total interactions of each node STRICTLY BEFORE its cutoff t (int64), one per node. Graph is
+        undirected, so Backward == total degree as-of-t. Inductive (any node) and online (grows with t).
+        Exclusive cutoff => the query edge itself is never counted."""
+        node_arr = np.ascontiguousarray(nodes, dtype=np.int32)
+        cutoff_arr = np.ascontiguousarray(cutoffs, dtype=np.int64)
+        if cutoff_arr.shape[0] != node_arr.shape[0]:
+            raise ValueError("cutoffs must have the same length as nodes "
+                             f"({cutoff_arr.shape[0]} vs {node_arr.shape[0]})")
+        return self.tempest.get_node_participation_counts(
+            node_arr, cutoff_times=cutoff_arr, direction="Backward_In_Time")
+
     def walks_for_nodes(self, seeds: np.ndarray, max_walk_len: Optional[int] = None,
                         num_walks_per_node: Optional[int] = None,
                         start_bias: Optional[str] = None,
