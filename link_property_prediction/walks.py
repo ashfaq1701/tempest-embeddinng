@@ -74,6 +74,18 @@ class WalkGenerator:
         return self.tempest.get_node_participation_counts(
             node_arr, cutoff_times=cutoff_arr, direction="Backward_In_Time")
 
+    def last_event_times(self, nodes: np.ndarray, cutoffs: np.ndarray) -> np.ndarray:
+        """Timestamp of each node's most recent edge strictly before its cutoff t (int64), one per node;
+        -1 when the node has no such edge. Undirected graph."""
+        node_arr = np.ascontiguousarray(nodes, dtype=np.int32)
+        cutoff_arr = np.ascontiguousarray(cutoffs, dtype=np.int64)
+        if cutoff_arr.shape[0] != node_arr.shape[0]:
+            raise ValueError("cutoffs must have the same length as nodes "
+                             f"({cutoff_arr.shape[0]} vs {node_arr.shape[0]})")
+        _, timestamps = self.tempest.get_latest_events_for_nodes(
+            node_arr, cutoff_times=cutoff_arr, direction="Backward_In_Time")
+        return timestamps
+
     def walks_for_nodes(self, seeds: np.ndarray, max_walk_len: Optional[int] = None,
                         num_walks_per_node: Optional[int] = None,
                         start_bias: Optional[str] = None,

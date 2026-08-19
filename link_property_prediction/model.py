@@ -1,7 +1,8 @@
 """Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f, f = [geo, cos, geo_spread_v,
-cos_spread_v, log1p(deg_v)] (geo=-d(P_u,P_v), cos=cos(P_u,P_v); the spreads are the candidate cloud's
-pooling-weighted mean geo/cos to its centroid; deg_v is the candidate's interaction count strictly before
-the query time), learnable w init [1,1,0,0,0]; P_x is the weighted gyro-midpoint of x's
+cos_spread_v, log1p(deg_v), log1p(age_v/mnia)] (geo=-d(P_u,P_v), cos=cos(P_u,P_v); the spreads are the
+candidate cloud's pooling-weighted mean geo/cos to its centroid; deg_v is the candidate's interaction count
+strictly before the query time, age_v the time since its last event before then), learnable w init
+[1,1,0,0,0,0]; P_x is the weighted gyro-midpoint of x's
 walk-token bag. Pooling weights come from a small MLP (hidden = 8*N_FEAT, random init) over four per-token
 scalars: -(age/mnia), -pos, and the geodesic distance / cosine alignment to the bag's unweighted midpoint
 (the last two are centre features with the per-bag level removed). mnia (mean node inter-arrival) is a fixed
@@ -86,9 +87,10 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        # Channel weights [geo, cos, geo_spread_v, cos_spread_v, log1p(deg_v)]; init 1,1,0,0,0
-        # (the spread and degree channels start off and learn their weights).
-        self.score_w = nn.Parameter(torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0]))
+        self.mnia = float(mean_node_inter_arrival)   # age scale for the candidate recency channel
+        # Channel weights [geo, cos, geo_spread_v, cos_spread_v, log1p(deg_v), log1p(age_v/mnia)]; init
+        # 1,1,0,0,0,0 (the spread, degree and recency channels start off and learn their weights).
+        self.score_w = nn.Parameter(torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0]))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Bag -> (P [Q,d], geo_spread [Q], cos_spread [Q]): the spreads are the pooling-weighted mean
@@ -109,10 +111,11 @@ class LinkPredHead(nn.Module):
         return p, geo_sp, cos_sp
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens,
-                cand_deg: torch.Tensor) -> torch.Tensor:
+                cand_deg: torch.Tensor, cand_age: torch.Tensor) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = w . [geo, cos, geo_spread_v, cos_spread_v, log1p(deg_v)]. cand_deg [B, C] = candidate's
-        interaction count strictly before its query time."""
+        score = w . [geo, cos, geo_spread_v, cos_spread_v, log1p(deg_v), log1p(age_v/mnia)].
+        cand_deg [B, C] = candidate's interaction count strictly before its query time; cand_age [B, C] =
+        query time minus its last event time (largest when the candidate has no prior event)."""
         emb = self.E.weight
         p_u, _, _ = self.pool(src_tokens, emb)                                  # [B, d]
         p_v, sg_v, sc_v = self.pool(cand_tokens, emb)                           # [B*C,d] + 2x [B*C]
@@ -124,4 +127,5 @@ class LinkPredHead(nn.Module):
         w = self.score_w
         return (w[0] * geo + w[1] * cos
                 + w[2] * sg_v.view(b, c) + w[3] * sc_v.view(b, c)               # candidate cloud spreads
-                + w[4] * torch.log1p(cand_deg))                                # online candidate degree (pop)
+                + w[4] * torch.log1p(cand_deg)                                 # candidate degree
+                + w[5] * torch.log1p(cand_age / self.mnia))                    # candidate recency

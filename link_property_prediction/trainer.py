@@ -137,13 +137,18 @@ class Trainer:
             start_bias=self.config.start_bias,
             walk_bias=self.config.walk_bias)
 
-        # Candidate interaction count strictly before the query time (log1p'd in the head).
+        # Candidate interaction count and time-since-last-event, both strictly before the query time.
+        cs_np = cand_seeds.detach().cpu().numpy()
+        cc_np = cand_cutoffs.detach().cpu().numpy()
         cand_deg = torch.as_tensor(
-            self.walk_gen.participation_counts(
-                cand_seeds.detach().cpu().numpy(), cand_cutoffs.detach().cpu().numpy()),
+            self.walk_gen.participation_counts(cs_np, cc_np),
             dtype=torch.float32, device=device).view(b, c)                  # [B, C]
+        last_ts = torch.as_tensor(
+            self.walk_gen.last_event_times(cs_np, cc_np),
+            dtype=torch.int64, device=device)                               # [B*C], -1 if none
+        cand_age = (cand_cutoffs - last_ts).to(torch.float32).view(b, c)    # [B, C]; largest when no event
 
-        return self.model(src_tokens, cand_tokens, cand_deg)
+        return self.model(src_tokens, cand_tokens, cand_deg, cand_age)
 
     # Per-batch training step
 
