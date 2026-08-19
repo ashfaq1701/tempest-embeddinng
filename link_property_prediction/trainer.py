@@ -43,6 +43,9 @@ class TrainerConfig:
     # Mean-field per-node inter-event time; AGE scale for the pooling recency weight.
     mean_node_inter_arrival: float = 1.0
 
+    # Append the edge-bank candidate channels [log1p(deg_v), log1p(age_v/mnia)] to the score.
+    use_edge_bank_feats: bool = False
+
     # Embedding dimension.
     d_emb: int = 128
 
@@ -74,6 +77,7 @@ class Trainer:
     def __init__(self, config: TrainerConfig, device: Optional[torch.device] = None):
         self.config = config
         self.t_min = int(config.t_min)   # cold-candidate recency reference
+        self.use_edge_bank_feats = bool(config.use_edge_bank_feats)
         self.device = device or torch.device(
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
@@ -82,6 +86,7 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             mean_node_inter_arrival=float(config.mean_node_inter_arrival),
+            use_edge_bank_feats=self.use_edge_bank_feats,
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(
@@ -142,20 +147,23 @@ class Trainer:
             start_bias=self.config.start_bias,
             walk_bias=self.config.walk_bias)
 
-        # Candidate interaction count and time-since-last-event, both strictly before the query time.
-        cs_np = cand_seeds.detach().cpu().numpy()
-        cc_np = cand_cutoffs.detach().cpu().numpy()
-        cand_deg = torch.as_tensor(
-            self.walk_gen.participation_counts(cs_np, cc_np),
-            dtype=torch.float32, device=device).view(b, c)                  # [B, C]
-        last_ts = torch.as_tensor(
-            self.walk_gen.last_event_times(cs_np, cc_np),
-            dtype=torch.int64, device=device)                               # [B*C], -1 if none
-        # No prior event -> reference the window start (t_min), not epoch 0: cold age = t - t_min
-        # is bounded by the train span and free of the Unix offset; seen nodes keep t - last_ts.
-        last_ts = torch.where(last_ts >= 0, last_ts,
-                              torch.full_like(last_ts, self.t_min))
-        cand_age = (cand_cutoffs - last_ts).clamp_min(0).to(torch.float32).view(b, c)   # [B, C]
+        # Edge-bank channels (optional): candidate interaction count and time-since-last-event, both
+        # strictly before the query time. Skipped entirely (incl. the Tempest queries) when disabled.
+        cand_deg = cand_age = None
+        if self.use_edge_bank_feats:
+            cs_np = cand_seeds.detach().cpu().numpy()
+            cc_np = cand_cutoffs.detach().cpu().numpy()
+            cand_deg = torch.as_tensor(
+                self.walk_gen.participation_counts(cs_np, cc_np),
+                dtype=torch.float32, device=device).view(b, c)                  # [B, C]
+            last_ts = torch.as_tensor(
+                self.walk_gen.last_event_times(cs_np, cc_np),
+                dtype=torch.int64, device=device)                               # [B*C], -1 if none
+            # No prior event -> reference the window start (t_min), not epoch 0: cold age = t - t_min
+            # is bounded by the train span and free of the Unix offset; seen nodes keep t - last_ts.
+            last_ts = torch.where(last_ts >= 0, last_ts,
+                                  torch.full_like(last_ts, self.t_min))
+            cand_age = (cand_cutoffs - last_ts).clamp_min(0).to(torch.float32).view(b, c)   # [B, C]
 
         return self.model(src_tokens, cand_tokens, cand_deg, cand_age)
 

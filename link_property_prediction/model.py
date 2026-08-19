@@ -1,8 +1,9 @@
 """Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f, f = [geo, cos, geo_spread_v,
-cos_spread_v, log1p(deg_v), log1p(age_v/mnia)] (geo=-d(P_u,P_v), cos=cos(P_u,P_v); the spreads are the
-candidate cloud's pooling-weighted mean geo/cos to its centroid; deg_v is the candidate's interaction count
-strictly before the query time, age_v the time since its last event before then), learnable w init
-[1,1,0,0,0,0]; P_x is the weighted gyro-midpoint of x's
+cos_spread_v] with two optional edge-bank channels [log1p(deg_v), log1p(age_v/mnia)] appended when
+--use-edge-bank-feats is set (geo=-d(P_u,P_v), cos=cos(P_u,P_v); the spreads are the candidate cloud's
+pooling-weighted mean geo/cos to its centroid; deg_v is the candidate's interaction count strictly before
+the query time, age_v the time since its last event before then), learnable w init [1,1,0,0(,0,0)]; P_x is
+the weighted gyro-midpoint of x's
 walk-token bag. Pooling weights come from a small MLP (hidden = 8*N_FEAT, random init) over four per-token
 scalars: -(age/mnia), -pos, and the geodesic distance / cosine alignment to the bag's unweighted midpoint
 (the last two are centre features with the per-bag level removed). mnia (mean node inter-arrival) is a fixed
@@ -73,7 +74,7 @@ class LinkPredHead(nn.Module):
     """E is a ManifoldParameter; BagWeights is the only other trained module."""
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float,
-                 init_irange: float = 1e-3):
+                 use_edge_bank_feats: bool = False, init_irange: float = 1e-3):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
@@ -88,9 +89,12 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
         self.mnia = float(mean_node_inter_arrival)   # age scale for the candidate recency channel
-        # Channel weights [geo, cos, geo_spread_v, cos_spread_v, log1p(deg_v), log1p(age_v/mnia)]; init
-        # 1,1,0,0,0,0 (the spread, degree and recency channels start off and learn their weights).
-        self.score_w = nn.Parameter(torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0]))
+        self.use_edge_bank_feats = bool(use_edge_bank_feats)
+        # Channel weights [geo, cos, geo_spread_v, cos_spread_v] always, + [log1p(deg_v),
+        # log1p(age_v/mnia)] (the edge-bank candidate channels) when enabled. init geo/cos = 1;
+        # spread/degree/recency channels start at 0 and learn their weights.
+        n_ch = 6 if self.use_edge_bank_feats else 4
+        self.score_w = nn.Parameter(torch.tensor([1.0, 1.0] + [0.0] * (n_ch - 2)))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Bag -> (P [Q,d], geo_spread [Q], cos_spread [Q]): the spreads are the pooling-weighted mean
@@ -111,11 +115,12 @@ class LinkPredHead(nn.Module):
         return p, geo_sp, cos_sp
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens,
-                cand_deg: torch.Tensor, cand_age: torch.Tensor) -> torch.Tensor:
+                cand_deg: torch.Tensor = None, cand_age: torch.Tensor = None) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = w . [geo, cos, geo_spread_v, cos_spread_v, log1p(deg_v), log1p(age_v/mnia)].
-        cand_deg [B, C] = candidate's interaction count strictly before its query time; cand_age [B, C] =
-        query time minus its last event time (largest when the candidate has no prior event)."""
+        score = w . [geo, cos, geo_spread_v, cos_spread_v] (+ [log1p(deg_v), log1p(age_v/mnia)] when
+        edge-bank feats are on). cand_deg [B, C] = candidate's interaction count strictly before its
+        query time; cand_age [B, C] = query time minus its last event time (largest when the candidate
+        has no prior event). Both are None (and unused) when edge-bank feats are off."""
         emb = self.E.weight
         p_u, _, _ = self.pool(src_tokens, emb)                                  # [B, d]
         p_v, sg_v, sc_v = self.pool(cand_tokens, emb)                           # [B*C,d] + 2x [B*C]
@@ -125,7 +130,10 @@ class LinkPredHead(nn.Module):
         geo = -self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic
         cos = F.cosine_similarity(p_u.unsqueeze(1), p_v, dim=-1, eps=1e-6)      # [B, C] direction agreement
         w = self.score_w
-        return (w[0] * geo + w[1] * cos
-                + w[2] * sg_v.view(b, c) + w[3] * sc_v.view(b, c)               # candidate cloud spreads
-                + w[4] * torch.log1p(cand_deg)                                 # candidate degree
-                + w[5] * torch.log1p(cand_age / self.mnia))                    # candidate recency
+        score = (w[0] * geo + w[1] * cos
+                 + w[2] * sg_v.view(b, c) + w[3] * sc_v.view(b, c))             # + candidate cloud spreads
+        if self.use_edge_bank_feats:
+            score = (score
+                     + w[4] * torch.log1p(cand_deg)                            # candidate degree
+                     + w[5] * torch.log1p(cand_age / self.mnia))               # candidate recency
+        return score

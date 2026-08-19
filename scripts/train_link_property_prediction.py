@@ -52,6 +52,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--is-bipartite", action="store_true",
                    help="Treat the graph as bipartite.")
+    p.add_argument("--use-edge-bank-feats", action="store_true",
+                   help="Append the edge-bank candidate channels [log1p(deg_v), "
+                        "log1p(age_v/mnia)] to the score (online degree + recency).")
 
     # Chronological subsample.
     p.add_argument(
@@ -194,6 +197,7 @@ def main() -> Dict[str, Any]:
         t_train=float(stats.T_train),
         t_min=int(stats.t_min),
         mean_node_inter_arrival=float(stats.mean_node_inter_arrival),
+        use_edge_bank_feats=args.use_edge_bank_feats,
 
         d_emb=args.d_emb,
 
