@@ -64,9 +64,8 @@ class WalkGenerator:
         self.tempest.add_multiple_edges(src, tgt, ts, edge_features=edge_feat)
 
     def participation_counts(self, nodes: np.ndarray, cutoffs: np.ndarray) -> np.ndarray:
-        """Total interactions of each node STRICTLY BEFORE its cutoff t (int64), one per node. Graph is
-        undirected, so Backward == total degree as-of-t. Inductive (any node) and online (grows with t).
-        Exclusive cutoff => the query edge itself is never counted."""
+        """Interactions of each node strictly before its cutoff t (int64), one per node. Undirected graph,
+        so this is the total degree as-of-t; the exclusive cutoff excludes the query edge itself."""
         node_arr = np.ascontiguousarray(nodes, dtype=np.int32)
         cutoff_arr = np.ascontiguousarray(cutoffs, dtype=np.int64)
         if cutoff_arr.shape[0] != node_arr.shape[0]:

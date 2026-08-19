@@ -1,8 +1,7 @@
 """Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f, f = [geo, cos, geo_spread_v,
 cos_spread_v, log1p(deg_v)] (geo=-d(P_u,P_v), cos=cos(P_u,P_v); the spreads are the candidate cloud's
-pooling-weighted mean geo/cos to its centroid; deg_v is the candidate's ONLINE interaction count as-of
-query time, replacing the frozen per-node pop_bias), learnable w init [1,1,0,0,0]; P_x is the weighted
-gyro-midpoint of x's
+pooling-weighted mean geo/cos to its centroid; deg_v is the candidate's interaction count strictly before
+the query time), learnable w init [1,1,0,0,0]; P_x is the weighted gyro-midpoint of x's
 walk-token bag. Pooling weights come from a small MLP (hidden = 8*N_FEAT, random init) over four per-token
 scalars: -(age/mnia), -pos, and the geodesic distance / cosine alignment to the bag's unweighted midpoint
 (the last two are centre features with the per-bag level removed). mnia (mean node inter-arrival) is a fixed
@@ -87,10 +86,8 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        # No learned pop_bias: the candidate popularity term is the ONLINE degree log1p(deg_v(t))
-        # (a computed graph statistic, inductive + drift-aware), fed in at forward.
-        # Channel weights [geo, cos, geo_spread_v, cos_spread_v, log1p(deg_v)]; init 1,1,0,0,0. The degree
-        # channel is off at step 0 (like the old zero-init b_v) and learns its weight.
+        # Channel weights [geo, cos, geo_spread_v, cos_spread_v, log1p(deg_v)]; init 1,1,0,0,0
+        # (the spread and degree channels start off and learn their weights).
         self.score_w = nn.Parameter(torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0]))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -115,7 +112,7 @@ class LinkPredHead(nn.Module):
                 cand_deg: torch.Tensor) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
         score = w . [geo, cos, geo_spread_v, cos_spread_v, log1p(deg_v)]. cand_deg [B, C] = candidate's
-        interaction count strictly before its query time (online, inductive; replaces the frozen pop_bias)."""
+        interaction count strictly before its query time."""
         emb = self.E.weight
         p_u, _, _ = self.pool(src_tokens, emb)                                  # [B, d]
         p_v, sg_v, sc_v = self.pool(cand_tokens, emb)                           # [B*C,d] + 2x [B*C]

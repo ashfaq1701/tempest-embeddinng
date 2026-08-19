@@ -137,7 +137,7 @@ class Trainer:
             start_bias=self.config.start_bias,
             walk_bias=self.config.walk_bias)
 
-        # Online candidate degree (as-of-t): inductive, drift-aware replacement for the frozen pop_bias.
+        # Candidate interaction count strictly before the query time (log1p'd in the head).
         cand_deg = torch.as_tensor(
             self.walk_gen.participation_counts(
                 cand_seeds.detach().cpu().numpy(), cand_cutoffs.detach().cpu().numpy()),
