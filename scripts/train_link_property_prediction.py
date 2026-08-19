@@ -192,6 +192,7 @@ def main() -> Dict[str, Any]:
         num_nodes=num_nodes,
         dst_pool=dst_pool,
         t_train=float(stats.T_train),
+        t_min=int(stats.t_min),
         mean_node_inter_arrival=float(stats.mean_node_inter_arrival),
 
         d_emb=args.d_emb,

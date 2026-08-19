@@ -36,6 +36,10 @@ class TrainerConfig:
     # Train-split span; sets the init of the recency scale.
     t_train: float = 1.0
 
+    # Earliest train timestamp; reference for a cold candidate's recency (age from the window
+    # start, not epoch 0, so the Unix offset does not inflate the no-history age).
+    t_min: int = 0
+
     # Mean-field per-node inter-event time; AGE scale for the pooling recency weight.
     mean_node_inter_arrival: float = 1.0
 
@@ -69,6 +73,7 @@ class TrainerConfig:
 class Trainer:
     def __init__(self, config: TrainerConfig, device: Optional[torch.device] = None):
         self.config = config
+        self.t_min = int(config.t_min)   # cold-candidate recency reference
         self.device = device or torch.device(
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
@@ -146,7 +151,11 @@ class Trainer:
         last_ts = torch.as_tensor(
             self.walk_gen.last_event_times(cs_np, cc_np),
             dtype=torch.int64, device=device)                               # [B*C], -1 if none
-        cand_age = (cand_cutoffs - last_ts).to(torch.float32).view(b, c)    # [B, C]; largest when no event
+        # No prior event -> reference the window start (t_min), not epoch 0: cold age = t - t_min
+        # is bounded by the train span and free of the Unix offset; seen nodes keep t - last_ts.
+        last_ts = torch.where(last_ts >= 0, last_ts,
+                              torch.full_like(last_ts, self.t_min))
+        cand_age = (cand_cutoffs - last_ts).clamp_min(0).to(torch.float32).view(b, c)   # [B, C]
 
         return self.model(src_tokens, cand_tokens, cand_deg, cand_age)
 
