@@ -1,9 +1,10 @@
 """Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f, f = [geo, cos, geo_spread_v,
-cos_spread_v] with two optional edge-bank channels [log1p(deg_v), log1p(age_v/mnia)] appended when
---use-edge-bank-feats is set (geo=-d(P_u,P_v), cos=cos(P_u,P_v); the spreads are the candidate cloud's
-pooling-weighted mean geo/cos to its centroid; deg_v is the candidate's interaction count strictly before
-the query time, age_v the time since its last event before then), learnable w init [1,1,0,0(,0,0)]; P_x is
-the weighted gyro-midpoint of x's
+cos_spread_v] with two optional edge-bank channels, per-query standardised [std(log1p(deg_v)),
+std(-log(age_v))], appended when --use-edge-bank-feats is set (geo=-d(P_u,P_v), cos=cos(P_u,P_v); the
+spreads are the candidate cloud's pooling-weighted mean geo/cos to its centroid; deg_v is the candidate's
+interaction count strictly before the query time, age_v the time since its last event before then, so
+-log(age_v) scores recent candidates high), learnable w init [1,1,0,0(,0,0)]; P_x is the weighted
+gyro-midpoint of x's
 walk-token bag. Pooling weights come from a small MLP (hidden = 8*N_FEAT, random init) over four per-token
 scalars: -(age/mnia), -pos, and the geodesic distance / cosine alignment to the bag's unweighted midpoint
 (the last two are centre features with the per-bag level removed). mnia (mean node inter-arrival) is a fixed
@@ -88,11 +89,10 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        self.mnia = float(mean_node_inter_arrival)   # age scale for the candidate recency channel
         self.use_edge_bank_feats = bool(use_edge_bank_feats)
-        # Channel weights [geo, cos, geo_spread_v, cos_spread_v] always, + [log1p(deg_v),
-        # log1p(age_v/mnia)] (the edge-bank candidate channels) when enabled. init geo/cos = 1;
-        # spread/degree/recency channels start at 0 and learn their weights.
+        # Channel weights [geo, cos, geo_spread_v, cos_spread_v] always, + [std(log1p(deg_v)),
+        # std(-log(age_v))] (the edge-bank candidate channels, per-query standardised) when enabled.
+        # init geo/cos = 1; spread/degree/recency channels start at 0 and learn their weights.
         n_ch = 6 if self.use_edge_bank_feats else 4
         self.score_w = nn.Parameter(torch.tensor([1.0, 1.0] + [0.0] * (n_ch - 2)))
 
@@ -114,13 +114,24 @@ class LinkPredHead(nn.Module):
         cos_sp = (w * F.cosine_similarity(pe, x, dim=-1, eps=1e-6)).sum(dim=-1) # [Q] weighted mean cos to P
         return p, geo_sp, cos_sp
 
+    @staticmethod
+    def _standardize(x: torch.Tensor) -> torch.Tensor:
+        """Per-query (per-row) zero-mean / unit-std over the candidate axis, so an edge-bank channel
+        enters the score at unit scale (comparable to geo/cos) and cannot dominate by raw magnitude.
+        Uses only a query's own candidates -> ranking-invariant to batching; std floored to avoid
+        blow-up when a query's candidates are tied (channel then contributes ~0 there)."""
+        m = x.mean(dim=1, keepdim=True)
+        s = x.std(dim=1, keepdim=True).clamp_min(1e-6)
+        return (x - m) / s
+
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens,
                 cand_deg: torch.Tensor = None, cand_age: torch.Tensor = None) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = w . [geo, cos, geo_spread_v, cos_spread_v] (+ [log1p(deg_v), log1p(age_v/mnia)] when
-        edge-bank feats are on). cand_deg [B, C] = candidate's interaction count strictly before its
-        query time; cand_age [B, C] = query time minus its last event time (largest when the candidate
-        has no prior event). Both are None (and unused) when edge-bank feats are off."""
+        score = w . [geo, cos, geo_spread_v, cos_spread_v] (+ per-query-standardised [log1p(deg_v),
+        -log(age_v)] when edge-bank feats are on). cand_deg [B, C] = candidate's interaction count
+        strictly before its query time; cand_age [B, C] = query time minus its last event time (largest
+        when the candidate has no prior event). Both are None (and unused) when edge-bank feats are off.
+        Recency uses -log(age): recent (small age) -> high, stale/cold -> low."""
         emb = self.E.weight
         p_u, _, _ = self.pool(src_tokens, emb)                                  # [B, d]
         p_v, sg_v, sc_v = self.pool(cand_tokens, emb)                           # [B*C,d] + 2x [B*C]
@@ -133,7 +144,7 @@ class LinkPredHead(nn.Module):
         score = (w[0] * geo + w[1] * cos
                  + w[2] * sg_v.view(b, c) + w[3] * sc_v.view(b, c))             # + candidate cloud spreads
         if self.use_edge_bank_feats:
-            score = (score
-                     + w[4] * torch.log1p(cand_deg)                            # candidate degree
-                     + w[5] * torch.log1p(cand_age / self.mnia))               # candidate recency
+            deg = self._standardize(torch.log1p(cand_deg))                     # candidate degree
+            rec = self._standardize(-torch.log(cand_age.clamp_min(1.0)))       # candidate recency (recent -> high)
+            score = score + w[4] * deg + w[5] * rec
         return score
