@@ -4,7 +4,7 @@ score; dist_spread_v = the candidate cloud's pooling-weighted mean L2 distance t
 pop_bias_v is a learned per-node scalar added at its own scale), learnable w init [1,0]; P_x is the
 plain weighted arithmetic mean (Sum_i w_i x_i) of x's walk-token bag. E is a plain unconstrained
 nn.Parameter (Adam moves it freely). Pooling weights come from a small MLP (hidden = 8*N_FEAT) over
-three per-token scalars: -(age/mnia), -pos, and the cosine similarity to the bag's unweighted midpoint
+three per-token scalars: -(age/mnia), -pos, and the L2 distance to the bag's unweighted midpoint
 (per-bag level removed). mnia (mean node inter-arrival) is a fixed age scale."""
 from typing import Tuple
 
@@ -32,10 +32,10 @@ class EuclideanGeometry:
 
 
 class BagWeights(nn.Module):
-    """Pooling weights = softmax(MLP([-(age/mnia), -pos, ang])); hidden = 8*N_FEAT, randomly
+    """Pooling weights = softmax(MLP([-(age/mnia), -pos, spr])); hidden = 8*N_FEAT, randomly
     initialised, with mnia as a fixed age scale. The softmax over tokens dampens the random init.
-    The single geometric per-token feature is the cosine similarity to the bag's unweighted center
-    (angular — carried over from the sphere head; a distance-to-center variant is possible)."""
+    The single geometric per-token feature is the L2 distance to the bag's unweighted center,
+    per-bag level removed (divided by the mean distance)."""
 
     N_FEAT = 3
 
@@ -47,21 +47,21 @@ class BagWeights(nn.Module):
 
     @staticmethod
     def centre_feats(geom: EuclideanGeometry, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        """Cosine similarity of each token to the bag's unweighted center C, per-bag level removed:
-        ang = cos(x_p, C) - mean_q cos(x_q, C).  -> [Q, T]."""
+        """L2 distance of each token to the bag's unweighted center C, per-bag level removed by
+        dividing by the mean distance: spr = d(x_p, C) / mean_q d(x_q, C).  -> [Q, T]."""
         vf = valid.to(x.dtype)
         n = vf.sum(dim=-1, keepdim=True).clamp_min(1.0)
         c = geom.midpoint(x, vf / n).unsqueeze(-2)                              # [Q, 1, d] unweighted center
-        cs = F.cosine_similarity(c, x, dim=-1, eps=1e-6) * vf
-        return (cs - cs.sum(dim=-1, keepdim=True) / n) * vf
+        dc = geom.dist(c, x) * vf                                               # [Q, T] L2 distance to center
+        return dc / (dc.sum(dim=-1, keepdim=True) / n).clamp_min(1e-6)
 
     def forward(self, geom: EuclideanGeometry, tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
         rec = -(tokens.ages.clamp_min(0).float() / self.mnia)                   # -(age/mnia)
         pos = -(tokens.positions.clamp_min(1).float() - 1.0)                    # -pos
-        ang = self.centre_feats(geom, x.detach(), valid)                        # cos to unweighted center
-        feat = torch.stack([rec, pos, ang], dim=-1).to(x.dtype)                 # [Q, T, 3]
+        spr = self.centre_feats(geom, x.detach(), valid)                        # L2 dist to unweighted center
+        feat = torch.stack([rec, pos, spr], dim=-1).to(x.dtype)                 # [Q, T, 3]
         logits = self.net(feat).squeeze(-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
