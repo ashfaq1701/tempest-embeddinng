@@ -1,7 +1,8 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f + pop_bias_v, f = [geo, cos,
+"""Centroid-to-centroid head on the unit sphere: s(u,v) = w . f + pop_bias_v, f = [geo, cos,
 geo_spread_v, cos_spread_v] (geo=-d(P_u,P_v), cos=cos(P_u,P_v); the spreads are the candidate cloud's
 pooling-weighted mean geo/cos to its centroid; pop_bias_v is a learned per-node scalar added at its own
-scale), learnable w init [1,1,0,0]; P_x is the weighted gyro-midpoint of x's walk-token bag. Pooling
+scale), learnable w init [1,1,0,0]; P_x is the normalized weighted resultant (spherical mean) of x's
+walk-token bag. (Phase 1: geometry swapped to the sphere; channel surgery to follow.) Pooling
 weights come from a small MLP (hidden = 8*N_FEAT) over four per-token scalars: -(age/mnia), -pos, and the
 geodesic distance / cosine alignment to the bag's unweighted midpoint (the last two are centre features
 with the per-bag level removed). mnia (mean node inter-arrival) is a fixed age scale."""
@@ -28,6 +29,27 @@ class PoincareManifold:
     def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """Weighted gyro-midpoint: x [Q,T,d], w [Q,T] -> [Q,d]."""
         return self.manifold.weighted_midpoint(x, weights=w, reducedim=[-2], dim=-1, keepdim=False)
+
+
+class SphereGeometry:
+    """Unit-hypersphere geometry (same interface as PoincareManifold). `manifold` is kept for E's
+    random init + RiemannianAdam. The sphere's weighted midpoint is the normalized weighted
+    resultant (the vMF MLE mean direction), and distance is the great-circle angle."""
+
+    def __init__(self):
+        self.manifold = geoopt.Sphere()
+
+    def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Great-circle (geodesic) distance = arccos(<x,y>), broadcasting over leading dims.
+        LOWER = closer."""
+        return self.manifold.dist(x, y)
+
+    def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """Weighted spherical mean = normalize(sum_i w_i x_i): x [Q,T,d], w [Q,T] (sums to 1 over
+        valid) -> [Q,d]. Minimizes weighted squared chordal distance == maximizes weighted mean
+        cosine; the pre-normalization norm is the resultant length R (cloud concentration)."""
+        resultant = (x * w.unsqueeze(-1)).sum(dim=-2)                           # [Q, d]
+        return F.normalize(resultant, dim=-1, eps=1e-8)
 
 
 class BagWeights(nn.Module):
@@ -74,14 +96,15 @@ class LinkPredHead(nn.Module):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
-        self.geom = PoincareManifold()
+        self.geom = SphereGeometry()
         self.bag_weights = BagWeights(mean_node_inter_arrival)
 
-        # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
+        # Uniform-random init on the sphere (Gaussian -> normalize). No origin to dilute toward, so
+        # geodesic (great-circle) distances have full scale from step 0; init_irange is unused on the
+        # sphere. RiemannianAdam keeps E on the sphere via the ManifoldParameter.
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            init = self.geom.manifold.projx(
-                (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
+            init = self.geom.manifold.random_uniform(self.num_nodes, self.d_emb)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
         self.pop_bias = nn.Embedding(self.num_nodes, 1)
