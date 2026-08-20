@@ -40,7 +40,7 @@ class TrainerConfig:
     mean_node_inter_arrival: float = 1.0
 
     # Embedding dimension.
-    d_emb: int = 128
+    d_emb: int = 64
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5

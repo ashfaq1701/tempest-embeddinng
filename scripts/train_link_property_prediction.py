@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
 
 
     # Model.
-    p.add_argument("--d-emb", default=128, type=int,
+    p.add_argument("--d-emb", default=64, type=int,
                    help="Embedding dimension.")
 
     # Link loss / head.

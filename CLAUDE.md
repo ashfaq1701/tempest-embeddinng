@@ -337,7 +337,7 @@ Historical (Vitter R) reservoir sampler.
 | `beta_time` | 1.0 | a-priori; validated by β sweep on wiki (full-InfoNCE), re-validated under projection_norm=none + l2_dist (2026-05-28) |
 | Alignment pool | full unique-batch-node, count-weighted partition | Replaces the earlier `num_align_negatives` sampled-K partition. Closed-form equivalent of multinomial sampling under the count distribution, with zero sampling variance. Hardcoded — not a CLI knob |
 | `K_train` | 100 | ranking-loss convention (DPR-style, RotatE); larger K_train means harder per-query competition and stronger ranking gradients, at proportional compute cost |
-| `d_emb` | 128 | |
+| `d_emb` | 64 | lowered from 128 (2026-08-20); the low-d sweep held leaderboard #1 on 4/8 tgb-seq datasets at d32, so 64 is the cheaper default |
 | `d_proj` | — | Removed; projection dim is now hardcoded to `d_emb` in ProjectionHead. The knob was always set equal to `d_emb` in practice, so collapsing it is behaviour-preserving. |
 | ProjectionHead output | L2-normalised on unit sphere | reverted from "no norm" (winning 2026-05-28 config) to L2-norm in the Prodigy + ranking-link-loss redesign (2026-05-30 sweep; see below). On the sphere, squared L2 distance equals 2-2*cos, so the alignment loss is cosine-equivalent up to a constant. Hardcoded — not a CLI knob |
 | Alignment sim | `-‖p_t − p_c‖² / tau_align` (L2-distance) | same sweep: equivalent to cosine on the unit sphere; off-sphere it carries strictly more information (magnitude + direction). Hardcoded — not a CLI knob |
@@ -1367,7 +1367,7 @@ datasets (GoogleLocal, ML-20M, Yelp, Taobao) need `--is-bipartite`. A bare `trai
 | 7 | Yelp        | 19.8M | yes | — | not yet run |
 | 8 | WikiLink    | 34.2M | no  | — | not yet run |
 
-**Mainline defaults (master):** d_emb 128, lr 1e-3, num_walks_per_node 5, K_train 20, num_epochs 50,
+**Mainline defaults (master):** d_emb 64, lr 1e-3, num_walks_per_node 5, K_train 20, num_epochs 50,
 early_stop_patience 3, cos scale init √d. Head = geo_cos on the gyro-midpoint: `s = -d_H(P_u,P_v) +
 scale·cos(P_u,P_v) + b_v`, 4-scalar pooler.
 
