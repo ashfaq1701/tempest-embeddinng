@@ -109,15 +109,15 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = w . [geo, cos, geo_spread_v, cos_spread_v]."""
+        score = w . [-geo, cos, geo_spread_v, cos_spread_v]."""
         emb = self.E.weight
         p_u, _, _ = self.pool(src_tokens, emb)                                  # [B, d]
         p_v, sg_v, sc_v = self.pool(cand_tokens, emb)                           # [B*C,d] + 2x [B*C]
         b, d = p_u.shape
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
-        geo = -self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic
+        geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
         cos = F.cosine_similarity(p_u.unsqueeze(1), p_v, dim=-1, eps=1e-6)      # [B, C] direction agreement
-        w = self.score_w
-        return (w[0] * geo + w[1] * cos
-                + w[2] * sg_v.view(b, c) + w[3] * sc_v.view(b, c))              # candidate cloud spreads
+        feats = torch.stack([-geo, cos,                                        # -geo: lower distance = higher score
+                             sg_v.view(b, c), sc_v.view(b, c)], dim=-1)         # [B, C, 4] candidate cloud spreads
+        return (feats * self.score_w).sum(dim=-1)
