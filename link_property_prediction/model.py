@@ -1,12 +1,10 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f + std(pop_bias_v), f = [geo, cos,
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f + pop_bias_v, f = [geo, cos,
 geo_spread_v, cos_spread_v] (geo=-d(P_u,P_v), cos=cos(P_u,P_v); the spreads are the candidate cloud's
-pooling-weighted mean geo/cos to its centroid; pop_bias_v is a learned per-node scalar STANDARDISED over
-the candidate set, added separately so it can't swallow the geometry), learnable w init [1,1,0,0]; P_x is
-the weighted gyro-midpoint of x's
-walk-token bag. Pooling weights come from a small MLP (hidden = 8*N_FEAT, random init) over four per-token
-scalars: -(age/mnia), -pos, and the geodesic distance / cosine alignment to the bag's unweighted midpoint
-(the last two are centre features with the per-bag level removed). mnia (mean node inter-arrival) is a fixed
-age scale. On Yelp this matched the previous linear-prior + zero-init-MLP-correction pooling."""
+pooling-weighted mean geo/cos to its centroid; pop_bias_v is a learned per-node scalar added at its own
+scale), learnable w init [1,1,0,0]; P_x is the weighted gyro-midpoint of x's walk-token bag. Pooling
+weights come from a small MLP (hidden = 8*N_FEAT) over four per-token scalars: -(age/mnia), -pos, and the
+geodesic distance / cosine alignment to the bag's unweighted midpoint (the last two are centre features
+with the per-bag level removed). mnia (mean node inter-arrival) is a fixed age scale."""
 from typing import Tuple
 
 import geoopt
@@ -33,9 +31,8 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """Pooling weights = softmax(MLP([-(age/mnia), -pos, spr, ang])); hidden = 8*N_FEAT, random init,
-    fixed age scale mnia (no learnable tau, no linear residual). The softmax over tokens dampens the
-    random init, so unlike a score-level MLP the prior/residual are not needed here."""
+    """Pooling weights = softmax(MLP([-(age/mnia), -pos, spr, ang])); hidden = 8*N_FEAT, randomly
+    initialised, with mnia as a fixed age scale. The softmax over tokens dampens the random init."""
 
     N_FEAT = 4
 
@@ -89,9 +86,8 @@ class LinkPredHead(nn.Module):
 
         self.pop_bias = nn.Embedding(self.num_nodes, 1)
         nn.init.zeros_(self.pop_bias.weight)
-        # Learnable channel weights [geo, cos, geo_spread_v, cos_spread_v], no calibration; init 1,1,0,0
-        # (the candidate cloud-spread channels are off at step 0). pop_bias is added SEPARATELY (weight 1),
-        # raw in forward — it keeps whatever scale it learns.
+        # Learnable channel weights [geo, cos, geo_spread_v, cos_spread_v], init 1,1,0,0 (the candidate
+        # cloud-spread channels are off at step 0). pop_bias is added separately at weight 1.
         self.score_w = nn.Parameter(torch.tensor([1.0, 1.0, 0.0, 0.0]))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -126,7 +122,7 @@ class LinkPredHead(nn.Module):
         cos = F.cosine_similarity(p_u.unsqueeze(1), p_v, dim=-1, eps=1e-6)      # [B, C] direction agreement
         feats = torch.stack([-geo, cos,                                        # -geo: lower distance = higher score
                              sg_v.view(b, c), sc_v.view(b, c)], dim=-1)         # [B, C, 4] candidate cloud spreads
-        pop = self.pop_bias(v_nodes).squeeze(-1)                                # [B, C] raw per-node bias
-        # Added RAW (no per-query standardisation): the bias keeps its own learned scale, so absolute
-        # popularity carries across queries. Zero-init pop starts at exactly 0 contribution.
+        # Per-node bias at its own learned scale, so absolute popularity carries across queries;
+        # zero-init means it contributes exactly 0 at step 0.
+        pop = self.pop_bias(v_nodes).squeeze(-1)                                # [B, C]
         return (feats * self.score_w).sum(dim=-1) + pop
