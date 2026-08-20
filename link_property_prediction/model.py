@@ -16,25 +16,10 @@ import torch.nn.functional as F
 from .walk_tokens import WalkTokens
 
 
-class PoincareManifold:
-    """Poincaré-ball geometry (c=1). `manifold` is kept for E's init + RiemannianAdam."""
-
-    def __init__(self, c: float = 1.0):
-        self.manifold = geoopt.PoincareBall(c=c)
-
-    def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Elementwise geodesic distance, broadcasting over leading dims. LOWER = closer."""
-        return self.manifold.dist(x, y)
-
-    def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        """Weighted gyro-midpoint: x [Q,T,d], w [Q,T] -> [Q,d]."""
-        return self.manifold.weighted_midpoint(x, weights=w, reducedim=[-2], dim=-1, keepdim=False)
-
-
 class SphereGeometry:
-    """Unit-hypersphere geometry (same interface as PoincareManifold). `manifold` is kept for E's
-    random init + RiemannianAdam. The sphere's weighted midpoint is the normalized weighted
-    resultant (the vMF MLE mean direction), and distance is the great-circle angle."""
+    """Unit-hypersphere geometry. `manifold` is kept for E's random init + RiemannianAdam. The
+    sphere's weighted midpoint is the normalized weighted resultant (the vMF MLE mean direction),
+    and distance is the great-circle angle."""
 
     def __init__(self):
         self.manifold = geoopt.Sphere()
@@ -65,7 +50,7 @@ class BagWeights(nn.Module):
         self.net = nn.Sequential(nn.Linear(self.N_FEAT, hidden), nn.GELU(), nn.Linear(hidden, 1))
 
     @staticmethod
-    def centre_feats(geom: PoincareManifold, x: torch.Tensor,
+    def centre_feats(geom: SphereGeometry, x: torch.Tensor,
                      valid: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Token geometry relative to the bag's unweighted midpoint C, per-bag level removed from both:
         spr = d(x_p, C) / mean_q d(x_q, C),  ang = cos(x_p, C) - mean_q cos(x_q, C).  Each -> [Q, T]."""
@@ -77,7 +62,7 @@ class BagWeights(nn.Module):
         cs = F.cosine_similarity(c, x, dim=-1, eps=1e-6) * vf
         return spr, (cs - cs.sum(dim=-1, keepdim=True) / n) * vf
 
-    def forward(self, geom: PoincareManifold, tokens: WalkTokens, x: torch.Tensor,
+    def forward(self, geom: SphereGeometry, tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
         rec = -(tokens.ages.clamp_min(0).float() / self.mnia)                   # -(age/mnia)

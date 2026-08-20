@@ -72,7 +72,7 @@ class Trainer:
         self.device = device or torch.device(
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
-        # Owns the Poincare-ball node embeddings and the monotone metric score.
+        # Owns the unit-sphere node embeddings and the metric score.
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
