@@ -172,12 +172,6 @@ class Trainer:
 
     # Geometry probe
 
-    @torch.no_grad()
-    def _geometry_probe(self) -> Dict[str, float]:
-        """Boundary watch: mean and max Euclidean norm of E (bulk vs tail radius)."""
-        norms = self.model.E.weight.detach().norm(dim=-1)
-        return {"max_norm": float(norms.max()), "mean_norm": float(norms.mean())}
-
     # Eval — strict-causal, no_grad
 
     def _eval(self, evaluator: Evaluator, batches: Iterable[Batch],
@@ -283,10 +277,6 @@ class Trainer:
                 f"lr={self.opt.param_groups[0]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
-
-            # Geometry watch: boundary radius (|E|mean vs |E|max).
-            g = self._geometry_probe()
-            line += f"  |E|mean={g['mean_norm']:.3f}  |E|max={g['max_norm']:.3f}"
 
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()
