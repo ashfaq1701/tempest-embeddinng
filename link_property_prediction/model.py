@@ -91,7 +91,7 @@ class LinkPredHead(nn.Module):
         nn.init.zeros_(self.pop_bias.weight)
         # Learnable channel weights [geo, cos, geo_spread_v, cos_spread_v], no calibration; init 1,1,0,0
         # (the candidate cloud-spread channels are off at step 0). pop_bias is added SEPARATELY (weight 1),
-        # per-query standardised in forward so it can't swallow the geometry.
+        # raw in forward — it keeps whatever scale it learns.
         self.score_w = nn.Parameter(torch.tensor([1.0, 1.0, 0.0, 0.0]))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -114,7 +114,7 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = w . [-geo, cos, geo_spread_v, cos_spread_v] + std(pop_bias_v)."""
+        score = w . [-geo, cos, geo_spread_v, cos_spread_v] + pop_bias_v."""
         emb = self.E.weight
         p_u, _, _ = self.pool(src_tokens, emb)                                  # [B, d]
         p_v, sg_v, sc_v = self.pool(cand_tokens, emb)                           # [B*C,d] + 2x [B*C]
@@ -127,7 +127,6 @@ class LinkPredHead(nn.Module):
         feats = torch.stack([-geo, cos,                                        # -geo: lower distance = higher score
                              sg_v.view(b, c), sc_v.view(b, c)], dim=-1)         # [B, C, 4] candidate cloud spreads
         pop = self.pop_bias(v_nodes).squeeze(-1)                                # [B, C] raw per-node bias
-        # Standardise over the C candidates -> unit-scale relative popularity, added directly so it can't
-        # swallow the geometry channels. Zero-init pop starts at exactly 0 contribution.
-        pop = (pop - pop.mean(dim=-1, keepdim=True)) / (pop.std(dim=-1, keepdim=True) + 1e-6)
+        # Added RAW (no per-query standardisation): the bias keeps its own learned scale, so absolute
+        # popularity carries across queries. Zero-init pop starts at exactly 0 contribution.
         return (feats * self.score_w).sum(dim=-1) + pop
