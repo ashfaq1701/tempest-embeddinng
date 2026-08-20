@@ -38,10 +38,12 @@ class SphereGeometry:
 
 
 class BagWeights(nn.Module):
-    """Pooling weights = softmax(MLP([-(age/mnia), -pos, spr, ang])); hidden = 8*N_FEAT, randomly
-    initialised, with mnia as a fixed age scale. The softmax over tokens dampens the random init."""
+    """Pooling weights = softmax(MLP([-(age/mnia), -pos, ang])); hidden = 8*N_FEAT, randomly
+    initialised, with mnia as a fixed age scale. The softmax over tokens dampens the random init.
+    On the sphere there is no meaningful geodesic 'spread' (distance == arccos(cos)), so the only
+    geometric per-token feature is the cosine similarity to the bag's unweighted center."""
 
-    N_FEAT = 4
+    N_FEAT = 3
 
     def __init__(self, mnia: float):
         super().__init__()
@@ -50,25 +52,22 @@ class BagWeights(nn.Module):
         self.net = nn.Sequential(nn.Linear(self.N_FEAT, hidden), nn.GELU(), nn.Linear(hidden, 1))
 
     @staticmethod
-    def centre_feats(geom: SphereGeometry, x: torch.Tensor,
-                     valid: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Token geometry relative to the bag's unweighted midpoint C, per-bag level removed from both:
-        spr = d(x_p, C) / mean_q d(x_q, C),  ang = cos(x_p, C) - mean_q cos(x_q, C).  Each -> [Q, T]."""
+    def centre_feats(geom: SphereGeometry, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """Cosine similarity of each token to the bag's unweighted center C, per-bag level removed:
+        ang = cos(x_p, C) - mean_q cos(x_q, C).  -> [Q, T]."""
         vf = valid.to(x.dtype)
         n = vf.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        c = geom.midpoint(x, vf / n).unsqueeze(-2)                              # [Q, 1, d]
-        dc = geom.dist(c, x) * vf
-        spr = dc / (dc.sum(dim=-1, keepdim=True) / n).clamp_min(1e-6)
+        c = geom.midpoint(x, vf / n).unsqueeze(-2)                              # [Q, 1, d] unweighted center
         cs = F.cosine_similarity(c, x, dim=-1, eps=1e-6) * vf
-        return spr, (cs - cs.sum(dim=-1, keepdim=True) / n) * vf
+        return (cs - cs.sum(dim=-1, keepdim=True) / n) * vf
 
     def forward(self, geom: SphereGeometry, tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
         rec = -(tokens.ages.clamp_min(0).float() / self.mnia)                   # -(age/mnia)
         pos = -(tokens.positions.clamp_min(1).float() - 1.0)                    # -pos
-        spr, ang = self.centre_feats(geom, x.detach(), valid)
-        feat = torch.stack([rec, pos, spr, ang], dim=-1).to(x.dtype)            # [Q, T, 4]
+        ang = self.centre_feats(geom, x.detach(), valid)                        # cos to unweighted center
+        feat = torch.stack([rec, pos, ang], dim=-1).to(x.dtype)                 # [Q, T, 3]
         logits = self.net(feat).squeeze(-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
