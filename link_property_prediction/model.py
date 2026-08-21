@@ -1,11 +1,18 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f, f = [geo,
-geo_spread_v] (geo=-d(P_u,P_v); geo_spread_v = the candidate cloud's pooling-weighted mean geodesic
-distance to its centroid). Cosine channels AND pop_bias removed so the score is purely radius-sensitive
-(geodesic distance), which forces the model to use the radial/hierarchy dimension. Learnable w
-init [1,0]; P_x is the weighted gyro-midpoint. Pooling
-weights come from a small MLP (hidden = 8*N_FEAT) over four per-token scalars: -(age/mnia), -pos, and the
-geodesic distance / cosine alignment to the bag's unweighted midpoint (the last two are centre features
-with the per-bag level removed). mnia (mean node inter-arrival) is a fixed age scale."""
+"""Centroid-to-centroid head on the Poincaré ball — the Gromov product, parameterless:
+
+    s(u,v) = rho_v - d(P_u, P_v)   =   2*(u|v)_o - rho_u,   rho_x = dist0(P_x)
+
+P_x is the weighted gyro-midpoint of x's walk-token bag. The Gromov product (u|v)_o = 0.5*(rho_u + rho_v - d)
+is a fixed function of the geometry with no free parameters: it equals LCA depth on a tree and is the
+defining quantity of Gromov hyperbolicity, so "how deep do u and v agree before branching" is read straight
+off the embedding rather than fitted. rho_u is dropped because it is constant within a query and therefore
+cancels from both the loss and the gradient under the per-query softmax CE (sum_c dL/ds_c = 0); the 0.5 is
+dropped because it is only a logit scale. Nothing here is a function of v alone with free weights, unlike a
+pop_bias table or a candidate-spread channel (both of which act as popularity proxies).
+
+Pooling weights come from a small MLP (hidden = 8*N_FEAT) over four per-token scalars: -(age/mnia), -pos,
+and the geodesic distance / cosine alignment to the bag's unweighted midpoint (the last two are centre
+features with the per-bag level removed). mnia (mean node inter-arrival) is a fixed age scale."""
 from typing import Tuple
 
 import geoopt
@@ -25,6 +32,10 @@ class PoincareManifold:
     def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Elementwise geodesic distance, broadcasting over leading dims. LOWER = closer."""
         return self.manifold.dist(x, y)
+
+    def dist0(self, x: torch.Tensor) -> torch.Tensor:
+        """Hyperbolic radius 2*artanh(||x||)."""
+        return self.manifold.dist0(x)
 
     def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """Weighted gyro-midpoint: x [Q,T,d], w [Q,T] -> [Q,d]."""
@@ -68,7 +79,8 @@ class BagWeights(nn.Module):
 
 
 class LinkPredHead(nn.Module):
-    """E is a ManifoldParameter; BagWeights is the only other trained module."""
+    """E is a ManifoldParameter; BagWeights is the only other trained module — the score itself
+    has no parameters."""
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float,
                  init_irange: float = 1e-3):
@@ -85,14 +97,10 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        # Learnable channel weights [geo, geo_spread_v], init 1,0 (geo_spread off at step 0). Cosine
-        # channels removed so the score depends only on radius-sensitive geodesic distance — forcing
-        # the model to use the radial dimension.
-        self.score_w = nn.Parameter(torch.tensor([1.0, 0.0]))
+        # No score parameters: the Gromov product is a fixed function of the geometry.
 
-    def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Bag -> (P [Q,d], geo_spread [Q]): geo_spread is the pooling-weighted mean geodesic distance
-        of the cloud tokens to their centroid P."""
+    def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
+        """Bag -> P [Q, d], the pooling-weighted gyro-midpoint."""
         nodes = tokens.nodes.clamp_min(0).clone()
         valid = tokens.mask.clone()
         cold = ~valid.any(dim=-1)                                               # all-padding walk -> use seed
@@ -102,20 +110,21 @@ class LinkPredHead(nn.Module):
 
         x = F.embedding(nodes, emb)                                             # [Q, T, d]
         w = self.bag_weights(self.geom, tokens, x, valid)                       # [Q, T] sums to 1, 0 on padding
-        p = self.geom.midpoint(x, w)                                            # [Q, d]
-        pe = p.unsqueeze(-2)                                                    # [Q, 1, d]
-        geo_sp = (w * self.geom.dist(pe, x)).sum(dim=-1)                        # [Q] weighted mean geo to P
-        return p, geo_sp
+        return self.geom.midpoint(x, w)
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = w . [-geo, geo_spread_v]  (cosine channels and pop_bias removed)."""
+        s(u,v) = rho_v - d(P_u, P_v), i.e. 2*(u|v)_o with the per-query-constant rho_u dropped.
+        Under the per-query softmax CE, rho_u adds the same constant to every candidate in a row,
+        so it cancels from both the loss and the gradient (sum_c dL/ds_c = 0); the 0.5 is a global
+        logit scale, dropped so the score is not artificially cooled. No free parameters."""
         emb = self.E.weight
-        p_u, _ = self.pool(src_tokens, emb)                                     # [B, d]
-        p_v, sg_v = self.pool(cand_tokens, emb)                                 # [B*C,d] + geo_spread [B*C]
+        p_u = self.pool(src_tokens, emb)                                        # [B, d]
+        p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
         b, d = p_u.shape
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
-        geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        feats = torch.stack([-geo, sg_v.view(b, c)], dim=-1)                    # [B, C, 2] -geo + geo cloud-spread
-        return (feats * self.score_w).sum(dim=-1)
+
+        rho_v = self.geom.dist0(p_v)                                            # [B, C]
+        dist = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C]
+        return rho_v - dist
