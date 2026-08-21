@@ -1,8 +1,8 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f + pop_bias_v, f = [geo,
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f, f = [geo,
 geo_spread_v] (geo=-d(P_u,P_v); geo_spread_v = the candidate cloud's pooling-weighted mean geodesic
-distance to its centroid; pop_bias_v is a learned per-node scalar added at its own scale). Cosine
-channels removed so the score is purely radius-sensitive (geodesic distance), which forces the model
-to use the radial/hierarchy dimension. Learnable w init [1,0]; P_x is the weighted gyro-midpoint. Pooling
+distance to its centroid). Cosine channels AND pop_bias removed so the score is purely radius-sensitive
+(geodesic distance), which forces the model to use the radial/hierarchy dimension. Learnable w
+init [1,0]; P_x is the weighted gyro-midpoint. Pooling
 weights come from a small MLP (hidden = 8*N_FEAT) over four per-token scalars: -(age/mnia), -pos, and the
 geodesic distance / cosine alignment to the bag's unweighted midpoint (the last two are centre features
 with the per-bag level removed). mnia (mean node inter-arrival) is a fixed age scale."""
@@ -85,11 +85,9 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        self.pop_bias = nn.Embedding(self.num_nodes, 1)
-        nn.init.zeros_(self.pop_bias.weight)
         # Learnable channel weights [geo, geo_spread_v], init 1,0 (geo_spread off at step 0). Cosine
         # channels removed so the score depends only on radius-sensitive geodesic distance — forcing
-        # the model to use the radial dimension. pop_bias is added separately at weight 1.
+        # the model to use the radial dimension.
         self.score_w = nn.Parameter(torch.tensor([1.0, 0.0]))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -111,17 +109,13 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = w . [-geo, geo_spread_v] + pop_bias_v  (cosine channels removed)."""
+        score = w . [-geo, geo_spread_v]  (cosine channels and pop_bias removed)."""
         emb = self.E.weight
         p_u, _ = self.pool(src_tokens, emb)                                     # [B, d]
         p_v, sg_v = self.pool(cand_tokens, emb)                                 # [B*C,d] + geo_spread [B*C]
         b, d = p_u.shape
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
-        v_nodes = cand_tokens.seeds.view(b, c)                                  # [B, C] candidate node ids
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
         feats = torch.stack([-geo, sg_v.view(b, c)], dim=-1)                    # [B, C, 2] -geo + geo cloud-spread
-        # Per-node bias at its own learned scale, so absolute popularity carries across queries;
-        # zero-init means it contributes exactly 0 at step 0.
-        pop = self.pop_bias(v_nodes).squeeze(-1)                                # [B, C]
-        return (feats * self.score_w).sum(dim=-1) + pop
+        return (feats * self.score_w).sum(dim=-1)
