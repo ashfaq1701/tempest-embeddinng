@@ -29,39 +29,25 @@ def parse_args() -> argparse.Namespace:
         description="Tempest walks-supervised temporal embedding training"
     )
 
-    # Dataset.
+    # ── Dataset ─────────────────────────────────────────────────────
     p.add_argument("--data-suite", default="tgb", choices=["tgb", "tgb-seq"],
                    help="Benchmark suite to load from.")
     p.add_argument("--dataset", required=True, type=str,
                    help="Dataset name within the suite.")
     p.add_argument("--tgb-root", default="datasets", type=str,
                    help="Data root directory.")
-    p.add_argument(
-        "--k-eval", default=100, type=int,
-        help="Eval negatives per positive (tgb-seq val only).")
+    p.add_argument("--is-bipartite", action="store_true",
+                   help="Treat the graph as bipartite.")
+    p.add_argument("--max-train-edges", default=0, type=int,
+                   help="If >0, train on only the most-recent N train edges.")
+    p.add_argument("--max-eval-edges", default=0, type=int,
+                   help="If >0, eval on only the first N val/test edges.")
 
-
-    # Model.
+    # ── Model ───────────────────────────────────────────────────────
     p.add_argument("--d-emb", default=64, type=int,
                    help="Embedding dimension.")
 
-    # Link loss / head.
-    p.add_argument(
-        "--k-train", type=int, default=5,
-        help="Per-query training negatives.",
-    )
-    p.add_argument("--is-bipartite", action="store_true",
-                   help="Treat the graph as bipartite.")
-
-    # Chronological subsample.
-    p.add_argument(
-        "--max-train-edges", default=0, type=int,
-        help="If >0, train on only the most-recent N train edges.")
-    p.add_argument(
-        "--max-eval-edges", default=0, type=int,
-        help="If >0, eval on only the first N val/test edges.")
-
-    # Walks.
+    # ── Walks ───────────────────────────────────────────────────────
     p.add_argument("--num-walks-per-node", default=5, type=int,
                    help="Walks per query node.")
     p.add_argument("--max-walk-len", default=5, type=int,
@@ -75,42 +61,37 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--t2nv-q", default=0.25, type=float,
                    help="node2vec in-out param q (TemporalNode2Vec bias only).")
 
-    # Optimisation.
+    # ── Negatives ───────────────────────────────────────────────────
+    p.add_argument("--k-train", default=5, type=int,
+                   help="Per-query training negatives.")
+    p.add_argument("--k-eval", default=100, type=int,
+                   help="Eval negatives per positive (tgb-seq val only).")
+
+    # ── Optimisation / training ─────────────────────────────────────
     p.add_argument("--lr", default=1e-3, type=float,
                    help="Learning rate.")
-    p.add_argument(
-        "--batch-size", default=1000, type=int,
-        help="Train batch size.",
-    )
-    p.add_argument(
-        "--eval-batch-size", default=1000, type=int,
-        help="Val/test eval batch size.",
-    )
+    p.add_argument("--batch-size", default=1000, type=int,
+                   help="Train batch size.")
+    p.add_argument("--eval-batch-size", default=1000, type=int,
+                   help="Val/test eval batch size.")
     p.add_argument("--num-epochs", default=50, type=int,
                    help="Max training epochs.")
     p.add_argument("--early-stop-patience", default=3, type=int,
                    help="Early-stop patience in epochs.")
 
-    # System.
+    # ── System ──────────────────────────────────────────────────────
     p.add_argument("--seed", default=42, type=int,
                    help="Random seed.")
     p.add_argument("--use-gpu", action="store_true",
                    help="Place PyTorch tensors on CUDA.")
-    p.add_argument(
-        "--use-gpu-tempest",
-        action="store_true",
-        help="Run Tempest's walk sampler in GPU mode.",
-    )
-    p.add_argument(
-        "--stratify",
-        action="store_true",
-        help="After training, stratify best-val test MRR by slice.",
-    )
-    p.add_argument(
-        "--export-best-embedding-table",
-        action="store_true",
-        help="After training, dump the best-val embedding table to disk.",
-    )
+    p.add_argument("--use-gpu-tempest", action="store_true",
+                   help="Run Tempest's walk sampler in GPU mode.")
+
+    # ── Post-training outputs ───────────────────────────────────────
+    p.add_argument("--stratify", action="store_true",
+                   help="After training, stratify best-val test MRR by slice.")
+    p.add_argument("--export-best-embedding-table", action="store_true",
+                   help="After training, dump the best-val embedding table to disk.")
 
     return p.parse_args()
 
