@@ -1,7 +1,8 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f + pop_bias_v, f = [geo, cos,
-geo_spread_v, cos_spread_v] (geo=-d(P_u,P_v), cos=cos(P_u,P_v); the spreads are the candidate cloud's
-pooling-weighted mean geo/cos to its centroid; pop_bias_v is a learned per-node scalar added at its own
-scale), learnable w init [1,1,0,0]; P_x is the weighted gyro-midpoint of x's walk-token bag. Pooling
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f + pop_bias_v, f = [geo,
+geo_spread_v] (geo=-d(P_u,P_v); geo_spread_v = the candidate cloud's pooling-weighted mean geodesic
+distance to its centroid; pop_bias_v is a learned per-node scalar added at its own scale). Cosine
+channels removed so the score is purely radius-sensitive (geodesic distance), which forces the model
+to use the radial/hierarchy dimension. Learnable w init [1,0]; P_x is the weighted gyro-midpoint. Pooling
 weights come from a small MLP (hidden = 8*N_FEAT) over four per-token scalars: -(age/mnia), -pos, and the
 geodesic distance / cosine alignment to the bag's unweighted midpoint (the last two are centre features
 with the per-bag level removed). mnia (mean node inter-arrival) is a fixed age scale."""
@@ -86,13 +87,14 @@ class LinkPredHead(nn.Module):
 
         self.pop_bias = nn.Embedding(self.num_nodes, 1)
         nn.init.zeros_(self.pop_bias.weight)
-        # Learnable channel weights [geo, cos, geo_spread_v, cos_spread_v], init 1,1,0,0 (the candidate
-        # cloud-spread channels are off at step 0). pop_bias is added separately at weight 1.
-        self.score_w = nn.Parameter(torch.tensor([1.0, 1.0, 0.0, 0.0]))
+        # Learnable channel weights [geo, geo_spread_v], init 1,0 (geo_spread off at step 0). Cosine
+        # channels removed so the score depends only on radius-sensitive geodesic distance — forcing
+        # the model to use the radial dimension. pop_bias is added separately at weight 1.
+        self.score_w = nn.Parameter(torch.tensor([1.0, 0.0]))
 
-    def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Bag -> (P [Q,d], geo_spread [Q], cos_spread [Q]): the spreads are the pooling-weighted mean
-        geodesic distance / cosine of the cloud tokens to their centroid P."""
+    def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Bag -> (P [Q,d], geo_spread [Q]): geo_spread is the pooling-weighted mean geodesic distance
+        of the cloud tokens to their centroid P."""
         nodes = tokens.nodes.clamp_min(0).clone()
         valid = tokens.mask.clone()
         cold = ~valid.any(dim=-1)                                               # all-padding walk -> use seed
@@ -105,23 +107,20 @@ class LinkPredHead(nn.Module):
         p = self.geom.midpoint(x, w)                                            # [Q, d]
         pe = p.unsqueeze(-2)                                                    # [Q, 1, d]
         geo_sp = (w * self.geom.dist(pe, x)).sum(dim=-1)                        # [Q] weighted mean geo to P
-        cos_sp = (w * F.cosine_similarity(pe, x, dim=-1, eps=1e-6)).sum(dim=-1) # [Q] weighted mean cos to P
-        return p, geo_sp, cos_sp
+        return p, geo_sp
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = w . [-geo, cos, geo_spread_v, cos_spread_v] + pop_bias_v."""
+        score = w . [-geo, geo_spread_v] + pop_bias_v  (cosine channels removed)."""
         emb = self.E.weight
-        p_u, _, _ = self.pool(src_tokens, emb)                                  # [B, d]
-        p_v, sg_v, sc_v = self.pool(cand_tokens, emb)                           # [B*C,d] + 2x [B*C]
+        p_u, _ = self.pool(src_tokens, emb)                                     # [B, d]
+        p_v, sg_v = self.pool(cand_tokens, emb)                                 # [B*C,d] + geo_spread [B*C]
         b, d = p_u.shape
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         v_nodes = cand_tokens.seeds.view(b, c)                                  # [B, C] candidate node ids
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        cos = F.cosine_similarity(p_u.unsqueeze(1), p_v, dim=-1, eps=1e-6)      # [B, C] direction agreement
-        feats = torch.stack([-geo, cos,                                        # -geo: lower distance = higher score
-                             sg_v.view(b, c), sc_v.view(b, c)], dim=-1)         # [B, C, 4] candidate cloud spreads
+        feats = torch.stack([-geo, sg_v.view(b, c)], dim=-1)                    # [B, C, 2] -geo + geo cloud-spread
         # Per-node bias at its own learned scale, so absolute popularity carries across queries;
         # zero-init means it contributes exactly 0 at step 0.
         pop = self.pop_bias(v_nodes).squeeze(-1)                                # [B, C]
