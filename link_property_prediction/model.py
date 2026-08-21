@@ -1,7 +1,7 @@
-"""Centroid-to-centroid head in plain Euclidean R^d: s(u,v) = w . f + pop_bias_v, f = [-dist,
+"""Centroid-to-centroid head in plain Euclidean R^d: s(u,v) = w . f, f = [-dist,
 dist_spread_v] (dist = ||P_u - P_v||, the centroid L2 distance, negated so lower distance = higher
-score; dist_spread_v = the candidate cloud's pooling-weighted mean L2 distance to its centroid;
-pop_bias_v is a learned per-node scalar added at its own scale), learnable w init [1,0]; P_x is the
+score; dist_spread_v = the candidate cloud's pooling-weighted mean L2 distance to its centroid).
+pop_bias removed; learnable w init [1,0]; P_x is the
 plain weighted arithmetic mean (Sum_i w_i x_i) of x's walk-token bag. E is a plain unconstrained
 nn.Parameter (Adam moves it freely). Pooling weights come from a small MLP (hidden = 8*N_FEAT) over
 three per-token scalars: -(age/mnia), -pos, and the L2 distance to the bag's unweighted midpoint
@@ -85,10 +85,8 @@ class LinkPredHead(nn.Module):
             init = F.normalize(torch.randn(self.num_nodes, self.d_emb), dim=-1)
         self.E.weight = nn.Parameter(init)
 
-        self.pop_bias = nn.Embedding(self.num_nodes, 1)
-        nn.init.zeros_(self.pop_bias.weight)
         # Learnable channel weights [-dist, dist_spread_v], init 1,0 (the cloud-spread channel is off
-        # at step 0; -dist so lower distance = higher score). pop_bias is added separately at weight 1.
+        # at step 0; -dist so lower distance = higher score).
         self.score_w = nn.Parameter(torch.tensor([1.0, 0.0]))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -110,17 +108,13 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = w . [-dist, dist_spread_v] + pop_bias_v."""
+        score = w . [-dist, dist_spread_v]  (pop_bias removed)."""
         emb = self.E.weight
         p_u, _ = self.pool(src_tokens, emb)                                     # [B, d]
         p_v, sd_v = self.pool(cand_tokens, emb)                                 # [B*C,d] + dist_spread [B*C]
         b, d = p_u.shape
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
-        v_nodes = cand_tokens.seeds.view(b, c)                                  # [B, C] candidate node ids
         dist = self.geom.dist(p_u.unsqueeze(1), p_v)                           # [B, C] L2 distance (lower=closer)
         feats = torch.stack([-dist, sd_v.view(b, c)], dim=-1)                   # [B, C, 2] -dist + dist-cloud-spread
-        # Per-node bias at its own learned scale, so absolute popularity carries across queries;
-        # zero-init means it contributes exactly 0 at step 0.
-        pop = self.pop_bias(v_nodes).squeeze(-1)                                # [B, C]
-        return (feats * self.score_w).sum(dim=-1) + pop
+        return (feats * self.score_w).sum(dim=-1)
