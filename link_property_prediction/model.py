@@ -1,14 +1,13 @@
-"""Centroid-to-centroid head on the Poincaré ball — the Gromov product, parameterless:
+"""Centroid-to-centroid head on the Poincaré ball — the Gromov product with LEARNABLE term weights:
 
-    s(u,v) = rho_v - d(P_u, P_v)   =   2*(u|v)_o - rho_u,   rho_x = dist0(P_x)
+    s(u,v) = w . [-d(P_u, P_v), rho_v],   w init [1, 1],   rho_x = dist0(P_x)
 
-P_x is the weighted gyro-midpoint of x's walk-token bag. The Gromov product (u|v)_o = 0.5*(rho_u + rho_v - d)
-is a fixed function of the geometry with no free parameters: it equals LCA depth on a tree and is the
-defining quantity of Gromov hyperbolicity, so "how deep do u and v agree before branching" is read straight
-off the embedding rather than fitted. rho_u is dropped because it is constant within a query and therefore
-cancels from both the loss and the gradient under the per-query softmax CE (sum_c dL/ds_c = 0); the 0.5 is
-dropped because it is only a logit scale. Nothing here is a function of v alone with free weights, unlike a
-pop_bias table or a candidate-spread channel (both of which act as popularity proxies).
+At w = [1, 1] this is exactly the Gromov product 2*(u|v)_o - rho_u (LCA depth on a tree, the defining
+quantity of Gromov hyperbolicity). rho_u is dropped because it is constant within a query and cancels
+from both the loss and the gradient under the per-query softmax CE (sum_c dL/ds_c = 0); the 0.5 is only
+a logit scale. The weights are added to READ where the ranking optimum sits relative to the theoretical
+[1,1]: w[1] << 1 (or < 0) means the ranking prefers a popularity prior over deep-LCA agreement.
+P_x is the weighted gyro-midpoint of x's walk-token bag.
 
 Pooling weights come from a small MLP (hidden = 8*N_FEAT) over four per-token scalars: -(age/mnia), -pos,
 and the geodesic distance / cosine alignment to the bag's unweighted midpoint (the last two are centre
@@ -97,7 +96,10 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        # No score parameters: the Gromov product is a fixed function of the geometry.
+        # Learnable weights on the Gromov terms [-d, rho_v], init [1, 1] = the exact Gromov product
+        # (2*(u|v)_o with rho_u dropped). Read whether they stay near [1,1] or move (e.g. w[1] < 0
+        # would mean the ranking prefers a popularity prior over the deep-LCA Gromov quantity).
+        self.score_w = nn.Parameter(torch.tensor([1.0, 1.0]))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q, d], the pooling-weighted gyro-midpoint."""
@@ -114,10 +116,8 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        s(u,v) = rho_v - d(P_u, P_v), i.e. 2*(u|v)_o with the per-query-constant rho_u dropped.
-        Under the per-query softmax CE, rho_u adds the same constant to every candidate in a row,
-        so it cancels from both the loss and the gradient (sum_c dL/ds_c = 0); the 0.5 is a global
-        logit scale, dropped so the score is not artificially cooled. No free parameters."""
+        s(u,v) = w . [-d(P_u,P_v), rho_v]; the per-query-constant rho_u is dropped (cancels under the
+        per-query softmax CE). w init [1,1] = the exact Gromov product 2*(u|v)_o; read where w goes."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -127,4 +127,5 @@ class LinkPredHead(nn.Module):
 
         rho_v = self.geom.dist0(p_v)                                            # [B, C]
         dist = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C]
-        return rho_v - dist
+        feats = torch.stack([-dist, rho_v], dim=-1)                             # [B, C, 2]
+        return (feats * self.score_w).sum(dim=-1)

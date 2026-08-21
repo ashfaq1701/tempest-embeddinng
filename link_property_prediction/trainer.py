@@ -288,6 +288,11 @@ class Trainer:
             g = self._geometry_probe()
             line += f"  |E|mean={g['mean_norm']:.3f}  |E|max={g['max_norm']:.3f}"
 
+            # TEMP: Gromov term weights w=[-d, rho_v]; [1,1] is the exact Gromov product.
+            sw = getattr(self.model, "score_w", None)
+            if sw is not None:
+                line += "  w=[" + ",".join(f"{x:.3f}" for x in sw.detach().tolist()) + "]"
+
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()
                 val_metric = self._eval(val_evaluator, val_batches_factory())
