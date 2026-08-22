@@ -1,8 +1,12 @@
-"""Dead-simple centroid-to-centroid head on the Poincaré ball: s(u,v) = temperature * (-d(P_u,P_v)).
-No spread, cosine, or pop_bias channels — the score is purely the radius-sensitive geodesic distance,
-which forces the model to use the radial/hierarchy dimension. P_x is the weighted gyro-midpoint of x's
-walk-token bag; the pooling weights are a PARAMETERLESS softmax over two fixed priors,
--log1p(age/mnia) and -log1p(pos-1). ONE head param (temperature) — a minimal base to scale up from."""
+"""Dead-simple centroid-to-centroid head on the Poincaré ball:
+
+    s(u,v) = temperature * (-d(P_u, P_v) + rho_v),   rho_v = dist0(P_v)
+
+Two FIXED unit-weight priors — the pair's geodesic distance and the candidate's own radius — with no
+learnable balance between them, so the temperature is the ONLY head parameter. rho_v carries no
+dependence on u and so acts as a popularity / prominence prior. P_x is the weighted gyro-midpoint of
+x's walk-token bag; the pooling weights are likewise a PARAMETERLESS softmax over two fixed priors,
+-log1p(age/mnia) and -log1p(pos-1)."""
 
 import geoopt
 import torch
@@ -21,6 +25,10 @@ class PoincareManifold:
     def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Elementwise geodesic distance, broadcasting over leading dims. LOWER = closer."""
         return self.manifold.dist(x, y)
+
+    def dist0(self, x: torch.Tensor) -> torch.Tensor:
+        """Hyperbolic radius from the origin, 2*artanh(||x||)."""
+        return self.manifold.dist0(x)
 
     def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """Weighted gyro-midpoint: x [Q,T,d], w [Q,T] -> [Q,d]."""
@@ -95,7 +103,14 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = temperature * (-geo)  (spread, cosine channels and pop_bias all removed -> pure geodesic)."""
+
+        score = temperature * (-d(P_u,P_v) + rho_v),   rho_v = dist0(P_v)
+
+        Both channels enter as FIXED unit-weight priors -- there is no learnable balance between
+        them, so the only head parameter is the temperature. rho_v depends on the candidate alone,
+        not on u, so it acts as a popularity / prominence prior; the source's own radius is omitted
+        because it is constant within a query and cancels from the loss and the gradient under the
+        per-query softmax CE (sum_c dL/ds_c = 0)."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -103,4 +118,5 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        return self.temperature * (-geo)                                       # [B, C] temperature-scaled score
+        rho_v = self.geom.dist0(p_v)                                            # [B, C] candidate radius
+        return self.temperature * (-geo + rho_v)                               # [B, C]
