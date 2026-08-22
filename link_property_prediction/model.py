@@ -1,8 +1,8 @@
 """Dead-simple centroid-to-centroid head on the Poincaré ball: s(u,v) = temperature * (-d(P_u,P_v)).
 No spread, cosine, or pop_bias channels — the score is purely the radius-sensitive geodesic distance,
 which forces the model to use the radial/hierarchy dimension. P_x is the weighted gyro-midpoint of x's
-walk-token bag; the pooling weights are a PARAMETERLESS softmax over two RAW fixed priors,
--age/mnia and -(pos-1) (no log1p). ONE head param (temperature) — a minimal base to scale up from."""
+walk-token bag; the pooling weights are a softmax over pooling_temp * (-age/mnia - (pos-1)),
+both priors RAW (no log1p). TWO head params: the score temperature and the pooling one."""
 
 import geoopt
 import torch
@@ -32,13 +32,18 @@ class BagWeights(nn.Module):
     def __init__(self, mnia: float):
         super().__init__()
         self.mnia = float(mnia)                                              # fixed age scale
+        # One multiplicative temperature on the whole prior. Init 0 -> logits are identically 0 at
+        # step 0, i.e. UNIFORM pooling; the model learns the sharpness from there. Both priors are
+        # <= 0 and exactly 0 at the seed, so seed share rises monotonically with this scalar
+        # (uniform 0.247 at 0, ~0.88 at 0.25, ~0.99 at 1.0 on YouTube-scale bags).
+        self._temp = nn.Parameter(torch.zeros(()))
 
     def forward(self, tokens: WalkTokens, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> pooling weights [Q,T] summing to 1, 0 on padding. (x sets dtype.)"""
         age = tokens.ages.clamp_min(0).float()                               # seed = 0, ctx >= 1, pad -> 0
         rec = -age / self.mnia                                               # LINEAR, unbounded  [Q, T]
         pos = -(tokens.positions.clamp_min(1).float() - 1.0)                 # LINEAR, in [-(L-1), 0]
-        logits = (rec + pos).to(x.dtype)                                     # [Q, T]
+        logits = (self._temp * (rec + pos)).to(x.dtype)                      # [Q, T]
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
 
