@@ -30,18 +30,25 @@ class PoincareManifold:
 
 class BagWeights(nn.Module):
     """Dead-simple token pooling: softmax over a walk's tokens of a learnable linear combination of two
-    per-token features, recency -(age/age_temp) and -pos. No MLP, no geometry features (a base to scale
-    up from). age_temp is a learnable age scale, init to mnia (mean node inter-arrival) — the model can
-    grow it to flatten the recency signal (bag -> more uniform)."""
+    per-token features, recency -log1p(age/s) and -pos. No MLP, no geometry features (a base to scale
+    up from).
+
+    The age scale is LOG-parameterised: s = exp(age_temp), age_temp init log(mnia) (mean node
+    inter-arrival). Learning the log matters — Adam's step is ~lr in ABSOLUTE units, so a parameter
+    living at ~1e6 moves ~1e-9 of itself per step and never leaves its init; on the log the same step
+    is a relative one, so s can traverse decades within an epoch. exp() also keeps s > 0 with no clamp.
+    Larger s flattens the recency signal (bag -> more uniform); smaller s sharpens it onto the newest
+    tokens."""
 
     def __init__(self, mnia: float):
         super().__init__()
-        self.age_temp = nn.Parameter(torch.tensor(float(mnia)))   # learnable age scale, init mnia
+        self.age_temp = nn.Parameter(torch.log1p(torch.tensor(float(mnia))))  # log age scale, init log1p(mnia)
         self.w = nn.Parameter(torch.ones(2))                      # learnable per-feature weights, init 1
 
     def forward(self, tokens: WalkTokens, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> pooling weights [Q,T] summing to 1, 0 on padding. (x unused here.)"""
-        rec = -(tokens.ages.clamp_min(0).float() / self.age_temp)            # -(age/age_temp)  [Q, T]
+        age = tokens.ages.clamp_min(0).float()                               # seed = 0, ctx >= 1, pad -> 0
+        rec = -torch.log1p(age / self.age_temp.exp())                        # -log1p(age/s)  [Q, T]
         pos = -(tokens.positions.clamp_min(1).float() - 1.0)                 # -pos         [Q, T]
         feats = torch.stack([rec, pos], dim=-1).to(x.dtype)                  # [Q, T, 2]
         logits = (feats * self.w).sum(dim=-1)                               # [Q, T]  linear over features
