@@ -1,12 +1,12 @@
 """Centroid-to-centroid head on the Poincaré ball with a simplified popularity channel:
 
-    s(u,v) = temperature * (w . [-d(P_u, P_v), rho_v]),   w init [1, 1],   rho_v = dist0(P_v)
+    s(u,v) = w . [-d(P_u, P_v), rho_v],   w init [1, 1],   rho_v = dist0(P_v)
 
 The first channel is the pair's NEGATED geodesic distance (closer scores higher); the second is the
 candidate's own radius, which carries no dependence on u and so acts as a popularity / prominence
 prior. P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a
-PARAMETERLESS softmax over two fixed priors, -log1p(age/mnia) and -log1p(pos-1). Three head params:
-the temperature and the two channel weights."""
+PARAMETERLESS softmax over two fixed priors, -log1p(age/mnia) and -log1p(pos-1). TWO head params:
+the channel weights, which carry the score's scale themselves."""
 
 import geoopt
 import torch
@@ -84,12 +84,10 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        # Scalar temperature on the whole score, plus one weight per channel. t is formally
-        # redundant with w -- t*(w0*x0 + w1*x1) == (t*w0)*x0 + (t*w1)*x1 -- but it is kept because
-        # it lets the score's SCALE grow multiplicatively (t and w both climbing) while w is left
-        # free to set the channel RATIO. Without it, w had to carry both jobs and spent its early
-        # epochs scaling in lockstep (ratio pinned at 1.005-1.011) instead of separating.
-        self.temperature = nn.Parameter(torch.tensor(1.0))
+        # One weight per channel, no separate temperature: t*(w0*x0 + w1*x1) == (t*w0)*x0 +
+        # (t*w1)*x1, so t adds no expressiveness and only lets the score's scale grow
+        # multiplicatively. With t present the scale ran away (t 7.3 -> 12.4 over three epochs)
+        # while val turned over -- so w carries the scale here.
         self.w = nn.Parameter(torch.ones(2))            # [-d(P_u,P_v), rho_v], init [1, 1]
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
@@ -108,7 +106,7 @@ class LinkPredHead(nn.Module):
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
 
-        score = temperature * (w . [-d(P_u,P_v), rho_v]),  w init [1, 1].
+        score = w . [-d(P_u,P_v), rho_v],  w init [1, 1]  (w carries the scale; no temperature).
 
         The distance channel is NEGATED, so at w = [1,1] closer scores higher -- the sign a metric
         score wants, without the model having to spend epochs driving w[0] through zero to find it.
@@ -128,4 +126,4 @@ class LinkPredHead(nn.Module):
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
         rho_v = self.geom.dist0(p_v)                                            # [B, C] candidate radius
         feats = torch.stack([-geo, rho_v], dim=-1)                              # [B, C, 2]  closer -> higher
-        return self.temperature * (feats * self.w).sum(dim=-1)                  # [B, C]
+        return (feats * self.w).sum(dim=-1)                                     # [B, C]
