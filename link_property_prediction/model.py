@@ -28,6 +28,14 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
+    """Parameterless token pooling: softmax over -age/mnia - (pos-1), a recency prior plus a hop
+    prior, both raw (no log compression). mnia (mean node inter-arrival) is a fixed age scale, so
+    -age/mnia reads as "how many typical inter-arrival gaps old is this token".
+
+    Sign structure worth knowing: both priors are <= 0, and both are exactly 0 for the seed (age 0
+    at position 1). The seed is therefore always the argmax and every other token sits below it --
+    steeper priors mean a sharper softmax and more pooling mass on the seed. Since the seed IS the
+    query node, that mass is what keeps P_u near E[u] for the geodesic score to work from."""
 
     def __init__(self, mnia: float):
         super().__init__()
@@ -60,6 +68,8 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
+        # Learned scalar on the geodesic logit (init 1). Scales -geo ahead of the per-query
+        # softmax CE, letting the model sharpen or soften the ranking without a second channel.
         self.temperature = nn.Parameter(torch.tensor(1.0))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
