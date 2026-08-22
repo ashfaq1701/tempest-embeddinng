@@ -22,6 +22,10 @@ class PoincareManifold:
         """Elementwise geodesic distance, broadcasting over leading dims. LOWER = closer."""
         return self.manifold.dist(x, y)
 
+    def dist0(self, x: torch.Tensor) -> torch.Tensor:
+        """Hyperbolic radius from the origin, 2*artanh(||x||)."""
+        return self.manifold.dist0(x)
+
     def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """Weighted gyro-midpoint: x [Q,T,d], w [Q,T] -> [Q,d]."""
         return self.manifold.weighted_midpoint(x, weights=w, reducedim=[-2], dim=-1, keepdim=False)
@@ -60,7 +64,7 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        self.temperature = nn.Parameter(torch.tensor(1.0))
+        self.w = nn.Parameter(torch.ones(2))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
@@ -77,7 +81,8 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = temperature * (-geo)  (spread, cosine channels and pop_bias all removed -> pure geodesic)."""
+        score = w . [-geo, rho_v], w learnable init [1, 1]. No temperature: it is formally
+        redundant with w, since t*(w0*x0 + w1*x1) == (t*w0)*x0 + (t*w1)*x1."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -85,4 +90,6 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        return self.temperature * (-geo)                                       # [B, C] temperature-scaled score
+        rho_v = self.geom.dist0(p_v)                                            # [B, C] candidate radius
+        feats = torch.stack([-geo, rho_v], dim=-1)                              # [B, C, 2]  closer -> higher
+        return (feats * self.w).sum(dim=-1)                                     # [B, C]
