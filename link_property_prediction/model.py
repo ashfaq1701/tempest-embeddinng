@@ -1,12 +1,9 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . f, f = [geo,
-geo_spread_v] (geo=-d(P_u,P_v); geo_spread_v = the candidate cloud's pooling-weighted mean geodesic
-distance to its centroid). Cosine channels AND pop_bias removed so the score is purely radius-sensitive
-(geodesic distance), which forces the model to use the radial/hierarchy dimension. Learnable w
-init [1,0]; P_x is the weighted gyro-midpoint. Pooling
-weights come from a small MLP (hidden = 8*N_FEAT) over four per-token scalars: -(age/mnia), -pos, and the
-geodesic distance / cosine alignment to the bag's unweighted midpoint (the last two are centre features
-with the per-bag level removed). mnia (mean node inter-arrival) is a fixed age scale."""
-from typing import Tuple
+"""Dead-simple centroid-to-centroid head on the Poincaré ball: s(u,v) = temperature * (-d(P_u,P_v)).
+No spread, cosine, or pop_bias channels — the score is purely the radius-sensitive geodesic distance,
+which forces the model to use the radial/hierarchy dimension. P_x is the weighted gyro-midpoint of x's
+walk-token bag; the pooling weights are a softmax over each walk's tokens of a learnable linear combo of
+two per-token features, -(age/age_temp) and -pos (age_temp and the feature weights both learnable). A
+minimal base (4 head params: temperature, age_temp, 2 feature weights) to scale up from."""
 
 import geoopt
 import torch
@@ -32,38 +29,22 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """Pooling weights = softmax(MLP([-(age/mnia), -pos, spr, ang])); hidden = 8*N_FEAT, randomly
-    initialised, with mnia as a fixed age scale. The softmax over tokens dampens the random init."""
-
-    N_FEAT = 4
+    """Dead-simple token pooling: softmax over a walk's tokens of a learnable linear combination of two
+    per-token features, recency -(age/age_temp) and -pos. No MLP, no geometry features (a base to scale
+    up from). age_temp is a learnable age scale, init to mnia (mean node inter-arrival) — the model can
+    grow it to flatten the recency signal (bag -> more uniform)."""
 
     def __init__(self, mnia: float):
         super().__init__()
-        self.mnia = float(mnia)                 # fixed age scale
-        hidden = 8 * self.N_FEAT                # 8x expansion, random init
-        self.net = nn.Sequential(nn.Linear(self.N_FEAT, hidden), nn.GELU(), nn.Linear(hidden, 1))
+        self.age_temp = nn.Parameter(torch.tensor(float(mnia)))   # learnable age scale, init mnia
+        self.w = nn.Parameter(torch.ones(2))                      # learnable per-feature weights, init 1
 
-    @staticmethod
-    def centre_feats(geom: PoincareManifold, x: torch.Tensor,
-                     valid: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Token geometry relative to the bag's unweighted midpoint C, per-bag level removed from both:
-        spr = d(x_p, C) / mean_q d(x_q, C),  ang = cos(x_p, C) - mean_q cos(x_q, C).  Each -> [Q, T]."""
-        vf = valid.to(x.dtype)
-        n = vf.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        c = geom.midpoint(x, vf / n).unsqueeze(-2)                              # [Q, 1, d]
-        dc = geom.dist(c, x) * vf
-        spr = dc / (dc.sum(dim=-1, keepdim=True) / n).clamp_min(1e-6)
-        cs = F.cosine_similarity(c, x, dim=-1, eps=1e-6) * vf
-        return spr, (cs - cs.sum(dim=-1, keepdim=True) / n) * vf
-
-    def forward(self, geom: PoincareManifold, tokens: WalkTokens, x: torch.Tensor,
-                valid: torch.Tensor) -> torch.Tensor:
-        """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
-        rec = -(tokens.ages.clamp_min(0).float() / self.mnia)                   # -(age/mnia)
-        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                    # -pos
-        spr, ang = self.centre_feats(geom, x.detach(), valid)
-        feat = torch.stack([rec, pos, spr, ang], dim=-1).to(x.dtype)            # [Q, T, 4]
-        logits = self.net(feat).squeeze(-1)
+    def forward(self, tokens: WalkTokens, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """x [Q,T,d], valid [Q,T] -> pooling weights [Q,T] summing to 1, 0 on padding. (x unused here.)"""
+        rec = -(tokens.ages.clamp_min(0).float() / self.age_temp)            # -(age/age_temp)  [Q, T]
+        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                 # -pos         [Q, T]
+        feats = torch.stack([rec, pos], dim=-1).to(x.dtype)                  # [Q, T, 2]
+        logits = (feats * self.w).sum(dim=-1)                               # [Q, T]  linear over features
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
 
@@ -85,14 +66,12 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        # Learnable channel weights [geo, geo_spread_v], init 1,0 (geo_spread off at step 0). Cosine
-        # channels removed so the score depends only on radius-sensitive geodesic distance — forcing
-        # the model to use the radial dimension.
-        self.score_w = nn.Parameter(torch.tensor([1.0, 0.0]))
+        # Learned scalar temperature on the geodesic logit (init 1). Scales -geo before the per-query
+        # softmax CE so the model can sharpen/soften the ranking without any extra score channel.
+        self.temperature = nn.Parameter(torch.tensor(1.0))
 
-    def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Bag -> (P [Q,d], geo_spread [Q]): geo_spread is the pooling-weighted mean geodesic distance
-        of the cloud tokens to their centroid P."""
+    def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
+        """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
         nodes = tokens.nodes.clamp_min(0).clone()
         valid = tokens.mask.clone()
         cold = ~valid.any(dim=-1)                                               # all-padding walk -> use seed
@@ -101,21 +80,17 @@ class LinkPredHead(nn.Module):
             valid[cold, 0] = True
 
         x = F.embedding(nodes, emb)                                             # [Q, T, d]
-        w = self.bag_weights(self.geom, tokens, x, valid)                       # [Q, T] sums to 1, 0 on padding
-        p = self.geom.midpoint(x, w)                                            # [Q, d]
-        pe = p.unsqueeze(-2)                                                    # [Q, 1, d]
-        geo_sp = (w * self.geom.dist(pe, x)).sum(dim=-1)                        # [Q] weighted mean geo to P
-        return p, geo_sp
+        w = self.bag_weights(tokens, x, valid)                                  # [Q, T] sums to 1, 0 on padding
+        return self.geom.midpoint(x, w)                                         # [Q, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = w . [-geo, geo_spread_v]  (cosine channels and pop_bias removed)."""
+        score = temperature * (-geo)  (spread, cosine channels and pop_bias all removed -> pure geodesic)."""
         emb = self.E.weight
-        p_u, _ = self.pool(src_tokens, emb)                                     # [B, d]
-        p_v, sg_v = self.pool(cand_tokens, emb)                                 # [B*C,d] + geo_spread [B*C]
+        p_u = self.pool(src_tokens, emb)                                        # [B, d]
+        p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
         b, d = p_u.shape
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        feats = torch.stack([-geo, sg_v.view(b, c)], dim=-1)                    # [B, C, 2] -geo + geo cloud-spread
-        return (feats * self.score_w).sum(dim=-1)
+        return self.temperature * (-geo)                                       # [B, C] temperature-scaled score
