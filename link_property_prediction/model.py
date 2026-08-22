@@ -1,8 +1,8 @@
 """Dead-simple centroid-to-centroid head on the Poincaré ball: s(u,v) = temperature * (-d(P_u,P_v)).
 No spread, cosine, or pop_bias channels — the score is purely the radius-sensitive geodesic distance,
 which forces the model to use the radial/hierarchy dimension. P_x is the weighted gyro-midpoint of x's
-walk-token bag; the pooling weights are a PARAMETERLESS softmax over two fixed priors,
--log1p(age/mnia) and -log1p(pos-1). ONE head param (temperature) — a minimal base to scale up from."""
+walk-token bag; the pooling weights are a PARAMETERLESS softmax over d(token, centroid) *
+(-log1p(age/mnia) - log1p(pos-1)). ONE head param (temperature) — a minimal base to scale up from."""
 
 import geoopt
 import torch
@@ -28,8 +28,21 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """Parameterless token pooling: softmax over -log1p(age/mnia) - log1p(pos-1). Both channels are
-    fixed priors on a FIXED scale (mnia = mean node inter-arrival); nothing here is learned.
+    """Parameterless token pooling: softmax over d(token, bag_centroid) * (rec + pos), with
+    rec = -log1p(age/mnia) and pos = -log1p(pos-1). Both priors are fixed (mnia = mean node
+    inter-arrival) and nothing here is learned; the centroid is the UNWEIGHTED gyro-midpoint.
+
+    Structural consequences of the `dist *` factor, all sign-driven (rec <= 0, pos <= 0, dist >= 0):
+      - The SEED still has logit exactly 0 (age 0 and position 1 -> rec = pos = 0) and every other
+        token is <= 0, so the seed remains the argmax whatever the geometry does. This scales the
+        suppression of the others; it does not contest the top slot.
+      - Among non-seed tokens, those NEAR the centroid are suppressed LESS (dist ~ 0 pulls their
+        logit toward 0), so the pooler now favours the bag's geometric core over its outliers.
+      - Logit SCALE is now tied to |E|: early on E is near the origin, distances are ~0.1, so the
+        logits shrink and pooling goes near-UNIFORM; as E expands the same priors sharpen. The
+        pooling temperature is no longer fixed -- it is coupled to embedding radius.
+      - Pooling weights now depend on E, so gradients flow from the softmax into E. Previously the
+        weights came only from token metadata and E saw no gradient through this path.
 
     Measured seed share of the pooling mass on YouTube (all training bags, cold excluded; uniform
     would be 0.244):
@@ -45,16 +58,27 @@ class BagWeights(nn.Module):
     that channel's standalone pull (0.657 -> 0.494). The residual 0.693 is structural and no reshaping
     reaches it -- the seed is the argmax of BOTH channels at once and occupies 5 of ~20.5 slots."""
 
-    def __init__(self, mnia: float):
+    def __init__(self, mnia: float, geom: "PoincareManifold"):
         super().__init__()
         self.mnia = float(mnia)                                              # fixed age scale
+        self.geom = geom                                                     # plain object -> NOT registered
+                                                                             # as a submodule, state_dict unchanged
+
+    @staticmethod
+    def centroid(geom: "PoincareManifold", x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """UNWEIGHTED gyro-midpoint of the valid tokens -> [Q, 1, d], broadcastable against x [Q,T,d]."""
+        vf = valid.to(x.dtype)
+        n = vf.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        return geom.midpoint(x, vf / n).unsqueeze(-2)
 
     def forward(self, tokens: WalkTokens, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> pooling weights [Q,T] summing to 1, 0 on padding. (x sets dtype.)"""
         age = tokens.ages.clamp_min(0).float()                               # seed = 0, ctx >= 1, pad -> 0
         rec = -torch.log1p(age / self.mnia)                                  # -log1p(age/mnia)  [Q, T]
         pos = -torch.log1p(tokens.positions.clamp_min(1).float() - 1.0)      # -log1p(pos-1)     [Q, T]
-        logits = (rec + pos).to(x.dtype)                                     # [Q, T]
+        c = self.centroid(self.geom, x, valid)                               # [Q, 1, d] bag centroid
+        dist = self.geom.dist(x, c)                                          # [Q, T] >= 0, geodesic to centroid
+        logits = (dist * (rec + pos)).to(x.dtype)                            # [Q, T] prior SCALED by spread
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
 
@@ -67,7 +91,7 @@ class LinkPredHead(nn.Module):
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.geom = PoincareManifold()
-        self.bag_weights = BagWeights(mean_node_inter_arrival)
+        self.bag_weights = BagWeights(mean_node_inter_arrival, self.geom)
 
         # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
