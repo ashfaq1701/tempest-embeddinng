@@ -1,8 +1,8 @@
 """Dead-simple centroid-to-centroid head on the Poincaré ball: s(u,v) = temperature * (-d(P_u,P_v)).
 No spread, cosine, or pop_bias channels — the score is purely the radius-sensitive geodesic distance,
 which forces the model to use the radial/hierarchy dimension. P_x is the weighted gyro-midpoint of x's
-walk-token bag; the pooling weights are a PARAMETERLESS softmax over two fixed priors,
--log1p(age/mnia) and -log1p(pos-1). ONE head param (temperature) — a minimal base to scale up from."""
+walk-token bag; the pooling weights are a PARAMETERLESS softmax over two RAW fixed priors,
+-age/mnia and -(pos-1) (no log1p). ONE head param (temperature) — a minimal base to scale up from."""
 
 import geoopt
 import torch
@@ -28,8 +28,12 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """Parameterless token pooling: softmax over -log1p(age/mnia) - log1p(pos-1). Both channels are
-    fixed priors on a FIXED scale (mnia = mean node inter-arrival); nothing here is learned.
+    """Parameterless token pooling: softmax over -age/mnia - (pos-1), both RAW (no log1p). Both
+    channels are fixed priors on a FIXED scale (mnia = mean node inter-arrival); nothing is learned.
+
+    This is the pre-log-compression feature pair, restored. Removing the logs makes the priors
+    steeper, so the softmax sharpens and the seed takes MORE of the mass -- 0.800 vs 0.693 for the
+    log form (measured, cold excluded; uniform would be 0.244).
 
     Measured seed share of the pooling mass on YouTube (all training bags, cold excluded; uniform
     would be 0.244):
@@ -52,8 +56,8 @@ class BagWeights(nn.Module):
     def forward(self, tokens: WalkTokens, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> pooling weights [Q,T] summing to 1, 0 on padding. (x sets dtype.)"""
         age = tokens.ages.clamp_min(0).float()                               # seed = 0, ctx >= 1, pad -> 0
-        rec = -torch.log1p(age / self.mnia)                                  # -log1p(age/mnia)  [Q, T]
-        pos = -torch.log1p(tokens.positions.clamp_min(1).float() - 1.0)      # -log1p(pos-1)     [Q, T]
+        rec = -age / self.mnia                                               # LINEAR, unbounded  [Q, T]
+        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                 # LINEAR, in [-(L-1), 0]
         logits = (rec + pos).to(x.dtype)                                     # [Q, T]
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
