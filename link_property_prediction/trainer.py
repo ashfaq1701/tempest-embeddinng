@@ -180,19 +180,12 @@ class Trainer:
 
     @torch.no_grad()
     def _head_probe(self) -> str:
-        """The head's scalar parameters, for the epoch line. age_temp is the LOG age scale, so both it
-        and the scale it denotes (s = exp(age_temp), in the timestamps' own units) are printed: s is
-        what sets how sharply the pooling softmax concentrates on the newest tokens, and it is the
-        knob most likely to move now that it is log-parameterised."""
-        m = self.model
+        """The head's scalar parameters, for the epoch line. The pooling is parameterless, so the score
+        temperature is all there is; read via hasattr so a head with more knobs degrades to a shorter
+        line rather than raising."""
         parts = []
-        bw = getattr(m, "bag_weights", None)
-        if bw is not None and hasattr(bw, "age_temp"):
-            parts.append(f"age_temp={float(bw.age_temp):.4f}(s={float(bw.age_temp.exp()):.4g})")
-        if bw is not None and hasattr(bw, "w"):
-            parts.append("w=[" + ",".join(f"{v:.3f}" for v in bw.w.detach().tolist()) + "]")
-        if hasattr(m, "temperature"):
-            parts.append(f"temp={float(m.temperature):.3f}")
+        if hasattr(self.model, "temperature"):
+            parts.append(f"temp={float(self.model.temperature):.3f}")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad

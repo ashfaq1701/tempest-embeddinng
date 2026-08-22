@@ -1,9 +1,8 @@
 """Dead-simple centroid-to-centroid head on the Poincaré ball: s(u,v) = temperature * (-d(P_u,P_v)).
 No spread, cosine, or pop_bias channels — the score is purely the radius-sensitive geodesic distance,
 which forces the model to use the radial/hierarchy dimension. P_x is the weighted gyro-midpoint of x's
-walk-token bag; the pooling weights are a softmax over each walk's tokens of a learnable linear combo of
-two per-token features, -(age/age_temp) and -pos (age_temp and the feature weights both learnable). A
-minimal base (4 head params: temperature, age_temp, 2 feature weights) to scale up from."""
+walk-token bag; the pooling weights are a PARAMETERLESS softmax over two fixed priors,
+-log1p(age/mnia) and -log1p(pos-1). ONE head param (temperature) — a minimal base to scale up from."""
 
 import geoopt
 import torch
@@ -29,29 +28,33 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """Dead-simple token pooling: softmax over a walk's tokens of a learnable linear combination of two
-    per-token features, recency -log1p(age/s) and -pos. No MLP, no geometry features (a base to scale
-    up from).
+    """Parameterless token pooling: softmax over -log1p(age/mnia) - log1p(pos-1). Both channels are
+    fixed priors on a FIXED scale (mnia = mean node inter-arrival); nothing here is learned.
 
-    The age scale is LOG-parameterised: s = exp(age_temp), age_temp init log(mnia) (mean node
-    inter-arrival). Learning the log matters — Adam's step is ~lr in ABSOLUTE units, so a parameter
-    living at ~1e6 moves ~1e-9 of itself per step and never leaves its init; on the log the same step
-    is a relative one, so s can traverse decades within an epoch. exp() also keeps s > 0 with no clamp.
-    Larger s flattens the recency signal (bag -> more uniform); smaller s sharpens it onto the newest
-    tokens."""
+    Measured seed share of the pooling mass on YouTube (all training bags, cold excluded; uniform
+    would be 0.244):
+
+        recency only                      0.485
+        -log1p(pos-1) only                0.494
+        BOTH, this pooler                 0.693
+        -(pos-1) linear only              0.657
+        recency + -(pos-1), w=[1,1]       0.800     <- the previous feature pair, untrained
+        same, trained to epoch 6          0.960
+
+    Log-compressing the position channel is what pulls the seed down from 0.800 to 0.693: it halves
+    that channel's standalone pull (0.657 -> 0.494). The residual 0.693 is structural and no reshaping
+    reaches it -- the seed is the argmax of BOTH channels at once and occupies 5 of ~20.5 slots."""
 
     def __init__(self, mnia: float):
         super().__init__()
-        self.age_temp = nn.Parameter(torch.log1p(torch.tensor(float(mnia))))  # log age scale, init log1p(mnia)
-        self.w = nn.Parameter(torch.ones(2))                      # learnable per-feature weights, init 1
+        self.mnia = float(mnia)                                              # fixed age scale
 
     def forward(self, tokens: WalkTokens, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        """x [Q,T,d], valid [Q,T] -> pooling weights [Q,T] summing to 1, 0 on padding. (x unused here.)"""
+        """x [Q,T,d], valid [Q,T] -> pooling weights [Q,T] summing to 1, 0 on padding. (x sets dtype.)"""
         age = tokens.ages.clamp_min(0).float()                               # seed = 0, ctx >= 1, pad -> 0
-        rec = -torch.log1p(age / self.age_temp.exp())                        # -log1p(age/s)  [Q, T]
-        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                 # -pos         [Q, T]
-        feats = torch.stack([rec, pos], dim=-1).to(x.dtype)                  # [Q, T, 2]
-        logits = (feats * self.w).sum(dim=-1)                               # [Q, T]  linear over features
+        rec = -torch.log1p(age / self.mnia)                                  # -log1p(age/mnia)  [Q, T]
+        pos = -torch.log1p(tokens.positions.clamp_min(1).float() - 1.0)      # -log1p(pos-1)     [Q, T]
+        logits = (rec + pos).to(x.dtype)                                     # [Q, T]
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
 
