@@ -1,8 +1,12 @@
-"""Dead-simple centroid-to-centroid head on the Poincaré ball: s(u,v) = temperature * (-d(P_u,P_v)).
-No spread, cosine, or pop_bias channels — the score is purely the radius-sensitive geodesic distance,
-which forces the model to use the radial/hierarchy dimension. P_x is the weighted gyro-midpoint of x's
-walk-token bag; the pooling weights are a PARAMETERLESS softmax over two fixed priors,
--log1p(age/mnia) and -log1p(pos-1). ONE head param (temperature) — a minimal base to scale up from."""
+"""Centroid-to-centroid head on the Poincaré ball with a simplified popularity channel:
+
+    s(u,v) = temperature * (w . [d(P_u, P_v), rho_v]),   w init [1, 1],   rho_v = dist0(P_v)
+
+The first channel is the pair's geodesic distance; the second is the candidate's own radius, which
+carries no dependence on u and so acts as a popularity / prominence prior. P_x is the weighted
+gyro-midpoint of x's walk-token bag; the pooling weights are a PARAMETERLESS softmax over two fixed
+priors, -log1p(age/mnia) and -log1p(pos-1). Three head params: temperature and the two channel
+weights."""
 
 import geoopt
 import torch
@@ -21,6 +25,10 @@ class PoincareManifold:
     def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Elementwise geodesic distance, broadcasting over leading dims. LOWER = closer."""
         return self.manifold.dist(x, y)
+
+    def dist0(self, x: torch.Tensor) -> torch.Tensor:
+        """Hyperbolic radius from the origin, 2*artanh(||x||)."""
+        return self.manifold.dist0(x)
 
     def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """Weighted gyro-midpoint: x [Q,T,d], w [Q,T] -> [Q,d]."""
@@ -76,9 +84,9 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        # Learned scalar temperature on the geodesic logit (init 1). Scales -geo before the per-query
-        # softmax CE so the model can sharpen/soften the ranking without any extra score channel.
+        # Learned scalar temperature on the score, and one weight per score channel.
         self.temperature = nn.Parameter(torch.tensor(1.0))
+        self.w = nn.Parameter(torch.ones(2))            # [d(P_u,P_v), rho_v], init [1, 1]
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
@@ -95,12 +103,22 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = temperature * (-geo)  (spread, cosine channels and pop_bias all removed -> pure geodesic)."""
+
+        score = temperature * (w . [d(P_u,P_v), rho_v]),  w init [1, 1].
+
+        Two channels: the pair's geodesic distance, and the CANDIDATE's radius rho_v = dist0(P_v).
+        rho_v is a per-candidate quantity with no dependence on u, so it acts as a popularity /
+        prominence prior on v rather than a pair signal; the source's own radius is dropped because
+        it is constant within a query and cancels from both the loss and the gradient under the
+        per-query softmax CE (sum_c dL/ds_c = 0)."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
         b, d = p_u.shape
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
+
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        return self.temperature * (-geo)                                       # [B, C] temperature-scaled score
+        rho_v = self.geom.dist0(p_v)                                            # [B, C] candidate radius
+        feats = torch.stack([geo, rho_v], dim=-1)                               # [B, C, 2]
+        return self.temperature * (feats * self.w).sum(dim=-1)                  # [B, C]
