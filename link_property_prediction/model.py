@@ -22,23 +22,47 @@ class PoincareManifold:
         """Elementwise geodesic distance, broadcasting over leading dims. LOWER = closer."""
         return self.manifold.dist(x, y)
 
+    def dist0(self, x: torch.Tensor) -> torch.Tensor:
+        """Hyperbolic radius from the origin, 2*artanh(||x||)."""
+        return self.manifold.dist0(x)
+
     def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """Weighted gyro-midpoint: x [Q,T,d], w [Q,T] -> [Q,d]."""
         return self.manifold.weighted_midpoint(x, weights=w, reducedim=[-2], dim=-1, keepdim=False)
 
 
 class BagWeights(nn.Module):
+    """Pooling weights = softmax(MLP([-(age/mnia), -pos, spr])); hidden = 8*N_FEAT, randomly
+    initialised, with mnia as a fixed age scale. The softmax over tokens dampens the random init."""
+
+    N_FEAT = 3
 
     def __init__(self, mnia: float):
         super().__init__()
-        self.mnia = float(mnia)                                              # fixed age scale
+        self.mnia = float(mnia)                 # fixed age scale
+        hidden = 8 * self.N_FEAT                # 8x expansion, random init
+        self.net = nn.Sequential(nn.Linear(self.N_FEAT, hidden), nn.GELU(), nn.Linear(hidden, 1))
 
-    def forward(self, tokens: WalkTokens, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        """x [Q,T,d], valid [Q,T] -> pooling weights [Q,T] summing to 1, 0 on padding. (x sets dtype.)"""
-        age = tokens.ages.clamp_min(0).float()                               # seed = 0, ctx >= 1, pad -> 0
-        rec = -age / self.mnia                                               # LINEAR, unbounded  [Q, T]
-        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                 # LINEAR, in [-(L-1), 0]
-        logits = (rec + pos).to(x.dtype)                                     # [Q, T]
+    @staticmethod
+    def get_centroid(geom: "PoincareManifold", x: torch.Tensor,
+                     valid: torch.Tensor) -> torch.Tensor:
+        """Unweighted gyro-midpoint of the valid tokens -> [Q, 1, d], broadcastable against x."""
+        vf = valid.to(x.dtype)
+        n = vf.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        return geom.midpoint(x, vf / n).unsqueeze(-2)                              # [Q, 1, d]
+
+    def forward(self, geom: "PoincareManifold", tokens: WalkTokens, x: torch.Tensor,
+                valid: torch.Tensor) -> torch.Tensor:
+        """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
+        vf = valid.to(x.dtype)
+        n = vf.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        rec = -(tokens.ages.clamp_min(0).float() / self.mnia)                   # -(age/mnia)
+        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                    # -pos
+        c = self.get_centroid(geom, x.detach(), valid)                          # [Q, 1, d]
+        dc = geom.dist(c, x) * vf                                               # [Q, T] 0 on padding
+        spr = dc / (dc.sum(dim=-1, keepdim=True) / n).clamp_min(1e-6)           # per-bag level removed
+        feat = torch.stack([rec, pos, spr], dim=-1).to(x.dtype)                 # [Q, T, 3]
+        logits = self.net(feat).squeeze(-1)                                     # [Q, T]
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
 
@@ -60,7 +84,7 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        self.temperature = nn.Parameter(torch.tensor(1.0))
+        self.w = nn.Parameter(torch.ones(2))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
@@ -72,12 +96,12 @@ class LinkPredHead(nn.Module):
             valid[cold, 0] = True
 
         x = F.embedding(nodes, emb)                                             # [Q, T, d]
-        w = self.bag_weights(tokens, x, valid)                                  # [Q, T] sums to 1, 0 on padding
+        w = self.bag_weights(self.geom, tokens, x, valid)                                  # [Q, T] sums to 1, 0 on padding
         return self.geom.midpoint(x, w)                                         # [Q, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = temperature * (-geo)  (spread, cosine channels and pop_bias all removed -> pure geodesic)."""
+        score = w . [-geo, rho_v], w learnable init [1, 1]. No temperature."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -85,4 +109,6 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        return self.temperature * (-geo)                                       # [B, C] temperature-scaled score
+        rho_v = self.geom.dist0(p_v)                                            # [B, C] candidate radius
+        feats = torch.stack([-geo, rho_v], dim=-1)                              # [B, C, 2]  closer -> higher
+        return (feats * self.w).sum(dim=-1)                                     # [B, C]

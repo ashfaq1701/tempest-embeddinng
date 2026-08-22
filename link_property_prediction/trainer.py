@@ -186,6 +186,9 @@ class Trainer:
         parts = []
         if hasattr(self.model, "temperature"):
             parts.append(f"temp={float(self.model.temperature):.3f}")
+        if isinstance(getattr(self.model, "w", None), torch.Tensor):
+            w = self.model.w.detach().flatten().tolist()
+            parts.append("w=[" + ",".join(f"{v:.3f}" for v in w) + "]")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad
