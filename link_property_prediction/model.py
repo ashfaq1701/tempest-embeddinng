@@ -28,26 +28,6 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """Parameterless token pooling: softmax over -age/mnia - (pos-1), both RAW (no log1p). Both
-    channels are fixed priors on a FIXED scale (mnia = mean node inter-arrival); nothing is learned.
-
-    This is the pre-log-compression feature pair, restored. Removing the logs makes the priors
-    steeper, so the softmax sharpens and the seed takes MORE of the mass -- 0.800 vs 0.693 for the
-    log form (measured, cold excluded; uniform would be 0.244).
-
-    Measured seed share of the pooling mass on YouTube (all training bags, cold excluded; uniform
-    would be 0.244):
-
-        recency only                      0.485
-        -log1p(pos-1) only                0.494
-        BOTH, this pooler                 0.693
-        -(pos-1) linear only              0.657
-        recency + -(pos-1), w=[1,1]       0.800     <- the previous feature pair, untrained
-        same, trained to epoch 6          0.960
-
-    Log-compressing the position channel is what pulls the seed down from 0.800 to 0.693: it halves
-    that channel's standalone pull (0.657 -> 0.494). The residual 0.693 is structural and no reshaping
-    reaches it -- the seed is the argmax of BOTH channels at once and occupies 5 of ~20.5 slots."""
 
     def __init__(self, mnia: float):
         super().__init__()
@@ -80,8 +60,6 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        # Learned scalar temperature on the geodesic logit (init 1). Scales -geo before the per-query
-        # softmax CE so the model can sharpen/soften the ranking without any extra score channel.
         self.temperature = nn.Parameter(torch.tensor(1.0))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
