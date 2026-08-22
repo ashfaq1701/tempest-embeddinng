@@ -32,10 +32,6 @@ class BagWeights(nn.Module):
     def __init__(self, mnia: float):
         super().__init__()
         self.mnia = float(mnia)                                              # fixed age scale
-        # One multiplicative temperature on the whole prior. Init 1 -> step 0 reproduces the plain
-        # rec + pos pooler exactly, so the model starts where the fixed version sat and is free to
-        # move from there. Both priors are <= 0 and exactly 0 at the seed, so seed share rises
-        # monotonically with this scalar (uniform 0.247 at 0, ~0.88 at 0.25, ~0.99 at 1.0).
         self._temp = nn.Parameter(torch.ones(()))
 
     @property
