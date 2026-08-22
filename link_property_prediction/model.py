@@ -1,12 +1,12 @@
 """Centroid-to-centroid head on the Poincaré ball with a simplified popularity channel:
 
-    s(u,v) = temperature * (w . [d(P_u, P_v), rho_v]),   w init [1, 1],   rho_v = dist0(P_v)
+    s(u,v) = w . [d(P_u, P_v), rho_v],   w init [1, 1],   rho_v = dist0(P_v)
 
 The first channel is the pair's geodesic distance; the second is the candidate's own radius, which
 carries no dependence on u and so acts as a popularity / prominence prior. P_x is the weighted
 gyro-midpoint of x's walk-token bag; the pooling weights are a PARAMETERLESS softmax over two fixed
-priors, -log1p(age/mnia) and -log1p(pos-1). Three head params: temperature and the two channel
-weights."""
+priors, -log1p(age/mnia) and -log1p(pos-1). TWO head params: the channel weights, which carry the
+score's scale themselves (no separate temperature -- it would be redundant with them)."""
 
 import geoopt
 import torch
@@ -84,8 +84,10 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        # Learned scalar temperature on the score, and one weight per score channel.
-        self.temperature = nn.Parameter(torch.tensor(1.0))
+        # One weight per score channel. There is deliberately NO separate temperature: a scalar t
+        # multiplying the whole score would be redundant with w, since t*(w0*d + w1*rho) is just
+        # (t*w0)*d + (t*w1)*rho -- three parameters for two degrees of freedom, and the pair then
+        # spends training renegotiating a split that has no unique solution.
         self.w = nn.Parameter(torch.ones(2))            # [d(P_u,P_v), rho_v], init [1, 1]
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
@@ -104,7 +106,7 @@ class LinkPredHead(nn.Module):
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
 
-        score = temperature * (w . [d(P_u,P_v), rho_v]),  w init [1, 1].
+        score = w . [d(P_u,P_v), rho_v],  w init [1, 1]  (w carries the scale; no temperature).
 
         Two channels: the pair's geodesic distance, and the CANDIDATE's radius rho_v = dist0(P_v).
         rho_v is a per-candidate quantity with no dependence on u, so it acts as a popularity /
@@ -121,4 +123,4 @@ class LinkPredHead(nn.Module):
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
         rho_v = self.geom.dist0(p_v)                                            # [B, C] candidate radius
         feats = torch.stack([geo, rho_v], dim=-1)                               # [B, C, 2]
-        return self.temperature * (feats * self.w).sum(dim=-1)                  # [B, C]
+        return (feats * self.w).sum(dim=-1)                                     # [B, C]

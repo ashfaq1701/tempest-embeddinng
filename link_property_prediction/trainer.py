@@ -180,12 +180,13 @@ class Trainer:
 
     @torch.no_grad()
     def _head_probe(self) -> str:
-        """The head's scalar parameters, for the epoch line. The pooling is parameterless, so the score
-        temperature is all there is; read via hasattr so a head with more knobs degrades to a shorter
-        line rather than raising."""
+        """The head's scalar parameters, for the epoch line. The pooling is parameterless, so the two
+        score-channel weights are all there is; read via hasattr so a head with a different parameter
+        set degrades to a shorter line rather than raising."""
+        m = self.model
         parts = []
-        if hasattr(self.model, "temperature"):
-            parts.append(f"temp={float(self.model.temperature):.3f}")
+        if hasattr(m, "w"):
+            parts.append("w=[" + ",".join(f"{v:.3f}" for v in m.w.detach().tolist()) + "]")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad
