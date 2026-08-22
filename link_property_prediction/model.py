@@ -38,12 +38,17 @@ class BagWeights(nn.Module):
         # (uniform 0.247 at 0, ~0.88 at 0.25, ~0.99 at 1.0 on YouTube-scale bags).
         self._temp = nn.Parameter(torch.zeros(()))
 
+    @property
+    def temp(self) -> torch.Tensor:
+        """The pooling temperature, for logging. Read-only accessor over the raw Parameter."""
+        return self._temp
+
     def forward(self, tokens: WalkTokens, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> pooling weights [Q,T] summing to 1, 0 on padding. (x sets dtype.)"""
         age = tokens.ages.clamp_min(0).float()                               # seed = 0, ctx >= 1, pad -> 0
         rec = -age / self.mnia                                               # LINEAR, unbounded  [Q, T]
         pos = -(tokens.positions.clamp_min(1).float() - 1.0)                 # LINEAR, in [-(L-1), 0]
-        logits = (self._temp * (rec + pos)).to(x.dtype)                      # [Q, T]
+        logits = (self.temp * (rec + pos)).to(x.dtype)                       # [Q, T]
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
 
