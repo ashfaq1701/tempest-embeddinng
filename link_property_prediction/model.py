@@ -32,12 +32,12 @@ class BagWeights(nn.Module):
     def __init__(self, mnia: float):
         super().__init__()
         self.mnia = float(mnia)                                              # fixed age scale
-        self._temp = nn.Parameter(torch.ones(()))
+        self._raw = nn.Parameter(torch.zeros(()))               # sigmoid -> temp in (0, 1)
 
     @property
     def temp(self) -> torch.Tensor:
-        """The pooling temperature, for logging. Read-only accessor over the raw Parameter."""
-        return self._temp
+        """Pooling temperature, constrained to (0, 1) by a sigmoid on the raw Parameter."""
+        return torch.sigmoid(self._raw)
 
     def forward(self, tokens: WalkTokens, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> pooling weights [Q,T] summing to 1, 0 on padding. (x sets dtype.)"""
