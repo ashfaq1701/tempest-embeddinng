@@ -83,7 +83,9 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = temperature * (-geo)  (spread, cosine channels and pop_bias all removed -> pure geodesic)."""
+        score = temperature * (-geo + <p_u, p_v>). The UNNORMALISED inner product carries the angular
+        signal (cos theta) scaled by the magnitudes, so it is O(||p||^2) near the origin -- small early
+        like the geodesic, growing as E expands. Angle is coupled to radius, not a scale-free shortcut."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -91,4 +93,5 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        return self.temperature * (-geo)                                       # [B, C] temperature-scaled score
+        ip = (p_u.unsqueeze(1) * p_v).sum(dim=-1)                              # [B, C] <p_u,p_v> = ||p_u|| ||p_v|| cos(theta)
+        return self.temperature * (-geo + ip)                                  # [B, C] temperature-scaled score
