@@ -79,6 +79,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--early-stop-patience", default=3, type=int,
                    help="Early-stop patience in epochs.")
 
+    # ── Training-dynamics snapshots (optional) ──────────────────────
+    p.add_argument("--snapshot-dir", default=None,
+                   help="If set, dump the E table (E_batch{idx:07d}.npy) here at batch 0 and every "
+                        "--snapshot-every-n-batches steps (for training-dynamics capture).")
+    p.add_argument("--snapshot-every-n-batches", default=0, type=int,
+                   help="Snapshot cadence in batches (0 = off). Requires --snapshot-dir.")
+
     # ── System ──────────────────────────────────────────────────────
     p.add_argument("--seed", default=42, type=int,
                    help="Random seed.")
@@ -188,6 +195,9 @@ def main() -> Dict[str, Any]:
         lr=args.lr,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
+
+        snapshot_dir=args.snapshot_dir,
+        snapshot_every_n_batches=args.snapshot_every_n_batches,
 
         seed=args.seed,
         use_gpu=args.use_gpu,

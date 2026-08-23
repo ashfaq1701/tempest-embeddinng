@@ -10,6 +10,7 @@ TWO-SIDED (walks for the source u and for every candidate v, each cut off at the
 then cross-entropy with target 0 and a single optimizer step. E and the head train together under
 the link CE with no detach.
 """
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
@@ -59,6 +60,11 @@ class TrainerConfig:
     # Run control.
     num_epochs: int = 50
     early_stop_patience: int = 3
+
+    # Optional training-dynamics capture: dump the E table (as E_batch{idx:07d}.npy) to snapshot_dir
+    # at init (batch 0) and every snapshot_every_n_batches steps. Off by default (dir None / n 0).
+    snapshot_dir: Optional[str] = None
+    snapshot_every_n_batches: int = 0
 
     # System.
     seed: int = 42
@@ -179,6 +185,12 @@ class Trainer:
         return {"max_norm": float(norms.max()), "mean_norm": float(norms.mean())}
 
     @torch.no_grad()
+    def _save_snapshot(self, snapshot_dir: str, batch_idx: int) -> None:
+        """Dump the E table as {snapshot_dir}/E_batch{batch_idx:07d}.npy (training-dynamics capture)."""
+        path = os.path.join(snapshot_dir, f"E_batch{batch_idx:07d}.npy")
+        np.save(path, self.model.E.weight.detach().cpu().numpy())
+
+    @torch.no_grad()
     def _head_probe(self) -> str:
         """The head's scalar parameters, for the epoch line. The pooling is parameterless, so the score
         temperature is all there is; read via hasattr so a head with more knobs degrades to a shorter
@@ -281,6 +293,15 @@ class Trainer:
         per_epoch_val: List[float] = []
         per_epoch_test: List[float] = []
 
+        # Optional training-dynamics capture (dump E at batch 0, then every N batches).
+        snap_dir = self.config.snapshot_dir
+        snap_every = int(self.config.snapshot_every_n_batches)
+        snap_on = bool(snap_dir) and snap_every > 0
+        snap_idx = 0
+        if snap_on:
+            os.makedirs(snap_dir, exist_ok=True)
+            self._save_snapshot(snap_dir, snap_idx)
+
         for ep in range(1, n_epochs + 1):
             self.model.train()
 
@@ -290,6 +311,10 @@ class Trainer:
                 m = self._train_step(batch)
                 link_sum += m["link"]
                 n_batches += 1
+                if snap_on:
+                    snap_idx += 1
+                    if snap_idx % snap_every == 0:
+                        self._save_snapshot(snap_dir, snap_idx)
             train_dt = time.time() - t0
 
             line = (
