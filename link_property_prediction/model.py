@@ -52,10 +52,11 @@ class LinkPredHead(nn.Module):
     """E is a ManifoldParameter; BagWeights is the only other trained module."""
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float,
-                 init_irange: float = 1e-3):
+                 init_irange: float = 1e-3, use_pop_bias: bool = False):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
+        self.use_pop_bias = bool(use_pop_bias)
         self.geom = PoincareManifold()
         self.bag_weights = BagWeights(mean_node_inter_arrival)
 
@@ -67,6 +68,12 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
         self.temperature = nn.Parameter(torch.tensor(1.0))
+
+        # Optional per-node popularity bias, added to the candidate's score at its own learned scale so
+        # absolute popularity carries across queries. Zero-init -> contributes exactly 0 at step 0.
+        if self.use_pop_bias:
+            self.pop_bias = nn.Embedding(self.num_nodes, 1)
+            nn.init.zeros_(self.pop_bias.weight)
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
@@ -83,7 +90,7 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = temperature * (-geo)  (spread, cosine channels and pop_bias all removed -> pure geodesic)."""
+        score = temperature * (-geo) [+ pop_bias_v]  (geodesic distance, optional per-node pop bias)."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -91,4 +98,8 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        return self.temperature * (-geo)                                       # [B, C] temperature-scaled score
+        score = self.temperature * (-geo)                                       # [B, C] temperature-scaled score
+        if self.use_pop_bias:
+            v_nodes = cand_tokens.seeds.view(b, c)                              # [B, C] candidate node ids
+            score = score + self.pop_bias(v_nodes).squeeze(-1)                  # + per-node popularity bias
+        return score

@@ -42,6 +42,9 @@ class TrainerConfig:
     # Embedding dimension.
     d_emb: int = 64
 
+    # Add a learned per-node popularity bias to the score (score += pop_bias[candidate]).
+    use_pop_bias: bool = False
+
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
 
@@ -77,6 +80,7 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             mean_node_inter_arrival=float(config.mean_node_inter_arrival),
+            use_pop_bias=bool(config.use_pop_bias),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(
