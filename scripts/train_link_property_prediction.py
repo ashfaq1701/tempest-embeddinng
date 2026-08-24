@@ -91,8 +91,6 @@ def parse_args() -> argparse.Namespace:
                    help="Run Tempest's walk sampler in GPU mode.")
 
     # ── Post-training outputs ───────────────────────────────────────
-    p.add_argument("--stratify", action="store_true",
-                   help="After training, stratify best-val test MRR by slice.")
     p.add_argument("--export-best-embedding-table", action="store_true",
                    help="After training, dump the best-val embedding table to disk.")
 
@@ -233,20 +231,6 @@ def main() -> Dict[str, Any]:
     print(f"  stopped_at_epoch:  {result['stopped_at_epoch']}")
     print(f"  best_val_mrr:      {result['best_val_mrr']:.4f}")
     print(f"  best_test_mrr:     {result['best_test_mrr']:.4f}")
-
-    # Optional: stratify the best-val model's test MRR to localize the gap.
-    if args.stratify:
-        from link_property_prediction.stratify import run_stratification
-        meta = {
-            "dataset": args.dataset, "seed": args.seed, "d_emb": args.d_emb,
-            "batch_size": args.batch_size, "eval_batch_size": args.eval_batch_size,
-            "head": type(trainer.model).__name__,
-            "best_epoch": result["stopped_at_epoch"],
-            "best_val": result["best_val_mrr"], "best_test": result["best_test_mrr"],
-        }
-        run_stratification(
-            trainer, train_batches_factory, val_batches_factory,
-            test_eval, test_batches_factory, num_nodes, meta)
 
     # Optional: dump best-val embedding table for downstream analysis.
     if args.export_best_embedding_table:
