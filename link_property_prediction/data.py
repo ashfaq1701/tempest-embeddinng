@@ -1,5 +1,5 @@
 """Suite-agnostic data containers (`SplitData`, `Batch`, `Loaded`) and the fixed-size
-(TGB-identical) chronological batch iterator. Suite modules do the loading."""
+chronological batch iterator. Suite modules do the loading."""
 
 from typing import Iterator, NamedTuple, Optional
 
@@ -25,10 +25,8 @@ class Loaded(NamedTuple):
     val: SplitData
     test: SplitData
     dataset: object             # live suite dataset handle (negatives + eval)
-    name: str                   # TGB-Seq dataset name (for the Evaluator)
-    eval_metric: str            # e.g. "mrr"
+    name: str                   # dataset name (for the Evaluator)
     max_node_count: int
-    node_feat: Optional[np.ndarray]
 
 
 def concat_splits(*splits: SplitData) -> SplitData:
@@ -43,7 +41,7 @@ def concat_splits(*splits: SplitData) -> SplitData:
 
 
 def create_batches(split: SplitData, batch_size: int) -> Iterator[Batch]:
-    """TGB-identical fixed-size chronological batches (train and eval): consecutive
+    """Fixed-size chronological batches (train and eval): consecutive
     `batch_size` chunks over the time-sorted stream. The final partial batch is kept
     (drop_last=False). Timestamps split freely across boundaries, so same-timestamp
     edges in different batches see each other's ingested state; within one batch they

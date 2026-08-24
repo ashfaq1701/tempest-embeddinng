@@ -14,12 +14,6 @@ import torch
 
 from link_property_prediction.pair_store import PairRecencyStore
 
-# Published leaderboard refs, by dataset — used only to print a "gap" line.
-LEADERBOARD_REF = {
-    "tgbl-wiki": {"name": "TPNet", "test": 0.827, "val": 0.842},
-}
-
-
 # ──────────────────────────────────────────────────────────────────────────
 # Analysis recorder — dedicated causal counters, queried pre-ingest / updated post.
 # ──────────────────────────────────────────────────────────────────────────
@@ -172,12 +166,7 @@ def _table(rows):
     return head
 
 
-def emit_md(strata, hr, meta, ref=None):
-    gap_line = ""
-    if ref is not None:
-        g_test = ref["test"] - strata["overall"]
-        gap_line = (f"- **{ref['name']} ref: test {ref['test']} / val {ref['val']}  →  "
-                    f"test gap ≈ {g_test:+.4f}**\n")
+def emit_md(strata, hr, meta):
     md = f"""# {meta['dataset']} test-set MRR stratification
 
 **Model:** {meta.get('head', 'current head')}, sphere E.
@@ -186,7 +175,7 @@ seed {meta['seed']}, d_emb {meta['d_emb']}, train bs {meta['batch_size']}
 
 - **test MRR (this stratified run): {strata['overall']:.4f}** over {strata['n']:,} positives
 - training-run best: val {meta['best_val']:.4f} / test {meta['best_test']:.4f} (walk-noise vs above)
-{gap_line}
+
 ## 1. Transductivity (endpoint seen in any prior edge)
 {_table(strata['transductivity'])}
 ## 2. Pair recurrence
@@ -240,13 +229,12 @@ def run_stratification(trainer, train_f, val_f, test_eval, test_f,
         assert abs(recon - strata["overall"]) < 1e-4, f"{part} reconstruct {recon}"
     print(f"  sanity OK — test MRR {strata['overall']:.4f} over {strata['n']:,} positives")
 
-    ref = LEADERBOARD_REF.get(meta["dataset"])
     out = pathlib.Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     stem = f"{meta['dataset']}_seed{meta['seed']}_strata"
-    (out / f"{stem}.md").write_text(emit_md(strata, hr, meta, ref=ref))
+    (out / f"{stem}.md").write_text(emit_md(strata, hr, meta))
     json.dump({"config": meta, "test_mrr_stratified": strata["overall"],
-               "n_positives": strata["n"], "leaderboard_ref": ref,
+               "n_positives": strata["n"],
                "strata": {k: strata[k] for k in
                           ("transductivity", "pair_recurrence", "source_degree",
                            "crosstab_pair_x_transductivity")},

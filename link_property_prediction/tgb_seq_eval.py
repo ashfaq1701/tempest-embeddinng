@@ -43,8 +43,6 @@ def load_tgb_seq(name: str, root: str = "datasets") -> Loaded:
 
     edge_feat = ds.edge_features
     edge_feat = np.asarray(edge_feat, dtype=np.float32) if edge_feat is not None else None
-    node_feat = ds.node_features
-    node_feat = np.asarray(node_feat, dtype=np.float32) if node_feat is not None else None
 
     def _split(mask: np.ndarray) -> SplitData:
         m = np.asarray(mask, dtype=bool)
@@ -57,9 +55,7 @@ def load_tgb_seq(name: str, root: str = "datasets") -> Loaded:
         test=_split(ds.test_mask),
         dataset=ds,
         name=name,
-        eval_metric="mrr",                                # TGB-Seq evaluates MRR only
         max_node_count=int(max(src.max(), dst.max())) + 1,
-        node_feat=node_feat,
     )
 
 

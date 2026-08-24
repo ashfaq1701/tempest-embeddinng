@@ -1,4 +1,4 @@
-"""Contract for the TGB-identical fixed-size batch iterator (data.create_batches).
+"""Contract for the fixed-size chronological batch iterator (data.create_batches).
 
 Pins: consecutive fixed-size chunks, order-preserving, drop_last=False, and a
 timestamp group larger than batch_size IS split across batches (matching

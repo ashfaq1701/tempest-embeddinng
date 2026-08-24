@@ -34,8 +34,7 @@ def parse_args() -> argparse.Namespace:
                    help="Benchmark suite to load from.")
     p.add_argument("--dataset", required=True, type=str,
                    help="Dataset name within the suite.")
-    p.add_argument("--data-root", "--tgb-root", dest="data_root",
-                   default="datasets", type=str,
+    p.add_argument("--data-root", default="datasets", type=str,
                    help="Data root directory.")
     p.add_argument("--is-bipartite", action="store_true",
                    help="Treat the graph as bipartite.")
