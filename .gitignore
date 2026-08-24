@@ -12,6 +12,7 @@ __pycache__/
 
 # Data + run artifacts (not source)
 datasets/
+datasets
 logs/
 *.log
 *.pt

@@ -1,0 +1,108 @@
+# d-sweep cell: dataset=YouTube d_emb=256
+# branch=master commit=3bfe0624
+# started=2026-08-24 03:50:39
+# cmd: /its/home/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq \
+#        --dataset YouTube --d-emb 256 --num-epochs 50 --early-stop-patience 3 \
+#        --use-gpu --use-gpu-tempest 
+
+=== tempest-embedding training ===
+dataset: YouTube
+device:  cuda
+seed:    42
+loaded (tgb-seq) in 0.9s
+  num_nodes:     402,423
+  neg_pool:      402,422 unique nodes (non-bipartite)
+  t_min:         1165705200
+  t_max:         1182722400
+  T_train:       17017200
+  median_inter_arrival: 86400.0
+  mean_inter_arrival:   97800.0
+  train edges:   2,730,407
+  val edges:     324,756
+  test edges:    232,865
+
+=== Config ===
+  num_nodes: 402423
+  dst_pool: <ndarray shape=(402422,) dtype=int32>
+  t_train: 17017200.0
+  mean_node_inter_arrival: 1254043.0160045738
+  d_emb: 256
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 50
+  early_stop_patience: 3
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:          103,020,288
+  head params:                2
+  TOTAL trainable:  103,020,290
+
+=== Training ===
+  Ingested full graph into Tempest: 3,288,028 edges (once; per-query cutoff enforces causality)
+epoch 1/50  link=1.7400  lr=1e-03  train 179.5s  |E|mean=0.069  |E|max=0.592  temp=3.604  ptemp=0.0691  praw=-2.601  val 0.1889  test 0.1678 (new best)  eval 32.9s
+epoch 2/50  link=1.4019  lr=1e-03  train 177.9s  |E|mean=0.121  |E|max=0.627  temp=6.405  ptemp=0.6082  praw=+0.440  val 0.3363  test 0.2927 (new best)  eval 32.3s
+epoch 3/50  link=1.0264  lr=1e-03  train 177.6s  |E|mean=0.154  |E|max=0.599  temp=8.876  ptemp=0.9015  praw=+2.214  val 0.4244  test 0.3639 (new best)  eval 32.6s
+epoch 4/50  link=0.7790  lr=1e-03  train 177.8s  |E|mean=0.176  |E|max=0.559  temp=11.154  ptemp=0.9732  praw=+3.593  val 0.4787  test 0.4114 (new best)  eval 32.5s
+epoch 5/50  link=0.6200  lr=1e-03  train 177.7s  |E|mean=0.193  |E|max=0.508  temp=13.382  ptemp=0.9922  praw=+4.851  val 0.5200  test 0.4505 (new best)  eval 32.6s
+epoch 6/50  link=0.5061  lr=1e-03  train 177.4s  |E|mean=0.206  |E|max=0.465  temp=15.589  ptemp=0.9976  praw=+6.035  val 0.5543  test 0.4826 (new best)  eval 32.5s
+epoch 7/50  link=0.4210  lr=1e-03  train 177.4s  |E|mean=0.217  |E|max=0.446  temp=17.768  ptemp=0.9992  praw=+7.173  val 0.5799  test 0.5076 (new best)  eval 32.7s
+epoch 8/50  link=0.3552  lr=1e-03  train 177.7s  |E|mean=0.226  |E|max=0.452  temp=19.921  ptemp=0.9997  praw=+8.278  val 0.6000  test 0.5268 (new best)  eval 32.7s
+epoch 9/50  link=0.3038  lr=1e-03  train 174.6s  |E|mean=0.233  |E|max=0.492  temp=22.031  ptemp=0.9999  praw=+9.356  val 0.6152  test 0.5423 (new best)  eval 32.7s
+epoch 10/50  link=0.2632  lr=1e-03  train 172.7s  |E|mean=0.239  |E|max=0.525  temp=24.092  ptemp=1.0000  praw=+10.418  val 0.6258  test 0.5520 (new best)  eval 31.7s
+epoch 11/50  link=0.2313  lr=1e-03  train 173.3s  |E|mean=0.245  |E|max=0.557  temp=26.078  ptemp=1.0000  praw=+11.466  val 0.6335  test 0.5589 (new best)  eval 31.7s
+epoch 12/50  link=0.2043  lr=1e-03  train 177.5s  |E|mean=0.250  |E|max=0.583  temp=27.994  ptemp=1.0000  praw=+12.498  val 0.6408  test 0.5658 (new best)  eval 31.7s
+epoch 13/50  link=0.1835  lr=1e-03  train 172.8s  |E|mean=0.255  |E|max=0.608  temp=29.756  ptemp=1.0000  praw=+13.514  val 0.6448  test 0.5688 (new best)  eval 31.8s
+epoch 14/50  link=0.1660  lr=1e-03  train 173.1s  |E|mean=0.259  |E|max=0.637  temp=31.382  ptemp=1.0000  praw=+14.502  val 0.6488  test 0.5716 (new best)  eval 31.7s
+epoch 15/50  link=0.1520  lr=1e-03  train 177.0s  |E|mean=0.262  |E|max=0.661  temp=32.832  ptemp=1.0000  praw=+15.443  val 0.6514  test 0.5748 (new best)  eval 31.8s
+epoch 16/50  link=0.1401  lr=1e-03  train 177.6s  |E|mean=0.266  |E|max=0.662  temp=34.117  ptemp=1.0000  praw=+16.288  val 0.6522  test 0.5773 (new best)  eval 31.8s
+epoch 17/50  link=0.1297  lr=1e-03  train 172.8s  |E|mean=0.269  |E|max=0.668  temp=35.259  ptemp=1.0000  praw=+16.641  val 0.6557  test 0.5791 (new best)  eval 31.7s
+epoch 18/50  link=0.1208  lr=1e-03  train 172.7s  |E|mean=0.272  |E|max=0.680  temp=36.259  ptemp=1.0000  praw=+16.641  val 0.6565  test 0.5801 (new best)  eval 31.7s
+epoch 19/50  link=0.1136  lr=1e-03  train 172.8s  |E|mean=0.275  |E|max=0.691  temp=37.131  ptemp=1.0000  praw=+16.641  val 0.6573  test 0.5825 (new best)  eval 31.8s
+epoch 20/50  link=0.1070  lr=1e-03  train 177.6s  |E|mean=0.278  |E|max=0.711  temp=37.894  ptemp=1.0000  praw=+16.641  val 0.6594  test 0.5831 (new best)  eval 31.7s
+epoch 21/50  link=0.1020  lr=1e-03  train 177.6s  |E|mean=0.280  |E|max=0.711  temp=38.516  ptemp=1.0000  praw=+16.641  val 0.6606  test 0.5851 (new best)  eval 31.7s
+epoch 22/50  link=0.0969  lr=1e-03  train 177.6s  |E|mean=0.283  |E|max=0.714  temp=39.078  ptemp=1.0000  praw=+16.641  val 0.6618  test 0.5860 (new best)  eval 31.5s
+epoch 23/50  link=0.0924  lr=1e-03  train 172.7s  |E|mean=0.286  |E|max=0.729  temp=39.572  ptemp=1.0000  praw=+16.641  val 0.6628  test 0.5866 (new best)  eval 31.7s
+epoch 24/50  link=0.0885  lr=1e-03  train 172.7s  |E|mean=0.288  |E|max=0.735  temp=39.993  ptemp=1.0000  praw=+16.641  val 0.6640  test 0.5876 (new best)  eval 31.6s
+epoch 25/50  link=0.0852  lr=1e-03  train 172.8s  |E|mean=0.290  |E|max=0.749  temp=40.352  ptemp=1.0000  praw=+16.641  val 0.6642  test 0.5874 (new best)  eval 31.7s
+epoch 26/50  link=0.0821  lr=1e-03  train 172.7s  |E|mean=0.293  |E|max=0.762  temp=40.651  ptemp=1.0000  praw=+16.641  val 0.6654  test 0.5904 (new best)  eval 31.6s
+epoch 27/50  link=0.0796  lr=1e-03  train 172.7s  |E|mean=0.295  |E|max=0.774  temp=40.882  ptemp=1.0000  praw=+16.641  val 0.6665  test 0.5904 (new best)  eval 31.7s
+epoch 28/50  link=0.0770  lr=1e-03  train 172.7s  |E|mean=0.297  |E|max=0.785  temp=41.081  ptemp=1.0000  praw=+16.641  val 0.6672  test 0.5902 (new best)  eval 31.7s
+epoch 29/50  link=0.0750  lr=1e-03  train 172.8s  |E|mean=0.300  |E|max=0.791  temp=41.232  ptemp=1.0000  praw=+16.641  val 0.6680  test 0.5919 (new best)  eval 31.7s
+epoch 30/50  link=0.0737  lr=1e-03  train 172.8s  |E|mean=0.302  |E|max=0.798  temp=41.307  ptemp=1.0000  praw=+16.641  val 0.6695  test 0.5921 (new best)  eval 31.6s
+epoch 31/50  link=0.0715  lr=1e-03  train 172.7s  |E|mean=0.304  |E|max=0.805  temp=41.386  ptemp=1.0000  praw=+16.641  val 0.6700  test 0.5935 (new best)  eval 31.7s
+epoch 32/50  link=0.0702  lr=1e-03  train 172.7s  |E|mean=0.306  |E|max=0.810  temp=41.414  ptemp=1.0000  praw=+16.641  val 0.6704  test 0.5933 (new best)  eval 31.7s
+epoch 33/50  link=0.0685  lr=1e-03  train 172.7s  |E|mean=0.308  |E|max=0.814  temp=41.430  ptemp=1.0000  praw=+16.641  val 0.6707  test 0.5920 (new best)  eval 31.7s
+epoch 34/50  link=0.0671  lr=1e-03  train 172.7s  |E|mean=0.310  |E|max=0.819  temp=41.431  ptemp=1.0000  praw=+16.641  val 0.6725  test 0.5929 (new best)  eval 31.7s
+epoch 35/50  link=0.0656  lr=1e-03  train 172.7s  |E|mean=0.312  |E|max=0.823  temp=41.417  ptemp=1.0000  praw=+16.641  val 0.6729  test 0.5958 (new best)  eval 31.7s
+epoch 36/50  link=0.0645  lr=1e-03  train 172.7s  |E|mean=0.314  |E|max=0.828  temp=41.379  ptemp=1.0000  praw=+16.641  val 0.6727  patience 1/3  eval 31.7s
+epoch 37/50  link=0.0634  lr=1e-03  train 172.7s  |E|mean=0.316  |E|max=0.830  temp=41.331  ptemp=1.0000  praw=+16.641  val 0.6726  patience 2/3  eval 31.7s
+epoch 38/50  link=0.0625  lr=1e-03  train 172.7s  |E|mean=0.318  |E|max=0.839  temp=41.259  ptemp=1.0000  praw=+16.641  val 0.6741  test 0.5964 (new best)  eval 31.7s
+epoch 39/50  link=0.0620  lr=1e-03  train 172.7s  |E|mean=0.320  |E|max=0.844  temp=41.152  ptemp=1.0000  praw=+16.641  val 0.6734  patience 1/3  eval 31.6s
+epoch 40/50  link=0.0607  lr=1e-03  train 172.7s  |E|mean=0.322  |E|max=0.850  temp=41.056  ptemp=1.0000  praw=+16.641  val 0.6747  test 0.5969 (new best)  eval 31.7s
+epoch 41/50  link=0.0603  lr=1e-03  train 172.8s  |E|mean=0.324  |E|max=0.865  temp=40.932  ptemp=1.0000  praw=+16.641  val 0.6744  patience 1/3  eval 31.7s
+epoch 42/50  link=0.0591  lr=1e-03  train 173.0s  |E|mean=0.326  |E|max=0.870  temp=40.814  ptemp=1.0000  praw=+16.641  val 0.6760  test 0.5995 (new best)  eval 31.7s
+epoch 43/50  link=0.0586  lr=1e-03  train 172.8s  |E|mean=0.327  |E|max=0.877  temp=40.696  ptemp=1.0000  praw=+16.641  val 0.6760  test 0.5997 (new best)  eval 31.6s
+epoch 44/50  link=0.0581  lr=1e-03  train 172.7s  |E|mean=0.329  |E|max=0.885  temp=40.548  ptemp=1.0000  praw=+16.641  val 0.6770  test 0.5990 (new best)  eval 31.5s
+epoch 45/50  link=0.0575  lr=1e-03  train 172.7s  |E|mean=0.331  |E|max=0.893  temp=40.397  ptemp=1.0000  praw=+16.641  val 0.6790  test 0.5996 (new best)  eval 31.7s
+epoch 46/50  link=0.0572  lr=1e-03  train 173.6s  |E|mean=0.333  |E|max=0.896  temp=40.226  ptemp=1.0000  praw=+16.641  val 0.6785  patience 1/3  eval 31.4s
+epoch 47/50  link=0.0560  lr=1e-03  train 172.7s  |E|mean=0.335  |E|max=0.906  temp=40.087  ptemp=1.0000  praw=+16.641  val 0.6800  test 0.6013 (new best)  eval 30.1s
+epoch 48/50  link=0.0557  lr=1e-03  train 172.7s  |E|mean=0.337  |E|max=0.909  temp=39.926  ptemp=1.0000  praw=+16.641  val 0.6786  patience 1/3  eval 30.3s
+epoch 49/50  link=0.0551  lr=1e-03  train 172.8s  |E|mean=0.338  |E|max=0.914  temp=39.765  ptemp=1.0000  praw=+16.641  val 0.6790  patience 2/3  eval 30.2s
+epoch 50/50  link=0.0550  lr=1e-03  train 172.7s  |E|mean=0.340  |E|max=0.921  temp=39.575  ptemp=1.0000  praw=+16.641  val 0.6802  test 0.6031 (new best)  eval 30.2s
+  restored best weights from epoch 50 (val 0.6802, test 0.6031)
+
+=== Final results ===
+  dataset:           YouTube
+  seed:              42
+  stopped_at_epoch:  50
+  best_val_mrr:      0.6802
+  best_test_mrr:     0.6031
