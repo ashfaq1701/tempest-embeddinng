@@ -318,35 +318,25 @@ class Trainer:
             line += f"  |E|mean={g['mean_norm']:.3f}  |E|max={g['max_norm']:.3f}"
             line += self._head_probe()
 
-            # Val AND test are measured every epoch: val selects the checkpoint, test is
-            # observed. Gating the test eval on val improvement made the test curve
-            # unobservable exactly where the two diverge (on Patent val plateaus while test
-            # keeps climbing), so the epoch at which test peaks could not be seen at all.
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()
                 val_metric = self._eval(val_evaluator, val_batches_factory())
+                eval_dt = time.time() - t1
                 per_epoch_val.append(val_metric)
 
-                test_metric: Optional[float] = None
-                if test_evaluator is not None and test_batches_factory is not None:
-                    test_metric = self._eval(test_evaluator, test_batches_factory())
-                    per_epoch_test.append(test_metric)
-                eval_dt = time.time() - t1
-
-                improved = val_metric > best_val
-                if improved:
+                if val_metric > best_val:
                     best_val, best_epoch = val_metric, ep
                     best_snap = self._snapshot()
                     no_improve = 0
-                    if test_metric is not None:
-                        best_test = test_metric          # test AT the val checkpoint
+                    if test_evaluator is not None and test_batches_factory is not None:
+                        best_test = self._eval(test_evaluator, test_batches_factory())
+                        per_epoch_test.append(best_test)
+                        line += f"  val {val_metric:.4f}  test {best_test:.4f} (new best)"
+                    else:
+                        line += f"  val {val_metric:.4f} (new best)"
                 else:
                     no_improve += 1
-
-                line += f"  val {val_metric:.4f}"
-                if test_metric is not None:
-                    line += f"  test {test_metric:.4f}"
-                line += " (new best)" if improved else f"  patience {no_improve}/{patience}"
+                    line += f"  val {val_metric:.4f}  patience {no_improve}/{patience}"
                 line += f"  eval {eval_dt:.1f}s"
             print(line)
 
@@ -362,10 +352,7 @@ class Trainer:
         return {
             "stopped_at_epoch": best_epoch if best_snap is not None else n_epochs,
             "best_val_mrr": best_val,
-            "best_test_mrr": best_test,                       # test at the val-selected epoch
-            "max_test_mrr": max(per_epoch_test, default=-1.0),  # highest test seen at any epoch
-            "max_test_epoch": (per_epoch_test.index(max(per_epoch_test)) + 1
-                               if per_epoch_test else -1),
+            "best_test_mrr": best_test,
             "per_epoch_val_mrr": per_epoch_val,
             "per_epoch_test_mrr": per_epoch_test,
         }
