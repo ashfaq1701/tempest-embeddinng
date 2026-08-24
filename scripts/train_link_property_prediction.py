@@ -233,6 +233,8 @@ def main() -> Dict[str, Any]:
     print(f"  stopped_at_epoch:  {result['stopped_at_epoch']}")
     print(f"  best_val_mrr:      {result['best_val_mrr']:.4f}")
     print(f"  best_test_mrr:     {result['best_test_mrr']:.4f}")
+    print(f"  max_test_mrr:      {result['max_test_mrr']:.4f} "
+          f"(epoch {result['max_test_epoch']})")
 
     # Optional: stratify the best-val model's test MRR to localize the gap.
     if args.stratify:
@@ -243,6 +245,7 @@ def main() -> Dict[str, Any]:
             "head": type(trainer.model).__name__,
             "best_epoch": result["stopped_at_epoch"],
             "best_val": result["best_val_mrr"], "best_test": result["best_test_mrr"],
+            "max_test": result["max_test_mrr"], "max_test_epoch": result["max_test_epoch"],
         }
         run_stratification(
             trainer, train_batches_factory, val_batches_factory,
