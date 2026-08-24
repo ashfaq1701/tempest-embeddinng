@@ -62,7 +62,7 @@ class TrainerConfig:
 
     # Run control.
     num_epochs: int = 50
-    early_stop_patience: int = 3
+    early_stop_patience: int = 5
 
     # System.
     seed: int = 42

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Full-run arm over all 8 TGB-Seq datasets at the chosen default d.
 #   usage: run_arm.sh with_cand_pop|without_cand_pop [run_tag]
-# Sequential (one GPU), cheap-first so a partial arm yields whole datasets.
+# Sequential (one GPU). Order is caller-specified: the big/unknown datasets first.
 # RESUMABLE: a cell whose log already holds "=== Final results ===" is skipped.
 
 ARM=${1:?arm required: with_cand_pop | without_cand_pop}
@@ -22,7 +22,7 @@ esac
 # Authoritative: tgb_seq/datasets/preprocess.py::bipartite_dict
 declare -A BIP=( [ML-20M]=1 [Taobao]=1 [Yelp]=1 [GoogleLocal]=1 \
                  [Flickr]=0 [YouTube]=0 [Patent]=0 [WikiLink]=0 )
-ORDER=(GoogleLocal YouTube ML-20M Patent Flickr Taobao Yelp WikiLink)
+ORDER=(Patent Taobao Flickr Yelp WikiLink ML-20M GoogleLocal YouTube)
 
 log() { echo "[$(date '+%F %T')] $*" >> "$DRIVER"; }
 running() { ps -eo args --no-headers | grep 'train_link_property_prediction.py' | grep -qv grep; }
@@ -44,13 +44,13 @@ for DS in "${ORDER[@]}"; do
     echo "# branch=$BRANCH commit=$SHA"
     echo "# started=$(date '+%F %T')"
     echo "# cmd: $PY -u scripts/train_link_property_prediction.py --data-suite tgb-seq \\"
-    echo "#        --dataset $DS --d-emb $D --num-epochs 50 --early-stop-patience 3 \\"
+    echo "#        --dataset $DS --d-emb $D --num-epochs 50 --early-stop-patience 5 \\"
     echo "#        --use-gpu --use-gpu-tempest $POP $FLAG"
     echo
   } > "$LOG"
   PYTHONUNBUFFERED=1 $PY -u scripts/train_link_property_prediction.py \
     --data-suite tgb-seq --dataset "$DS" --d-emb $D \
-    --num-epochs 50 --early-stop-patience 3 \
+    --num-epochs 50 --early-stop-patience 5 \
     --use-gpu --use-gpu-tempest $POP $FLAG >> "$LOG" 2>&1
   RC=$?
   log "DONE  $DS rc=$RC  $(grep -E 'best_val_mrr|best_test_mrr|stopped_at_epoch' "$LOG" | tr -s ' ' | tr '\n' ' ')"
