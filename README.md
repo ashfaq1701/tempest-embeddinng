@@ -1,27 +1,26 @@
 # tempest-embedding
 
-Walks-supervised temporal link prediction with Tempest. Architecture
-notes in `CLAUDE.md`.
-
-The pre-rewrite design and its development history (35 lessons across
-7 stages of diagnostics) are preserved on branch
-`backup/important-walk-embedding`.
+Walks-supervised temporal link prediction with Tempest, evaluated on TGB-Seq.
+Dataset and eval notes in `CLAUDE.md`.
 
 ## Layout
 
 ```
 link_property_prediction/
-  data.py        TGB loader + Batch dataclass + batcher
-  evaluator.py   TGB Evaluator wrapper (architecture-agnostic)
-  negatives.py   Uniform / Historical (Vitter R) / TGB samplers
-  walks.py       Tempest walk-sampler wrapper
-  model.py       EmbeddingTable + ProjectionHead + LinkHead
-  losses.py      alignment_loss (InfoNCE with sampled negatives)
-  trainer.py     Strict-causal train + eval loop
-  utils.py       seeding, dataset derivation, LR schedule λ
+  data.py           SplitData / Loaded / Batch + chronological batcher
+  evaluator.py      Evaluator + DataSuite ABCs, make_suite
+  tgb_seq_eval.py   TGB-Seq loader, fixed eval negatives, TGB-Seq evaluator
+  data_stats.py     train-split statistics
+  negatives.py      uniform negative sampler
+  walks.py          Tempest walk-sampler wrapper
+  walk_tokens.py    per-query walk token bags
+  model.py          Poincare embedding table + link-pred head
+  trainer.py        strict-causal train + eval loop
+  utils.py          seeding
 scripts/
-  train.py       CLI entry point
+  train_link_property_prediction.py   CLI entry point
 tests/
-  test_walk_contract.py        shape + alignment contract for Tempest walks
-  test_vitter_r_uniformity.py  χ² check on Historical (Vitter R) reservoir
+  test_create_batches.py   batch-iterator contract
+  test_walk_edge_feats.py  walk edge-feature pairing
+experiment_logs/            versioned run logs for the paper
 ```
