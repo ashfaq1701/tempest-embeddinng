@@ -22,7 +22,7 @@ esac
 # Authoritative: tgb_seq/datasets/preprocess.py::bipartite_dict
 declare -A BIP=( [ML-20M]=1 [Taobao]=1 [Yelp]=1 [GoogleLocal]=1 \
                  [Flickr]=0 [YouTube]=0 [Patent]=0 [WikiLink]=0 )
-ORDER=(Patent Taobao Flickr Yelp WikiLink ML-20M GoogleLocal YouTube)
+ORDER=(ML-20M Taobao Yelp Patent Flickr YouTube GoogleLocal WikiLink)
 
 log() { echo "[$(date '+%F %T')] $*" >> "$DRIVER"; }
 running() { ps -eo args --no-headers | grep 'train_link_property_prediction.py' | grep -qv grep; }
@@ -44,13 +44,13 @@ for DS in "${ORDER[@]}"; do
     echo "# branch=$BRANCH commit=$SHA"
     echo "# started=$(date '+%F %T')"
     echo "# cmd: $PY -u scripts/train_link_property_prediction.py --data-suite tgb-seq \\"
-    echo "#        --dataset $DS --d-emb $D --num-epochs 50 --early-stop-patience 5 \\"
+    echo "#        --dataset $DS --d-emb $D --num-epochs 50 --early-stop-patience 3 \\"
     echo "#        --use-gpu --use-gpu-tempest $POP $FLAG"
     echo
   } > "$LOG"
   PYTHONUNBUFFERED=1 $PY -u scripts/train_link_property_prediction.py \
     --data-suite tgb-seq --dataset "$DS" --d-emb $D \
-    --num-epochs 50 --early-stop-patience 5 \
+    --num-epochs 50 --early-stop-patience 3 \
     --use-gpu --use-gpu-tempest $POP $FLAG >> "$LOG" 2>&1
   RC=$?
   log "DONE  $DS rc=$RC  $(grep -E 'best_val_mrr|best_test_mrr|stopped_at_epoch' "$LOG" | tr -s ' ' | tr '\n' ' ')"
