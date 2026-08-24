@@ -194,12 +194,17 @@ class Trainer:
 
     @torch.no_grad()
     def _head_probe(self) -> str:
-        """The head's scalar parameters, for the epoch line. The pooling is parameterless, so the score
-        temperature is all there is; read via hasattr so a head with more knobs degrades to a shorter
-        line rather than raising."""
+        """The head's scalar parameters, for the epoch line. Read via hasattr so a head with a different
+        set of knobs degrades to a shorter line rather than raising. geo_temp/cand_pop_temp are the two
+        score scales; their RATIO is the readable signal -- it says how the model weighs popularity
+        against distance once both are free to move."""
         parts = []
         if hasattr(self.model, "temperature"):
             parts.append(f"temp={float(self.model.temperature):.3f}")
+        if hasattr(self.model, "geo_temp"):
+            parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
+        if hasattr(self.model, "cand_pop_temp"):
+            parts.append(f"pop_temp={float(self.model.cand_pop_temp):.3f}")
         bw = getattr(self.model, "bag_weights", None)
         if isinstance(getattr(bw, "temp", None), torch.Tensor):
             parts.append(f"ptemp={float(bw.temp):.4f}")

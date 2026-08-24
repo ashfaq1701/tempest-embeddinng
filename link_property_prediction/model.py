@@ -1,9 +1,12 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = temperature * (-d(P_u,P_v)) [+ cand_pop].
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = geo_temp * (-d(P_u,P_v)) [+ cand_pop_temp * cand_pop].
 The core score is the radius-sensitive geodesic distance (forcing the model to use the radial/hierarchy
 dimension); an OPTIONAL fixed additive per-candidate popularity term (cand_pop, supplied by the caller,
 e.g. log1p(causal degree)) can ride alongside it. P_x is the weighted gyro-midpoint of x's walk-token
 bag; the pooling weights are a softmax over pooling_temp * (-age/mnia - (pos-1)), both priors RAW (no
-log1p). TWO learned head params: the score temperature and the pooling one (cand_pop adds none)."""
+log1p). THREE learned head params: geo_temp scaling the distance, cand_pop_temp scaling the popularity
+term, and the pooling temperature. Both score temperatures init at 1.0, so at step 0 the score is exactly
+the fixed-weight form -- cand_pop_temp then lets the model up- or down-weight popularity as it learns,
+instead of being pinned at unit weight against a distance whose own scale is free to grow."""
 
 import geoopt
 import torch
@@ -67,7 +70,11 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        self.temperature = nn.Parameter(torch.tensor(1.0))
+        # Two independent score scales, both init 1.0 -> step 0 matches the fixed-weight head exactly.
+        # Without its own scale, cand_pop sits at unit weight while geo_temp is free to grow, so the
+        # popularity term is effectively annealed away as training scales the distance up.
+        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+        self.cand_pop_temp = nn.Parameter(torch.tensor(1.0))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
@@ -85,8 +92,9 @@ class LinkPredHead(nn.Module):
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens,
                 cand_pop: "torch.Tensor | None" = None) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = temperature * (-geo) [+ cand_pop]  (geodesic distance, plus an optional FIXED additive
-        per-candidate popularity term e.g. log1p(causal degree), supplied by the caller)."""
+        score = geo_temp * (-geo) [+ cand_pop_temp * cand_pop]  (geodesic distance and an optional
+        per-candidate popularity term e.g. log1p(causal degree), supplied by the caller, each at its own
+        learned scale)."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -94,7 +102,7 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        score = self.temperature * (-geo)                                       # [B, C] temperature-scaled score
+        score = self.geo_temp * (-geo)                                          # [B, C] scaled distance term
         if cand_pop is not None:
-            score = score + cand_pop                                            # + fixed per-candidate popularity
+            score = score + self.cand_pop_temp * cand_pop                       # + scaled popularity term
         return score
