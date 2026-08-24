@@ -42,8 +42,9 @@ class TrainerConfig:
     # Embedding dimension.
     d_emb: int = 64
 
-    # Add a learned per-node popularity bias to the score (score += pop_bias[candidate]).
-    use_pop_bias: bool = False
+    # Add a FIXED additive per-candidate popularity term (score += log1p(backward participation count
+    # of the candidate, strictly before the query time)) — popularity as pure support, no learned params.
+    use_cand_pop: bool = False
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
@@ -80,7 +81,6 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             mean_node_inter_arrival=float(config.mean_node_inter_arrival),
-            use_pop_bias=bool(config.use_pop_bias),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(
@@ -141,7 +141,17 @@ class Trainer:
             start_bias=self.config.start_bias,
             walk_bias=self.config.walk_bias)
 
-        return self.model(src_tokens, cand_tokens)
+        # Fixed causal-degree support: log1p of each candidate's backward participation count
+        # strictly before its query cutoff (EXCLUSIVE). No learned params; added at its own scale.
+        cand_pop = None
+        if self.config.use_cand_pop:
+            counts = self.walk_gen.participation_counts(
+                cand_seeds.cpu().numpy(), cand_cutoffs.cpu().numpy(),
+                direction="Backward_In_Time")                               # [B*C] int64
+            counts_t = torch.from_numpy(np.asarray(counts)).to(device=device, dtype=torch.float32)
+            cand_pop = torch.log1p(counts_t).view(b, c)                     # [B, C]
+
+        return self.model(src_tokens, cand_tokens, cand_pop=cand_pop)
 
     # Per-batch training step
 

@@ -63,6 +63,17 @@ class WalkGenerator:
         """Ingest edges into Tempest (indexed by time; ingestion order is irrelevant)."""
         self.tempest.add_multiple_edges(src, tgt, ts, edge_features=edge_feat)
 
+    def participation_counts(self, nodes: np.ndarray,
+                             cutoff_times: Optional[np.ndarray] = None,
+                             direction: str = "Backward_In_Time") -> np.ndarray:
+        """Per-node causal degree: # incident edges with t_edge < cutoff (EXCLUSIVE), one cutoff per
+        node. Backward = inbound edges (a candidate's popularity as a destination); the graph is
+        ingested undirected so this counts all incident edges. Returns int64 counts, len == len(nodes)."""
+        node_arr = np.ascontiguousarray(nodes, dtype=np.int32)
+        cut = None if cutoff_times is None else np.ascontiguousarray(cutoff_times, dtype=np.int64)
+        return self.tempest.get_node_participation_counts(
+            node_arr, cutoff_times=cut, direction=direction)
+
     def walks_for_nodes(self, seeds: np.ndarray, max_walk_len: Optional[int] = None,
                         num_walks_per_node: Optional[int] = None,
                         start_bias: Optional[str] = None,

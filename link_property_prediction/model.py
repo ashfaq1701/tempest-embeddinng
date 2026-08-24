@@ -1,8 +1,9 @@
-"""Dead-simple centroid-to-centroid head on the Poincaré ball: s(u,v) = temperature * (-d(P_u,P_v)).
-No spread, cosine, or pop_bias channels — the score is purely the radius-sensitive geodesic distance,
-which forces the model to use the radial/hierarchy dimension. P_x is the weighted gyro-midpoint of x's
-walk-token bag; the pooling weights are a softmax over pooling_temp * (-age/mnia - (pos-1)),
-both priors RAW (no log1p). TWO head params: the score temperature and the pooling one."""
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = temperature * (-d(P_u,P_v)) [+ cand_pop].
+The core score is the radius-sensitive geodesic distance (forcing the model to use the radial/hierarchy
+dimension); an OPTIONAL fixed additive per-candidate popularity term (cand_pop, supplied by the caller,
+e.g. log1p(causal degree)) can ride alongside it. P_x is the weighted gyro-midpoint of x's walk-token
+bag; the pooling weights are a softmax over pooling_temp * (-age/mnia - (pos-1)), both priors RAW (no
+log1p). TWO learned head params: the score temperature and the pooling one (cand_pop adds none)."""
 
 import geoopt
 import torch
@@ -52,11 +53,10 @@ class LinkPredHead(nn.Module):
     """E is a ManifoldParameter; BagWeights is the only other trained module."""
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float,
-                 init_irange: float = 1e-3, use_pop_bias: bool = False):
+                 init_irange: float = 1e-3):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
-        self.use_pop_bias = bool(use_pop_bias)
         self.geom = PoincareManifold()
         self.bag_weights = BagWeights(mean_node_inter_arrival)
 
@@ -68,12 +68,6 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
         self.temperature = nn.Parameter(torch.tensor(1.0))
-
-        # Optional per-node popularity bias, added to the candidate's score at its own learned scale so
-        # absolute popularity carries across queries. Zero-init -> contributes exactly 0 at step 0.
-        if self.use_pop_bias:
-            self.pop_bias = nn.Embedding(self.num_nodes, 1)
-            nn.init.zeros_(self.pop_bias.weight)
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
@@ -88,9 +82,11 @@ class LinkPredHead(nn.Module):
         w = self.bag_weights(tokens, x, valid)                                  # [Q, T] sums to 1, 0 on padding
         return self.geom.midpoint(x, w)                                         # [Q, d]
 
-    def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
+    def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens,
+                cand_pop: "torch.Tensor | None" = None) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = temperature * (-geo) [+ pop_bias_v]  (geodesic distance, optional per-node pop bias)."""
+        score = temperature * (-geo) [+ cand_pop]  (geodesic distance, plus an optional FIXED additive
+        per-candidate popularity term e.g. log1p(causal degree), supplied by the caller)."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -99,7 +95,6 @@ class LinkPredHead(nn.Module):
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
         score = self.temperature * (-geo)                                       # [B, C] temperature-scaled score
-        if self.use_pop_bias:
-            v_nodes = cand_tokens.seeds.view(b, c)                              # [B, C] candidate node ids
-            score = score + self.pop_bias(v_nodes).squeeze(-1)                  # + per-node popularity bias
+        if cand_pop is not None:
+            score = score + cand_pop                                            # + fixed per-candidate popularity
         return score

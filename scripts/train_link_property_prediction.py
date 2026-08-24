@@ -46,8 +46,9 @@ def parse_args() -> argparse.Namespace:
     # ── Model ───────────────────────────────────────────────────────
     p.add_argument("--d-emb", default=64, type=int,
                    help="Embedding dimension.")
-    p.add_argument("--use-pop-bias", action="store_true",
-                   help="Add a learned per-node popularity bias to the score (score += pop_bias[cand]).")
+    p.add_argument("--use-cand-pop", action="store_true",
+                   help="Add a FIXED additive per-candidate popularity term (score += log1p(backward "
+                        "participation count of candidate, strictly before query time)) — no learned params.")
 
     # ── Walks ───────────────────────────────────────────────────────
     p.add_argument("--num-walks-per-node", default=5, type=int,
@@ -178,7 +179,7 @@ def main() -> Dict[str, Any]:
         mean_node_inter_arrival=float(stats.mean_node_inter_arrival),
 
         d_emb=args.d_emb,
-        use_pop_bias=args.use_pop_bias,
+        use_cand_pop=args.use_cand_pop,
 
         K_train=args.k_train,
 
