@@ -1,11 +1,10 @@
 """Negative samplers.
 
   - NegativeSampler         : ABC (`sample(batch) → (neg_src, neg_tgt)`).
-  - UniformNegativeSampler  : random over a destination pool; used for training on
-                              every suite and to build TGB-Seq's fixed eval negatives.
+  - UniformNegativeSampler  : random over a destination pool; used for training and
+                              to build TGB-Seq's fixed eval negatives.
 
-Eval-time suite-native samplers live in their suite modules (`tgb_eval.py`,
-`tgb_seq_eval.py`).
+The eval-time suite-native sampler lives in `tgb_seq_eval.py`.
 """
 
 import abc

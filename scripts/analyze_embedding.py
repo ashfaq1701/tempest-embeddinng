@@ -17,7 +17,7 @@ _PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from link_property_prediction.tgb_eval import load_tgb
+from link_property_prediction.tgb_seq_eval import load_tgb_seq
 
 
 # ─── CLI ────────────────────────────────────────────────────────────────
@@ -28,8 +28,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--emb-path", required=True, type=str,
                    help="Path to the dumped embedding table (.npy).")
     p.add_argument("--dataset", required=True, type=str,
-                   help="TGB dataset name (used to load train edges).")
-    p.add_argument("--tgb-root", default="datasets", type=str)
+                   help="TGB-Seq dataset name (used to load train edges).")
+    p.add_argument("--data-root", "--tgb-root", dest="data_root",
+                   default="datasets", type=str)
     p.add_argument("--seed", default=42, type=int,
                    help="Numpy/random seed for the sampling-based tests.")
     p.add_argument("--n-sample", default=2000, type=int,
@@ -731,7 +732,7 @@ def main():
     print(f"Loading embedding from {args.emb_path} ...")
     E_raw = np.load(args.emb_path).astype(np.float32)
     print(f"Loading dataset {args.dataset} ...")
-    loaded = load_tgb(name=args.dataset, root=args.tgb_root)
+    loaded = load_tgb_seq(name=args.dataset, root=args.data_root)
 
     E_norm = l2_normalise(E_raw)
     G = build_graph(loaded.train)

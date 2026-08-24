@@ -24,8 +24,8 @@ class Loaded(NamedTuple):
     train: SplitData
     val: SplitData
     test: SplitData
-    dataset: object             # live LinkPropPredDataset (negative_sampler + eval)
-    name: str                   # TGB name (for the Evaluator)
+    dataset: object             # live suite dataset handle (negatives + eval)
+    name: str                   # TGB-Seq dataset name (for the Evaluator)
     eval_metric: str            # e.g. "mrr"
     max_node_count: int
     node_feat: Optional[np.ndarray]

@@ -3,7 +3,7 @@
 The full graph (train + val + test) is ingested into Tempest once up front; causality is enforced
 per query by the walk cutoff, not by ingestion order. A walk for (u, t) uses cutoff = t, which is
 EXCLUSIVE: it traverses only edges with t_edge < t, so the target edge at t and any
-simultaneous/future edge are never seen. TGB splits are chronological (train < val < test).
+simultaneous/future edge are never seen. TGB-Seq splits are chronological (train < val < test).
 
 Training per batch: sample K_train uniform negatives, form candidates [pos | negs], score them
 TWO-SIDED (walks for the source u and for every candidate v, each cut off at the query time t_i),
@@ -212,7 +212,7 @@ class Trainer:
     def _eval(self, evaluator: Evaluator, batches: Iterable[Batch],
               recorder: Any = None) -> float:
         self.model.eval()
-        # Rewind any fixed-negative cursor (TGB-Seq); no-op for content-addressed samplers (TGB).
+        # Rewind the fixed-negative cursor so every eval pass sees the same negatives.
         # Must precede the first sample_negatives call.
         evaluator.reset()
         total, n = 0.0, 0

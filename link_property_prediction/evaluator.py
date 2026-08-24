@@ -1,5 +1,5 @@
 """Benchmark-agnostic evaluation interfaces (Evaluator, DataSuite) and the
-`make_suite` factory. Concrete implementations live in `tgb_eval.py` and
+`make_suite` factory. The only suite is TGB-Seq, implemented in
 `tgb_seq_eval.py`."""
 import abc
 from typing import List, Optional, Tuple
@@ -28,7 +28,7 @@ class Evaluator(abc.ABC):
 
 class DataSuite(abc.ABC):
     """Benchmark adapter: native load + native evaluator construction. One instance
-    per run, selected by `--data-suite`."""
+    per run."""
 
     def __init__(self, name: str, root: str, is_bipartite: bool,
                  k_eval: int, seed: int):
@@ -65,13 +65,10 @@ class DataSuite(abc.ABC):
 
 
 def make_suite(data_suite: str, **kwargs) -> DataSuite:
-    """Dispatch `--data-suite` to its native suite. Suites imported lazily to avoid
-    an import cycle."""
-    if data_suite == "tgb":
-        from .tgb_eval import TGBSuite
-        return TGBSuite(**kwargs)
+    """Dispatch `--data-suite` to its native suite. The suite is imported lazily to
+    avoid an import cycle (it subclasses the ABCs defined here)."""
     if data_suite == "tgb-seq":
         from .tgb_seq_eval import TGBSeqSuite
         return TGBSeqSuite(**kwargs)
     raise ValueError(
-        f"unknown --data-suite {data_suite!r} (expected 'tgb' or 'tgb-seq')")
+        f"unknown --data-suite {data_suite!r} (expected 'tgb-seq')")

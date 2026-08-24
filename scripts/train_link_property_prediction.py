@@ -30,11 +30,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     # ── Dataset ─────────────────────────────────────────────────────
-    p.add_argument("--data-suite", default="tgb", choices=["tgb", "tgb-seq"],
+    p.add_argument("--data-suite", default="tgb-seq", choices=["tgb-seq"],
                    help="Benchmark suite to load from.")
     p.add_argument("--dataset", required=True, type=str,
                    help="Dataset name within the suite.")
-    p.add_argument("--tgb-root", default="datasets", type=str,
+    p.add_argument("--data-root", "--tgb-root", dest="data_root",
+                   default="datasets", type=str,
                    help="Data root directory.")
     p.add_argument("--is-bipartite", action="store_true",
                    help="Treat the graph as bipartite.")
@@ -116,7 +117,7 @@ def main() -> Dict[str, Any]:
     t0 = time.time()
     suite = make_suite(
         args.data_suite,
-        name=args.dataset, root=args.tgb_root,
+        name=args.dataset, root=args.data_root,
         is_bipartite=args.is_bipartite, k_eval=args.k_eval, seed=args.seed,
     )
     loaded: Loaded = suite.load()
