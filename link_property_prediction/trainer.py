@@ -42,9 +42,8 @@ class TrainerConfig:
     # Embedding dimension.
     d_emb: int = 64
 
-    # Add a FIXED additive per-candidate popularity term (score += log1p(backward participation count
-    # of the candidate, strictly before the query time)) — popularity as pure support, no learned params.
-    use_cand_pop: bool = False
+    # Score a learned per-node popularity scalar (zero-init) alongside the distance, mixed by w.
+    use_pop_bias: bool = False
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
@@ -81,6 +80,7 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             mean_node_inter_arrival=float(config.mean_node_inter_arrival),
+            use_pop_bias=bool(config.use_pop_bias),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(
@@ -141,17 +141,7 @@ class Trainer:
             start_bias=self.config.start_bias,
             walk_bias=self.config.walk_bias)
 
-        # Fixed causal-degree support: log1p of each candidate's backward participation count
-        # strictly before its query cutoff (EXCLUSIVE). No learned params; added at its own scale.
-        cand_pop = None
-        if self.config.use_cand_pop:
-            counts = self.walk_gen.participation_counts(
-                cand_seeds.cpu().numpy(), cand_cutoffs.cpu().numpy(),
-                direction="Backward_In_Time")                               # [B*C] int64
-            counts_t = torch.from_numpy(np.asarray(counts)).to(device=device, dtype=torch.float32)
-            cand_pop = torch.log1p(counts_t).view(b, c)                     # [B, C]
-
-        return self.model(src_tokens, cand_tokens, cand_pop=cand_pop)
+        return self.model(src_tokens, cand_tokens)
 
     # Per-batch training step
 
@@ -195,16 +185,13 @@ class Trainer:
     @torch.no_grad()
     def _head_probe(self) -> str:
         """The head's scalar parameters, for the epoch line. Read via hasattr so a head with a different
-        set of knobs degrades to a shorter line rather than raising. geo_temp/cand_pop_temp are the two
-        score scales; their RATIO is the readable signal -- it says how the model weighs popularity
-        against distance once both are free to move."""
+        set of knobs degrades to a shorter line rather than raising. w is the mixing vector over the
+        score features; its second entry, when present, is how much popularity the model is using."""
         parts = []
         if hasattr(self.model, "temperature"):
             parts.append(f"temp={float(self.model.temperature):.3f}")
-        if hasattr(self.model, "geo_temp"):
-            parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
-        if hasattr(self.model, "cand_pop_temp"):
-            parts.append(f"pop_temp={float(self.model.cand_pop_temp):.3f}")
+        if hasattr(self.model, "w"):
+            parts.append("w=[" + ",".join(f"{x:.3f}" for x in self.model.w.detach().tolist()) + "]")
         bw = getattr(self.model, "bag_weights", None)
         if isinstance(getattr(bw, "temp", None), torch.Tensor):
             parts.append(f"ptemp={float(bw.temp):.4f}")

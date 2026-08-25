@@ -1,12 +1,13 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = geo_temp * (-d(P_u,P_v)) [+ cand_pop_temp * cand_pop].
-The core score is the radius-sensitive geodesic distance (forcing the model to use the radial/hierarchy
-dimension); an OPTIONAL fixed additive per-candidate popularity term (cand_pop, supplied by the caller,
-e.g. log1p(causal degree)) can ride alongside it. P_x is the weighted gyro-midpoint of x's walk-token
-bag; the pooling weights are a softmax over pooling_temp * (-age/mnia - (pos-1)), both priors RAW (no
-log1p). THREE learned head params: geo_temp scaling the distance, cand_pop_temp scaling the popularity
-term, and the pooling temperature. Both score temperatures init at 1.0, so at step 0 the score is exactly
-the fixed-weight form -- cand_pop_temp then lets the model up- or down-weight popularity as it learns,
-instead of being pinned at unit weight against a distance whose own scale is free to grow."""
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . feats.
+
+feats is [-d_H(P_u, P_v)] and, when the popularity channel is on, [-d_H(P_u,P_v), pop_bias[v]] -- a
+learned per-node scalar, zero-init, so the channel contributes exactly 0 at step 0. w is the mixing
+vector over those features, init ones, so the distance enters at unit weight from the start and the
+model learns how much popularity to mix in.
+
+P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over
+pooling_temp * (-age/mnia - (pos-1)), both priors RAW (no log1p). Learned head params: w (1 or 2),
+the pooling temperature, and num_nodes popularity scalars when the channel is on."""
 
 import geoopt
 import torch
@@ -56,10 +57,11 @@ class LinkPredHead(nn.Module):
     """E is a ManifoldParameter; BagWeights is the only other trained module."""
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float,
-                 init_irange: float = 1e-3):
+                 init_irange: float = 1e-3, use_pop_bias: bool = False):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
+        self.use_pop_bias = bool(use_pop_bias)
         self.geom = PoincareManifold()
         self.bag_weights = BagWeights(mean_node_inter_arrival)
 
@@ -70,11 +72,14 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        # Two independent score scales, both init 1.0 -> step 0 matches the fixed-weight head exactly.
-        # Without its own scale, cand_pop sits at unit weight while geo_temp is free to grow, so the
-        # popularity term is effectively annealed away as training scales the distance up.
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
-        self.cand_pop_temp = nn.Parameter(torch.tensor(1.0))
+        # Learned per-node popularity scalar, zero-init: the channel contributes exactly 0 at step 0,
+        # so turning it on cannot perturb the starting point.
+        if self.use_pop_bias:
+            self.pop_bias = nn.Embedding(self.num_nodes, 1)
+            nn.init.zeros_(self.pop_bias.weight)
+
+        # Mixing weights over the score features, init ones. Length tracks the feature count.
+        self.w = nn.Parameter(torch.ones(2 if self.use_pop_bias else 1))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
@@ -89,12 +94,9 @@ class LinkPredHead(nn.Module):
         w = self.bag_weights(tokens, x, valid)                                  # [Q, T] sums to 1, 0 on padding
         return self.geom.midpoint(x, w)                                         # [Q, d]
 
-    def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens,
-                cand_pop: "torch.Tensor | None" = None) -> torch.Tensor:
+    def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = geo_temp * (-geo) [+ cand_pop_temp * cand_pop]  (geodesic distance and an optional
-        per-candidate popularity term e.g. log1p(causal degree), supplied by the caller, each at its own
-        learned scale)."""
+        score = w . feats, over [-geo] or [-geo, pop_bias[v]]."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -102,7 +104,8 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        score = self.geo_temp * (-geo)                                          # [B, C] scaled distance term
-        if cand_pop is not None:
-            score = score + self.cand_pop_temp * cand_pop                       # + scaled popularity term
-        return score
+        feats = [-geo]                                                          # closer -> higher
+        if self.use_pop_bias:
+            v_nodes = cand_tokens.seeds.view(b, c)                              # [B, C] candidate node ids
+            feats.append(self.pop_bias(v_nodes).squeeze(-1))                    # [B, C] learned per-node scalar
+        return (self.w * torch.stack(feats, dim=-1)).sum(dim=-1)                # [B, C]
