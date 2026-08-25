@@ -14,7 +14,7 @@ OUT=$WD/experiment_logs/complete_runs/$ARM
 DRIVER=$OUT/DRIVER_$TAG.log
 
 case "$ARM" in
-  with_cand_pop)    POP="--use-cand-pop" ;;
+  with_cand_pop)    POP="--use-pop-bias" ;;
   without_cand_pop) POP="" ;;
   *) echo "bad arm: $ARM" >&2; exit 1 ;;
 esac
@@ -22,7 +22,7 @@ esac
 # Authoritative: tgb_seq/datasets/preprocess.py::bipartite_dict
 declare -A BIP=( [ML-20M]=1 [Taobao]=1 [Yelp]=1 [GoogleLocal]=1 \
                  [Flickr]=0 [YouTube]=0 [Patent]=0 [WikiLink]=0 )
-ORDER=(ML-20M Taobao Yelp Patent Flickr YouTube GoogleLocal WikiLink)
+ORDER=(ML-20M Taobao)
 
 log() { echo "[$(date '+%F %T')] $*" >> "$DRIVER"; }
 running() { ps -eo args --no-headers | grep 'train_link_property_prediction.py' | grep -qv grep; }
