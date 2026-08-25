@@ -46,9 +46,6 @@ def parse_args() -> argparse.Namespace:
     # ── Model ───────────────────────────────────────────────────────
     p.add_argument("--d-emb", default=64, type=int,
                    help="Embedding dimension.")
-    p.add_argument("--use-pop-bias", action="store_true",
-                   help="Score a learned per-node popularity scalar (zero-init) alongside the distance, "
-                        "mixed by the learned weight vector w.")
 
     # ── Walks ───────────────────────────────────────────────────────
     p.add_argument("--num-walks-per-node", default=5, type=int,
@@ -65,8 +62,7 @@ def parse_args() -> argparse.Namespace:
                    help="node2vec in-out param q (TemporalNode2Vec bias only).")
 
     # ── Negatives ───────────────────────────────────────────────────
-    p.add_argument("--k-train", default=5, type=int,
-                   help="Per-query training negatives.")
+    # Training is 1:1 BCE (exactly one negative per positive), so there is no train-negatives knob.
     p.add_argument("--k-eval", default=100, type=int,
                    help="Eval negatives per positive (tgb-seq val only).")
 
@@ -177,9 +173,6 @@ def main() -> Dict[str, Any]:
         mean_node_inter_arrival=float(stats.mean_node_inter_arrival),
 
         d_emb=args.d_emb,
-        use_pop_bias=args.use_pop_bias,
-
-        K_train=args.k_train,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,

@@ -1,14 +1,15 @@
-"""Per-query-causal training + eval loop with a monotone metric head over walk bags.
+"""Per-query-causal training + eval loop with a geodesic-distance head over walk bags.
 
 The full graph (train + val + test) is ingested into Tempest once up front; causality is enforced
 per query by the walk cutoff, not by ingestion order. A walk for (u, t) uses cutoff = t, which is
 EXCLUSIVE: it traverses only edges with t_edge < t, so the target edge at t and any
 simultaneous/future edge are never seen. TGB-Seq splits are chronological (train < val < test).
 
-Training per batch: sample K_train uniform negatives, form candidates [pos | negs], score them
-TWO-SIDED (walks for the source u and for every candidate v, each cut off at the query time t_i),
-then cross-entropy with target 0 and a single optimizer step. E and the head train together under
-the link CE with no detach.
+Training per batch (1:1 BCE): sample one uniform negative per positive, score the pair [pos, neg]
+TWO-SIDED (walks for the source u and for both candidates, each cut off at the query time t_i), then
+binary cross-entropy with labels [1, 0] and a single optimizer step. E is trained end-to-end through
+the parameter-free -geo score (no detach). Val/test are ranking MRR from the suite evaluator and are
+independent of the training loss.
 """
 import time
 from dataclasses import dataclass
@@ -42,12 +43,6 @@ class TrainerConfig:
     # Embedding dimension.
     d_emb: int = 64
 
-    # Score a learned per-node popularity scalar (zero-init) alongside the distance, mixed by w.
-    use_pop_bias: bool = False
-
-    # Per-query training negatives ([B, 1+K_train]).
-    K_train: int = 5
-
     # Walks: BACKWARD only, undirected; two-sided (source and every candidate).
     num_walks_per_node: int = 5
     max_walk_len: int = 5
@@ -75,12 +70,11 @@ class Trainer:
         self.device = device or torch.device(
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
-        # Owns the Poincare-ball node embeddings and the monotone metric score.
+        # Owns the Poincare-ball node embeddings and the geodesic-distance score.
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             mean_node_inter_arrival=float(config.mean_node_inter_arrival),
-            use_pop_bias=bool(config.use_pop_bias),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(
@@ -92,8 +86,9 @@ class Trainer:
             temporal_node2vec_p=config.t2nv_p,
             temporal_node2vec_q=config.t2nv_q,
         )
+        # 1:1 BCE: exactly one uniform negative per positive.
         self.neg_sampler_train = UniformNegativeSampler(
-            num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
+            num_neg_per_pos=1, dst_pool=config.dst_pool, seed=config.seed,
         )
 
         # One param group at a single lr: Riemannian update for E, standard Adam for the head.
@@ -147,26 +142,24 @@ class Trainer:
 
     def _train_step(self, batch: Batch) -> Dict[str, float]:
         device = self.device
-        B = len(batch.src)
 
         # Full graph already ingested; each query walks with cutoff = t (EXCLUSIVE).
-        _, neg_tgt = self.neg_sampler_train.sample(batch)              # [B, K_train]
+        _, neg_tgt = self.neg_sampler_train.sample(batch)              # [B, 1]
         src_t = torch.from_numpy(batch.src.astype(np.int64)).to(device)
         cand_np = np.concatenate(
             [batch.tgt.astype(np.int64)[:, None],
-             np.ascontiguousarray(neg_tgt, dtype=np.int64)], axis=1)   # [B, 1+K]
+             np.ascontiguousarray(neg_tgt, dtype=np.int64)], axis=1)   # [B, 2] = [pos, neg]
         cand_t = torch.from_numpy(cand_np).to(device)
         t_query_t = torch.from_numpy(batch.ts.astype(np.int64)).to(device)
 
-        logits = self._score(src_t, cand_t, t_query_t)                            # [B, 1+K]
-        target = torch.zeros(B, dtype=torch.long, device=device)
-        link_loss = F.cross_entropy(logits, target)
+        logits = self._score(src_t, cand_t, t_query_t)                # [B, 2]: col 0 pos, col 1 neg
+        target = torch.zeros_like(logits)                             # per-candidate BCE labels
+        target[:, 0] = 1.0                                            # positive = 1, negative = 0
+        link_loss = F.binary_cross_entropy_with_logits(logits, target)
 
-        # loss = link CE only; E trained end-to-end through the monotone head (no detach).
-        loss = link_loss
-
+        # loss = 1:1 BCE link loss only; E trained end-to-end through the geodesic head (no detach).
         self.opt.zero_grad(set_to_none=True)
-        loss.backward()
+        link_loss.backward()
         self.opt.step()
 
         return {
@@ -184,15 +177,10 @@ class Trainer:
 
     @torch.no_grad()
     def _head_probe(self) -> str:
-        """The head's scalar parameters, for the epoch line. Read via hasattr so a head with a different
-        set of knobs degrades to a shorter line rather than raising. geo_temp scales the distance term;
-        the popularity channel (when on) rides at fixed unit weight and its per-node bias mean is a
-        nuisance quantity (gauge + K-dependent negative-sampling offset), so it is not logged."""
+        """The head's scalar parameters, for the epoch line. The score is parameter-free geometry
+        (-geo), so the only knob is the pooling temperature; read via getattr so a head without it
+        degrades to an empty string rather than raising."""
         parts = []
-        if hasattr(self.model, "temperature"):
-            parts.append(f"temp={float(self.model.temperature):.3f}")
-        if hasattr(self.model, "geo_temp"):
-            parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
         bw = getattr(self.model, "bag_weights", None)
         if isinstance(getattr(bw, "temp", None), torch.Tensor):
             parts.append(f"ptemp={float(bw.temp):.4f}")
