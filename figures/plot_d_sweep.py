@@ -1,8 +1,9 @@
 """Two-panel d_emb sweep figure: peak test MRR and runtime per epoch.
 
 Data source: experiment_logs/d-sweep/<dataset>/d-<d>.log (seed 42, K_train 5,
-patience 3, 2-param geo_temp head, no pop bias). MRR is max test observed at any
-epoch; runtime is the mean of (train + eval) over the cell's epochs.
+patience 3, 2-param geo_temp head, no pop bias). MRR is best_test_mrr -- test at
+the best-VAL epoch, i.e. the val-selected checkpoint, which is the reported
+metric. Runtime is the mean of (train + eval) over the cell's epochs.
 
 Palette: dataviz categorical slots 1, 2, 7 (blue / orange / violet). Validated
 all-pairs on the light surface #fcfcfb -- worst normal-vision dE 16.3 (floor 15),
@@ -17,14 +18,14 @@ from matplotlib.ticker import FixedLocator, FixedFormatter
 
 DIMS = [8, 16, 32, 64, 128, 256]
 
-# dataset -> (peak test MRR, mean train s, mean eval s) per dim
+# dataset -> (test MRR at best-val checkpoint, mean train s, mean eval s) per dim
 DATA = {
-    "GoogleLocal": [(0.5536, 23.51, 3.92), (0.6044, 30.18, 3.47), (0.6303, 38.30, 4.79),
-                    (0.6442, 48.38, 4.96), (0.6498, 73.47, 5.55), (0.6550, 129.86, 6.63)],
+    "GoogleLocal": [(0.5530, 23.51, 3.92), (0.6043, 30.18, 3.47), (0.6301, 38.30, 4.79),
+                    (0.6441, 48.38, 4.96), (0.6498, 73.47, 5.55), (0.6550, 129.86, 6.63)],
     "YouTube":     [(0.3911, 36.95, 20.68), (0.4685, 41.24, 16.16), (0.5302, 50.34, 22.58),
                     (0.5677, 66.42, 23.64), (0.5899, 100.57, 26.81), (0.6031, 174.20, 31.73)],
-    "ML-20M":      [(0.2000, 189.60, 25.17), (0.2170, 188.91, 23.65), (0.2225, 206.87, 24.07),
-                    (0.2241, 215.74, 24.10), (0.2244, 272.37, 29.38), (0.2249, 405.81, 35.75)],
+    "ML-20M":      [(0.2000, 189.60, 25.17), (0.2161, 188.91, 23.65), (0.2224, 206.87, 24.07),
+                    (0.2234, 215.74, 24.10), (0.2234, 272.37, 29.38), (0.2245, 405.81, 35.75)],
 }
 
 SERIES = [("GoogleLocal", "#2a78d6", "o"),
@@ -72,10 +73,11 @@ ax2.yaxis.set_major_locator(FixedLocator([25, 50, 100, 200, 400]))
 ax2.yaxis.set_major_formatter(FixedFormatter(["25", "50", "100", "200", "400"]))
 ax2.minorticks_off()
 
-ax1.legend(frameon=False, loc="lower right", handlelength=1.6, labelcolor=INK)
+ax1.legend(frameon=False, loc="center right", bbox_to_anchor=(1.0, 0.42),
+           handlelength=1.6, labelcolor=INK)
 
 fig.tight_layout()
 for ext in ("png", "svg"):
-    fig.savefig(f"/its/home/ms2420/tempest-wt-mainline/figures/d_sweep.{ext}",
+    fig.savefig(f"/its/home/ms2420/tempest-wt-masterbr/figures/d_sweep.{ext}",
                 dpi=200, facecolor=SURFACE)
 print("wrote figures/d_sweep.png and figures/d_sweep.svg")
