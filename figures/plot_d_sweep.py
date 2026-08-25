@@ -73,8 +73,11 @@ ax2.yaxis.set_major_locator(FixedLocator([25, 50, 100, 200, 400]))
 ax2.yaxis.set_major_formatter(FixedFormatter(["25", "50", "100", "200", "400"]))
 ax2.minorticks_off()
 
-ax1.legend(frameon=False, loc="center right", bbox_to_anchor=(1.0, 0.42),
-           handlelength=1.6, labelcolor=INK)
+# Opaque surface-coloured, edgeless frame: reads as frameless but masks the grid,
+# which otherwise runs straight through the entries. Inset from the right spine.
+ax1.legend(loc="center right", bbox_to_anchor=(0.97, 0.40),
+           frameon=True, facecolor=SURFACE, edgecolor="none", framealpha=1.0,
+           borderpad=0.6, handlelength=1.6, labelcolor=INK).set_zorder(5)
 
 fig.tight_layout()
 for ext in ("png", "svg"):
