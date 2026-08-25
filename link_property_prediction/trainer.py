@@ -177,10 +177,12 @@ class Trainer:
 
     @torch.no_grad()
     def _head_probe(self) -> str:
-        """The head's scalar parameters, for the epoch line. The score is parameter-free geometry
-        (-geo), so the only knob is the pooling temperature; read via getattr so a head without it
-        degrades to an empty string rather than raising."""
+        """The head's scalar parameters, for the epoch line: the score temperature (scales -geo) and
+        the pooling temperature. Read via hasattr/getattr so a head missing either degrades to a
+        shorter line rather than raising."""
         parts = []
+        if hasattr(self.model, "temperature"):
+            parts.append(f"temp={float(self.model.temperature):.3f}")
         bw = getattr(self.model, "bag_weights", None)
         if isinstance(getattr(bw, "temp", None), torch.Tensor):
             parts.append(f"ptemp={float(bw.temp):.4f}")

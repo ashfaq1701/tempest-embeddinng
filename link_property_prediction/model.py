@@ -1,12 +1,13 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = -d_H(P_u, P_v).
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = temperature * (-d_H(P_u, P_v)).
 
-The score is the raw negative geodesic distance -- no temperature, no popularity term. E's own spread
-sets the score scale (larger radius -> larger distances -> sharper separation), and the 1:1 BCE link
-loss trains it contrastively (pull the positive close, push the sampled negative away).
+The score is the negative geodesic distance scaled by a learned temperature (init 1.0); no popularity
+term. The temperature provides the score scale so E need not inflate to the boundary to create
+separation, and the 1:1 BCE link loss trains it contrastively (pull the positive close, push the
+sampled negative away).
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over
-pooling_temp * (-age/mnia - (pos-1)), both priors RAW (no log1p). The only learned head parameter is
-the pooling temperature; the score itself is parameter-free geometry over E."""
+pooling_temp * (-age/mnia - (pos-1)), both priors RAW (no log1p). Learned head params: the score
+temperature and the pooling temperature."""
 
 import geoopt
 import torch
@@ -70,6 +71,9 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
+        # Learnable score temperature (init 1.0): scales -geo before the BCE sigmoid.
+        self.temperature = nn.Parameter(torch.tensor(1.0))
+
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
         nodes = tokens.nodes.clamp_min(0).clone()
@@ -85,8 +89,8 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = -d_H(P_u, P_v), the raw negative geodesic distance (closer -> higher). No temperature
-        or popularity term: E's own spread sets the score scale, trained by the 1:1 BCE link loss."""
+        score = temperature * (-d_H(P_u, P_v)) (closer -> higher); the learned temperature scales the
+        distance so E need not inflate to the boundary. Trained by the 1:1 BCE link loss."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -94,4 +98,4 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        return -geo                                                             # [B, C] closer -> higher
+        return self.temperature * (-geo)                                        # [B, C] closer -> higher
