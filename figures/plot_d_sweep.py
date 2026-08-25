@@ -1,9 +1,19 @@
-"""Two-panel d_emb sweep figure: peak test MRR and runtime per epoch.
+"""Two-panel d_emb sweep figure: MRR growth vs d_emb, and runtime per epoch.
+
+Left panel plots test MRR RELATIVE to each dataset's own d=8 value, so every
+series starts at 1.0 and the panel reads as growth. Absolute MRR spans
+0.20-0.66 across these datasets, and on one shared linear axis ML-20M's real
+d=8->32 climb (+0.0224, 91% of its whole range, 112x the ~0.0002 noise floor)
+is compressed into a visually flat line. Relative scaling makes that shape
+legible and makes the per-dataset saturation point comparable.
 
 Data source: experiment_logs/d-sweep/<dataset>/d-<d>.log (seed 42, K_train 5,
 patience 3, 2-param geo_temp head, no pop bias). MRR is best_test_mrr -- test at
 the best-VAL epoch, i.e. the val-selected checkpoint, which is the reported
 metric. Runtime is the mean of (train + eval) over the cell's epochs.
+
+Absolute MRR at d=8 (the denominator of the left panel): GoogleLocal 0.5530,
+YouTube 0.3911, ML-20M 0.2000.
 
 Palette: dataviz categorical slots 1, 2, 7 (blue / orange / violet). Validated
 all-pairs on the light surface #fcfcfb -- worst normal-vision dE 16.3 (floor 15),
@@ -56,15 +66,16 @@ for ax in (ax1, ax2):
 
 for name, color, marker in SERIES:
     mrr = [row[0] for row in DATA[name]]
+    rel = [m / mrr[0] for m in mrr]          # growth relative to d=8
     rt = [row[1] + row[2] for row in DATA[name]]
     kw = dict(color=color, marker=marker, linewidth=2, markersize=7,
               markeredgecolor=SURFACE, markeredgewidth=1.2)
-    ax1.plot(DIMS, mrr, label=name, **kw)
+    ax1.plot(DIMS, rel, label=name, **kw)
     ax2.plot(DIMS, rt, label=name, **kw)
 
-ax1.set_ylabel("test MRR")
-ax1.set_ylim(0.15, 0.70)
-ax1.yaxis.set_major_locator(FixedLocator([0.2, 0.3, 0.4, 0.5, 0.6, 0.7]))
+ax1.set_ylabel("test MRR / test MRR at d_emb=8")
+ax1.set_ylim(0.97, 1.60)
+ax1.yaxis.set_major_locator(FixedLocator([1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6]))
 
 ax2.set_ylabel("runtime / epoch (s)")
 ax2.set_yscale("log", base=2)
@@ -75,7 +86,7 @@ ax2.minorticks_off()
 
 # Opaque surface-coloured, edgeless frame: reads as frameless but masks the grid,
 # which otherwise runs straight through the entries. Inset from the right spine.
-ax1.legend(loc="center right", bbox_to_anchor=(0.97, 0.40),
+ax1.legend(loc="upper left", bbox_to_anchor=(0.03, 0.97),
            frameon=True, facecolor=SURFACE, edgecolor="none", framealpha=1.0,
            borderpad=0.6, handlelength=1.6, labelcolor=INK).set_zorder(5)
 
