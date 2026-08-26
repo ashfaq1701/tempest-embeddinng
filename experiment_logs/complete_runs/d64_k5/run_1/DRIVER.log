@@ -1,0 +1,2 @@
+[2026-08-26 19:00:56] === d64_k5/run_1 START  branch=feature/without-pop-bias commit=9bda9a3  d=64  K_train=5  order=GoogleLocal YouTube Flickr Patent ML-20M Taobao
+[2026-08-26 19:00:56] START GoogleLocal  d=64 K_train=5 lr=1e-3 commit=9bda9a3 --is-bipartite

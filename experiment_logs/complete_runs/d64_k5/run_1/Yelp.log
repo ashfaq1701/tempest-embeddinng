@@ -1,0 +1,51 @@
+# complete run: dataset=Yelp d_emb=64 k_train=5 lr=1e-3
+# branch=feature/without-pop-bias commit=9bda9a3   head=linear-mix: score = weights . [-d_H, P_u . P_v]
+# started=2026-08-26 18:59:26
+# cmd: /mnt/nfs2/inf/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq \
+#        --dataset Yelp --d-emb 64 --k-train 5 --lr 1e-3 \
+#        --num-epochs 50 --early-stop-patience 3 \
+#        --use-gpu --use-gpu-tempest --is-bipartite
+
+=== tempest-embedding training ===
+dataset: Yelp
+device:  cuda
+seed:    42
+loaded (tgb-seq) in 5.1s
+  num_nodes:     1,743,770
+  neg_pool:      405,081 unique destinations (bipartite)
+  t_min:         1097585304
+  t_max:         1511329850
+  T_train:       413744546
+  median_inter_arrival: 12.0
+  mean_inter_arrival:   34.5
+  train edges:   17,025,551
+  val edges:     1,702,388
+  test edges:    1,032,354
+
+=== Config ===
+  num_nodes: 1743770
+  dst_pool: <ndarray shape=(405081,) dtype=int32>
+  t_train: 413744546.0
+  mean_node_inter_arrival: 21188004.81799015
+  d_emb: 64
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 50
+  early_stop_patience: 3
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:          111,601,280
+  head params:                3
+  TOTAL trainable:  111,601,283
+
+=== Training ===
+  Ingested full graph into Tempest: 19,760,293 edges (once; per-query cutoff enforces causality)
