@@ -1,11 +1,11 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = geo_temp * (-d_H(P_u, P_v)).
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = weights . [-d_H(P_u,P_v), P_u . P_v].
 
-The score is the geodesic distance scaled by a learned geo_temp (init 1.0) -- parameter-light geometry,
-no popularity term.
+A learned 2-vector `weights` (init [1,1]) linearly mixes two features: the geodesic-proximity term
+(-geo) and the raw Euclidean dot product of the pooled points, P_u . P_v.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over
-pooling_temp * (-age/mnia - (pos-1)), both priors RAW (no log1p). Learned head params: geo_temp and
-the pooling temperature."""
+pooling_temp * (-age/mnia - (pos-1)), both priors RAW (no log1p). Learned head params: the 2 mix
+weights and the pooling temperature."""
 
 import geoopt
 import torch
@@ -69,7 +69,9 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+        # Learned linear mix over [-geo, P_u.P_v], init [1,1]: weights[0] scales the geodesic-proximity
+        # term, weights[1] scales the raw Euclidean dot product.
+        self.weights = nn.Parameter(torch.tensor([1.0, 1.0]))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
@@ -86,7 +88,7 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = geo_temp * (-geo)  (negative geodesic distance scaled by the learned geo_temp)."""
+        score = weights . [-geo, P_u . P_v]  (learned mix of geodesic proximity and the raw dot product)."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -94,4 +96,6 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        return self.geo_temp * (-geo)                                          # [B, C] scaled distance term
+        dot = (p_u.unsqueeze(1) * p_v).sum(dim=-1)                              # [B, C] Euclidean dot product
+        feats = torch.stack([-geo, dot], dim=-1)                                # [B, C, 2]
+        return (self.weights * feats).sum(dim=-1)                              # [B, C] learned linear mix

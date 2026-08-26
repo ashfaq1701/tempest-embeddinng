@@ -181,14 +181,16 @@ class Trainer:
     @torch.no_grad()
     def _head_probe(self) -> str:
         """The head's scalar parameters, for the epoch line. Read via hasattr so a head with a different
-        set of knobs degrades to a shorter line rather than raising. geo_temp scales the distance term;
-        the popularity channel (when on) rides at fixed unit weight and its per-node bias mean is a
-        nuisance quantity (gauge + K-dependent negative-sampling offset), so it is not logged."""
+        set of knobs degrades to a shorter line rather than raising. `weights` is the learned mix over
+        [-geo, P_u.P_v]; both entries are logged (w0 = proximity, w1 = dot product)."""
         parts = []
         if hasattr(self.model, "temperature"):
             parts.append(f"temp={float(self.model.temperature):.3f}")
         if hasattr(self.model, "geo_temp"):
             parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
+        if hasattr(self.model, "weights"):
+            wv = self.model.weights.detach().tolist()
+            parts.append("w=[" + ",".join(f"{x:.3f}" for x in wv) + "]")
         bw = getattr(self.model, "bag_weights", None)
         if isinstance(getattr(bw, "temp", None), torch.Tensor):
             parts.append(f"ptemp={float(bw.temp):.4f}")
