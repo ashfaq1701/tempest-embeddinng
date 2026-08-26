@@ -1,0 +1,65 @@
+# complete run: dataset=Taobao arm=without_cand_pop tag=run-1 d_emb=64 k_train=10 lr=1e-3
+# branch=master commit=257af98
+# started=2026-08-26 08:39:50
+# cmd: /mnt/nfs2/inf/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq \
+#        --dataset Taobao --d-emb 64 --k-train 10 --lr 1e-3 \
+#        --num-epochs 50 --early-stop-patience 3 \
+#        --use-gpu --use-gpu-tempest  --is-bipartite
+
+=== tempest-embedding training ===
+dataset: Taobao
+device:  cuda
+seed:    42
+[93mDownload started, this might take a while . . . [0m
+Dataset Taobao will be downloaded in  datasets
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+loaded (tgb-seq) in 41.6s
+  num_nodes:     1,623,634
+  neg_pool:      863,016 unique destinations (bipartite)
+  t_min:         1512178977
+  t_max:         1512284682
+  T_train:       105705
+  median_inter_arrival: 1.0
+  mean_inter_arrival:   1.0
+  train edges:   13,981,096
+  val edges:     2,466,625
+  test edges:    2,406,071
+
+=== Config ===
+  num_nodes: 1623634
+  dst_pool: <ndarray shape=(863016,) dtype=int32>
+  t_train: 105705.0
+  mean_node_inter_arrival: 6137.79228270087
+  d_emb: 64
+  use_pop_bias: False
+  K_train: 10
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 50
+  early_stop_patience: 3
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:          103,912,576
+  head params:                2
+  TOTAL trainable:  103,912,578
+
+=== Training ===
+  Ingested full graph into Tempest: 18,853,792 edges (once; per-query cutoff enforces causality)
+epoch 1/50  link=1.8915  lr=1e-03  train 1055.5s  |E|mean=0.145  |E|max=0.468  geo_temp=8.216  ptemp=0.9983  praw=+6.392  val 0.3604  test 0.3536 (new best)  eval 160.2s
+epoch 2/50  link=1.4331  lr=1e-03  train 1046.3s  |E|mean=0.206  |E|max=0.549  geo_temp=9.156  ptemp=1.0000  praw=+11.509  val 0.4154  test 0.4068 (new best)  eval 150.8s
+epoch 3/50  link=1.1945  lr=1e-03  train 1023.7s  |E|mean=0.253  |E|max=0.615  geo_temp=9.939  ptemp=1.0000  praw=+16.640  val 0.4577  test 0.4492 (new best)  eval 150.8s
+epoch 4/50  link=1.0239  lr=1e-03  train 1026.4s  |E|mean=0.291  |E|max=0.670  geo_temp=10.481  ptemp=1.0000  praw=+16.640  val 0.4850  test 0.4770 (new best)  eval 151.3s
+epoch 5/50  link=0.9016  lr=1e-03  train 1025.8s  |E|mean=0.324  |E|max=0.700  geo_temp=10.778  ptemp=1.0000  praw=+16.640  val 0.5012  test 0.4936 (new best)  eval 152.3s
+epoch 6/50  link=0.8107  lr=1e-03  train 1026.0s  |E|mean=0.353  |E|max=0.716  geo_temp=10.935  ptemp=1.0000  praw=+16.640  val 0.5113  test 0.5038 (new best)  eval 151.7s
+epoch 7/50  link=0.7404  lr=1e-03  train 1025.9s  |E|mean=0.379  |E|max=0.734  geo_temp=10.983  ptemp=1.0000  praw=+16.640  val 0.5177  test 0.5105 (new best)  eval 151.4s
+epoch 8/50  link=0.6836  lr=1e-03  train 1026.0s  |E|mean=0.402  |E|max=0.759  geo_temp=11.011  ptemp=1.0000  praw=+16.640  val 0.5221  test 0.5145 (new best)  eval 152.1s
+epoch 9/50  link=0.6366  lr=1e-03  train 1033.1s  |E|mean=0.423  |E|max=0.784  geo_temp=11.019  ptemp=1.0000  praw=+16.640  val 0.5247  test 0.5173 (new best)  eval 155.0s
+epoch 10/50  link=0.5968  lr=1e-03  train 1047.2s  |E|mean=0.442  |E|max=0.803  geo_temp=11.021  ptemp=1.0000  praw=+16.640  val 0.5266  test 0.5188 (new best)  eval 183.1s
