@@ -33,23 +33,41 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
+    """Pooling weights = softmax(MLP([-(age/mnia), -pos, spr])); hidden = 8*N_FEAT, randomly
+    initialised, with mnia as a fixed age scale. The softmax over tokens dampens the random init.
+
+    N_FEAT = 3: the cosine feature `ang` is OUT, by request. Note this does NOT reconstruct the
+    archived 197-param no-pop head -- 3*24+24 + 24+1 = 121 pooler params here, vs 4*32+32 + 32+1 =
+    193 for the 4-feature version, and 197 - 193 = 4 (a 4-element score vector) is the only clean
+    decomposition of that head. So this is a 3-feature variant of it, not a reproduction."""
+
+    N_FEAT = 3
 
     def __init__(self, mnia: float):
         super().__init__()
-        self.mnia = float(mnia)                                              # fixed age scale
-        self._raw = nn.Parameter(torch.zeros(()))               # sigmoid -> temp in (0, 1)
+        self.mnia = float(mnia)                 # fixed age scale
+        hidden = 8 * self.N_FEAT                # 8x expansion, random init
+        self.net = nn.Sequential(nn.Linear(self.N_FEAT, hidden), nn.GELU(), nn.Linear(hidden, 1))
 
-    @property
-    def temp(self) -> torch.Tensor:
-        """Pooling temperature, constrained to (0, 1) by a sigmoid on the raw Parameter."""
-        return torch.sigmoid(self._raw)
+    @staticmethod
+    def spread(geom: "PoincareManifold", x: torch.Tensor,
+               valid: torch.Tensor) -> torch.Tensor:
+        """Token spread relative to the bag's unweighted midpoint C, per-bag level removed:
+        spr = d(x_p, C) / mean_q d(x_q, C)  ->  [Q, T]."""
+        vf = valid.to(x.dtype)
+        n = vf.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        c = geom.midpoint(x, vf / n).unsqueeze(-2)                              # [Q, 1, d]
+        dc = geom.dist(c, x) * vf
+        return dc / (dc.sum(dim=-1, keepdim=True) / n).clamp_min(1e-6)
 
-    def forward(self, tokens: WalkTokens, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        """x [Q,T,d], valid [Q,T] -> pooling weights [Q,T] summing to 1, 0 on padding. (x sets dtype.)"""
-        age = tokens.ages.clamp_min(0).float()                               # seed = 0, ctx >= 1, pad -> 0
-        rec = -age / self.mnia                                               # LINEAR, unbounded  [Q, T]
-        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                 # LINEAR, in [-(L-1), 0]
-        logits = (self.temp * (rec + pos)).to(x.dtype)                       # [Q, T]
+    def forward(self, geom: "PoincareManifold", tokens: WalkTokens, x: torch.Tensor,
+                valid: torch.Tensor) -> torch.Tensor:
+        """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
+        rec = -(tokens.ages.clamp_min(0).float() / self.mnia)                   # -(age/mnia)
+        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                    # -pos
+        spr = self.spread(geom, x.detach(), valid)
+        feat = torch.stack([rec, pos, spr], dim=-1).to(x.dtype)                 # [Q, T, 3]
+        logits = self.net(feat).squeeze(-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
 
@@ -90,7 +108,7 @@ class LinkPredHead(nn.Module):
             valid[cold, 0] = True
 
         x = F.embedding(nodes, emb)                                             # [Q, T, d]
-        w = self.bag_weights(tokens, x, valid)                                  # [Q, T] sums to 1, 0 on padding
+        w = self.bag_weights(self.geom, tokens, x, valid)                                  # [Q, T] sums to 1, 0 on padding
         return self.geom.midpoint(x, w)                                         # [Q, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
