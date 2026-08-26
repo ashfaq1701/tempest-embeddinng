@@ -63,3 +63,18 @@ epoch 7/50  link=0.7404  lr=1e-03  train 1025.9s  |E|mean=0.379  |E|max=0.734  g
 epoch 8/50  link=0.6836  lr=1e-03  train 1026.0s  |E|mean=0.402  |E|max=0.759  geo_temp=11.011  ptemp=1.0000  praw=+16.640  val 0.5221  test 0.5145 (new best)  eval 152.1s
 epoch 9/50  link=0.6366  lr=1e-03  train 1033.1s  |E|mean=0.423  |E|max=0.784  geo_temp=11.019  ptemp=1.0000  praw=+16.640  val 0.5247  test 0.5173 (new best)  eval 155.0s
 epoch 10/50  link=0.5968  lr=1e-03  train 1047.2s  |E|mean=0.442  |E|max=0.803  geo_temp=11.021  ptemp=1.0000  praw=+16.640  val 0.5266  test 0.5188 (new best)  eval 183.1s
+epoch 11/50  link=0.5629  lr=1e-03  train 1041.7s  |E|mean=0.459  |E|max=0.823  geo_temp=11.019  ptemp=1.0000  praw=+16.640  val 0.5277  test 0.5198 (new best)  eval 151.3s
+epoch 12/50  link=0.5332  lr=1e-03  train 1036.6s  |E|mean=0.475  |E|max=0.853  geo_temp=11.045  ptemp=1.0000  praw=+16.640  val 0.5285  test 0.5204 (new best)  eval 169.8s
+epoch 13/50  link=0.5065  lr=1e-03  train 1040.0s  |E|mean=0.490  |E|max=0.869  geo_temp=11.065  ptemp=1.0000  praw=+16.640  val 0.5288  test 0.5205 (new best)  eval 152.6s
+epoch 14/50  link=0.4825  lr=1e-03  train 1030.5s  |E|mean=0.504  |E|max=0.889  geo_temp=11.103  ptemp=1.0000  praw=+16.640  val 0.5289  test 0.5203 (new best)  eval 148.4s
+epoch 15/50  link=0.4611  lr=1e-03  train 1025.7s  |E|mean=0.516  |E|max=0.906  geo_temp=11.148  ptemp=1.0000  praw=+16.640  val 0.5288  patience 1/3  eval 150.8s
+epoch 16/50  link=0.4413  lr=1e-03  train 1025.5s  |E|mean=0.528  |E|max=0.912  geo_temp=11.194  ptemp=1.0000  praw=+16.640  val 0.5286  patience 2/3  eval 150.8s
+epoch 17/50  link=0.4231  lr=1e-03  train 1025.5s  |E|mean=0.539  |E|max=0.924  geo_temp=11.250  ptemp=1.0000  praw=+16.640  val 0.5282  patience 3/3  eval 150.9s
+  restored best weights from epoch 14 (val 0.5289, test 0.5203)
+
+=== Final results ===
+  dataset:           Taobao
+  seed:              42
+  stopped_at_epoch:  14
+  best_val_mrr:      0.5289
+  best_test_mrr:     0.5203
