@@ -1,0 +1,53 @@
+# complete run: dataset=WikiLink arm=without_cand_pop-5 tag=run-1 d_emb=64 k_train=5 lr=1e-3
+# branch=master commit=8083f4fd
+# started=2026-08-26 13:50:31
+# run on a second A40 in parallel with the other 7 datasets of this arm; sole job on this GPU
+# cmd: /its/home/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq \
+#        --dataset WikiLink --d-emb 64 --k-train 5 --lr 1e-3 \
+#        --num-epochs 50 --early-stop-patience 3 \
+#        --use-gpu --use-gpu-tempest  
+
+=== tempest-embedding training ===
+dataset: WikiLink
+device:  cuda
+seed:    42
+loaded (tgb-seq) in 7.0s
+  num_nodes:     1,361,973
+  neg_pool:      1,361,972 unique nodes (non-bipartite)
+  t_min:         982623600
+  t_max:         1157925600
+  T_train:       175302000
+  median_inter_arrival: 86400.0
+  mean_inter_arrival:   88091.5
+  train edges:   27,635,253
+  val edges:     3,455,476
+  test edges:    3,073,045
+
+=== Config ===
+  num_nodes: 1361973
+  dst_pool: <ndarray shape=(1361972,) dtype=int32>
+  t_train: 175302000.0
+  mean_node_inter_arrival: 4319779.803427166
+  d_emb: 64
+  use_pop_bias: False
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 50
+  early_stop_patience: 3
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:           87,166,272
+  head params:                2
+  TOTAL trainable:   87,166,274
+
+=== Training ===
+  Ingested full graph into Tempest: 34,163,774 edges (once; per-query cutoff enforces causality)
