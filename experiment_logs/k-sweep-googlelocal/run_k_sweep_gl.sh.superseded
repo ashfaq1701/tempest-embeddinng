@@ -1,0 +1,60 @@
+#!/bin/bash
+# K_train sweep on GoogleLocal, d=64, NO pop bias. Companion to the YouTube
+# K-sweep; K grid identical so the two curves are directly comparable.
+#
+# DELIBERATELY CONCURRENT with the YouTube sweep. One A6000 (49 GB) with each
+# run taking ~2 GB, so memory is not the constraint; the two contend on compute
+# and each runs slower, but both make progress. Serialising would very likely
+# mean zero GoogleLocal cells land tonight, since the YouTube sweep alone can
+# fill the night. MRR results are seed-deterministic and unaffected by
+# contention -- only wall-clock is.
+#
+# GoogleLocal IS bipartite (tgb_seq/datasets/preprocess.py::bipartite_dict),
+# hence --is-bipartite.
+#
+# Ascending K (cheap-first): a partial night still yields the low-K end.
+# RESUMABLE: a cell whose log already holds "=== Final results ===" is skipped.
+
+PY=/its/home/ms2420/tempest-embeddinng/venv/bin/python
+WD=/its/home/ms2420/tempest-wt-masterbr
+OUT=$WD/experiment_logs/k-sweep-googlelocal
+DRIVER=$OUT/DRIVER.log
+
+DS=GoogleLocal
+D=64
+KS=(1 3 5 10 20 50 100)
+
+log() { echo "[$(date '+%F %T')] $*" >> "$DRIVER"; }
+
+cd "$WD" || exit 1
+SHA=$(git rev-parse --short HEAD); BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+log "=== K-sweep START  dataset=$DS d=$D  branch=$BRANCH commit=$SHA  K=${KS[*]}  (no pop bias, concurrent with YouTube sweep)"
+
+for K in "${KS[@]}"; do
+  LOG=$OUT/k-$K.log
+  if [ -f "$LOG" ] && grep -q '=== Final results ===' "$LOG"; then
+    log "SKIP  K=$K (already complete)"; continue
+  fi
+  log "START K=$K"
+  {
+    echo "# K-sweep cell: dataset=$DS d_emb=$D k_train=$K patience=3 NO pop-bias"
+    echo "# branch=$BRANCH commit=$SHA"
+    echo "# started=$(date '+%F %T')"
+    echo "# NOTE: ran concurrently with the YouTube K-sweep on one GPU; wall-clock"
+    echo "#       timings in this log are contended and NOT comparable to solo runs."
+    echo "# cmd: $PY -u scripts/train_link_property_prediction.py --data-suite tgb-seq \\"
+    echo "#        --dataset $DS --d-emb $D --k-train $K --num-epochs 50 \\"
+    echo "#        --early-stop-patience 3 --use-gpu --use-gpu-tempest --is-bipartite"
+    echo
+  } > "$LOG"
+  PYTHONUNBUFFERED=1 $PY -u scripts/train_link_property_prediction.py \
+    --data-suite tgb-seq --dataset "$DS" --d-emb $D --k-train "$K" \
+    --num-epochs 50 --early-stop-patience 3 \
+    --use-gpu --use-gpu-tempest --is-bipartite >> "$LOG" 2>&1
+  RC=$?
+  RES=$(grep -E 'best_val_mrr|best_test_mrr|stopped_at_epoch' "$LOG" | tr -s ' ' | tr '\n' ' ')
+  MAXTEST=$(grep -o 'test [0-9.]*' "$LOG" | awk '{if($2>m)m=$2}END{printf "max_test_seen: %.4f", m}')
+  log "DONE  K=$K rc=$RC  $RES $MAXTEST"
+done
+log "=== K-sweep COMPLETE ==="
