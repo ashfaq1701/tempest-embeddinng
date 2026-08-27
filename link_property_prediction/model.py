@@ -33,21 +33,26 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """Pooling weights = softmax(MLP([-(age/mnia), -pos, spr])); hidden = 8*N_FEAT, randomly
-    initialised, with mnia as a fixed age scale. The softmax over tokens dampens the random init.
+    """Pooling weights = softmax(prior + MLP_residual([-(age/mnia), -pos, spr])), where the fixed
+    PRIOR = pos + spr is a hand-crafted logit and the MLP learns a RESIDUAL correction on top of it.
 
-    N_FEAT = 3: the cosine feature `ang` is OUT, by request. Note this does NOT reconstruct the
-    archived 197-param no-pop head -- 3*24+24 + 24+1 = 121 pooler params here, vs 4*32+32 + 32+1 =
-    193 for the 4-feature version, and 197 - 193 = 4 (a 4-element score vector) is the only clean
-    decomposition of that head. So this is a 3-feature variant of it, not a reproduction."""
+    The MLP output layer is ZERO-INITIALISED, so at step 0 the residual is exactly 0 and the pooler
+    starts as the pure prior (recent-position + high-spread tokens up-weighted); it then learns to
+    deviate. hidden = 8*N_FEAT. This anchors the free MLP -- which alone under-performed on YouTube --
+    to a known-good starting point instead of a random init.
+
+    N_FEAT = 3: the cosine feature `ang` is OUT, by request."""
 
     N_FEAT = 3
 
     def __init__(self, mnia: float):
         super().__init__()
         self.mnia = float(mnia)                 # fixed age scale
-        hidden = 8 * self.N_FEAT                # 8x expansion, random init
+        hidden = 8 * self.N_FEAT                # 8x expansion
         self.net = nn.Sequential(nn.Linear(self.N_FEAT, hidden), nn.GELU(), nn.Linear(hidden, 1))
+        # Zero-init the residual head: training starts at the pure prior (residual == 0).
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
 
     @staticmethod
     def spread(geom: "PoincareManifold", x: torch.Tensor,
@@ -66,8 +71,10 @@ class BagWeights(nn.Module):
         rec = -(tokens.ages.clamp_min(0).float() / self.mnia)                   # -(age/mnia)
         pos = -(tokens.positions.clamp_min(1).float() - 1.0)                    # -pos
         spr = self.spread(geom, x.detach(), valid)
+        prior = (pos + spr).to(x.dtype)                                         # [Q, T] fixed prior logit
         feat = torch.stack([rec, pos, spr], dim=-1).to(x.dtype)                 # [Q, T, 3]
-        logits = self.net(feat).squeeze(-1)
+        residual = self.net(feat).squeeze(-1)                                   # [Q, T] learned correction
+        logits = prior + residual                                              # prior anchored, MLP corrects
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
 
