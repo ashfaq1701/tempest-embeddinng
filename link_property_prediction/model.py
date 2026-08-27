@@ -6,8 +6,8 @@ FIXED unit weight -- the model sharpens the geometry via geo_temp while populari
 a constant scale.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over
-pooling_temp * (-age/mnia - (pos-1)), both priors RAW (no log1p). Learned head params: geo_temp,
-the pooling temperature, and num_nodes popularity scalars when the channel is on."""
+-age/mnia - (pos-1), both priors RAW (no log1p) and at fixed unit scale -- there is no learned pooling
+temperature. Learned head params: geo_temp and num_nodes popularity scalars when the channel is on."""
 
 import geoopt
 import torch
@@ -37,24 +37,18 @@ class BagWeights(nn.Module):
     def __init__(self, mnia: float):
         super().__init__()
         self.mnia = float(mnia)                                              # fixed age scale
-        self._raw = nn.Parameter(torch.zeros(()))               # sigmoid -> temp in (0, 1)
-
-    @property
-    def temp(self) -> torch.Tensor:
-        """Pooling temperature, constrained to (0, 1) by a sigmoid on the raw Parameter."""
-        return torch.sigmoid(self._raw)
 
     def forward(self, tokens: WalkTokens, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> pooling weights [Q,T] summing to 1, 0 on padding. (x sets dtype.)"""
         age = tokens.ages.clamp_min(0).float()                               # seed = 0, ctx >= 1, pad -> 0
         rec = -age / self.mnia                                               # LINEAR, unbounded  [Q, T]
         pos = -(tokens.positions.clamp_min(1).float() - 1.0)                 # LINEAR, in [-(L-1), 0]
-        logits = (self.temp * (rec + pos)).to(x.dtype)                       # [Q, T]
+        logits = (rec + pos).to(x.dtype)                                     # [Q, T]
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
 
 class LinkPredHead(nn.Module):
-    """E is a ManifoldParameter; BagWeights is the only other trained module."""
+    """E is a ManifoldParameter; the pooling weights carry no learned parameters."""
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float,
                  init_irange: float = 1e-3, use_pop_bias: bool = False):

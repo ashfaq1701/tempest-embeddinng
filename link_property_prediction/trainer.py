@@ -193,11 +193,6 @@ class Trainer:
             parts.append(f"temp={float(self.model.temperature):.3f}")
         if hasattr(self.model, "geo_temp"):
             parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
-        bw = getattr(self.model, "bag_weights", None)
-        if isinstance(getattr(bw, "temp", None), torch.Tensor):
-            parts.append(f"ptemp={float(bw.temp):.4f}")
-            if isinstance(getattr(bw, "_raw", None), torch.Tensor):
-                parts.append(f"praw={float(bw._raw):+.3f}")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad
