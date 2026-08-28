@@ -61,3 +61,26 @@ Two consequences. An A/B does not need multiple seeds to separate configs that d
 more than ~0.001 — the remaining reason to run several seeds is to report mean±std against
 a leaderboard, not to establish an ordering. And a run that fails to reproduce is a real
 signal: suspect a code or config change rather than variance.
+
+## Where run logs live
+
+**Every run writes to `logs/`, never to `experiment_logs/`.** `logs/` is git-untracked
+(`.gitignore`), lives on this disk, and is the working tree Claude Code writes into and
+reads back — it is the only place a run in flight or a run just finished can be found.
+
+Organize under `logs/<experiment>/<cell>/<tag>/<Dataset>.log`, e.g.
+`logs/simple_head_2/d64_k5/run_1/YouTube.log`. `<experiment>` names the code change under
+test, `<cell>` the config (`d64_k5`), `<tag>` the replicate (`run_1`). A sweep driver's own
+`DRIVER.log` lives in that same tag directory; the driver script itself belongs in `scripts/`,
+parameterized so its output root points into `logs/`.
+
+Traceability is on the log itself. Every log opens with a header naming dataset, cell, tag,
+d_emb, k_train, lr, branch, **commit**, start time, and the full command line. If the working
+tree carries uncommitted changes, say so in the header — a bare commit SHA that does not
+describe the code that ran is worse than no SHA. Commit the code change before launching
+where you can; that makes the SHA sufficient on its own.
+
+`experiment_logs/` is the curated, git-tracked archive: **selected result logs only**, copied
+in once a run is finished and judged worth keeping, and permanent thereafter. No driver
+scripts, no shell scripts, no scratch or superseded logs, no in-flight runs. A log is copied
+from `logs/` to `experiment_logs/` — never moved, and never written there directly by a run.
