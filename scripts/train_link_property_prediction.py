@@ -65,6 +65,10 @@ def parse_args() -> argparse.Namespace:
                    help="node2vec in-out param q (TemporalNode2Vec bias only).")
 
     # ── Negatives ───────────────────────────────────────────────────
+    p.add_argument("--degree-negatives", action="store_true",
+                   help="Sample TRAINING negatives proportional to node degree (drop the unique() "
+                        "on the pool). Val negatives stay uniform; TEST uses the shipped test_ns, "
+                        "which is uniform -- so this makes train and eval differ on purpose.")
     p.add_argument("--k-train", default=5, type=int,
                    help="Per-query training negatives.")
     p.add_argument("--k-eval", default=100, type=int,
@@ -139,11 +143,15 @@ def main() -> Dict[str, Any]:
 
     # Negative-sampling pool, computed by the suite from the full train split.
     dst_pool = suite.dst_pool()
+    train_pool = suite.dst_pool_degree() if args.degree_negatives else dst_pool
     stats = compute_train_stats(train_sp.timestamps, train_sp.sources, train_sp.destinations)
 
     print(f"  num_nodes:     {num_nodes:,}")
     _pool_kind = "destinations (bipartite)" if args.is_bipartite else "nodes (non-bipartite)"
     print(f"  neg_pool:      {len(dst_pool):,} unique {_pool_kind}")
+    if args.degree_negatives:
+        print(f"  TRAIN neg_pool: {len(train_pool):,} endpoints, DEGREE-PROPORTIONAL "
+              f"(val stays uniform; shipped test_ns is uniform)")
     print(f"  t_min:         {stats.t_min}")
     print(f"  t_max:         {stats.t_max}")
     print(f"  T_train:       {stats.T_train:.0f}")
@@ -172,7 +180,7 @@ def main() -> Dict[str, Any]:
     # ─── Build TrainerConfig ───────────────────────────────────────
     config = TrainerConfig(
         num_nodes=num_nodes,
-        dst_pool=dst_pool,
+        dst_pool=train_pool,
         t_train=float(stats.T_train),
         mean_node_inter_arrival=float(stats.mean_node_inter_arrival),
 

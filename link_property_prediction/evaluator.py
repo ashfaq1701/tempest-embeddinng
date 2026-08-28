@@ -63,6 +63,22 @@ class DataSuite(abc.ABC):
             pool = np.unique(np.concatenate([train.sources, train.destinations]))
         return pool.astype(np.int32)
 
+    def dst_pool_degree(self) -> np.ndarray:
+        """Degree-proportional negative pool: the SAME endpoints as `dst_pool` but WITHOUT
+        `np.unique`, so a node appears once per incident edge and uniform sampling from this
+        array draws it with probability proportional to its degree.
+
+        TRAINING ONLY. Val negatives keep the uniform pool, and TEST uses TGB-Seq's shipped
+        `test_ns`, which was measured to be uniform over nodes (Patent: mean negative degree
+        12.26 vs 11.34 for uniform, 21.89 for degree-proportional). So enabling this makes the
+        training distribution deliberately differ from the eval one."""
+        train = self.load().train
+        if self.is_bipartite:
+            pool = train.destinations
+        else:
+            pool = np.concatenate([train.sources, train.destinations])
+        return pool.astype(np.int32)
+
 
 def make_suite(data_suite: str, **kwargs) -> DataSuite:
     """Dispatch `--data-suite` to its native suite. The suite is imported lazily to
