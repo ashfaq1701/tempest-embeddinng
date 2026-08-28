@@ -1,7 +1,9 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = geo_temp * (-d_H(P_u, P_v)).
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . [-d_v, d_u + d_v - d_uv].
 
-The score is the geodesic distance scaled by a learned geo_temp (init 1.0) -- parameter-light geometry,
-no popularity term.
+A learned 2-vector w (init [1,1]) mixes two isometry-invariant channels: the candidate depth (-d_v,
+d_v = dist0(P_v)) and the Gromov overlap d_u + d_v - d_uv = 2*(u|v)_o (d_u = dist0(P_u)). At w=[1,1]
+the score is -d_uv up to a per-query constant (pure geodesic), so any mix is a learned departure; the
+ratio w[1]/w[0] reads how far the model moves from metric scoring. No popularity term.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over
 -age/mnia - (pos-1), both priors RAW (no log1p) and at fixed unit scale -- there is no learned pooling
@@ -24,6 +26,10 @@ class PoincareManifold:
     def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Elementwise geodesic distance, broadcasting over leading dims. LOWER = closer."""
         return self.manifold.dist(x, y)
+
+    def dist0(self, x: torch.Tensor) -> torch.Tensor:
+        """Hyperbolic radius: geodesic distance from the origin (0 at center, large near boundary)."""
+        return self.manifold.dist0(x)
 
     def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """Weighted gyro-midpoint: x [Q,T,d], w [Q,T] -> [Q,d]."""
@@ -63,7 +69,10 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+        # Learned 2-vector mix over [depth, overlap], init [1,1] -- at init the score equals -d_uv
+        # (pure geodesic) up to a per-query constant; departures are learned. w[0] scales candidate
+        # depth (-d_v), w[1] scales the Gromov overlap (d_u + d_v - d_uv = 2*(u|v)_o).
+        self.w = nn.Parameter(torch.tensor([1.0, 1.0]))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
@@ -80,7 +89,8 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = geo_temp * (-geo)  (negative geodesic distance scaled by the learned geo_temp)."""
+        score = w . [-d_v, d_u + d_v - d_uv] = w . [candidate depth, 2*Gromov overlap]. At w=[1,1] this
+        equals -d_uv up to a per-query constant (pure geodesic); the mix is a learned departure."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -88,4 +98,8 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        return self.geo_temp * (-geo)                                          # [B, C] scaled distance term
+        d_u = self.geom.dist0(p_u).unsqueeze(1)                                 # [B, 1] source radius
+        d_v = self.geom.dist0(p_v)                                              # [B, C] candidate radius
+        radial = -d_v                                                          # candidate depth
+        angular = d_u + d_v - geo                                              # 2 * Gromov product (u|v)_o
+        return (self.w * torch.stack([radial, angular], dim=-1)).sum(dim=-1)   # [B, C] learned mix
