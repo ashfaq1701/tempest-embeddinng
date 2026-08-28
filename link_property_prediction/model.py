@@ -89,15 +89,8 @@ class LinkPredHead(nn.Module):
             self.pop_bias = nn.Embedding(self.num_nodes, 1)
             nn.init.zeros_(self.pop_bias.weight)
 
-        # Log-parameterised distance temperature: geo_temp = exp(raw), raw init 0 -> geo_temp 1.0.
-        # Multiplicative updates let it slew scale-free across datasets (no linear parameter chasing a
-        # badly-scaled optimum over many epochs).
-        self.geo_temp_raw = nn.Parameter(torch.zeros(()))
-
-    @property
-    def geo_temp(self) -> torch.Tensor:
-        """Effective distance temperature = exp(raw) (> 0 by construction)."""
-        return torch.exp(self.geo_temp_raw)
+        # Linear distance temperature (init 1.0): a plain additive parameter, NOT log-parameterised.
+        self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
