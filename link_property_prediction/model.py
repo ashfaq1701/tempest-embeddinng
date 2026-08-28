@@ -1,13 +1,13 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = -temp * (w . [d_uv, d_u * d_v]).
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = -(w . [d_uv, d_u * d_v]).
 
 A learned 2-vector w (init [1,1]) mixes the geodesic distance with the radius product d_u * d_v
 (d_u = dist0(P_u), d_v = dist0(P_v)); the outer minus makes w[0] > 0 a closer-is-better term and
 w[1] > 0 a penalty on peripheral-peripheral pairs (favouring hubs) -- both weights stay positive.
-An outer temperature temp (plain scalar, init 1) scales the logits. No popularity term.
+There is NO outer temperature: w alone carries the scale. No popularity term.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over
 -age/mnia - (pos-1), both priors RAW (no log1p) and at fixed unit scale -- there is no learned pooling
-temperature. Learned head params: the 2 mix weights w and the outer temp."""
+temperature. Only learned head params: the 2 mix weights w."""
 
 import geoopt
 import torch
@@ -72,8 +72,6 @@ class LinkPredHead(nn.Module):
         # Learned 2-vector mix over [-d_uv, d_u*d_v], init [1,1]: w[0] scales the geodesic-proximity
         # term, w[1] scales the radius product (sign learned: negative => penalty on peripheral pairs).
         self.w = nn.Parameter(torch.tensor([1.0, 1.0]))
-        # Outer temperature, plain linear parameter (init 1): scales the logits alongside the mix.
-        self.temp = nn.Parameter(torch.tensor(1.0))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
@@ -90,9 +88,10 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = -temp * (w . [d_uv, d_u*d_v]), temp a plain learned scalar (init 1). Both features
-        are positive; the outer minus makes w[0]>0 = closer-better and w[1]>0 = penalty on peripheral
-        pairs, so both weights stay positive (init [1,1])."""
+        score = -(w . [d_uv, d_u*d_v]). Both features are positive; the outer minus makes w[0]>0 =
+        closer-better and w[1]>0 = penalty on peripheral pairs (init [1,1]). No outer temperature:
+        w carries the scale by itself, so it must travel ADDITIVELY at lr, unlike the temp*w product
+        which compounded multiplicatively."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -103,4 +102,4 @@ class LinkPredHead(nn.Module):
         d_u = self.geom.dist0(p_u).unsqueeze(1)                                 # [B, 1] source radius
         d_v = self.geom.dist0(p_v)                                              # [B, C] candidate radius
         mix = (self.w * torch.stack([d_uv, d_u * d_v], dim=-1)).sum(dim=-1)    # [B, C] channel mix
-        return -self.temp * mix                                               # [B, C] outer minus
+        return -mix                                                           # [B, C] outer minus
