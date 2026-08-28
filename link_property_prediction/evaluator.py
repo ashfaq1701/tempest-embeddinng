@@ -54,19 +54,13 @@ class DataSuite(abc.ABC):
         """Native evaluator for `split_mode` in {'val', 'test'}."""
 
     def dst_pool(self) -> np.ndarray:
-        """Negative-destination pool (int32) from the TRAIN split, DEGREE-PROPORTIONAL: the raw
-        endpoints with no `unique()`, so a node appears once per incident edge and uniform sampling
-        from this array draws it with probability proportional to its degree. Bipartite -> train
-        destinations; non-bipartite -> train sources ++ destinations.
-
-        Note this pool feeds BOTH the training sampler and the VAL negatives. TEST is unaffected:
-        it uses TGB-Seq's shipped `test_ns`, which was measured to be uniform over nodes (Patent:
-        mean negative degree 12.26, vs 11.34 uniform and 21.89 degree-proportional)."""
+        """Negative-destination universe (int32) from the TRAIN split. Bipartite ->
+        unique train destinations; non-bipartite -> all unique train nodes (src ∪ dst)."""
         train = self.load().train
         if self.is_bipartite:
-            pool = train.destinations
+            pool = np.unique(train.destinations)
         else:
-            pool = np.concatenate([train.sources, train.destinations])
+            pool = np.unique(np.concatenate([train.sources, train.destinations]))
         return pool.astype(np.int32)
 
 

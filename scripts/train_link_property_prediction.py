@@ -143,8 +143,7 @@ def main() -> Dict[str, Any]:
 
     print(f"  num_nodes:     {num_nodes:,}")
     _pool_kind = "destinations (bipartite)" if args.is_bipartite else "nodes (non-bipartite)"
-    print(f"  neg_pool:      {len(dst_pool):,} train {_pool_kind} endpoints, DEGREE-PROPORTIONAL "
-          f"({len(np.unique(dst_pool)):,} distinct)")
+    print(f"  neg_pool:      {len(dst_pool):,} unique {_pool_kind}")
     print(f"  t_min:         {stats.t_min}")
     print(f"  t_max:         {stats.t_max}")
     print(f"  T_train:       {stats.T_train:.0f}")
