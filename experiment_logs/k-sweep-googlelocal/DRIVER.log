@@ -1,3 +1,0 @@
-[2026-08-25 20:31:29] === K-sweep START  dataset=GoogleLocal d=64  branch=master commit=257af981  K=1 3 5 10 20 50 100  (no pop bias, concurrent with YouTube sweep)
-[2026-08-25 20:31:29] START K=1
-[2026-08-25 20:32:22] === SWEEP STOPPED by user (driver killed); K=1 cell incomplete at epoch 0. Remaining cells 3,5,10,20,50,100 never started. Relaunch run_k_sweep_gl.sh to resume (K=1 restarts from scratch).

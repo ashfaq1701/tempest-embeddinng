@@ -1,2 +1,0 @@
-[2026-08-26 12:04:25] === ML-20M K-sweep QUEUED behind run_k_sweep_all.sh  d=64  K=1 3 5 10 20 50 100  branch=master commit=e14d80e4
-[2026-08-26 12:44:16] === CANCELLED by user before any cell started. No K=1..100 cell ran; no results lost. Relaunch experiment_logs/run_k_sweep_ml20m.sh to run it later (its wait-for-parent guard is a no-op once no run_k_sweep_all.sh is alive).
