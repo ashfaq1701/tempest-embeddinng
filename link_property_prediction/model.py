@@ -7,8 +7,9 @@ FIXED unit weight -- the model sharpens the geometry via geo_temp while populari
 a constant scale.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over
--age/mnia - (pos-1), both priors RAW (no log1p) and at fixed unit scale -- there is no learned pooling
-temperature. Learned head params: geo_temp and num_nodes popularity scalars when the channel is on."""
+2*(mix*rec + (1-mix)*pos), a single bounded mix = sigmoid(raw) in (0,1) blending the recency and hop
+priors (mix=0.5 reproduces the old rec+pos exactly). Learned head params: geo_temp, the pooling mix,
+and num_nodes popularity scalars when the channel is on."""
 
 import geoopt
 import torch
@@ -34,17 +35,41 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
+    """Pooling weights = softmax(2 * (mix*rec + (1-mix)*pos)), mix = sigmoid(raw) in (0,1).
+
+    ONE bounded parameter that re-weights the recency prior against the hop prior. Deliberately
+    minimal: mix cannot go negative and cannot grow without bound, so it can neither invert a prior
+    nor act as a runaway temperature -- the three ways previous pooler knobs destroyed themselves
+    (free 2-vector weights went negative; an MLP pooler memorised Patent; an unbounded temperature
+    ran away).
+
+    The 2.0 factor makes mix=0.5 reproduce the previous head EXACTLY (2*0.5*(rec+pos) = rec+pos),
+    so raw init 0 starts at the known-good point and any departure is learned. Without it the
+    convex blend would be uniformly FLATTER than before -- 0.5x at init -- which matters because
+    the old sigmoid pooling temperature pinned at its 1.0 ceiling on both WikiLink and YouTube,
+    i.e. the model wanted SHARPER pooling, not flatter.
+
+    Note rec and pos are already non-positive, so there is no outer minus: more negative = older /
+    further = lower weight. rec spans about [-40, 0] on WikiLink against pos's [-4, 0], so the sum
+    is ~91% recency already; expect mix to drift high."""
 
     def __init__(self, mnia: float):
         super().__init__()
         self.mnia = float(mnia)                                              # fixed age scale
+        self._mix_raw = nn.Parameter(torch.zeros(()))        # sigmoid -> mix in (0,1), init 0.5
+
+    @property
+    def mix(self) -> torch.Tensor:
+        """Recency-vs-hop blend in (0,1). 0.5 reproduces the previous rec+pos head exactly."""
+        return torch.sigmoid(self._mix_raw)
 
     def forward(self, tokens: WalkTokens, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> pooling weights [Q,T] summing to 1, 0 on padding. (x sets dtype.)"""
         age = tokens.ages.clamp_min(0).float()                               # seed = 0, ctx >= 1, pad -> 0
         rec = -age / self.mnia                                               # LINEAR, unbounded  [Q, T]
         pos = -(tokens.positions.clamp_min(1).float() - 1.0)                 # LINEAR, in [-(L-1), 0]
-        logits = (rec + pos).to(x.dtype)                                     # [Q, T]
+        m = self.mix
+        logits = (2.0 * (m * rec + (1.0 - m) * pos)).to(x.dtype)             # [Q, T] mix=0.5 -> rec+pos
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
 

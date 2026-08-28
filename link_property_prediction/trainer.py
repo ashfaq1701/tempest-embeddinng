@@ -193,6 +193,9 @@ class Trainer:
             parts.append(f"temp={float(self.model.temperature):.3f}")
         if hasattr(self.model, "geo_temp"):
             parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
+        bw = getattr(self.model, "bag_weights", None)
+        if bw is not None and hasattr(bw, "mix"):
+            parts.append(f"mix={float(bw.mix):.4f}")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad
