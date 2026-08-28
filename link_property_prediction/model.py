@@ -1,6 +1,7 @@
 """Centroid-to-centroid head on the Poincaré ball: s(u,v) = geo_temp * (-d_H(P_u, P_v)) [+ pop_bias[v]].
 
-The distance term is scaled by a learned geo_temp (init 1.0). When the popularity channel is on, a
+The distance term is scaled by a learned geo_temp = exp(raw) (log-parameterised, init 1.0, so its
+updates are multiplicative). When the popularity channel is on, a
 learned per-node scalar pop_bias[v] (zero-init, so it contributes exactly 0 at step 0) is added at
 FIXED unit weight -- the model sharpens the geometry via geo_temp while popularity rides alongside at
 a constant scale.
@@ -72,7 +73,15 @@ class LinkPredHead(nn.Module):
             self.pop_bias = nn.Embedding(self.num_nodes, 1)
             nn.init.zeros_(self.pop_bias.weight)
 
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+        # Log-parameterised distance temperature: geo_temp = exp(raw), raw init 0 -> geo_temp 1.0.
+        # Multiplicative updates let it slew scale-free across datasets (no linear parameter chasing a
+        # badly-scaled optimum over many epochs).
+        self.geo_temp_raw = nn.Parameter(torch.zeros(()))
+
+    @property
+    def geo_temp(self) -> torch.Tensor:
+        """Effective distance temperature = exp(raw) (> 0 by construction)."""
+        return torch.exp(self.geo_temp_raw)
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
