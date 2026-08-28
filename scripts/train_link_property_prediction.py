@@ -73,6 +73,10 @@ def parse_args() -> argparse.Namespace:
     # ── Optimisation / training ─────────────────────────────────────
     p.add_argument("--lr", default=1e-3, type=float,
                    help="Learning rate.")
+    p.add_argument("--lr-temperature", default=1e-2, type=float,
+                   help="Learning rate for the distance temperature (geo_temp = exp(raw)), in "
+                        "its own param group. Adam steps a parameter by ~lr regardless of "
+                        "gradient size, so this sets how fast the scale slews.")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
@@ -188,6 +192,7 @@ def main() -> Dict[str, Any]:
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
         lr=args.lr,
+        lr_temperature=args.lr_temperature,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 
