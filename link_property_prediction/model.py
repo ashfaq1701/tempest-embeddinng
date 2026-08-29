@@ -48,26 +48,17 @@ class BagWeights(nn.Module):
     A fourth feature `dev` (geodesic distance to the bag's unweighted centroid) was measured and
     REMOVED -- see the pooler-feature ablation in CLAUDE.md. It is recoverable from commit e6b6079c.
 
-    `hidden` is the MLP width and `hidden_layers` its depth: 1 gives 3->hidden->1 (the measured
-    default), 2 gives 3->hidden->hidden->1. Each extra level is a (hidden, hidden) block plus a
-    GELU. Keep the width fixed when sweeping depth, so depth is the single variable.
+    `hidden` is the MLP width: the net is 3 -> hidden -> 1.
     """
 
     N_FEAT = 3
 
-    def __init__(self, mnia: float, hidden: int = 32, hidden_layers: int = 1):
+    def __init__(self, mnia: float, hidden: int = 32):
         super().__init__()
-        n_hidden = int(hidden_layers)
-        if n_hidden < 1:
-            raise ValueError(f"pooler needs at least one hidden layer, got {n_hidden}")
         self.mnia = float(mnia)                 # fixed age scale
         self.hidden = int(hidden)
-        self.hidden_layers = n_hidden
-        layers = [nn.Linear(self.N_FEAT, self.hidden), nn.GELU()]
-        for _ in range(n_hidden - 1):           # each extra level is (hidden, hidden) + GELU
-            layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
-        layers += [nn.Linear(self.hidden, 1)]
-        self.net = nn.Sequential(*layers)
+        self.net = nn.Sequential(nn.Linear(self.N_FEAT, self.hidden), nn.GELU(),
+                                 nn.Linear(self.hidden, 1))
 
     def forward(self, geom: "PoincareManifold", tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
@@ -85,13 +76,13 @@ class LinkPredHead(nn.Module):
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float,
                  init_irange: float = 1e-3, use_pop_bias: bool = False,
-                 pooler_hidden: int = 32, pooler_hidden_layers: int = 1):
+                 pooler_hidden: int = 32):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.use_pop_bias = bool(use_pop_bias)
         self.geom = PoincareManifold()
-        self.bag_weights = BagWeights(mean_node_inter_arrival, pooler_hidden, pooler_hidden_layers)
+        self.bag_weights = BagWeights(mean_node_inter_arrival, pooler_hidden)
 
         # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)

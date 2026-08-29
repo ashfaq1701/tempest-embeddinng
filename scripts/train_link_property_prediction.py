@@ -47,10 +47,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--d-emb", default=64, type=int,
                    help="Embedding dimension.")
     p.add_argument("--pooler-hidden", default=32, type=int,
-                   help="width of the NN pooler's hidden layers.")
-    p.add_argument("--pooler-hidden-layers", default=1, type=int,
-                   help="depth of the NN pooler at constant width: 1 = 3->hidden->1 (the measured "
-                        "default), 2 = 3->hidden->hidden->1.")
+                   help="width of the NN pooler's hidden layer (the net is 3 -> hidden -> 1).")
     p.add_argument("--use-pop-bias", action="store_true",
                    help="Score a learned per-node popularity scalar (zero-init) alongside the distance, "
                         "mixed by the learned weight vector w.")
@@ -184,7 +181,6 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
         use_pop_bias=args.use_pop_bias,
         pooler_hidden=args.pooler_hidden,
-        pooler_hidden_layers=args.pooler_hidden_layers,
 
         K_train=args.k_train,
 

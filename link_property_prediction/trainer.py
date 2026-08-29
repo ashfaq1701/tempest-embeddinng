@@ -45,9 +45,8 @@ class TrainerConfig:
     # Score a learned per-node popularity scalar (zero-init) alongside the distance, mixed by w.
     use_pop_bias: bool = False
 
-    # Pooler MLP width, and depth at that width: 1 = 3->hidden->1, 2 = 3->hidden->hidden->1.
+    # Pooler MLP width: the net is 3 -> hidden -> 1.
     pooler_hidden: int = 32
-    pooler_hidden_layers: int = 1
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
@@ -86,7 +85,6 @@ class Trainer:
             mean_node_inter_arrival=float(config.mean_node_inter_arrival),
             use_pop_bias=bool(config.use_pop_bias),
             pooler_hidden=int(config.pooler_hidden),
-            pooler_hidden_layers=int(config.pooler_hidden_layers),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(
