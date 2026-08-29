@@ -50,6 +50,9 @@ def parse_args() -> argparse.Namespace:
                    help="comma-separated NN-pooler features in order, from {rec,pos,rad}. "
                         "Hidden width is a fixed 32 for every choice, so a feature A/B does not "
                         "also change pooler capacity.")
+    p.add_argument("--pooler-hidden-layers", default=1, type=int,
+                   help="depth of the NN pooler at constant width 32: 1 = n_feat->32->1 (the "
+                        "measured default), 2 = n_feat->32->32->1.")
     p.add_argument("--use-pop-bias", action="store_true",
                    help="Score a learned per-node popularity scalar (zero-init) alongside the distance, "
                         "mixed by the learned weight vector w.")
@@ -183,6 +186,7 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
         use_pop_bias=args.use_pop_bias,
         pooler_features=tuple(f.strip() for f in args.pooler_features.split(",") if f.strip()),
+        pooler_hidden_layers=args.pooler_hidden_layers,
 
         K_train=args.k_train,
 

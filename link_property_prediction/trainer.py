@@ -48,6 +48,9 @@ class TrainerConfig:
     # Which features the NN pooler reads, in order. Hidden width is fixed at 32 regardless of count.
     pooler_features: tuple = ("rec", "pos", "rad")
 
+    # Pooler MLP depth at constant width 32: 1 = n_feat->32->1, 2 = n_feat->32->32->1.
+    pooler_hidden_layers: int = 1
+
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
 
@@ -85,6 +88,7 @@ class Trainer:
             mean_node_inter_arrival=float(config.mean_node_inter_arrival),
             use_pop_bias=bool(config.use_pop_bias),
             pooler_features=tuple(config.pooler_features),
+            pooler_hidden_layers=int(config.pooler_hidden_layers),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(
