@@ -6,10 +6,8 @@ FIXED unit weight -- the model sharpens the geometry via geo_temp while populari
 a constant scale.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over a
-selectable-feature MLP over [rec, pos, rad] at a FIXED hidden width of 32. Learned head params:
+3-feature MLP over [rec, pos, rad] at a fixed hidden width. Learned head params:
 geo_temp, the MLP pooler, and num_nodes popularity scalars when the channel is on."""
-
-from typing import Sequence
 
 import geoopt
 import torch
@@ -39,13 +37,8 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """Pooling weights = softmax(MLP(features)); hidden = HIDDEN, randomly initialised, with mnia as
-    a fixed age scale. The softmax over tokens dampens the random init.
-
-    The feature set is selectable so that adding a feature is a single-variable change. HIDDEN is a
-    FIXED 32 regardless of how many features are on -- under the old `8 * N_FEAT` rule the hidden
-    width moved with the feature count, so a feature-count A/B also changed pooler capacity and the
-    two effects could not be separated.
+    """Pooling weights = softmax(MLP([rec, pos, rad])), with mnia as a fixed age scale. The softmax
+    over tokens dampens the random init.
 
     Features (`rad` is detached, so the pooler reads geometry but does not backprop through it):
       rec -- -(age / mnia), token recency at a fixed age scale
@@ -55,45 +48,34 @@ class BagWeights(nn.Module):
     A fourth feature `dev` (geodesic distance to the bag's unweighted centroid) was measured and
     REMOVED -- see the pooler-feature ablation in CLAUDE.md. It is recoverable from commit e6b6079c.
 
-    `hidden_layers` sets DEPTH at a constant width: 1 gives n_feat->32->1 (the measured default),
-    2 gives n_feat->32->32->1. Each extra layer is a (HIDDEN, HIDDEN) block plus a GELU.
+    `hidden` is the MLP width and `hidden_layers` its depth: 1 gives 3->hidden->1 (the measured
+    default), 2 gives 3->hidden->hidden->1. Each extra level is a (hidden, hidden) block plus a
+    GELU. Keep the width fixed when sweeping depth, so depth is the single variable.
     """
 
-    ALL_FEATURES = ("rec", "pos", "rad")
-    HIDDEN = 32
+    N_FEAT = 3
 
-    def __init__(self, mnia: float, features: Sequence[str] = ALL_FEATURES, hidden_layers: int = 1):
+    def __init__(self, mnia: float, hidden: int = 32, hidden_layers: int = 1):
         super().__init__()
-        feats = tuple(features)
-        unknown = [f for f in feats if f not in self.ALL_FEATURES]
-        if unknown:
-            raise ValueError(f"unknown pooler feature(s) {unknown}; known: {list(self.ALL_FEATURES)}")
-        if not feats:
-            raise ValueError("pooler needs at least one feature")
         n_hidden = int(hidden_layers)
         if n_hidden < 1:
             raise ValueError(f"pooler needs at least one hidden layer, got {n_hidden}")
-        self.features = feats
-        self.hidden_layers = n_hidden
         self.mnia = float(mnia)                 # fixed age scale
-        layers = [nn.Linear(len(feats), self.HIDDEN), nn.GELU()]
-        for _ in range(n_hidden - 1):           # each extra level is (HIDDEN, HIDDEN) + GELU
-            layers += [nn.Linear(self.HIDDEN, self.HIDDEN), nn.GELU()]
-        layers += [nn.Linear(self.HIDDEN, 1)]
+        self.hidden = int(hidden)
+        self.hidden_layers = n_hidden
+        layers = [nn.Linear(self.N_FEAT, self.hidden), nn.GELU()]
+        for _ in range(n_hidden - 1):           # each extra level is (hidden, hidden) + GELU
+            layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
+        layers += [nn.Linear(self.hidden, 1)]
         self.net = nn.Sequential(*layers)
 
     def forward(self, geom: "PoincareManifold", tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
-        cols = []
-        for f in self.features:                 # built in self.features order
-            if f == "rec":
-                cols.append(-(tokens.ages.clamp_min(0).float() / self.mnia))
-            elif f == "pos":
-                cols.append(-(tokens.positions.clamp_min(1).float() - 1.0))
-            elif f == "rad":
-                cols.append(geom.dist0(x.detach()))                             # [Q, T] hyperbolic radius
-        feat = torch.stack(cols, dim=-1).to(x.dtype)                            # [Q, T, n_feat]
+        rec = -(tokens.ages.clamp_min(0).float() / self.mnia)                   # -(age/mnia)
+        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                    # -(pos-1)
+        rad = geom.dist0(x.detach())                                            # [Q, T] hyperbolic radius
+        feat = torch.stack([rec, pos, rad], dim=-1).to(x.dtype)                 # [Q, T, 3]
         logits = self.net(feat).squeeze(-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
@@ -103,14 +85,13 @@ class LinkPredHead(nn.Module):
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float,
                  init_irange: float = 1e-3, use_pop_bias: bool = False,
-                 pooler_features: Sequence[str] = BagWeights.ALL_FEATURES,
-                 pooler_hidden_layers: int = 1):
+                 pooler_hidden: int = 32, pooler_hidden_layers: int = 1):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.use_pop_bias = bool(use_pop_bias)
         self.geom = PoincareManifold()
-        self.bag_weights = BagWeights(mean_node_inter_arrival, pooler_features, pooler_hidden_layers)
+        self.bag_weights = BagWeights(mean_node_inter_arrival, pooler_hidden, pooler_hidden_layers)
 
         # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
