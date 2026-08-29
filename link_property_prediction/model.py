@@ -6,8 +6,10 @@ FIXED unit weight -- the model sharpens the geometry via geo_temp while populari
 a constant scale.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over a
-3-feature MLP of [-(age/mnia), -pos, rad] (rad = each token's hyperbolic radius). Learned head params:
+selectable-feature MLP over [rec, pos, rad, dev] at a FIXED hidden width of 32. Learned head params:
 geo_temp, the MLP pooler, and num_nodes popularity scalars when the channel is on."""
+
+from typing import Sequence
 
 import geoopt
 import torch
@@ -37,29 +39,53 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """Pooling weights = softmax(MLP([-(age/mnia), -pos, rad, dev])); hidden = 8*N_FEAT, randomly
-    initialised, with mnia as a fixed age scale. The softmax over tokens dampens the random init.
+    """Pooling weights = softmax(MLP(features)); hidden = HIDDEN, randomly initialised, with mnia as
+    a fixed age scale. The softmax over tokens dampens the random init.
 
-    N_FEAT = 4: rad = each token's hyperbolic radius (dist0); dev = each token's geodesic distance to
-    the bag's unweighted centroid (a per-token spread signal). Both geometric features are detached."""
+    The feature set is selectable so that adding a feature is a single-variable change. HIDDEN is a
+    FIXED 32 regardless of how many features are on -- under the old `8 * N_FEAT` rule the hidden
+    width moved with the feature count, so a feature-count A/B also changed pooler capacity and the
+    two effects could not be separated.
 
-    N_FEAT = 4
+    Features (both geometric ones are detached, so the pooler reads geometry but does not backprop
+    through it):
+      rec -- -(age / mnia), token recency at a fixed age scale
+      pos -- -(position - 1), depth along the walk
+      rad -- geodesic distance from the origin: the token's hyperbolic radius
+      dev -- geodesic distance to the bag's UNWEIGHTED centroid: a per-token spread signal
+    """
 
-    def __init__(self, mnia: float):
+    ALL_FEATURES = ("rec", "pos", "rad", "dev")
+    HIDDEN = 32
+
+    def __init__(self, mnia: float, features: Sequence[str] = ALL_FEATURES):
         super().__init__()
+        feats = tuple(features)
+        unknown = [f for f in feats if f not in self.ALL_FEATURES]
+        if unknown:
+            raise ValueError(f"unknown pooler feature(s) {unknown}; known: {list(self.ALL_FEATURES)}")
+        if not feats:
+            raise ValueError("pooler needs at least one feature")
+        self.features = feats
         self.mnia = float(mnia)                 # fixed age scale
-        hidden = 8 * self.N_FEAT                # 8x expansion, random init
-        self.net = nn.Sequential(nn.Linear(self.N_FEAT, hidden), nn.GELU(), nn.Linear(hidden, 1))
+        self.net = nn.Sequential(nn.Linear(len(feats), self.HIDDEN), nn.GELU(),
+                                 nn.Linear(self.HIDDEN, 1))
 
     def forward(self, geom: "PoincareManifold", tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
-        rec = -(tokens.ages.clamp_min(0).float() / self.mnia)                   # -(age/mnia)
-        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                    # -pos
-        rad = geom.dist0(x.detach())                                            # [Q, T] token hyperbolic radius
-        m0 = geom.midpoint(x, valid.float() / valid.sum(-1, keepdim=True).clamp_min(1))  # [Q, d] centroid
-        dev = geom.dist(x, m0.unsqueeze(1)).detach()                            # [Q, T] token-to-centroid
-        feat = torch.stack([rec, pos, rad, dev], dim=-1).to(x.dtype)           # [Q, T, 4]
+        cols = []
+        for f in self.features:                 # built in self.features order
+            if f == "rec":
+                cols.append(-(tokens.ages.clamp_min(0).float() / self.mnia))
+            elif f == "pos":
+                cols.append(-(tokens.positions.clamp_min(1).float() - 1.0))
+            elif f == "rad":
+                cols.append(geom.dist0(x.detach()))                             # [Q, T] hyperbolic radius
+            elif f == "dev":                                                    # token -> unweighted centroid
+                m0 = geom.midpoint(x, valid.float() / valid.sum(-1, keepdim=True).clamp_min(1))
+                cols.append(geom.dist(x, m0.unsqueeze(1)).detach())
+        feat = torch.stack(cols, dim=-1).to(x.dtype)                            # [Q, T, n_feat]
         logits = self.net(feat).squeeze(-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
@@ -68,13 +94,14 @@ class LinkPredHead(nn.Module):
     """E is a ManifoldParameter; the pooling weights carry no learned parameters."""
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float,
-                 init_irange: float = 1e-3, use_pop_bias: bool = False):
+                 init_irange: float = 1e-3, use_pop_bias: bool = False,
+                 pooler_features: Sequence[str] = BagWeights.ALL_FEATURES):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.use_pop_bias = bool(use_pop_bias)
         self.geom = PoincareManifold()
-        self.bag_weights = BagWeights(mean_node_inter_arrival)
+        self.bag_weights = BagWeights(mean_node_inter_arrival, pooler_features)
 
         # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)

@@ -45,6 +45,9 @@ class TrainerConfig:
     # Score a learned per-node popularity scalar (zero-init) alongside the distance, mixed by w.
     use_pop_bias: bool = False
 
+    # Which features the NN pooler reads, in order. Hidden width is fixed at 32 regardless of count.
+    pooler_features: tuple = ("rec", "pos", "rad", "dev")
+
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
 
@@ -81,6 +84,7 @@ class Trainer:
             d_emb=int(config.d_emb),
             mean_node_inter_arrival=float(config.mean_node_inter_arrival),
             use_pop_bias=bool(config.use_pop_bias),
+            pooler_features=tuple(config.pooler_features),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(
