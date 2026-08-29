@@ -59,8 +59,8 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. Two RiemannianAdam param groups: the distance
-    # temperature gets its own (larger) lr, everything else shares `lr`.
+    # Constant lr, no weight decay. Two RiemannianAdam param groups: every non-embedding
+    # param (temperature + NN pooler) gets its own (larger) lr, E stays at `lr`.
     lr: float = 1e-3
     lr_temperature: float = 1e-2
 
@@ -110,13 +110,18 @@ class Trainer:
         # Matches either form of the knob -- the linear `geo_temp` or the log-parameterised
         # `geo_temp_raw` -- and splits by identity, not name, so a head carrying neither yields
         # one group unchanged.
-        temp_params = [p for n, p in self.model.named_parameters()
-                       if n.split(".")[-1] in ("geo_temp", "geo_temp_raw")]
-        temp_ids = {id(p) for p in temp_params}
-        rest = [p for p in self.model.parameters() if id(p) not in temp_ids]
+        # The fast group is everything the embedding table does not own: the distance
+        # temperature AND the NN pooler. The pooler decides which walk tokens the centroid
+        # listens to; at the embedding lr it re-weights the bag as slowly as the geometry
+        # moves, so a dataset needing a different pooling rule cannot find one before
+        # patience fires. Split by identity, so E alone stays at `lr`.
+        emb_ids = {id(p) for p in self.model.E.parameters()}
+        fast = [p for p in self.model.parameters() if id(p) not in emb_ids]
+        fast_ids = {id(p) for p in fast}
+        rest = [p for p in self.model.parameters() if id(p) not in fast_ids]
         groups = [{"params": rest, "lr": float(config.lr)}]
-        if temp_params:
-            groups.append({"params": temp_params, "lr": float(config.lr_temperature)})
+        if fast:
+            groups.append({"params": fast, "lr": float(config.lr_temperature)})
         self.opt = geoopt.optim.RiemannianAdam(groups, lr=float(config.lr), stabilize=10)
 
     # Full-graph ingestion (once, up front)
