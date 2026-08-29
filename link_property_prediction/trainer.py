@@ -59,8 +59,10 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, one RiemannianAdam param group, no weight decay.
+    # Constant lr, no weight decay. Two RiemannianAdam param groups: the distance
+    # temperature gets its own (larger) lr, everything else shares `lr`.
     lr: float = 1e-3
+    lr_temperature: float = 1e-2
 
     # Run control.
     num_epochs: int = 50
@@ -100,10 +102,22 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # One param group at a single lr: Riemannian update for E, standard Adam for the head.
-        self.opt = geoopt.optim.RiemannianAdam(
-            self.model.parameters(), lr=float(config.lr), stabilize=10,
-        )
+        # Two param groups: Riemannian update for E and standard Adam for the head at `lr`,
+        # with the distance temperature split off at `lr_temperature`. Adam moves a parameter by
+        # ~lr per step regardless of gradient size, so the temperature's step size alone sets how
+        # fast the distance scale slews; at the shared lr a dataset whose optimum is ~160 (Patent)
+        # crawls there over a dozen epochs while one at ~2 (ML-20M) arrives in a tenth of an epoch.
+        # Matches either form of the knob -- the linear `geo_temp` or the log-parameterised
+        # `geo_temp_raw` -- and splits by identity, not name, so a head carrying neither yields
+        # one group unchanged.
+        temp_params = [p for n, p in self.model.named_parameters()
+                       if n.split(".")[-1] in ("geo_temp", "geo_temp_raw")]
+        temp_ids = {id(p) for p in temp_params}
+        rest = [p for p in self.model.parameters() if id(p) not in temp_ids]
+        groups = [{"params": rest, "lr": float(config.lr)}]
+        if temp_params:
+            groups.append({"params": temp_params, "lr": float(config.lr_temperature)})
+        self.opt = geoopt.optim.RiemannianAdam(groups, lr=float(config.lr), stabilize=10)
 
     # Full-graph ingestion (once, up front)
 
