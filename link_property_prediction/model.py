@@ -37,12 +37,13 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """Pooling weights = softmax(MLP([-(age/mnia), -pos, rad])); hidden = 8*N_FEAT, randomly
+    """Pooling weights = softmax(MLP([-(age/mnia), -pos, rad, dev])); hidden = 8*N_FEAT, randomly
     initialised, with mnia as a fixed age scale. The softmax over tokens dampens the random init.
 
-    N_FEAT = 3: the third feature is `rad` = each token's hyperbolic radius (dist0)."""
+    N_FEAT = 4: rad = each token's hyperbolic radius (dist0); dev = each token's geodesic distance to
+    the bag's unweighted centroid (a per-token spread signal). Both geometric features are detached."""
 
-    N_FEAT = 3
+    N_FEAT = 4
 
     def __init__(self, mnia: float):
         super().__init__()
@@ -56,7 +57,9 @@ class BagWeights(nn.Module):
         rec = -(tokens.ages.clamp_min(0).float() / self.mnia)                   # -(age/mnia)
         pos = -(tokens.positions.clamp_min(1).float() - 1.0)                    # -pos
         rad = geom.dist0(x.detach())                                            # [Q, T] token hyperbolic radius
-        feat = torch.stack([rec, pos, rad], dim=-1).to(x.dtype)                 # [Q, T, 3]
+        m0 = geom.midpoint(x, valid.float() / valid.sum(-1, keepdim=True).clamp_min(1))  # [Q, d] centroid
+        dev = geom.dist(x, m0.unsqueeze(1)).detach()                            # [Q, T] token-to-centroid
+        feat = torch.stack([rec, pos, rad, dev], dim=-1).to(x.dtype)           # [Q, T, 4]
         logits = self.net(feat).squeeze(-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
