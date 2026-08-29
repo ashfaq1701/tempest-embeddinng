@@ -27,23 +27,38 @@ class PoincareManifold:
         """Elementwise geodesic distance, broadcasting over leading dims. LOWER = closer."""
         return self.manifold.dist(x, y)
 
+    def dist0(self, x: torch.Tensor) -> torch.Tensor:
+        """Hyperbolic radius: geodesic distance from the origin (0 at center, large near boundary)."""
+        return self.manifold.dist0(x)
+
     def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """Weighted gyro-midpoint: x [Q,T,d], w [Q,T] -> [Q,d]."""
         return self.manifold.weighted_midpoint(x, weights=w, reducedim=[-2], dim=-1, keepdim=False)
 
 
 class BagWeights(nn.Module):
+    """Pooling weights = softmax(MLP([-(age/mnia), -pos, rad])); hidden = 8*N_FEAT, randomly
+    initialised, with mnia as a fixed age scale. The softmax over tokens dampens the random init.
+
+    N_FEAT = 3: the third feature is `rad` = each token's hyperbolic radius (dist0), replacing the
+    old centroid-spread term."""
+
+    N_FEAT = 3
 
     def __init__(self, mnia: float):
         super().__init__()
-        self.mnia = float(mnia)                                              # fixed age scale
+        self.mnia = float(mnia)                 # fixed age scale
+        hidden = 8 * self.N_FEAT                # 8x expansion, random init
+        self.net = nn.Sequential(nn.Linear(self.N_FEAT, hidden), nn.GELU(), nn.Linear(hidden, 1))
 
-    def forward(self, tokens: WalkTokens, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        """x [Q,T,d], valid [Q,T] -> pooling weights [Q,T] summing to 1, 0 on padding. (x sets dtype.)"""
-        age = tokens.ages.clamp_min(0).float()                               # seed = 0, ctx >= 1, pad -> 0
-        rec = -age / self.mnia                                               # LINEAR, unbounded  [Q, T]
-        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                 # LINEAR, in [-(L-1), 0]
-        logits = (rec + pos).to(x.dtype)                                     # [Q, T]
+    def forward(self, geom: "PoincareManifold", tokens: WalkTokens, x: torch.Tensor,
+                valid: torch.Tensor) -> torch.Tensor:
+        """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
+        rec = -(tokens.ages.clamp_min(0).float() / self.mnia)                   # -(age/mnia)
+        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                    # -pos
+        rad = geom.dist0(x.detach())                                            # [Q, T] token hyperbolic radius
+        feat = torch.stack([rec, pos, rad], dim=-1).to(x.dtype)                 # [Q, T, 3]
+        logits = self.net(feat).squeeze(-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
 
@@ -84,7 +99,7 @@ class LinkPredHead(nn.Module):
             valid[cold, 0] = True
 
         x = F.embedding(nodes, emb)                                             # [Q, T, d]
-        w = self.bag_weights(tokens, x, valid)                                  # [Q, T] sums to 1, 0 on padding
+        w = self.bag_weights(self.geom, tokens, x, valid)                                  # [Q, T] sums to 1, 0 on padding
         return self.geom.midpoint(x, w)                                         # [Q, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
