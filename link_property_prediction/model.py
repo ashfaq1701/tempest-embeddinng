@@ -6,7 +6,7 @@ FIXED unit weight -- the model sharpens the geometry via geo_temp while populari
 a constant scale.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over a
-selectable-feature MLP over [rec, pos, rad, dev] at a FIXED hidden width of 32. Learned head params:
+selectable-feature MLP over [rec, pos, rad] at a FIXED hidden width of 32. Learned head params:
 geo_temp, the MLP pooler, and num_nodes popularity scalars when the channel is on."""
 
 from typing import Sequence
@@ -47,15 +47,16 @@ class BagWeights(nn.Module):
     width moved with the feature count, so a feature-count A/B also changed pooler capacity and the
     two effects could not be separated.
 
-    Features (both geometric ones are detached, so the pooler reads geometry but does not backprop
-    through it):
+    Features (`rad` is detached, so the pooler reads geometry but does not backprop through it):
       rec -- -(age / mnia), token recency at a fixed age scale
       pos -- -(position - 1), depth along the walk
       rad -- geodesic distance from the origin: the token's hyperbolic radius
-      dev -- geodesic distance to the bag's UNWEIGHTED centroid: a per-token spread signal
+
+    A fourth feature `dev` (geodesic distance to the bag's unweighted centroid) was measured and
+    REMOVED -- see the pooler-feature ablation in CLAUDE.md. It is recoverable from commit e6b6079c.
     """
 
-    ALL_FEATURES = ("rec", "pos", "rad", "dev")
+    ALL_FEATURES = ("rec", "pos", "rad")
     HIDDEN = 32
 
     def __init__(self, mnia: float, features: Sequence[str] = ALL_FEATURES):
@@ -82,9 +83,6 @@ class BagWeights(nn.Module):
                 cols.append(-(tokens.positions.clamp_min(1).float() - 1.0))
             elif f == "rad":
                 cols.append(geom.dist0(x.detach()))                             # [Q, T] hyperbolic radius
-            elif f == "dev":                                                    # token -> unweighted centroid
-                m0 = geom.midpoint(x, valid.float() / valid.sum(-1, keepdim=True).clamp_min(1))
-                cols.append(geom.dist(x, m0.unsqueeze(1)).detach())
         feat = torch.stack(cols, dim=-1).to(x.dtype)                            # [Q, T, n_feat]
         logits = self.net(feat).squeeze(-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)

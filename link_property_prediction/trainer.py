@@ -46,7 +46,7 @@ class TrainerConfig:
     use_pop_bias: bool = False
 
     # Which features the NN pooler reads, in order. Hidden width is fixed at 32 regardless of count.
-    pooler_features: tuple = ("rec", "pos", "rad", "dev")
+    pooler_features: tuple = ("rec", "pos", "rad")
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5

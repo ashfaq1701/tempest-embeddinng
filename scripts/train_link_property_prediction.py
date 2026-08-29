@@ -46,8 +46,8 @@ def parse_args() -> argparse.Namespace:
     # ── Model ───────────────────────────────────────────────────────
     p.add_argument("--d-emb", default=64, type=int,
                    help="Embedding dimension.")
-    p.add_argument("--pooler-features", default="rec,pos,rad,dev", type=str,
-                   help="comma-separated NN-pooler features in order, from {rec,pos,rad,dev}. "
+    p.add_argument("--pooler-features", default="rec,pos,rad", type=str,
+                   help="comma-separated NN-pooler features in order, from {rec,pos,rad}. "
                         "Hidden width is a fixed 32 for every choice, so a feature A/B does not "
                         "also change pooler capacity.")
     p.add_argument("--use-pop-bias", action="store_true",
