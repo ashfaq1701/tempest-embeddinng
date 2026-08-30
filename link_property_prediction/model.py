@@ -80,10 +80,6 @@ class TimeEncoding(nn.Module):
         self.n_per = n_per
         self.register_buffer("w", 2.0 * math.pi / wl)                   # [k], fixed
 
-    @property
-    def out_dim(self) -> int:
-        return self.time_dim
-
     def forward(self, ages: torch.Tensor) -> torch.Tensor:
         """ages [Q,T] (>=0; padding pre-clamped) -> [Q,T,time_dim]"""
         u = (ages.clamp_min(0).float() / self.t_train).unsqueeze(-1)    # [Q,T,1] ~ [0,1]
@@ -123,7 +119,7 @@ class BagWeights(nn.Module):
         nn.init.normal_(self.pos.weight, std=0.02)
         with torch.no_grad():
             self.pos.weight[0].zero_()
-        self.n_feat = self.time.out_dim + int(pos_dim) + 1
+        self.n_feat = int(time_dim) + int(pos_dim) + 1
         self.net = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU(),
                                  nn.Linear(self.hidden, 1))
 
