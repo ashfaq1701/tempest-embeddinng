@@ -59,10 +59,10 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. Two RiemannianAdam param groups: every non-embedding
-    # param (the distance temperature and the NN pooler) rides `lr_network`, E stays at `lr_e`.
-    lr_e: float = 1e-3
-    lr_network: float = 1e-2
+    # Constant lr, no weight decay. Two RiemannianAdam param groups: ONLY the NN pooler rides the
+    # larger `lr_pooler`; everything else (E, the distance temperature, pop_bias) stays at `lr`.
+    lr: float = 1e-3
+    lr_pooler: float = 1e-2
 
     # Run control.
     num_epochs: int = 50
@@ -102,24 +102,21 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # Two param groups, split by identity: the embedding table at `lr_e`, everything else
-        # -- the distance temperature and the NN pooler -- at the larger `lr_network`.
+        # Two param groups, split by identity: ONLY the NN pooler rides the larger `lr_pooler`;
+        # everything else (E, the distance temperature, pop_bias) stays at the base `lr`.
         #
-        # Adam moves a parameter by ~lr per step regardless of gradient magnitude, so these 162
-        # numbers were slewing at the same rate as a 143M-row embedding table. Two things need to
-        # move faster than the geometry: the temperature, whose optimum is ~170 on Patent and ~2
-        # on ML-20M, and the pooler, which decides which walk tokens the centroid listens to. At
-        # the embedding lr neither can adapt before early stopping fires -- Patent's best val
-        # landed on epoch 1 and the run died at epoch 4. Measured: temperature alone does NOT fix
-        # it (stalls at epoch 3 with an identical geo_temp trajectory); adding the pooler does,
-        # taking Patent's test MRR 0.1630 -> 0.2633.
-        emb = list(self.model.E.parameters())
-        emb_ids = {id(p) for p in emb}
-        fast = [p for p in self.model.parameters() if id(p) not in emb_ids]
-        groups = [{"params": emb, "lr": float(config.lr_e)}]
-        if fast:
-            groups.append({"params": fast, "lr": float(config.lr_network)})
-        self.opt = geoopt.optim.RiemannianAdam(groups, lr=float(config.lr_e), stabilize=10)
+        # The pooler (random-init MLP that decides which walk tokens the centroid listens to) must
+        # adapt faster than a 143M-row embedding table can, or early stopping fires before it groks.
+        # But the distance temperature is deliberately kept at the base lr: slewing it fast supplies
+        # the logit scale directly, which lets E stay compact and caps the ceiling -- keeping it slow
+        # forces the scale to come from E's own expansion instead.
+        pooler = list(self.model.bag_weights.parameters())
+        pooler_ids = {id(p) for p in pooler}
+        base = [p for p in self.model.parameters() if id(p) not in pooler_ids]
+        groups = [{"params": base, "lr": float(config.lr)}]
+        if pooler:
+            groups.append({"params": pooler, "lr": float(config.lr_pooler)})
+        self.opt = geoopt.optim.RiemannianAdam(groups, lr=float(config.lr), stabilize=10)
 
     # Full-graph ingestion (once, up front)
 
@@ -191,8 +188,8 @@ class Trainer:
 
         return {
             "link": float(link_loss.detach()),
-            "lr_e": float(self.opt.param_groups[0]["lr"]),
-            "lr_network": float(self.opt.param_groups[-1]["lr"]),
+            "lr": float(self.opt.param_groups[0]["lr"]),
+            "lr_pooler": float(self.opt.param_groups[-1]["lr"]),
         }
 
     # Geometry probe
@@ -318,7 +315,7 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
-                f"lr_e={self.opt.param_groups[0]['lr']:.0e}  "
+                f"lr={self.opt.param_groups[0]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
 

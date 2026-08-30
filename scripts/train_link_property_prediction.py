@@ -73,13 +73,13 @@ def parse_args() -> argparse.Namespace:
                    help="Eval negatives per positive (tgb-seq val only).")
 
     # ── Optimisation / training ─────────────────────────────────────
-    p.add_argument("--lr-e", default=1e-3, type=float,
-                   help="Learning rate for the embedding table E (Riemannian updates).")
-    p.add_argument("--lr-network", default=1e-2, type=float,
-                   help="Learning rate for every non-embedding param -- the distance temperature "
-                        "and the NN pooler -- in their own param group. Adam steps a parameter by "
-                        "~lr regardless of gradient size, so this sets how fast they adapt "
-                        "relative to the embedding table.")
+    p.add_argument("--lr", default=1e-3, type=float,
+                   help="Base learning rate for E, the distance temperature, and pop_bias.")
+    p.add_argument("--lr-pooler", default=1e-2, type=float,
+                   help="Learning rate for ONLY the NN pooler (its own param group). The random-init "
+                        "pooler MLP must adapt faster than the embedding table can, or early stopping "
+                        "fires before it groks. The temperature stays at the base --lr so E expands "
+                        "rather than the temperature supplying the logit scale.")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
@@ -195,8 +195,8 @@ def main() -> Dict[str, Any]:
         start_bias=args.start_bias,
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
-        lr_e=args.lr_e,
-        lr_network=args.lr_network,
+        lr=args.lr,
+        lr_pooler=args.lr_pooler,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 
