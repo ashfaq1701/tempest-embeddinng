@@ -71,14 +71,9 @@ def parse_args() -> argparse.Namespace:
                    help="Eval negatives per positive (tgb-seq val only).")
 
     # ── Optimisation / training ─────────────────────────────────────
-    p.add_argument("--lr-embedding", default=1e-3, type=float,
-                   help="Learning rate for the per-node lookup tables: the embedding table E "
-                        "(Riemannian updates) and, when the popularity channel is on, pop_bias.")
-    p.add_argument("--lr-network", default=1e-2, type=float,
-                   help="Learning rate for the network: the distance temperature and the NN "
-                        "pooler, in their own param group. Adam steps a parameter by ~lr "
-                        "regardless of gradient size, so this sets how fast they adapt relative "
-                        "to the embedding tables.")
+    p.add_argument("--lr", default=1e-3, type=float,
+                   help="Learning rate. One param group: the embedding tables, the distance "
+                        "temperature and the NN pooler all step at this rate.")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
@@ -206,8 +201,7 @@ def main() -> Dict[str, Any]:
         start_bias=args.start_bias,
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
-        lr_embedding=args.lr_embedding,
-        lr_network=args.lr_network,
+        lr=args.lr,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 
