@@ -23,7 +23,7 @@ from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import LinkPredHead
 from .negatives import UniformNegativeSampler
-from .walk_tokens import build_query_walk_tokens
+from .walk_tokens import build_query_walk_tokens, median_context_age
 from .walks import WalkGenerator
 
 
@@ -37,7 +37,9 @@ class TrainerConfig:
     t_train: float = 1.0
 
     # Mean-field per-node inter-event time; AGE scale for the pooling recency weight.
-    mean_node_inter_arrival: float = 1.0
+    # Query edges sampled for calibration; each contributes 3 seeds (src, dst, one negative).
+    # 16k holds the estimate to ~1% across seeds and costs well under a second.
+    recency_calib_queries: int = 16384
 
     # Embedding dimension.
     d_emb: int = 64
@@ -85,7 +87,7 @@ class Trainer:
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
-            mean_node_inter_arrival=float(config.mean_node_inter_arrival),
+            recency_scale=1.0,          # placeholder; calibrated after ingest, before training
             use_pop_bias=bool(config.use_pop_bias),
             pooler_hidden=int(config.pooler_hidden),
         ).to(self.device)
@@ -134,6 +136,61 @@ class Trainer:
         self.walk_gen.add_edges(src, tgt, ts, edge_feat)
         print(f"  Ingested full graph into Tempest: {len(src):,} edges "
               f"(once; per-query cutoff enforces causality)")
+        self._ingested = True
+
+    # Recency-scale calibration (once, right after ingest)
+
+    def calibrate_recency_scale(self, train: SplitData) -> float:
+        """Set the pooler's age scale to the median context walk-token age.
+
+        Must run AFTER ingest_full_graph(): the ages come from real backward walks, not from the
+        edge list. Samples the query distribution the model actually scores -- source, positive
+        destination and one negative per sampled TRAIN edge, each at that edge's own timestamp --
+        because occupancy is wildly asymmetric on some graphs (Patent fills 0.02% of source slots
+        against 21.8% of destination slots, so a source-only sample yields ~10 tokens). Cutoffs
+        come from train edges only, so val/test never enter the estimate.
+
+        Uses the run's own walk configuration, so the scale describes the tokens this run will
+        see. Deterministic: a private RNG seeded from config.seed, which never perturbs the
+        training sample order.
+
+        Raises if the sample is too cold to yield a median. There is no fallback by design: every
+        closed-form substitute was measured against the tokens and found wrong (median_inter_arrival
+        misses by 4e5x on GoogleLocal), so training on one would be silently mis-scaled. A graph
+        that cannot fill 1000 context slots out of ~1.2M is telling you the walk model does not
+        apply to it, which is a result, not a case to paper over.
+        """
+        if not getattr(self, "_ingested", False):
+            raise RuntimeError("calibrate_recency_scale() requires ingest_full_graph() first")
+
+        n = int(train.sources.shape[0])
+        if n == 0:
+            raise RuntimeError("calibrate_recency_scale(): empty train split")
+        rng = np.random.default_rng(self.config.seed)
+        idx = rng.choice(n, size=min(int(self.config.recency_calib_queries), n), replace=False)
+        t = train.timestamps[idx].astype(np.int64)
+        seeds = np.concatenate([
+            train.sources[idx], train.destinations[idx],
+            rng.choice(self.config.dst_pool, size=idx.size),
+        ]).astype(np.int64)
+        scale = median_context_age(
+            self.walk_gen, self.device,
+            torch.as_tensor(seeds), torch.as_tensor(np.concatenate([t, t, t])),
+            max_walk_len=self.config.max_walk_len,
+            num_walks_per_node=self.config.num_walks_per_node,
+            start_bias=self.config.start_bias, walk_bias=self.config.walk_bias)
+
+        if scale is None or scale < 1.0:
+            raise RuntimeError(
+                "calibrate_recency_scale(): too few context walk tokens to measure an age scale "
+                f"(need >= 1000 from {idx.size:,} sampled query edges x 3 seeds). This graph's "
+                "queries are almost all cold, so the walk-token bag carries no recency signal.")
+        print(f"  recency_scale: {scale:,.1f} (median context walk-token age, "
+              f"K={self.config.num_walks_per_node} L={self.config.max_walk_len})")
+        with torch.no_grad():
+            self.model.bag_weights.recency_scale.fill_(float(scale))
+        self.recency_scale = float(scale)
+        return float(scale)
 
     # Scoring — shared by train + eval
 
@@ -194,6 +251,7 @@ class Trainer:
 
         return {
             "link": float(link_loss.detach()),
+            "recency_scale": float(getattr(self, "recency_scale", float("nan"))),
             "lr_embedding": float(self.opt.param_groups[0]["lr"]),
             "lr_network": float(self.opt.param_groups[-1]["lr"]),
         }
@@ -288,6 +346,7 @@ class Trainer:
         self,
         train_batches_factory,
         full_graph: SplitData,
+        train_split: SplitData,
         val_evaluator: Optional[Evaluator] = None,
         val_batches_factory=None,
         test_evaluator: Optional[Evaluator] = None,
@@ -297,6 +356,7 @@ class Trainer:
         self.ingest_full_graph(
             full_graph.sources, full_graph.destinations,
             full_graph.timestamps, full_graph.edge_feat)
+        self.calibrate_recency_scale(train_split)
 
         n_epochs = self.config.num_epochs
         patience = self.config.early_stop_patience

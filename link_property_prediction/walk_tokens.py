@@ -91,3 +91,48 @@ def build_query_walk_tokens(
         seed_mask.reshape(q, -1),
         edge_features,
     )
+
+
+def median_context_age(
+    walk_gen,
+    device: torch.device,
+    query_seeds: torch.Tensor,
+    query_cutoffs: torch.Tensor,
+    *,
+    max_walk_len: int,
+    num_walks_per_node: int,
+    start_bias: Optional[str] = None,
+    walk_bias: Optional[str] = None,
+    min_tokens: int = 1000,
+) -> Optional[float]:
+    """Median age of the CONTEXT walk tokens produced by (seeds, cutoffs).
+
+    The recency feature is -(age / scale); this measures the age distribution the pooler will
+    actually see, so the scale is derived from the same walks the model consumes rather than
+    from a mean-field estimate over the edge list.
+
+    Lives here because it depends on this module's token invariants: `ages` is 0 on the seed
+    slot, >= 1 on context, -1 on padding, and `mask` includes the seed while `seed_mask` marks
+    only the walk origin. Seed slots are dropped -- they are structurally 0 (about a quarter of
+    valid slots) and would drag the median toward zero -- as are zero ages from timestamp ties.
+
+    Returns None when fewer than `min_tokens` context tokens survive: on a graph whose queries
+    are nearly all cold (Patent's source side fills 0.02% of slots) a median over a handful of
+    tokens is noise, and the caller should fall back rather than trust it.
+
+    The result depends on the walk configuration -- num_walks_per_node, max_walk_len and the
+    biases all move the age distribution -- so a sweep over those also moves the scale. Record
+    it alongside them.
+    """
+    toks = build_query_walk_tokens(
+        walk_gen, device, query_seeds, query_cutoffs,
+        max_walk_len=max_walk_len, num_walks_per_node=num_walks_per_node,
+        start_bias=start_bias, walk_bias=walk_bias)
+    ages = toks.ages[toks.mask & ~toks.seed_mask]        # context slots only
+    ages = ages[ages > 0]                                # drop zero-gap ties
+    if int(ages.numel()) < int(min_tokens):
+        return None
+    # int64 median: ages reach ~1e9 and float32 holds only ~1.7e7 integers exactly. torch.median
+    # is the lower order statistic on even counts (not numpy's midpoint average), so the scale is
+    # always a real observed age.
+    return float(torch.median(ages).item())

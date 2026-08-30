@@ -37,11 +37,12 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """Pooling weights = softmax(MLP([rec, pos, rad])), with mnia as a fixed age scale. The softmax
-    over tokens dampens the random init.
+    """Pooling weights = softmax(MLP([rec, pos, rad])). `recency_scale` is the median context
+    walk-token age, calibrated from the ingested graph; the softmax over tokens dampens the
+    random init.
 
     Features (`rad` is detached, so the pooler reads geometry but does not backprop through it):
-      rec -- -(age / mnia), token recency at a fixed age scale
+      rec -- -(age / recency_scale), token recency at the calibrated age scale
       pos -- -(position - 1), depth along the walk
       rad -- geodesic distance from the origin: the token's hyperbolic radius
 
@@ -53,9 +54,12 @@ class BagWeights(nn.Module):
 
     N_FEAT = 3
 
-    def __init__(self, mnia: float, hidden: int = 32):
+    def __init__(self, recency_scale: float = 1.0, hidden: int = 32):
         super().__init__()
-        self.mnia = float(mnia)                 # fixed age scale
+        # Buffer, not a float: it is calibrated from the ingested graph AFTER construction, and it
+        # must travel with .to(device) and land in state_dict -- a checkpoint that scores under a
+        # different age scale than it trained under is silently wrong.
+        self.register_buffer("recency_scale", torch.tensor(float(recency_scale)))
         self.hidden = int(hidden)
         self.net = nn.Sequential(nn.Linear(self.N_FEAT, self.hidden), nn.GELU(),
                                  nn.Linear(self.hidden, 1))
@@ -63,7 +67,7 @@ class BagWeights(nn.Module):
     def forward(self, geom: "PoincareManifold", tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
-        rec = -(tokens.ages.clamp_min(0).float() / self.mnia)                   # -(age/mnia)
+        rec = -(tokens.ages.clamp_min(0).float() / self.recency_scale)          # -(age/scale)
         pos = -(tokens.positions.clamp_min(1).float() - 1.0)                    # -(pos-1)
         rad = geom.dist0(x.detach())                                            # [Q, T] hyperbolic radius
         feat = torch.stack([rec, pos, rad], dim=-1).to(x.dtype)                 # [Q, T, 3]
@@ -74,7 +78,7 @@ class BagWeights(nn.Module):
 class LinkPredHead(nn.Module):
     """E is a ManifoldParameter; the pooling weights carry no learned parameters."""
 
-    def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float,
+    def __init__(self, num_nodes: int, d_emb: int, recency_scale: float = 1.0,
                  init_irange: float = 1e-3, use_pop_bias: bool = False,
                  pooler_hidden: int = 32):
         super().__init__()
@@ -82,7 +86,7 @@ class LinkPredHead(nn.Module):
         self.d_emb = int(d_emb)
         self.use_pop_bias = bool(use_pop_bias)
         self.geom = PoincareManifold()
-        self.bag_weights = BagWeights(mean_node_inter_arrival, pooler_hidden)
+        self.bag_weights = BagWeights(recency_scale, pooler_hidden)
 
         # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
