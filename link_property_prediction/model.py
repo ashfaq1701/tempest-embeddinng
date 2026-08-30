@@ -55,28 +55,41 @@ class TimeEncoding(nn.Module):
     the same, using a fixed encoding by choice.
 
     The linear term carries monotone recency; the cosines cannot express "fresher is better" on
-    their own, which is why Time2Vec keeps one too. Output width is 2k + 1.
+    their own, which is why Time2Vec keeps one too.
+
+    `time_dim` is the TOTAL output width, so the caller sizes the feature directly instead of
+    reasoning about a frequency count that gets doubled: slot 0 is the linear term and the
+    remaining time_dim - 1 slots are cos/sin in quadrature over ceil((time_dim - 1) / 2)
+    geometric frequencies, truncated to fit. An even time_dim therefore leaves the highest
+    frequency with its cosine only.
     """
 
     LAM_MIN, LAM_MAX = 1e-4, 1.0        # wavelengths in units of T_train
 
-    def __init__(self, k: int, t_train: float):
+    def __init__(self, time_dim: int, t_train: float):
         super().__init__()
-        self.k = int(k)
+        if int(time_dim) < 3:
+            raise ValueError(f"time_dim must be >= 3 (1 linear + >= 2 periodic), got {time_dim}")
+        self.time_dim = int(time_dim)
         self.t_train = max(float(t_train), 1.0)
-        i = torch.arange(self.k, dtype=torch.float32) / max(self.k - 1, 1)
+        n_per = self.time_dim - 1                                       # periodic slots
+        k = (n_per + 1) // 2                                            # frequencies, ceil
+        i = torch.arange(k, dtype=torch.float32) / max(k - 1, 1)
         wl = self.LAM_MIN * (self.LAM_MAX / self.LAM_MIN) ** i          # geometric, relative
+        self.n_per = n_per
         self.register_buffer("w", 2.0 * math.pi / wl)                   # [k], fixed
 
     @property
     def out_dim(self) -> int:
-        return 2 * self.k + 1
+        return self.time_dim
 
     def forward(self, ages: torch.Tensor) -> torch.Tensor:
-        """ages [Q,T] (>=0; padding pre-clamped) -> [Q,T,2k+1]"""
+        """ages [Q,T] (>=0; padding pre-clamped) -> [Q,T,time_dim]"""
         u = (ages.clamp_min(0).float() / self.t_train).unsqueeze(-1)    # [Q,T,1] ~ [0,1]
         wu = u * self.w                                                 # [Q,T,k]
-        return torch.cat([-u, torch.cos(wu), torch.sin(wu)], dim=-1)
+        # interleave cos_i, sin_i so truncating an odd tail drops only the last sine
+        pairs = torch.stack([torch.cos(wu), torch.sin(wu)], dim=-1).flatten(-2)   # [Q,T,2k]
+        return torch.cat([-u, pairs[..., :self.n_per]], dim=-1)
 
 
 class BagWeights(nn.Module):
@@ -97,19 +110,19 @@ class BagWeights(nn.Module):
     two effects could not be separated (see the pooler-feature ablation in CLAUDE.md).
     """
 
-    def __init__(self, t_train: float, max_walk_len: int, hidden: int = 32,
-                 time_k: int = 4, d_pos: int = 4):
+    def __init__(self, t_train: float, max_walk_len: int, time_dim: int = 16,
+                 pos_dim: int = 4, hidden_dim: int = 32):
         super().__init__()
-        self.hidden = int(hidden)
-        self.time = TimeEncoding(time_k, t_train)
+        self.hidden = int(hidden_dim)
+        self.time = TimeEncoding(time_dim, t_train)
         # +1 row for the padding index 0; real positions are 1..max_walk_len.
-        self.pos = nn.Embedding(int(max_walk_len) + 1, int(d_pos), padding_idx=0)
+        self.pos = nn.Embedding(int(max_walk_len) + 1, int(pos_dim), padding_idx=0)
         # Small init: the time features are bounded in [-1, 1] and rad is O(1), so a default
         # N(0,1) table would dominate the input and the pooler would start on position alone.
         nn.init.normal_(self.pos.weight, std=0.02)
         with torch.no_grad():
             self.pos.weight[0].zero_()
-        self.n_feat = self.time.out_dim + int(d_pos) + 1
+        self.n_feat = self.time.out_dim + int(pos_dim) + 1
         self.net = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU(),
                                  nn.Linear(self.hidden, 1))
 
@@ -129,13 +142,13 @@ class LinkPredHead(nn.Module):
 
     def __init__(self, num_nodes: int, d_emb: int, t_train: float, max_walk_len: int,
                  init_irange: float = 1e-3, use_pop_bias: bool = False,
-                 pooler_hidden: int = 32):
+                 time_dim: int = 16, pos_dim: int = 4, hidden_dim: int = 32):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.use_pop_bias = bool(use_pop_bias)
         self.geom = PoincareManifold()
-        self.bag_weights = BagWeights(t_train, max_walk_len, pooler_hidden)
+        self.bag_weights = BagWeights(t_train, max_walk_len, time_dim, pos_dim, hidden_dim)
 
         # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)

@@ -46,8 +46,6 @@ def parse_args() -> argparse.Namespace:
     # ── Model ───────────────────────────────────────────────────────
     p.add_argument("--d-emb", default=64, type=int,
                    help="Embedding dimension.")
-    p.add_argument("--pooler-hidden", default=32, type=int,
-                   help="width of the NN pooler's hidden layer (the net is 3 -> hidden -> 1).")
     p.add_argument("--use-pop-bias", action="store_true",
                    help="Score a learned per-node popularity scalar (zero-init) alongside the distance, "
                         "mixed by the learned weight vector w.")
@@ -97,6 +95,17 @@ def parse_args() -> argparse.Namespace:
                    help="Place PyTorch tensors on CUDA.")
     p.add_argument("--use-gpu-tempest", action="store_true",
                    help="Run Tempest's walk sampler in GPU mode.")
+
+    # ── Pooler widths ───────────────────────────────────────────────
+    # Low-priority knobs: the defaults are the measured design and these are not swept.
+    p.add_argument("--time-dim", default=16, type=int,
+                   help="Total width of the time encoding: 1 linear term + cos/sin over a "
+                        "geometric ladder of relative wavelengths.")
+    p.add_argument("--pos-dim", default=4, type=int,
+                   help="Width of the learned walk-position embedding (1..max_walk_len).")
+    p.add_argument("--hidden-dim", default=32, type=int,
+                   help="Hidden width of the pooler MLP. Pinned independently of the feature "
+                        "count so a feature change does not also move pooler capacity.")
 
     # ── Post-training outputs ───────────────────────────────────────
     p.add_argument("--export-best-embedding-table", action="store_true",
@@ -185,7 +194,9 @@ def main() -> Dict[str, Any]:
 
         d_emb=args.d_emb,
         use_pop_bias=args.use_pop_bias,
-        pooler_hidden=args.pooler_hidden,
+        time_dim=args.time_dim,
+        pos_dim=args.pos_dim,
+        hidden_dim=args.hidden_dim,
 
         K_train=args.k_train,
 

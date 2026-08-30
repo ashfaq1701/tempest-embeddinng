@@ -45,7 +45,10 @@ class TrainerConfig:
     use_pop_bias: bool = False
 
     # Pooler MLP width: the net is 3 -> hidden -> 1.
-    pooler_hidden: int = 32
+    # Pooler feature widths. Low-priority knobs; not swept.
+    time_dim: int = 16
+    pos_dim: int = 4
+    hidden_dim: int = 32
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
@@ -87,7 +90,9 @@ class Trainer:
             t_train=float(config.t_train),
             max_walk_len=int(config.max_walk_len),
             use_pop_bias=bool(config.use_pop_bias),
-            pooler_hidden=int(config.pooler_hidden),
+            time_dim=int(config.time_dim),
+            pos_dim=int(config.pos_dim),
+            hidden_dim=int(config.hidden_dim),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(
