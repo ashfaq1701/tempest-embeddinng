@@ -73,9 +73,9 @@ def parse_args() -> argparse.Namespace:
                    help="Eval negatives per positive (tgb-seq val only).")
 
     # ── Optimisation / training ─────────────────────────────────────
-    p.add_argument("--lr", default=1e-3, type=float,
-                   help="Learning rate.")
-    p.add_argument("--lr-fast", default=1e-2, type=float,
+    p.add_argument("--lr-e", default=1e-3, type=float,
+                   help="Learning rate for the embedding table E (Riemannian updates).")
+    p.add_argument("--lr-network", default=1e-2, type=float,
                    help="Learning rate for every non-embedding param -- the distance temperature "
                         "and the NN pooler -- in their own param group. Adam steps a parameter by "
                         "~lr regardless of gradient size, so this sets how fast they adapt "
@@ -195,8 +195,8 @@ def main() -> Dict[str, Any]:
         start_bias=args.start_bias,
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
-        lr=args.lr,
-        lr_fast=args.lr_fast,
+        lr_e=args.lr_e,
+        lr_network=args.lr_network,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 

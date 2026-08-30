@@ -60,9 +60,9 @@ class TrainerConfig:
     t2nv_q: float = 0.25   # node2vec in-out param
 
     # Constant lr, no weight decay. Two RiemannianAdam param groups: every non-embedding
-    # param (the distance temperature and the NN pooler) rides `lr_fast`, E stays at `lr`.
-    lr: float = 1e-3
-    lr_fast: float = 1e-2
+    # param (the distance temperature and the NN pooler) rides `lr_network`, E stays at `lr_e`.
+    lr_e: float = 1e-3
+    lr_network: float = 1e-2
 
     # Run control.
     num_epochs: int = 50
@@ -102,8 +102,8 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # Two param groups, split by identity: the embedding table at `lr`, everything else
-        # -- the distance temperature and the NN pooler -- at the larger `lr_fast`.
+        # Two param groups, split by identity: the embedding table at `lr_e`, everything else
+        # -- the distance temperature and the NN pooler -- at the larger `lr_network`.
         #
         # Adam moves a parameter by ~lr per step regardless of gradient magnitude, so these 162
         # numbers were slewing at the same rate as a 143M-row embedding table. Two things need to
@@ -116,10 +116,10 @@ class Trainer:
         emb = list(self.model.E.parameters())
         emb_ids = {id(p) for p in emb}
         fast = [p for p in self.model.parameters() if id(p) not in emb_ids]
-        groups = [{"params": emb, "lr": float(config.lr)}]
+        groups = [{"params": emb, "lr": float(config.lr_e)}]
         if fast:
-            groups.append({"params": fast, "lr": float(config.lr_fast)})
-        self.opt = geoopt.optim.RiemannianAdam(groups, lr=float(config.lr), stabilize=10)
+            groups.append({"params": fast, "lr": float(config.lr_network)})
+        self.opt = geoopt.optim.RiemannianAdam(groups, lr=float(config.lr_e), stabilize=10)
 
     # Full-graph ingestion (once, up front)
 
@@ -191,7 +191,8 @@ class Trainer:
 
         return {
             "link": float(link_loss.detach()),
-            "lr": float(self.opt.param_groups[0]["lr"]),
+            "lr_e": float(self.opt.param_groups[0]["lr"]),
+            "lr_network": float(self.opt.param_groups[-1]["lr"]),
         }
 
     # Geometry probe
@@ -317,7 +318,7 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
-                f"lr={self.opt.param_groups[0]['lr']:.0e}  "
+                f"lr_e={self.opt.param_groups[0]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
 
