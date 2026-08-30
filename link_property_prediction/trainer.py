@@ -60,9 +60,9 @@ class TrainerConfig:
     t2nv_q: float = 0.25   # node2vec in-out param
 
     # Constant lr, no weight decay. Two RiemannianAdam param groups: every non-embedding
-    # param (temperature + NN pooler) gets its own (larger) lr, E stays at `lr`.
+    # param (the distance temperature and the NN pooler) rides `lr_fast`, E stays at `lr`.
     lr: float = 1e-3
-    lr_temperature: float = 1e-2
+    lr_fast: float = 1e-2
 
     # Run control.
     num_epochs: int = 50
@@ -102,26 +102,23 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # Two param groups: Riemannian update for E and standard Adam for the head at `lr`,
-        # with the distance temperature split off at `lr_temperature`. Adam moves a parameter by
-        # ~lr per step regardless of gradient size, so the temperature's step size alone sets how
-        # fast the distance scale slews; at the shared lr a dataset whose optimum is ~160 (Patent)
-        # crawls there over a dozen epochs while one at ~2 (ML-20M) arrives in a tenth of an epoch.
-        # Matches either form of the knob -- the linear `geo_temp` or the log-parameterised
-        # `geo_temp_raw` -- and splits by identity, not name, so a head carrying neither yields
-        # one group unchanged.
-        # The fast group is everything the embedding table does not own: the distance
-        # temperature AND the NN pooler. The pooler decides which walk tokens the centroid
-        # listens to; at the embedding lr it re-weights the bag as slowly as the geometry
-        # moves, so a dataset needing a different pooling rule cannot find one before
-        # patience fires. Split by identity, so E alone stays at `lr`.
-        emb_ids = {id(p) for p in self.model.E.parameters()}
+        # Two param groups, split by identity: the embedding table at `lr`, everything else
+        # -- the distance temperature and the NN pooler -- at the larger `lr_fast`.
+        #
+        # Adam moves a parameter by ~lr per step regardless of gradient magnitude, so these 162
+        # numbers were slewing at the same rate as a 143M-row embedding table. Two things need to
+        # move faster than the geometry: the temperature, whose optimum is ~170 on Patent and ~2
+        # on ML-20M, and the pooler, which decides which walk tokens the centroid listens to. At
+        # the embedding lr neither can adapt before early stopping fires -- Patent's best val
+        # landed on epoch 1 and the run died at epoch 4. Measured: temperature alone does NOT fix
+        # it (stalls at epoch 3 with an identical geo_temp trajectory); adding the pooler does,
+        # taking Patent's test MRR 0.1630 -> 0.2633.
+        emb = list(self.model.E.parameters())
+        emb_ids = {id(p) for p in emb}
         fast = [p for p in self.model.parameters() if id(p) not in emb_ids]
-        fast_ids = {id(p) for p in fast}
-        rest = [p for p in self.model.parameters() if id(p) not in fast_ids]
-        groups = [{"params": rest, "lr": float(config.lr)}]
+        groups = [{"params": emb, "lr": float(config.lr)}]
         if fast:
-            groups.append({"params": fast, "lr": float(config.lr_temperature)})
+            groups.append({"params": fast, "lr": float(config.lr_fast)})
         self.opt = geoopt.optim.RiemannianAdam(groups, lr=float(config.lr), stabilize=10)
 
     # Full-graph ingestion (once, up front)
