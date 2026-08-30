@@ -161,6 +161,7 @@ def main() -> Dict[str, Any]:
     print(f"  T_train:       {stats.T_train:.0f}")
     print(f"  median_inter_arrival: {stats.median_inter_arrival:.1f}")
     print(f"  mean_inter_arrival:   {stats.mean_inter_arrival:.1f}")
+    print(f"  ts_quantum:           {stats.ts_quantum:.1f}")
     print(f"  train edges:   {len(train_sp.sources):,}")
     print(f"  val edges:     {len(val_sp.sources):,}")
     print(f"  test edges:    {len(test_sp.sources):,}")
@@ -186,6 +187,7 @@ def main() -> Dict[str, Any]:
         num_nodes=num_nodes,
         dst_pool=dst_pool,
         t_train=float(stats.T_train),
+        ts_quantum=float(stats.ts_quantum),
 
         d_emb=args.d_emb,
         use_pop_bias=args.use_pop_bias,

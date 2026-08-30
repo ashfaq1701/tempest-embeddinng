@@ -64,9 +64,10 @@ class TimeEncoding(nn.Module):
     frequency with its cosine only.
     """
 
-    LAM_MIN, LAM_MAX = 1e-4, 1.0        # wavelengths in units of T_train
+    LAM_MIN, LAM_MAX = 1e-4, 1.0        # window in units of T_train, BEFORE the resolution floor
+    NYQUIST_FACTOR = 2.5                # shortest wavelength, in timestamp-grid quanta
 
-    def __init__(self, time_dim: int, t_train: float):
+    def __init__(self, time_dim: int, t_train: float, ts_quantum: float = 0.0):
         super().__init__()
         if int(time_dim) < 3:
             raise ValueError(f"time_dim must be >= 3 (1 linear + >= 2 periodic), got {time_dim}")
@@ -74,8 +75,27 @@ class TimeEncoding(nn.Module):
         self.t_train = max(float(t_train), 1.0)
         n_per = self.time_dim - 1                                       # periodic slots
         k = (n_per + 1) // 2                                            # frequencies, ceil
+        # A wavelength shorter than ~2x the timestamp grid resolves nothing: every age is a
+        # multiple of the grid, so such a cosine is a deterministic hash of the grid index
+        # rather than a time signal. Floor the ladder at the data's own resolution. Measured
+        # under the bare LAM_MIN: 4/8 frequencies below Nyquist on YouTube and Flickr, 3/8 on
+        # Patent, 2/8 on WikiLink; 0/8 on the four second-grained datasets, where the floor
+        # falls below LAM_MIN and this max() does not fire.
+        #
+        # NYQUIST_FACTOR is 2.5, not 2.0. Nyquist wants strictly more than two samples per
+        # wavelength, and landing exactly on 2 is degenerate on a regular grid: an age of n
+        # grid steps then has phase pi*n, so sin(pi*n) == 0 for every n and the finest sine
+        # channel is identically zero (measured: std 1e-5 vs 0.71 for its cosine). Any factor
+        # above 2 removes it; 2.5 keeps the ladder tight to the grid with margin to spare.
+        lam_min = max(self.LAM_MIN, self.NYQUIST_FACTOR * float(ts_quantum) / self.t_train)
+        if self.LAM_MAX / lam_min < 10.0:
+            raise ValueError(
+                f"timestamp quantum {ts_quantum} leaves under a decade of ladder below "
+                f"T_train={t_train} (lam_min={lam_min:.3g}); the frequencies would be "
+                f"near-duplicates. Needs roughly >20 distinct training timestamps.")
         i = torch.arange(k, dtype=torch.float32) / max(k - 1, 1)
-        wl = self.LAM_MIN * (self.LAM_MAX / self.LAM_MIN) ** i          # geometric, relative
+        wl = lam_min * (self.LAM_MAX / lam_min) ** i                    # geometric, relative
+        self.lam_min = float(lam_min)
         self.n_per = n_per
         self.register_buffer("w", 2.0 * math.pi / wl)                   # [k], fixed
 
@@ -107,10 +127,10 @@ class BagWeights(nn.Module):
     """
 
     def __init__(self, t_train: float, max_walk_len: int, time_dim: int = 16,
-                 pos_dim: int = 4, hidden_dim: int = 32):
+                 pos_dim: int = 4, hidden_dim: int = 32, ts_quantum: float = 0.0):
         super().__init__()
         self.hidden = int(hidden_dim)
-        self.time = TimeEncoding(time_dim, t_train)
+        self.time = TimeEncoding(time_dim, t_train, ts_quantum)
         # +1 row for the padding index 0; real positions are 1..max_walk_len.
         self.pos = nn.Embedding(int(max_walk_len) + 1, int(pos_dim), padding_idx=0)
         # Small init: the time features are bounded in [-1, 1] and rad is O(1), so a default
@@ -138,13 +158,15 @@ class LinkPredHead(nn.Module):
 
     def __init__(self, num_nodes: int, d_emb: int, t_train: float, max_walk_len: int,
                  init_irange: float = 1e-3, use_pop_bias: bool = False,
-                 time_dim: int = 16, pos_dim: int = 4, hidden_dim: int = 32):
+                 time_dim: int = 16, pos_dim: int = 4, hidden_dim: int = 32,
+                 ts_quantum: float = 0.0):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.use_pop_bias = bool(use_pop_bias)
         self.geom = PoincareManifold()
-        self.bag_weights = BagWeights(t_train, max_walk_len, time_dim, pos_dim, hidden_dim)
+        self.bag_weights = BagWeights(t_train, max_walk_len, time_dim, pos_dim, hidden_dim,
+                                      ts_quantum)
 
         # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)

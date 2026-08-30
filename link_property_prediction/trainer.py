@@ -45,6 +45,10 @@ class TrainerConfig:
     use_pop_bias: bool = False
 
     # Pooler MLP width: the net is 3 -> hidden -> 1.
+    # Timestamp-grid resolution (data_stats.ts_quantum). Floors the TimeEncoding ladder so no
+    # wavelength lands below Nyquist for the grid. 0.0 leaves the bare LAM_MIN in place.
+    ts_quantum: float = 0.0
+
     # Pooler feature widths. Low-priority knobs; not swept.
     time_dim: int = 16
     pos_dim: int = 4
@@ -91,6 +95,7 @@ class Trainer:
             time_dim=int(config.time_dim),
             pos_dim=int(config.pos_dim),
             hidden_dim=int(config.hidden_dim),
+            ts_quantum=float(config.ts_quantum),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(
