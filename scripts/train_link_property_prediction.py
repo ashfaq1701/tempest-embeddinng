@@ -147,7 +147,7 @@ def main() -> Dict[str, Any]:
 
     # Negative-sampling pool, computed by the suite from the full train split.
     dst_pool = suite.dst_pool()
-    stats = compute_train_stats(train_sp.timestamps, train_sp.sources, train_sp.destinations)
+    stats = compute_train_stats(train_sp.timestamps)
 
     print(f"  num_nodes:     {num_nodes:,}")
     _pool_kind = "destinations (bipartite)" if args.is_bipartite else "nodes (non-bipartite)"
@@ -182,7 +182,6 @@ def main() -> Dict[str, Any]:
         num_nodes=num_nodes,
         dst_pool=dst_pool,
         t_train=float(stats.T_train),
-        mean_node_inter_arrival=float(stats.mean_node_inter_arrival),
 
         d_emb=args.d_emb,
         use_pop_bias=args.use_pop_bias,

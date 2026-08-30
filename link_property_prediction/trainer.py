@@ -37,7 +37,6 @@ class TrainerConfig:
     t_train: float = 1.0
 
     # Mean-field per-node inter-event time; AGE scale for the pooling recency weight.
-    mean_node_inter_arrival: float = 1.0
 
     # Embedding dimension.
     d_emb: int = 64
@@ -85,7 +84,8 @@ class Trainer:
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
-            mean_node_inter_arrival=float(config.mean_node_inter_arrival),
+            t_train=float(config.t_train),
+            max_walk_len=int(config.max_walk_len),
             use_pop_bias=bool(config.use_pop_bias),
             pooler_hidden=int(config.pooler_hidden),
         ).to(self.device)

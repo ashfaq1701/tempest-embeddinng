@@ -5,8 +5,6 @@ Fields:
     T_train                     — span (t_max - t_min), > 0
     median_inter_arrival        — median Δt between consecutive events
     mean_inter_arrival          — mean Δt between consecutive events
-    mean_node_inter_arrival     — T_train*N/(2E): mean-field per-node inter-event time
-                                  (over-estimates on degree-skewed graphs)
 """
 
 from dataclasses import dataclass
@@ -23,15 +21,10 @@ class TrainStats:
     T_train: float
     median_inter_arrival: float
     mean_inter_arrival: float
-    mean_node_inter_arrival: float
 
 
-def compute_train_stats(
-    timestamps: np.ndarray,
-    sources: np.ndarray,
-    destinations: np.ndarray,
-) -> TrainStats:
-    """Compute every derived constant from the training-split arrays.
+def compute_train_stats(timestamps: np.ndarray) -> TrainStats:
+    """Compute every derived constant from the training-split timestamps.
 
     Inter-arrival stats use Δt between sorted consecutive events, excluding zero gaps
     (same-timestamp events are common and would skew the central tendency).
@@ -56,18 +49,10 @@ def compute_train_stats(
         median_ia = float(np.median(gaps))
         mean_ia = float(np.mean(gaps))
 
-    # Mean-field per-node inter-event time = T_train * N / (2E); N = distinct nodes,
-    # E = edges. Uniform-degree estimate — over-estimates on degree-skewed graphs.
-    n_edges = int(ts.size)
-    n_nodes = int(np.unique(np.concatenate([
-        np.asarray(sources).ravel(), np.asarray(destinations).ravel()])).size)
-    mean_node_ia = float(T_train * n_nodes / (2.0 * n_edges)) if n_edges > 0 else 1.0
-
     return TrainStats(
         t_min=t_min,
         t_max=t_max,
         T_train=T_train,
         median_inter_arrival=median_ia,
         mean_inter_arrival=mean_ia,
-        mean_node_inter_arrival=mean_node_ia,
     )
