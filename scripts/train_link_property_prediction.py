@@ -46,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     # ── Model ───────────────────────────────────────────────────────
     p.add_argument("--d-emb", default=64, type=int,
                    help="Embedding dimension.")
+    p.add_argument("--pooler-hidden", default=32, type=int,
+                   help="width of the NN pooler's hidden layer (the net is 3 -> hidden -> 1).")
     p.add_argument("--use-pop-bias", action="store_true",
                    help="Score a learned per-node popularity scalar (zero-init) alongside the distance, "
                         "mixed by the learned weight vector w.")
@@ -71,15 +73,21 @@ def parse_args() -> argparse.Namespace:
                    help="Eval negatives per positive (tgb-seq val only).")
 
     # ── Optimisation / training ─────────────────────────────────────
-    p.add_argument("--lr", default=1e-3, type=float,
-                   help="Learning rate.")
+    p.add_argument("--lr-embedding", default=1e-3, type=float,
+                   help="Learning rate for the per-node lookup tables: the embedding table E "
+                        "(Riemannian updates) and, when the popularity channel is on, pop_bias.")
+    p.add_argument("--lr-network", default=1e-2, type=float,
+                   help="Learning rate for the network: the distance temperature and the NN "
+                        "pooler, in their own param group. Adam steps a parameter by ~lr "
+                        "regardless of gradient size, so this sets how fast they adapt relative "
+                        "to the embedding tables.")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
                    help="Val/test eval batch size.")
     p.add_argument("--num-epochs", default=50, type=int,
                    help="Max training epochs.")
-    p.add_argument("--early-stop-patience", default=3, type=int,
+    p.add_argument("--early-stop-patience", default=5, type=int,
                    help="Early-stop patience in epochs.")
 
     # ── System ──────────────────────────────────────────────────────
@@ -178,6 +186,7 @@ def main() -> Dict[str, Any]:
 
         d_emb=args.d_emb,
         use_pop_bias=args.use_pop_bias,
+        pooler_hidden=args.pooler_hidden,
 
         K_train=args.k_train,
 
@@ -187,7 +196,8 @@ def main() -> Dict[str, Any]:
         start_bias=args.start_bias,
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
-        lr=args.lr,
+        lr_embedding=args.lr_embedding,
+        lr_network=args.lr_network,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 

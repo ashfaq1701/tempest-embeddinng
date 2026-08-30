@@ -5,9 +5,9 @@ learned per-node scalar pop_bias[v] (zero-init, so it contributes exactly 0 at s
 FIXED unit weight -- the model sharpens the geometry via geo_temp while popularity rides alongside at
 a constant scale.
 
-P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over
--age/mnia - (pos-1), both priors RAW (no log1p) and at fixed unit scale -- there is no learned pooling
-temperature. Learned head params: geo_temp and num_nodes popularity scalars when the channel is on."""
+P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over a
+3-feature MLP over [rec, pos, rad] at a fixed hidden width. Learned head params:
+geo_temp, the MLP pooler, and num_nodes popularity scalars when the channel is on."""
 
 import geoopt
 import torch
@@ -27,23 +27,47 @@ class PoincareManifold:
         """Elementwise geodesic distance, broadcasting over leading dims. LOWER = closer."""
         return self.manifold.dist(x, y)
 
+    def dist0(self, x: torch.Tensor) -> torch.Tensor:
+        """Hyperbolic radius: geodesic distance from the origin (0 at center, large near boundary)."""
+        return self.manifold.dist0(x)
+
     def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """Weighted gyro-midpoint: x [Q,T,d], w [Q,T] -> [Q,d]."""
         return self.manifold.weighted_midpoint(x, weights=w, reducedim=[-2], dim=-1, keepdim=False)
 
 
 class BagWeights(nn.Module):
+    """Pooling weights = softmax(MLP([rec, pos, rad])), with mnia as a fixed age scale. The softmax
+    over tokens dampens the random init.
 
-    def __init__(self, mnia: float):
+    Features (`rad` is detached, so the pooler reads geometry but does not backprop through it):
+      rec -- -(age / mnia), token recency at a fixed age scale
+      pos -- -(position - 1), depth along the walk
+      rad -- geodesic distance from the origin: the token's hyperbolic radius
+
+    A fourth feature `dev` (geodesic distance to the bag's unweighted centroid) was measured and
+    REMOVED -- see the pooler-feature ablation in CLAUDE.md. It is recoverable from commit e6b6079c.
+
+    `hidden` is the MLP width: the net is 3 -> hidden -> 1.
+    """
+
+    N_FEAT = 3
+
+    def __init__(self, mnia: float, hidden: int = 32):
         super().__init__()
-        self.mnia = float(mnia)                                              # fixed age scale
+        self.mnia = float(mnia)                 # fixed age scale
+        self.hidden = int(hidden)
+        self.net = nn.Sequential(nn.Linear(self.N_FEAT, self.hidden), nn.GELU(),
+                                 nn.Linear(self.hidden, 1))
 
-    def forward(self, tokens: WalkTokens, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        """x [Q,T,d], valid [Q,T] -> pooling weights [Q,T] summing to 1, 0 on padding. (x sets dtype.)"""
-        age = tokens.ages.clamp_min(0).float()                               # seed = 0, ctx >= 1, pad -> 0
-        rec = -age / self.mnia                                               # LINEAR, unbounded  [Q, T]
-        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                 # LINEAR, in [-(L-1), 0]
-        logits = (rec + pos).to(x.dtype)                                     # [Q, T]
+    def forward(self, geom: "PoincareManifold", tokens: WalkTokens, x: torch.Tensor,
+                valid: torch.Tensor) -> torch.Tensor:
+        """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
+        rec = -(tokens.ages.clamp_min(0).float() / self.mnia)                   # -(age/mnia)
+        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                    # -(pos-1)
+        rad = geom.dist0(x.detach())                                            # [Q, T] hyperbolic radius
+        feat = torch.stack([rec, pos, rad], dim=-1).to(x.dtype)                 # [Q, T, 3]
+        logits = self.net(feat).squeeze(-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
 
@@ -51,13 +75,14 @@ class LinkPredHead(nn.Module):
     """E is a ManifoldParameter; the pooling weights carry no learned parameters."""
 
     def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float,
-                 init_irange: float = 1e-3, use_pop_bias: bool = False):
+                 init_irange: float = 1e-3, use_pop_bias: bool = False,
+                 pooler_hidden: int = 32):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.use_pop_bias = bool(use_pop_bias)
         self.geom = PoincareManifold()
-        self.bag_weights = BagWeights(mean_node_inter_arrival)
+        self.bag_weights = BagWeights(mean_node_inter_arrival, pooler_hidden)
 
         # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
@@ -84,7 +109,7 @@ class LinkPredHead(nn.Module):
             valid[cold, 0] = True
 
         x = F.embedding(nodes, emb)                                             # [Q, T, d]
-        w = self.bag_weights(tokens, x, valid)                                  # [Q, T] sums to 1, 0 on padding
+        w = self.bag_weights(self.geom, tokens, x, valid)                       # [Q, T] sums to 1, 0 on padding
         return self.geom.midpoint(x, w)                                         # [Q, d]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:

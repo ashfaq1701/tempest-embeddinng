@@ -45,6 +45,9 @@ class TrainerConfig:
     # Score a learned per-node popularity scalar (zero-init) alongside the distance, mixed by w.
     use_pop_bias: bool = False
 
+    # Pooler MLP width: the net is 3 -> hidden -> 1.
+    pooler_hidden: int = 32
+
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
 
@@ -56,12 +59,15 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, one RiemannianAdam param group, no weight decay.
-    lr: float = 1e-3
+    # Constant lr, no weight decay. Two RiemannianAdam param groups, split embeddings vs network:
+    # the per-node tables (E, and pop_bias when the channel is on) ride `lr_embedding`; the network
+    # (the distance temperature and the NN pooler) rides the larger `lr_network`.
+    lr_embedding: float = 1e-3
+    lr_network: float = 1e-2
 
     # Run control.
     num_epochs: int = 50
-    early_stop_patience: int = 3
+    early_stop_patience: int = 5
 
     # System.
     seed: int = 42
@@ -81,6 +87,7 @@ class Trainer:
             d_emb=int(config.d_emb),
             mean_node_inter_arrival=float(config.mean_node_inter_arrival),
             use_pop_bias=bool(config.use_pop_bias),
+            pooler_hidden=int(config.pooler_hidden),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(
@@ -96,10 +103,26 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # One param group at a single lr: Riemannian update for E, standard Adam for the head.
-        self.opt = geoopt.optim.RiemannianAdam(
-            self.model.parameters(), lr=float(config.lr), stabilize=10,
-        )
+        # Two param groups, split by identity into per-node tables vs the network:
+        #   lr_embedding -- E, plus pop_bias when the popularity channel is on. Both are
+        #                   num_nodes-row lookup tables: one row per node, each row touched only
+        #                   when that node appears in a batch, so they want the slow lr.
+        #   lr_network   -- the distance temperature and the NN pooler. A handful of parameters
+        #                   (162 at hidden 32) updated by every example in every batch.
+        #
+        # Adam moves a parameter by ~lr per step regardless of gradient magnitude, so at a shared
+        # lr the network slews as slowly as a 143M-row table and cannot adapt before early stopping
+        # fires. Measured on Patent d=64 k=5: single group 0.1630 (died at epoch 1); temperature
+        # alone fast, stalled at epoch 3; pooler alone fast, 0.1644; both fast, 0.2633.
+        emb = list(self.model.E.parameters())
+        if getattr(self.model, "use_pop_bias", False):
+            emb += list(self.model.pop_bias.parameters())
+        emb_ids = {id(p) for p in emb}
+        net = [p for p in self.model.parameters() if id(p) not in emb_ids]
+        groups = [{"params": emb, "lr": float(config.lr_embedding)}]
+        if net:
+            groups.append({"params": net, "lr": float(config.lr_network)})
+        self.opt = geoopt.optim.RiemannianAdam(groups, lr=float(config.lr_embedding), stabilize=10)
 
     # Full-graph ingestion (once, up front)
 
@@ -171,7 +194,8 @@ class Trainer:
 
         return {
             "link": float(link_loss.detach()),
-            "lr": float(self.opt.param_groups[0]["lr"]),
+            "lr_embedding": float(self.opt.param_groups[0]["lr"]),
+            "lr_network": float(self.opt.param_groups[-1]["lr"]),
         }
 
     # Geometry probe
@@ -297,7 +321,7 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
-                f"lr={self.opt.param_groups[0]['lr']:.0e}  "
+                f"lr_emb={self.opt.param_groups[0]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
 
