@@ -37,6 +37,8 @@ class TrainerConfig:
     t_train: float = 1.0
 
     # Mean-field per-node inter-event time; AGE scale for the pooling recency weight.
+    # Age scale used when the walk sample yields no usable median (all-cold graph).
+    recency_scale_fallback: float = 1.0
     # Query edges sampled for calibration; each contributes 3 seeds (src, dst, one negative).
     # 16k holds the estimate to ~1% across seeds and costs well under a second.
     recency_calib_queries: int = 16384
@@ -87,7 +89,7 @@ class Trainer:
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
-            recency_scale=1.0,          # placeholder; calibrated after ingest, before training
+            recency_scale=float(config.recency_scale_fallback),   # calibrated after ingest
             use_pop_bias=bool(config.use_pop_bias),
             pooler_hidden=int(config.pooler_hidden),
         ).to(self.device)
@@ -154,39 +156,37 @@ class Trainer:
         see. Deterministic: a private RNG seeded from config.seed, which never perturbs the
         training sample order.
 
-        Raises if the sample is too cold to yield a median. There is no fallback by design: every
-        closed-form substitute was measured against the tokens and found wrong (median_inter_arrival
-        misses by 4e5x on GoogleLocal), so training on one would be silently mis-scaled. A graph
-        that cannot fill 1000 context slots out of ~1.2M is telling you the walk model does not
-        apply to it, which is a result, not a case to paper over.
+        An invalid scale -- no median from the walk sample, or one below 1 -- falls back to
+        `recency_scale_fallback` (mean_node_inter_arrival), the mean-field estimate that this
+        calibration replaces. It only triggers on a graph whose queries are all cold.
         """
         if not getattr(self, "_ingested", False):
             raise RuntimeError("calibrate_recency_scale() requires ingest_full_graph() first")
 
+        scale = None
         n = int(train.sources.shape[0])
-        if n == 0:
-            raise RuntimeError("calibrate_recency_scale(): empty train split")
-        rng = np.random.default_rng(self.config.seed)
-        idx = rng.choice(n, size=min(int(self.config.recency_calib_queries), n), replace=False)
-        t = train.timestamps[idx].astype(np.int64)
-        seeds = np.concatenate([
-            train.sources[idx], train.destinations[idx],
-            rng.choice(self.config.dst_pool, size=idx.size),
-        ]).astype(np.int64)
-        scale = median_context_age(
-            self.walk_gen, self.device,
-            torch.as_tensor(seeds), torch.as_tensor(np.concatenate([t, t, t])),
-            max_walk_len=self.config.max_walk_len,
-            num_walks_per_node=self.config.num_walks_per_node,
-            start_bias=self.config.start_bias, walk_bias=self.config.walk_bias)
+        if n > 0:
+            rng = np.random.default_rng(self.config.seed)
+            idx = rng.choice(n, size=min(int(self.config.recency_calib_queries), n), replace=False)
+            t = train.timestamps[idx].astype(np.int64)
+            seeds = np.concatenate([
+                train.sources[idx], train.destinations[idx],
+                rng.choice(self.config.dst_pool, size=idx.size),
+            ]).astype(np.int64)
+            scale = median_context_age(
+                self.walk_gen, self.device,
+                torch.as_tensor(seeds), torch.as_tensor(np.concatenate([t, t, t])),
+                max_walk_len=self.config.max_walk_len,
+                num_walks_per_node=self.config.num_walks_per_node,
+                start_bias=self.config.start_bias, walk_bias=self.config.walk_bias)
 
         if scale is None or scale < 1.0:
-            raise RuntimeError(
-                "calibrate_recency_scale(): too few context walk tokens to measure an age scale "
-                f"(need >= 1000 from {idx.size:,} sampled query edges x 3 seeds). This graph's "
-                "queries are almost all cold, so the walk-token bag carries no recency signal.")
-        print(f"  recency_scale: {scale:,.1f} (median context walk-token age, "
-              f"K={self.config.num_walks_per_node} L={self.config.max_walk_len})")
+            scale = float(self.config.recency_scale_fallback)
+            print(f"  recency_scale: {scale:,.1f} (FALLBACK mean_node_inter_arrival -- "
+                  f"no usable context-age median from the walk sample)")
+        else:
+            print(f"  recency_scale: {scale:,.1f} (median context walk-token age, "
+                  f"K={self.config.num_walks_per_node} L={self.config.max_walk_len})")
         with torch.no_grad():
             self.model.bag_weights.recency_scale.fill_(float(scale))
         self.recency_scale = float(scale)

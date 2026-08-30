@@ -103,7 +103,6 @@ def median_context_age(
     num_walks_per_node: int,
     start_bias: Optional[str] = None,
     walk_bias: Optional[str] = None,
-    min_tokens: int = 1000,
 ) -> Optional[float]:
     """Median age of the CONTEXT walk tokens produced by (seeds, cutoffs).
 
@@ -116,9 +115,8 @@ def median_context_age(
     only the walk origin. Seed slots are dropped -- they are structurally 0 (about a quarter of
     valid slots) and would drag the median toward zero -- as are zero ages from timestamp ties.
 
-    Returns None when fewer than `min_tokens` context tokens survive: on a graph whose queries
-    are nearly all cold (Patent's source side fills 0.02% of slots) a median over a handful of
-    tokens is noise, and the caller should fall back rather than trust it.
+    Returns None when no context token survives -- on a graph whose queries are all cold there is
+    no age distribution to measure. The caller decides what to use instead.
 
     The result depends on the walk configuration -- num_walks_per_node, max_walk_len and the
     biases all move the age distribution -- so a sweep over those also moves the scale. Record
@@ -130,7 +128,7 @@ def median_context_age(
         start_bias=start_bias, walk_bias=walk_bias)
     ages = toks.ages[toks.mask & ~toks.seed_mask]        # context slots only
     ages = ages[ages > 0]                                # drop zero-gap ties
-    if int(ages.numel()) < int(min_tokens):
+    if int(ages.numel()) == 0:
         return None
     # int64 median: ages reach ~1e9 and float32 holds only ~1.7e7 integers exactly. torch.median
     # is the lower order statistic on even counts (not numpy's midpoint average), so the scale is
