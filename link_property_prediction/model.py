@@ -10,7 +10,6 @@ MLP of [time encoding | position embedding | rad] at a fixed hidden width. Learn
 geo_temp, the MLP pooler (encoder included), and num_nodes popularity scalars when on."""
 
 import math
-from dataclasses import replace
 
 import geoopt
 import torch
@@ -170,14 +169,6 @@ class LinkPredHead(nn.Module):
         if bool(cold.any()):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
-            # Slot 0 now IS the seed, so it must carry the seed's hop index. Its position is still
-            # 0 from the padding fill, which indexes the pooler's frozen padding row instead of the
-            # learned "position 1 = seed" row. Harmless today -- a cold bag has exactly one valid
-            # token, so its softmax weight is 1.0 whatever the logit -- but it would quietly become
-            # wrong the moment a cold bag carried more than one token.
-            positions = tokens.positions.clone()
-            positions[cold, 0] = 1
-            tokens = replace(tokens, positions=positions)
 
         x = F.embedding(nodes, emb)                                             # [Q, T, d]
         w = self.bag_weights(self.geom, tokens, x, valid)                       # [Q, T] sums to 1, 0 on padding
