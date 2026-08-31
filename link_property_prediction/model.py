@@ -6,7 +6,7 @@ FIXED unit weight -- the model sharpens the geometry via geo_temp while populari
 a constant scale.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over an
-MLP of [normalised age | one-hot position | rad] at a fixed hidden width. Ages are min-max
+MLP of [normalised age | raw position | rad] at a fixed hidden width. Ages are min-max
 log1p'd and standardised against statistics pooled over both bags of the batch, so the pooler
 carries no dataset-derived time constant. Learned head params: geo_temp, the MLP pooler,
 and num_nodes popularity scalars when on."""
@@ -48,13 +48,14 @@ class BagWeights(nn.Module):
       age_norm -- log1p(age), standardised to mean 0 / std 1 against statistics pooled over both
                   bags, by LinkPredHead.normalize_ages. It arrives already normalised; this
                   module applies no scale of its own, so no dataset constant enters here.
-      pos      -- ONE-HOT over the hop index 1..max_walk_len. Padding (index 0) is dropped, so a
-                  padded slot is the all-zero vector rather than a category of its own.
+      pos      -- the RAW hop index as one scalar: 1 = seed .. max_walk_len = oldest, padding 0.
+                  Padded slots are masked out of the softmax, so their value never matters.
       rad      -- geodesic distance from the origin: the token's hyperbolic radius
 
-    Position is one-hot rather than a learned embedding or a sinusoid: there are only
-    max_walk_len distinct values (5 in the default config), so one-hot is exact and carries no
-    parameters -- the first Linear learns whatever per-hop weight it wants directly.
+    Position is a RAW SCALAR here, not one-hot. One-hot lets the first Linear learn an arbitrary
+    per-hop weight; a scalar forces the response to be affine in the hop index, so the pooler can
+    only express a monotone depth preference and cannot single out, say, the seed slot. That is
+    the trade this arm measures: 3 features and 162 head params against 7 and 290.
 
     `hidden` is the MLP width, pinned independently of the feature count: under an earlier rule
     where it scaled with the feature count, every feature change silently moved pooler capacity
@@ -65,8 +66,8 @@ class BagWeights(nn.Module):
         super().__init__()
         self.max_walk_len = int(max_walk_len)
         self.hidden = int(hidden_dim)
-        # 1 normalised age + max_walk_len one-hot position slots + 1 radius.
-        self.n_feat = 1 + self.max_walk_len + 1
+        # 1 normalised age + 1 raw position scalar + 1 radius.
+        self.n_feat = 3
         self.net = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU(),
                                  nn.Linear(self.hidden, 1))
 
@@ -76,12 +77,10 @@ class BagWeights(nn.Module):
         # ages arrive ALREADY log1p'd and standardised by LinkPredHead.normalize_ages; padding keeps
         # its -1 sentinel and is masked out of the softmax below, so its value never matters.
         age = tokens.ages.unsqueeze(-1).to(x.dtype)                             # [Q, T, 1]
-        # One-hot over hop index 1..max_walk_len. Column 0 (padding) is dropped, so a padded slot
-        # is the all-zero vector rather than a category of its own.
-        pos = tokens.positions.clamp(0, self.max_walk_len).long()               # [Q, T]
-        p_oh = F.one_hot(pos, self.max_walk_len + 1)[..., 1:].to(x.dtype)       # [Q, T, L]
+        # RAW hop index as a single scalar, 1 = seed .. max_walk_len = oldest, padding 0.
+        pos = tokens.positions.clamp_min(0).unsqueeze(-1).to(x.dtype)           # [Q, T, 1]
         rad = geom.dist0(x.detach()).unsqueeze(-1)                              # [Q, T, 1]
-        feat = torch.cat([age, p_oh, rad], dim=-1).to(x.dtype)                  # [Q, T, n_feat]
+        feat = torch.cat([age, pos, rad], dim=-1).to(x.dtype)                   # [Q, T, 3]
         logits = self.net(feat).squeeze(-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
