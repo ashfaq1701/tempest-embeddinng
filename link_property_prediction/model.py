@@ -5,9 +5,12 @@ learned per-node scalar pop_bias[v] (zero-init, so it contributes exactly 0 at s
 FIXED unit weight -- the model sharpens the geometry via geo_temp while popularity rides alongside at
 a constant scale.
 
-P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over a
-3-feature MLP over [rec, pos, rad] at a fixed hidden width. Learned head params:
-geo_temp, the MLP pooler, and num_nodes popularity scalars when the channel is on."""
+P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over an
+MLP of [log1p(age) | raw position | rad] at a fixed hidden width. Nothing is standardised: log1p
+is a fixed function of the age alone, so no batch-dependent or dataset-derived quantity enters
+the pooler. Learned head params: geo_temp, the MLP pooler, and num_nodes popularity scalars
+when on."""
+
 
 import geoopt
 import torch
@@ -37,36 +40,49 @@ class PoincareManifold:
 
 
 class BagWeights(nn.Module):
-    """Pooling weights = softmax(MLP([rec, pos, rad])), with mnia as a fixed age scale. The softmax
-    over tokens dampens the random init.
+    """Pooling weights = softmax(MLP([age_norm | onehot(position) | rad])).
 
     Features (`rad` is detached, so the pooler reads geometry but does not backprop through it):
-      rec -- -(age / mnia), token recency at a fixed age scale
-      pos -- -(position - 1), depth along the walk
-      rad -- geodesic distance from the origin: the token's hyperbolic radius
+      age      -- log1p(age). NOT standardised: log1p is a fixed function of the age alone, so
+                  the feature stays absolutely anchored and no batch-dependent quantity enters
+                  the pooler.
+      pos      -- the RAW hop index as one scalar, 1..max_walk_len, padding 0. Padded slots are
+                  masked out of the softmax, so their value never matters.
+      rad      -- geodesic distance from the origin: the token's hyperbolic radius
 
-    A fourth feature `dev` (geodesic distance to the bag's unweighted centroid) was measured and
-    REMOVED -- see the pooler-feature ablation in CLAUDE.md. It is recoverable from commit e6b6079c.
+    Position is a RAW SCALAR here, not one-hot. One-hot lets the first Linear learn an arbitrary
+    per-hop weight; a scalar forces the response to be affine in the hop index, so the pooler can
+    only express a monotone depth preference and cannot single out, say, the seed slot. That is
+    the trade this arm measures: 3 features and 162 head params against 7 and 290.
 
-    `hidden` is the MLP width: the net is 3 -> hidden -> 1.
+    `hidden` is the MLP width, pinned independently of the feature count: under an earlier rule
+    where it scaled with the feature count, every feature change silently moved pooler capacity
+    too and the two effects could not be separated (see the ablation in CLAUDE.md).
     """
 
-    N_FEAT = 3
-
-    def __init__(self, mnia: float, hidden: int = 32):
+    def __init__(self, max_walk_len: int, hidden_dim: int = 32):
         super().__init__()
-        self.mnia = float(mnia)                 # fixed age scale
-        self.hidden = int(hidden)
-        self.net = nn.Sequential(nn.Linear(self.N_FEAT, self.hidden), nn.GELU(),
+        self.max_walk_len = int(max_walk_len)
+        self.hidden = int(hidden_dim)
+        # 1 normalised age + 1 raw position scalar + 1 radius.
+        self.n_feat = 3
+        self.net = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU(),
                                  nn.Linear(self.hidden, 1))
 
     def forward(self, geom: "PoincareManifold", tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
-        rec = -(tokens.ages.clamp_min(0).float() / self.mnia)                   # -(age/mnia)
-        pos = -(tokens.positions.clamp_min(1).float() - 1.0)                    # -(pos-1)
-        rad = geom.dist0(x.detach())                                            # [Q, T] hyperbolic radius
-        feat = torch.stack([rec, pos, rad], dim=-1).to(x.dtype)                 # [Q, T, 3]
+        # log1p compresses ages that span orders of magnitude and are heavily right-skewed
+        # (measured on real YouTube tokens: skew +1.83 raw, -1.07 after; and the mean is 2-3x the
+        # median on every dataset in the suite). It is a fixed function of the age alone, so the
+        # feature stays absolutely anchored -- a given age maps to the same value in every batch
+        # and on every dataset. clamp_min(0) sends the -1 padding sentinel to log1p(0) = 0 rather
+        # than -inf; padded slots are masked out of the softmax below in any case.
+        age = torch.log1p(tokens.ages.clamp_min(0).to(x.dtype)).unsqueeze(-1)   # [Q, T, 1]
+        # RAW hop index: 1 = seed .. max_walk_len = oldest, padding 0. Masked out below.
+        pos = tokens.positions.unsqueeze(-1).to(x.dtype)                        # [Q, T, 1]
+        rad = geom.dist0(x.detach()).unsqueeze(-1)                              # [Q, T, 1]
+        feat = torch.cat([age, pos, rad], dim=-1).to(x.dtype)                   # [Q, T, 3]
         logits = self.net(feat).squeeze(-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
@@ -74,15 +90,15 @@ class BagWeights(nn.Module):
 class LinkPredHead(nn.Module):
     """E is a ManifoldParameter; the pooling weights carry no learned parameters."""
 
-    def __init__(self, num_nodes: int, d_emb: int, mean_node_inter_arrival: float,
+    def __init__(self, num_nodes: int, d_emb: int, max_walk_len: int,
                  init_irange: float = 1e-3, use_pop_bias: bool = False,
-                 pooler_hidden: int = 32):
+                 hidden_dim: int = 32):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.use_pop_bias = bool(use_pop_bias)
         self.geom = PoincareManifold()
-        self.bag_weights = BagWeights(mean_node_inter_arrival, pooler_hidden)
+        self.bag_weights = BagWeights(max_walk_len, hidden_dim)
 
         # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)

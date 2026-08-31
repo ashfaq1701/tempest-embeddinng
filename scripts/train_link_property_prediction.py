@@ -46,8 +46,6 @@ def parse_args() -> argparse.Namespace:
     # ── Model ───────────────────────────────────────────────────────
     p.add_argument("--d-emb", default=64, type=int,
                    help="Embedding dimension.")
-    p.add_argument("--pooler-hidden", default=32, type=int,
-                   help="width of the NN pooler's hidden layer (the net is 3 -> hidden -> 1).")
     p.add_argument("--use-pop-bias", action="store_true",
                    help="Score a learned per-node popularity scalar (zero-init) alongside the distance, "
                         "mixed by the learned weight vector w.")
@@ -73,14 +71,9 @@ def parse_args() -> argparse.Namespace:
                    help="Eval negatives per positive (tgb-seq val only).")
 
     # ── Optimisation / training ─────────────────────────────────────
-    p.add_argument("--lr-embedding", default=1e-3, type=float,
-                   help="Learning rate for the per-node lookup tables: the embedding table E "
-                        "(Riemannian updates) and, when the popularity channel is on, pop_bias.")
-    p.add_argument("--lr-network", default=1e-2, type=float,
-                   help="Learning rate for the network: the distance temperature and the NN "
-                        "pooler, in their own param group. Adam steps a parameter by ~lr "
-                        "regardless of gradient size, so this sets how fast they adapt relative "
-                        "to the embedding tables.")
+    p.add_argument("--lr", default=1e-3, type=float,
+                   help="Learning rate. One param group: the embedding tables, the distance "
+                        "temperature and the NN pooler all step at this rate.")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
@@ -97,6 +90,12 @@ def parse_args() -> argparse.Namespace:
                    help="Place PyTorch tensors on CUDA.")
     p.add_argument("--use-gpu-tempest", action="store_true",
                    help="Run Tempest's walk sampler in GPU mode.")
+
+    # ── Pooler widths ───────────────────────────────────────────────
+    # Low-priority knobs: the defaults are the measured design and these are not swept.
+    p.add_argument("--hidden-dim", default=32, type=int,
+                   help="Hidden width of the pooler MLP. Pinned independently of the feature "
+                        "count so a feature change does not also move pooler capacity.")
 
     # ── Post-training outputs ───────────────────────────────────────
     p.add_argument("--export-best-embedding-table", action="store_true",
@@ -147,7 +146,7 @@ def main() -> Dict[str, Any]:
 
     # Negative-sampling pool, computed by the suite from the full train split.
     dst_pool = suite.dst_pool()
-    stats = compute_train_stats(train_sp.timestamps, train_sp.sources, train_sp.destinations)
+    stats = compute_train_stats(train_sp.timestamps)
 
     print(f"  num_nodes:     {num_nodes:,}")
     _pool_kind = "destinations (bipartite)" if args.is_bipartite else "nodes (non-bipartite)"
@@ -181,12 +180,10 @@ def main() -> Dict[str, Any]:
     config = TrainerConfig(
         num_nodes=num_nodes,
         dst_pool=dst_pool,
-        t_train=float(stats.T_train),
-        mean_node_inter_arrival=float(stats.mean_node_inter_arrival),
 
         d_emb=args.d_emb,
         use_pop_bias=args.use_pop_bias,
-        pooler_hidden=args.pooler_hidden,
+        hidden_dim=args.hidden_dim,
 
         K_train=args.k_train,
 
@@ -196,8 +193,7 @@ def main() -> Dict[str, Any]:
         start_bias=args.start_bias,
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
-        lr_embedding=args.lr_embedding,
-        lr_network=args.lr_network,
+        lr=args.lr,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 
