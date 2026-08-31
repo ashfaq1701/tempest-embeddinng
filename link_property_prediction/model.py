@@ -17,8 +17,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dataclasses import replace
-
 from .walk_tokens import WalkTokens
 
 
@@ -45,9 +43,9 @@ class BagWeights(nn.Module):
     """Pooling weights = softmax(MLP([age_norm | onehot(position) | rad])).
 
     Features (`rad` is detached, so the pooler reads geometry but does not backprop through it):
-      age      -- log1p(age), applied by LinkPredHead.log_ages. NOT standardised: log1p is a
-                  fixed function of the age alone, so the feature stays absolutely anchored and
-                  no batch-dependent quantity enters the pooler.
+      age      -- log1p(age). NOT standardised: log1p is a fixed function of the age alone, so
+                  the feature stays absolutely anchored and no batch-dependent quantity enters
+                  the pooler.
       pos      -- the RAW hop index as one scalar, 1..max_walk_len, padding 0. Padded slots are
                   masked out of the softmax, so their value never matters.
       rad      -- geodesic distance from the origin: the token's hyperbolic radius
@@ -74,9 +72,13 @@ class BagWeights(nn.Module):
     def forward(self, geom: "PoincareManifold", tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
-        # ages arrive ALREADY log1p'd (not standardised) by LinkPredHead.log_ages; padding keeps
-        # its -1 sentinel and is masked out of the softmax below, so its value never matters.
-        age = tokens.ages.unsqueeze(-1).to(x.dtype)                             # [Q, T, 1]
+        # log1p compresses ages that span orders of magnitude and are heavily right-skewed
+        # (measured on real YouTube tokens: skew +1.83 raw, -1.07 after; and the mean is 2-3x the
+        # median on every dataset in the suite). It is a fixed function of the age alone, so the
+        # feature stays absolutely anchored -- a given age maps to the same value in every batch
+        # and on every dataset. clamp_min(0) sends the -1 padding sentinel to log1p(0) = 0 rather
+        # than -inf; padded slots are masked out of the softmax below in any case.
+        age = torch.log1p(tokens.ages.clamp_min(0).to(x.dtype)).unsqueeze(-1)   # [Q, T, 1]
         # RAW hop index: 1 = seed .. max_walk_len = oldest, padding 0. Masked out below.
         pos = tokens.positions.unsqueeze(-1).to(x.dtype)                        # [Q, T, 1]
         rad = geom.dist0(x.detach()).unsqueeze(-1)                              # [Q, T, 1]
@@ -113,34 +115,6 @@ class LinkPredHead(nn.Module):
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
-    @staticmethod
-    def log_ages(src_tokens: WalkTokens, cand_tokens: WalkTokens):
-        """log1p the ages. NO standardisation of anything.
-
-        log1p is a FIXED monotone function of the age alone, so a given age maps to the same
-        value in every batch and on every dataset -- absolute anchoring is preserved. That is the
-        property the per-batch z-score destroyed: it rescales each batch to mean 0 / std 1, so a
-        candidate with a fresh history and one with a decade-old history become indistinguishable
-        once their bags are normalised.
-
-        It also does the work no affine rescale can. Ages span orders of magnitude and are
-        heavily right-skewed (measured on real YouTube tokens: skew +1.83, and the mean is 2-3x
-        the median on every dataset in the suite); log1p takes skew to -1.07. And it compresses
-        the cross-dataset scale spread from 47x on raw age/mnia to 1.5x on context log-age
-        spread, which is what makes one feature definition serve all eight datasets.
-
-        Positions are left RAW (1..max_walk_len, padding 0) and rad is left raw, so the pooler
-        sees [log1p(age), pos, rad] with no batch-dependent quantity anywhere.
-
-        Padding keeps its -1 age sentinel untouched -- log1p(-1) is -inf, so it must not be
-        transformed -- and padded slots are masked out of the softmax downstream. Tokens are
-        rebuilt rather than mutated, so the caller's tensors are unchanged.
-        """
-        def _log(tok):
-            a = tok.ages.to(torch.float32)
-            return replace(tok, ages=torch.where(tok.mask, torch.log1p(a.clamp_min(0)), a))
-        return _log(src_tokens), _log(cand_tokens)
-
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
         nodes = tokens.nodes.clamp_min(0).clone()
@@ -158,7 +132,6 @@ class LinkPredHead(nn.Module):
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
         score = geo_temp * (-geo) [+ pop_bias[v]]  (distance scaled by geo_temp; the learned per-node
         popularity scalar, when on, added at fixed unit weight)."""
-        src_tokens, cand_tokens = self.log_ages(src_tokens, cand_tokens)
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
