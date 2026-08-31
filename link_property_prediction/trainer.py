@@ -33,25 +33,15 @@ class TrainerConfig:
     num_nodes: int
     dst_pool: np.ndarray
 
-    # Train-split span; sets the init of the recency scale.
-    t_train: float = 1.0
-
-    # Mean-field per-node inter-event time; AGE scale for the pooling recency weight.
-
     # Embedding dimension.
     d_emb: int = 64
 
     # Score a learned per-node popularity scalar (zero-init) alongside the distance, mixed by w.
     use_pop_bias: bool = False
 
-    # Pooler MLP width: the net is 3 -> hidden -> 1.
-    # Timestamp-grid resolution (data_stats.ts_quantum). Floors the TimeEncoding ladder so no
-    # wavelength lands below Nyquist for the grid. 0.0 leaves the bare LAM_MIN in place.
-    ts_quantum: float = 0.0
-
-    # Pooler feature widths. Low-priority knobs; not swept.
-    time_dim: int = 16
-    pos_dim: int = 4
+    # Pooler MLP width. The feature count is fixed by max_walk_len: 1 normalised age +
+    # max_walk_len one-hot position slots + 1 radius.
+    # Pooler MLP width. Feature count is fixed by max_walk_len (1 age + L one-hot + 1 rad).
     hidden_dim: int = 32
 
     # Per-query training negatives ([B, 1+K_train]).
@@ -89,13 +79,9 @@ class Trainer:
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
-            t_train=float(config.t_train),
             max_walk_len=int(config.max_walk_len),
             use_pop_bias=bool(config.use_pop_bias),
-            time_dim=int(config.time_dim),
-            pos_dim=int(config.pos_dim),
             hidden_dim=int(config.hidden_dim),
-            ts_quantum=float(config.ts_quantum),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(

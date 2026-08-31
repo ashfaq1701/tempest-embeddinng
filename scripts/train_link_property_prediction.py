@@ -93,11 +93,6 @@ def parse_args() -> argparse.Namespace:
 
     # ── Pooler widths ───────────────────────────────────────────────
     # Low-priority knobs: the defaults are the measured design and these are not swept.
-    p.add_argument("--time-dim", default=16, type=int,
-                   help="Total width of the time encoding: 1 linear term + cos/sin over a "
-                        "geometric ladder of relative wavelengths.")
-    p.add_argument("--pos-dim", default=4, type=int,
-                   help="Width of the learned walk-position embedding (1..max_walk_len).")
     p.add_argument("--hidden-dim", default=32, type=int,
                    help="Hidden width of the pooler MLP. Pinned independently of the feature "
                         "count so a feature change does not also move pooler capacity.")
@@ -161,7 +156,6 @@ def main() -> Dict[str, Any]:
     print(f"  T_train:       {stats.T_train:.0f}")
     print(f"  median_inter_arrival: {stats.median_inter_arrival:.1f}")
     print(f"  mean_inter_arrival:   {stats.mean_inter_arrival:.1f}")
-    print(f"  ts_quantum:           {stats.ts_quantum:.1f}")
     print(f"  train edges:   {len(train_sp.sources):,}")
     print(f"  val edges:     {len(val_sp.sources):,}")
     print(f"  test edges:    {len(test_sp.sources):,}")
@@ -186,13 +180,9 @@ def main() -> Dict[str, Any]:
     config = TrainerConfig(
         num_nodes=num_nodes,
         dst_pool=dst_pool,
-        t_train=float(stats.T_train),
-        ts_quantum=float(stats.ts_quantum),
 
         d_emb=args.d_emb,
         use_pop_bias=args.use_pop_bias,
-        time_dim=args.time_dim,
-        pos_dim=args.pos_dim,
         hidden_dim=args.hidden_dim,
 
         K_train=args.k_train,
