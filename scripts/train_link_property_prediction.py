@@ -93,6 +93,12 @@ def parse_args() -> argparse.Namespace:
 
     # ── Pooler widths ───────────────────────────────────────────────
     # Low-priority knobs: the defaults are the measured design and these are not swept.
+    p.add_argument("--d-time", default=16, type=int,
+                   help="Width of the TimeEncoder output: 1 monotone linear term plus d_time-1 "
+                        "cos/sin slots over log-age. Minimum 3.")
+    p.add_argument("--d-pos", default=4, type=int,
+                   help="Width of the learned hop-index embedding (max_walk_len+1 rows, row 0 "
+                        "reserved for padding).")
     p.add_argument("--hidden-dim", default=32, type=int,
                    help="Hidden width of the pooler MLP. Pinned independently of the feature "
                         "count so a feature change does not also move pooler capacity.")
@@ -146,7 +152,10 @@ def main() -> Dict[str, Any]:
 
     # Negative-sampling pool, computed by the suite from the full train split.
     dst_pool = suite.dst_pool()
-    stats = compute_train_stats(train_sp.timestamps)
+    stats = compute_train_stats(
+        train_sp.timestamps,
+        np.concatenate([train_sp.timestamps, val_sp.timestamps, test_sp.timestamps]),
+    )
 
     print(f"  num_nodes:     {num_nodes:,}")
     _pool_kind = "destinations (bipartite)" if args.is_bipartite else "nodes (non-bipartite)"
@@ -154,6 +163,7 @@ def main() -> Dict[str, Any]:
     print(f"  t_min:         {stats.t_min}")
     print(f"  t_max:         {stats.t_max}")
     print(f"  T_train:       {stats.T_train:.0f}")
+    print(f"  T_full:        {stats.T_full:.0f}")
     print(f"  median_inter_arrival: {stats.median_inter_arrival:.1f}")
     print(f"  mean_inter_arrival:   {stats.mean_inter_arrival:.1f}")
     print(f"  train edges:   {len(train_sp.sources):,}")
@@ -183,12 +193,15 @@ def main() -> Dict[str, Any]:
 
         d_emb=args.d_emb,
         use_pop_bias=args.use_pop_bias,
+        d_time=args.d_time,
+        d_pos=args.d_pos,
         hidden_dim=args.hidden_dim,
 
         K_train=args.k_train,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,
+        t_full=float(stats.T_full),
         walk_bias=args.walk_bias,
         start_bias=args.start_bias,
         t2nv_p=args.t2nv_p,

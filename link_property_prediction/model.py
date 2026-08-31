@@ -6,11 +6,13 @@ FIXED unit weight -- the model sharpens the geometry via geo_temp while populari
 a constant scale.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over an
-MLP of [log1p(age) | raw position | rad] at a fixed hidden width. Nothing is standardised: log1p
-is a fixed function of the age alone, so no batch-dependent or dataset-derived quantity enters
-the pooler. Learned head params: geo_temp, the MLP pooler, and num_nodes popularity scalars
+MLP of [time_enc(age) | hop_enc(hop) | rad] at a fixed hidden width. The time encoding is a fixed
+cos/sin ladder over log-age normalised by log1p(T_full), so it is absolutely anchored and no batch
+statistic enters the pooler. Learned head params: geo_temp, the MLP pooler, and num_nodes popularity scalars
 when on."""
 
+
+import math
 
 import geoopt
 import torch
@@ -39,50 +41,98 @@ class PoincareManifold:
         return self.manifold.weighted_midpoint(x, weights=w, reducedim=[-2], dim=-1, keepdim=False)
 
 
+class TimeEncoder(nn.Module):
+    """Fixed cos/sin ladder over log-age, plus a monotone linear term.
+
+    Ages span seconds to years, so a ladder in raw seconds wastes most of its
+    resolution: scaled to the largest age it cannot separate anything below
+    roughly a day. Working in log-age gives uniform resolution per decade
+    instead, and matches the heavy-tailed inter-event distribution.
+
+    Normalising by log1p(t_full) puts every age in [0, 1]. The full dataset
+    span is used rather than the training span because ages are measured back
+    from a query cutoff, so test-time ages exceed the training span and would
+    push u past 1.
+
+    Frequencies are fixed: the gradient of cos(xw) wrt w scales with x, which
+    destabilises training on large timestamps (Cong et al., ICLR 2023).
+    """
+
+    def __init__(self, time_dim: int, t_full: float, lam_min: float = 0.05,
+                 lam_max: float = 2.0):
+        super().__init__()
+        time_dim = int(time_dim)
+        if time_dim < 3:
+            raise ValueError(
+                f"time_dim must be >= 3 (1 linear + >= 2 periodic), got {time_dim}")
+        if not 0.0 < lam_min <= lam_max:
+            raise ValueError(
+                f"need 0 < lam_min <= lam_max, got {lam_min} and {lam_max}")
+        self.time_dim = time_dim
+        self.n_per = time_dim - 1
+        self.lmax = math.log1p(max(float(t_full), 1.0))
+
+        k = (self.n_per + 1) // 2                        # frequencies, ceil
+        i = torch.arange(k, dtype=torch.float32) / max(k - 1, 1)
+        lam = lam_min * (lam_max / lam_min) ** i         # geometric ladder
+        self.register_buffer("w", 2.0 * math.pi / lam)   # [k], not a parameter
+
+    def forward(self, ages: torch.Tensor) -> torch.Tensor:
+        """ages [...] (non-negative seconds) -> [..., time_dim] in [-1, 1]."""
+        u = torch.log1p(ages.clamp_min(0).float()) / self.lmax      # [...]
+        wu = u.unsqueeze(-1) * self.w                               # [..., k]
+        # interleave cos_i, sin_i so an odd tail drops only the last sine
+        pairs = torch.stack([torch.cos(wu), torch.sin(wu)], dim=-1).flatten(-2)
+        lin = 1.0 - 2.0 * u                              # [+1, -1], monotone
+        return torch.cat([lin.unsqueeze(-1), pairs[..., :self.n_per]], dim=-1)
+
+
 class BagWeights(nn.Module):
-    """Pooling weights = softmax(MLP([age_norm | onehot(position) | rad])).
+    """Pooling weights = softmax(MLP([time_enc(age) | hop_enc(hop) | rad])).
 
     Features (`rad` is detached, so the pooler reads geometry but does not backprop through it):
-      age      -- log1p(age). NOT standardised: log1p is a fixed function of the age alone, so
-                  the feature stays absolutely anchored and no batch-dependent quantity enters
-                  the pooler.
-      pos      -- the RAW hop index as one scalar, 1..max_walk_len, padding 0. Padded slots are
-                  masked out of the softmax, so their value never matters.
-      rad      -- geodesic distance from the origin: the token's hyperbolic radius
+      time_enc -- TimeEncoder(age): d_time fixed features over log-age normalised by
+                  log1p(T_full). Absolutely anchored -- a given age maps to the same vector in
+                  every batch and on every dataset, and no batch statistic enters the pooler.
+      hop_enc  -- a learned embedding of the hop index. walk_tokens builds positions as
+                  (lens - arange).clamp_min(0) with lens <= max_walk_len, so the values are
+                  0..max_walk_len with 0 meaning padding -- hence max_walk_len + 1 rows and
+                  padding_idx=0, which pins the pad row at zero and keeps it there.
+      rad      -- geodesic distance from the origin: the token's hyperbolic radius.
 
-    Position is a RAW SCALAR here, not one-hot. One-hot lets the first Linear learn an arbitrary
-    per-hop weight; a scalar forces the response to be affine in the hop index, so the pooler can
-    only express a monotone depth preference and cannot single out, say, the seed slot. That is
-    the trade this arm measures: 3 features and 162 head params against 7 and 290.
+    The hop embedding is initialised small (std 0.02): the time features are bounded in [-1, 1]
+    and rad is O(1), so a default N(0, 1) table would dominate the input and the pooler would
+    start on hop alone.
 
     `hidden` is the MLP width, pinned independently of the feature count: under an earlier rule
     where it scaled with the feature count, every feature change silently moved pooler capacity
     too and the two effects could not be separated (see the ablation in CLAUDE.md).
     """
 
-    def __init__(self, max_walk_len: int, hidden_dim: int = 32):
+    def __init__(self, max_walk_len: int, t_full: float, d_time: int = 16, d_pos: int = 4,
+                 hidden_dim: int = 32):
         super().__init__()
         self.max_walk_len = int(max_walk_len)
         self.hidden = int(hidden_dim)
-        # 1 normalised age + 1 raw position scalar + 1 radius.
-        self.n_feat = 3
+        self.time = TimeEncoder(d_time, t_full)
+        # +1 row for the padding index 0; real hops are 1..max_walk_len.
+        self.pos = nn.Embedding(self.max_walk_len + 1, int(d_pos), padding_idx=0)
+        nn.init.normal_(self.pos.weight, std=0.02)
+        with torch.no_grad():
+            self.pos.weight[0].zero_()
+        self.n_feat = int(d_time) + int(d_pos) + 1
         self.net = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU(),
                                  nn.Linear(self.hidden, 1))
 
     def forward(self, geom: "PoincareManifold", tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
-        # log1p compresses ages that span orders of magnitude and are heavily right-skewed
-        # (measured on real YouTube tokens: skew +1.83 raw, -1.07 after; and the mean is 2-3x the
-        # median on every dataset in the suite). It is a fixed function of the age alone, so the
-        # feature stays absolutely anchored -- a given age maps to the same value in every batch
-        # and on every dataset. clamp_min(0) sends the -1 padding sentinel to log1p(0) = 0 rather
-        # than -inf; padded slots are masked out of the softmax below in any case.
-        age = torch.log1p(tokens.ages.clamp_min(0).to(x.dtype)).unsqueeze(-1)   # [Q, T, 1]
-        # RAW hop index: 1 = seed .. max_walk_len = oldest, padding 0. Masked out below.
-        pos = tokens.positions.unsqueeze(-1).to(x.dtype)                        # [Q, T, 1]
+        # TimeEncoder clamps the -1 padding sentinel to 0 internally, so padding is finite;
+        # padded slots are masked out of the softmax below in any case.
+        t_enc = self.time(tokens.ages)                                          # [Q, T, d_time]
+        p_emb = self.pos(tokens.positions.clamp(0, self.max_walk_len))          # [Q, T, d_pos]
         rad = geom.dist0(x.detach()).unsqueeze(-1)                              # [Q, T, 1]
-        feat = torch.cat([age, pos, rad], dim=-1).to(x.dtype)                   # [Q, T, 3]
+        feat = torch.cat([t_enc, p_emb, rad], dim=-1).to(x.dtype)               # [Q, T, n_feat]
         logits = self.net(feat).squeeze(-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
@@ -90,15 +140,15 @@ class BagWeights(nn.Module):
 class LinkPredHead(nn.Module):
     """E is a ManifoldParameter; the pooling weights carry no learned parameters."""
 
-    def __init__(self, num_nodes: int, d_emb: int, max_walk_len: int,
+    def __init__(self, num_nodes: int, d_emb: int, max_walk_len: int, t_full: float,
                  init_irange: float = 1e-3, use_pop_bias: bool = False,
-                 hidden_dim: int = 32):
+                 d_time: int = 16, d_pos: int = 4, hidden_dim: int = 32):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.use_pop_bias = bool(use_pop_bias)
         self.geom = PoincareManifold()
-        self.bag_weights = BagWeights(max_walk_len, hidden_dim)
+        self.bag_weights = BagWeights(max_walk_len, t_full, d_time, d_pos, hidden_dim)
 
         # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
