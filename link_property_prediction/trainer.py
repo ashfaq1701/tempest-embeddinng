@@ -44,7 +44,7 @@ class TrainerConfig:
 
     # Pooler MLP depth: number of GELU-activated hidden layers (>= 1). 1 = the original single
     # -hidden-layer MLP; >1 stacks extra Linear(hidden,hidden)+GELU blocks.
-    pooler_n_layers: int = 1
+    n_layers: int = 1
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
@@ -84,7 +84,7 @@ class Trainer:
             max_walk_len=int(config.max_walk_len),
             use_pop_bias=bool(config.use_pop_bias),
             hidden_dim=int(config.hidden_dim),
-            pooler_n_layers=int(config.pooler_n_layers),
+            n_layers=int(config.n_layers),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(

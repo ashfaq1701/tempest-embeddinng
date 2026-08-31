@@ -106,13 +106,13 @@ class LinkPredHead(nn.Module):
 
     def __init__(self, num_nodes: int, d_emb: int, max_walk_len: int,
                  init_irange: float = 1e-3, use_pop_bias: bool = False,
-                 hidden_dim: int = 32, pooler_n_layers: int = 1):
+                 hidden_dim: int = 32, n_layers: int = 1):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.use_pop_bias = bool(use_pop_bias)
         self.geom = PoincareManifold()
-        self.bag_weights = BagWeights(max_walk_len, hidden_dim, pooler_n_layers)
+        self.bag_weights = BagWeights(max_walk_len, hidden_dim, n_layers)
 
         # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
