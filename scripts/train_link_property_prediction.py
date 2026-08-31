@@ -96,10 +96,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hidden-dim", default=32, type=int,
                    help="Hidden width of the pooler MLP. Pinned independently of the feature "
                         "count so a feature change does not also move pooler capacity.")
-    p.add_argument("--n-layers", default=1, type=int,
-                   help="Pooler MLP depth = number of GELU-activated hidden layers (>= 1). "
-                        "1 (default) is the original single-hidden-layer MLP; >1 stacks extra "
-                        "Linear(hidden,hidden)+GELU blocks.")
 
     # ── Post-training outputs ───────────────────────────────────────
     p.add_argument("--export-best-embedding-table", action="store_true",
@@ -188,7 +184,6 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
         use_pop_bias=args.use_pop_bias,
         hidden_dim=args.hidden_dim,
-        n_layers=args.n_layers,
 
         K_train=args.k_train,
 
