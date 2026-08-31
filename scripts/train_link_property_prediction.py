@@ -72,8 +72,13 @@ def parse_args() -> argparse.Namespace:
 
     # ── Optimisation / training ─────────────────────────────────────
     p.add_argument("--lr", default=1e-3, type=float,
-                   help="Learning rate. One param group: the embedding tables, the distance "
-                        "temperature and the NN pooler all step at this rate.")
+                   help="Learning rate for the embedding tables and the NN pooler.")
+    p.add_argument("--lr-temp", default=1e-2, type=float,
+                   help="Learning rate for the distance temperature geo_temp, in its own param "
+                        "group. Adam steps a parameter by ~lr regardless of gradient size, and "
+                        "geo_temp must travel from 1.0 to a dataset-dependent optimum (~44 on "
+                        "YouTube, ~170 on Patent), so this sets how fast the distance scale "
+                        "arrives relative to everything else.")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
@@ -204,6 +209,7 @@ def main() -> Dict[str, Any]:
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
         lr=args.lr,
+        lr_temp=args.lr_temp,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 

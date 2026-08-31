@@ -65,9 +65,11 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. One RiemannianAdam param group at a single `lr`: the
-    # embedding tables, the distance temperature and the NN pooler all step at the same rate.
+    # Constant lr, no weight decay. Two RiemannianAdam param groups split on the TEMPERATURE
+    # ALONE: geo_temp rides `lr_temp`; everything else -- the embedding tables and the whole NN
+    # pooler -- stays at `lr`.
     lr: float = 1e-3
+    lr_temp: float = 1e-2
 
     # Run control.
     num_epochs: int = 50
@@ -111,10 +113,26 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # One param group at a single lr: Riemannian update for E, standard Adam for the rest.
-        self.opt = geoopt.optim.RiemannianAdam(
-            self.model.parameters(), lr=float(config.lr), stabilize=10,
-        )
+        # Two param groups, split by identity on the distance temperature alone:
+        #   lr_temp -- geo_temp only. One scalar that has to travel from 1.0 to an optimum that is
+        #              dataset-dependent (~44 on YouTube, ~170 on Patent). Adam moves a parameter
+        #              by ~lr per step regardless of gradient magnitude, so with a LINEAR
+        #              parameterisation the steps needed scale with the target, and at the
+        #              embedding lr it cannot arrive before early stopping fires.
+        #   lr      -- everything else: E (Riemannian) and the whole NN pooler.
+        #
+        # Measured caution, from the Patent A/B on the raw-scalar pooler: the temperature alone on
+        # a fast group did NOT rescue Patent (stalled at epoch 3 with an identical geo_temp
+        # trajectory); widening the fast group to include the pooler is what moved it, 0.1630 ->
+        # 0.2633. That was a different pooler and a different dataset, so this split is worth
+        # re-measuring here, but it is not a configuration that has previously worked.
+        temp = [p for n, p in self.model.named_parameters() if n == "geo_temp"]
+        temp_ids = {id(p) for p in temp}
+        rest = [p for p in self.model.parameters() if id(p) not in temp_ids]
+        groups = [{"params": rest, "lr": float(config.lr)}]
+        if temp:
+            groups.append({"params": temp, "lr": float(config.lr_temp)})
+        self.opt = geoopt.optim.RiemannianAdam(groups, lr=float(config.lr), stabilize=10)
 
     # Full-graph ingestion (once, up front)
 
@@ -187,6 +205,7 @@ class Trainer:
         return {
             "link": float(link_loss.detach()),
             "lr": float(self.opt.param_groups[0]["lr"]),
+            "lr_temp": float(self.opt.param_groups[-1]["lr"]),
         }
 
     # Geometry probe
