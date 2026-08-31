@@ -6,7 +6,7 @@ FIXED unit weight -- the model sharpens the geometry via geo_temp while populari
 a constant scale.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over an
-MLP of [normalised age | raw position | rad] at a fixed hidden width. Ages are min-max
+MLP of [standardised log-age | standardised position | rad] at a fixed hidden width. Ages are min-max
 log1p'd and standardised against statistics pooled over both bags of the batch, so the pooler
 carries no dataset-derived time constant. Learned head params: geo_temp, the MLP pooler,
 and num_nodes popularity scalars when on."""
@@ -46,10 +46,10 @@ class BagWeights(nn.Module):
 
     Features (`rad` is detached, so the pooler reads geometry but does not backprop through it):
       age_norm -- log1p(age), standardised to mean 0 / std 1 against statistics pooled over both
-                  bags, by LinkPredHead.normalize_ages. It arrives already normalised; this
+                  bags, by LinkPredHead.normalize_tokens. It arrives already normalised; this
                   module applies no scale of its own, so no dataset constant enters here.
-      pos      -- the RAW hop index as one scalar: 1 = seed .. max_walk_len = oldest, padding 0.
-                  Padded slots are masked out of the softmax, so their value never matters.
+      pos      -- the hop index as one scalar, z-scored across both bags by
+                  LinkPredHead.normalize_tokens. Padded slots are masked out of the softmax.
       rad      -- geodesic distance from the origin: the token's hyperbolic radius
 
     Position is a RAW SCALAR here, not one-hot. One-hot lets the first Linear learn an arbitrary
@@ -74,11 +74,12 @@ class BagWeights(nn.Module):
     def forward(self, geom: "PoincareManifold", tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
-        # ages arrive ALREADY log1p'd and standardised by LinkPredHead.normalize_ages; padding keeps
+        # ages arrive ALREADY log1p'd and standardised by LinkPredHead.normalize_tokens; padding keeps
         # its -1 sentinel and is masked out of the softmax below, so its value never matters.
         age = tokens.ages.unsqueeze(-1).to(x.dtype)                             # [Q, T, 1]
-        # RAW hop index as a single scalar, 1 = seed .. max_walk_len = oldest, padding 0.
-        pos = tokens.positions.clamp_min(0).unsqueeze(-1).to(x.dtype)           # [Q, T, 1]
+        # Hop index, ALREADY z-scored by normalize_tokens (so it may be negative -- do NOT
+        # clamp). Padding keeps its 0 sentinel and is masked out below.
+        pos = tokens.positions.unsqueeze(-1).to(x.dtype)                        # [Q, T, 1]
         rad = geom.dist0(x.detach()).unsqueeze(-1)                              # [Q, T, 1]
         feat = torch.cat([age, pos, rad], dim=-1).to(x.dtype)                   # [Q, T, 3]
         logits = self.net(feat).squeeze(-1)
@@ -114,53 +115,58 @@ class LinkPredHead(nn.Module):
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
     @staticmethod
-    def normalize_ages(src_tokens: WalkTokens, cand_tokens: WalkTokens):
-        """log1p the ages, then standardise them to mean 0 / std 1.
+    def normalize_tokens(src_tokens: WalkTokens, cand_tokens: WalkTokens):
+        """Standardise both scalar token features against statistics pooled ACROSS BOTH BAGS.
 
-        Two transforms, and they do different jobs:
+          age -- log1p first, then z-score. log1p changes the SHAPE: ages span orders of
+                 magnitude and are heavily right-skewed (measured on real YouTube tokens, skew
+                 +1.83 raw, mean 2-3x median on every dataset in the suite). A linear rescale
+                 cannot touch that -- min-max and z-score are both affine and leave relative
+                 spacing identical -- so log1p is the only step here that improves resolution
+                 among the bulk of tokens; it takes skew to -1.07. The z-score then sets scale.
+                 Measured: dropping the z-score and keeping log1p alone costs 0.0176 max test on
+                 YouTube (0.5793 -> 0.5617), so both steps earn their place.
 
-          log1p  changes the SHAPE. Ages span orders of magnitude and are heavily right-skewed
-                 -- measured on YouTube walk tokens, skew +1.83 raw, and the mean is 2-3x the
-                 median on every dataset in the suite. A linear rescale cannot fix that: min-max
-                 and z-score are both affine, so they leave the relative spacing of every token
-                 untouched (verified: standardising a min-max output reproduces the z-score
-                 exactly). log1p is the only step here that improves resolution among the bulk
-                 of tokens -- it takes skew from +1.83 to -1.07 and IQR/range from 0.208 to
-                 0.224, and moves the typical token off the floor.
+          pos -- z-score only. The hop index is 1..max_walk_len, a small bounded integer with no
+                 dynamic range to compress, so log1p would do nothing useful. Standardising it
+                 puts it on the same footing as the age channel; left raw it enters at 1..5
+                 against an age channel of mean 0 / std 1.
 
-          z-score sets the SCALE. The other two pooler features are one-hot (0/1) and rad (O(1)),
-                 so an age channel wants unit-ish variance to enter on equal footing. Min-max
-                 was measured at std 0.198 on real batches, a fifth of the others, which
-                 under-weights age at initialisation.
-
-        Statistics are pooled over BOTH bags and the whole batch. Pooling the two bags is
+        Statistics are pooled over both bags and the whole batch. Pooling the two bags is
         necessary -- normalising them separately would put source and candidate on different
-        scales, so a given value would mean different things on the two sides of one comparison.
-        Batch-wide is safe for mean/std specifically because they are BULK statistics over ~1e5
-        non-padded slots. Note this is exactly why min-max was rejected: its max is an EXTREME
-        order statistic, and measured over 8 independent batches the batch max was T_train --
-        the ceiling -- in 8 of 8, so min-max silently degenerated into dividing by T_train and
-        reintroduced the fixed dataset constant this pooler exists to avoid.
+        scales, so a value would mean different things on the two sides of one comparison.
+        Batch-wide is safe for mean/std because they are BULK statistics over ~1e5 non-padded
+        slots; it is NOT safe for a max, which is an extreme order statistic -- measured over 8
+        independent batches the batch max age was T_train, the ceiling, in 8 of 8, which is why
+        an earlier min-max version silently degenerated into dividing by T_train.
 
-        Padding keeps its -1 sentinel untouched (log1p(-1) is -inf, so it must not be
-        transformed), and padded slots are masked out of the softmax downstream anyway. Tokens
-        are rebuilt rather than mutated, so the caller's tensors are unchanged.
+        Both are mildly K-dependent, since the candidate bag is B*(1+K) rows: measured on
+        YouTube, log1p(age) mean moves 10.6375 -> 10.9664 and std 6.1026 -> 6.3329 as K goes
+        1 -> 20, i.e. about 0.05 of a standard deviation over a 20x change, and ~0.003 between
+        K=5 and K=10. Small enough to ignore; if exact K-invariance is ever needed, take the
+        statistics from the source bags alone, which are always B rows.
+
+        Padding keeps its sentinels untouched -- ages -1 (log1p(-1) is -inf, so it must not be
+        transformed) and positions 0 -- and padded slots are masked out of the softmax anyway.
+        Tokens are rebuilt rather than mutated, so the caller's tensors are unchanged.
         """
         sm, cm = src_tokens.mask, cand_tokens.mask
-        vals = torch.cat([src_tokens.ages[sm], cand_tokens.ages[cm]])
-        if vals.numel() == 0:
+        av = torch.cat([src_tokens.ages[sm], cand_tokens.ages[cm]])
+        if av.numel() == 0:
             return src_tokens, cand_tokens
-        lv = torch.log1p(vals.clamp_min(0).to(torch.float32))
-        mu = lv.mean()
-        # Floor at 1e-3, not something smaller: when every age is equal the true std is 0 and
-        # the centred values are pure float error (~1e-7). A 1e-6 floor amplifies that noise 10x
-        # into the feature; 1e-3 keeps it at ~1e-4, which is negligible, and is still ~1000x
-        # below any real batch's log-age std (~1-2 on this suite).
-        sd = torch.clamp(lv.std(), min=1e-3)
+        la = torch.log1p(av.clamp_min(0).to(torch.float32))
+        a_mu, a_sd = la.mean(), torch.clamp(la.std(), min=1e-3)
+        pv = torch.cat([src_tokens.positions[sm], cand_tokens.positions[cm]]).to(torch.float32)
+        p_mu, p_sd = pv.mean(), torch.clamp(pv.std(), min=1e-3)
+
         def _norm(tok, m):
             a = tok.ages.to(torch.float32)
-            la = torch.log1p(a.clamp_min(0))
-            return replace(tok, ages=torch.where(m, (la - mu) / sd, a))
+            p = tok.positions.to(torch.float32)
+            return replace(
+                tok,
+                ages=torch.where(m, (torch.log1p(a.clamp_min(0)) - a_mu) / a_sd, a),
+                positions=torch.where(m, (p - p_mu) / p_sd, p),
+            )
         return _norm(src_tokens, sm), _norm(cand_tokens, cm)
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
@@ -180,7 +186,7 @@ class LinkPredHead(nn.Module):
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
         score = geo_temp * (-geo) [+ pop_bias[v]]  (distance scaled by geo_temp; the learned per-node
         popularity scalar, when on, added at fixed unit weight)."""
-        src_tokens, cand_tokens = self.normalize_ages(src_tokens, cand_tokens)
+        src_tokens, cand_tokens = self.normalize_tokens(src_tokens, cand_tokens)
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
