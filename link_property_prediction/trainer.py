@@ -200,7 +200,8 @@ class Trainer:
     @torch.no_grad()
     def _head_probe(self) -> str:
         """The head's scalar parameters, for the epoch line. Read via hasattr so a head with a different
-        set of knobs degrades to a shorter line rather than raising. geo_temp scales the distance term;
+        set of knobs degrades to a shorter line rather than raising. w = [distance weight, radius-product
+        weight] on this head, geo_temp the single scale on heads that carry one instead;
         the popularity channel (when on) rides at fixed unit weight and its per-node bias mean is a
         nuisance quantity (gauge + K-dependent negative-sampling offset), so it is not logged."""
         parts = []
@@ -208,6 +209,9 @@ class Trainer:
             parts.append(f"temp={float(self.model.temperature):.3f}")
         if hasattr(self.model, "geo_temp"):
             parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
+        if hasattr(self.model, "w"):
+            wv = self.model.w.detach().flatten().tolist()
+            parts.append("w=[" + ",".join(f"{x:.3f}" for x in wv) + "]")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad

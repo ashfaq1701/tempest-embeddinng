@@ -1,13 +1,18 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = geo_temp * (-d_H(P_u, P_v)) [+ pop_bias[v]].
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = w . [-d_H(P_u,P_v), r_u * r_v] [+ pop_bias[v]].
 
-The distance term is scaled by a learned geo_temp (init 1.0). When the popularity channel is on, a
+Two learned score weights w (init [1.0, 1.0]) over two geometric terms: the negated geodesic
+distance between the centroids, and the PRODUCT OF THEIR RADII r_u * r_v = d_H(0,P_u)*d_H(0,P_v).
+w[0] plays the role the old scalar geo_temp did -- it sets the distance scale. w[1] is new: it
+lets the score depend on how far out on the ball the two centroids sit, independently of how far
+apart they are. On the Poincare ball radius tracks a node's activity/degree, so r_u * r_v is a
+learned popularity-like geometric term that costs one parameter rather than num_nodes. When the popularity channel is on, a
 learned per-node scalar pop_bias[v] (zero-init, so it contributes exactly 0 at step 0) is added at
-FIXED unit weight -- the model sharpens the geometry via geo_temp while popularity rides alongside at
-a constant scale.
+FIXED unit weight, OUTSIDE the weighted sum -- the model sharpens the geometry via w while
+popularity rides alongside at a constant scale.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over an
 MLP of [time encoding | position embedding | rad] at a fixed hidden width. Learned head params:
-geo_temp, the MLP pooler (encoder included), and num_nodes popularity scalars when on."""
+w (2), the MLP pooler (encoder included), and num_nodes popularity scalars when on."""
 
 import math
 
@@ -181,7 +186,12 @@ class LinkPredHead(nn.Module):
             self.pop_bias = nn.Embedding(self.num_nodes, 1)
             nn.init.zeros_(self.pop_bias.weight)
 
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+        # Two score weights over [-geo, r_u * r_v], both init 1.0. NOTE the sign convention: the
+        # distance enters already negated, so a POSITIVE w[0] means "closer is better" as before.
+        # The radius-product term enters unnegated, so w[1] > 0 rewards pairs of far-out (active)
+        # centroids and w[1] < 0 penalises them; init +1.0 starts it rewarding, and the optimiser
+        # is free to drive it through zero.
+        self.w = nn.Parameter(torch.tensor([1.0, 1.0]))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
@@ -198,8 +208,8 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = geo_temp * (-geo) [+ pop_bias[v]]  (distance scaled by geo_temp; the learned per-node
-        popularity scalar, when on, added at fixed unit weight)."""
+        score = w[0]*(-geo) + w[1]*(r_u*r_v) [+ pop_bias[v]]  (the learned per-node popularity
+        scalar, when on, still added OUTSIDE the weighted sum at fixed unit weight)."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -207,7 +217,9 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        score = self.geo_temp * (-geo)                                         # [B, C] scaled distance term
+        r_u = self.geom.dist0(p_u).unsqueeze(1)                                 # [B, 1] source radius
+        r_v = self.geom.dist0(p_v)                                              # [B, C] candidate radius
+        score = self.w[0] * (-geo) + self.w[1] * (r_u * r_v)                    # [B, C]
         if self.use_pop_bias:
             v_nodes = cand_tokens.seeds.view(b, c)                              # [B, C] candidate node ids
             score = score + self.pop_bias(v_nodes).squeeze(-1)
