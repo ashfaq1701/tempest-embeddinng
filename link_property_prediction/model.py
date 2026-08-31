@@ -1,6 +1,6 @@
 """Centroid-to-centroid head on the Poincaré ball: s(u,v) = geo_temp * (-d_H(P_u, P_v)) [+ pop_bias[v]].
 
-The distance term is scaled by a learned geo_temp (init 1.0). When the popularity channel is on, a
+The distance term is scaled by a learned geo_temp = exp(geo_temp_raw), init 1.0 (raw 0.0). When the popularity channel is on, a
 learned per-node scalar pop_bias[v] (zero-init, so it contributes exactly 0 at step 0) is added at
 FIXED unit weight -- the model sharpens the geometry via geo_temp while popularity rides alongside at
 a constant scale.
@@ -181,7 +181,20 @@ class LinkPredHead(nn.Module):
             self.pop_bias = nn.Embedding(self.num_nodes, 1)
             nn.init.zeros_(self.pop_bias.weight)
 
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+        # LOG-parameterised: the learned quantity is log(geo_temp), so geo_temp = exp(raw) and is
+        # positive by construction. Init raw=0 -> geo_temp=1.0, the same starting point as the
+        # linear parameterisation. The reason to prefer it: Adam moves a parameter by ~lr per step
+        # regardless of gradient magnitude, so a LINEAR geo_temp slews ADDITIVELY -- it needs
+        # ~44/lr steps to walk from 1 to YouTube's optimum ~44, and ~170/lr to reach Patent's ~170.
+        # Under exp(), the same fixed step is MULTIPLICATIVE: geo_temp scales by exp(lr) per step,
+        # so the distance to any optimum is log-many steps, and datasets whose optima differ by
+        # 100x cost only log(100) more steps rather than 100x more.
+        self.geo_temp_raw = nn.Parameter(torch.tensor(0.0))
+
+    @property
+    def geo_temp(self) -> torch.Tensor:
+        """exp of the learned log-temperature; positive by construction."""
+        return torch.exp(self.geo_temp_raw)
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
