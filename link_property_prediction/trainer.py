@@ -39,10 +39,12 @@ class TrainerConfig:
     # Score a learned per-node popularity scalar (zero-init) alongside the distance, mixed by w.
     use_pop_bias: bool = False
 
-    # Pooler MLP width. The feature count is fixed by max_walk_len: 1 normalised age +
-    # max_walk_len one-hot position slots + 1 radius.
-    # Pooler MLP width. Feature count is fixed by max_walk_len (1 age + L one-hot + 1 rad).
+    # Pooler MLP width. Feature count is fixed at 3 (log1p age + raw position scalar + radius).
     hidden_dim: int = 32
+
+    # Pooler MLP depth: number of GELU-activated hidden layers (>= 1). 1 = the original single
+    # -hidden-layer MLP; >1 stacks extra Linear(hidden,hidden)+GELU blocks.
+    pooler_n_layers: int = 1
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
@@ -82,6 +84,7 @@ class Trainer:
             max_walk_len=int(config.max_walk_len),
             use_pop_bias=bool(config.use_pop_bias),
             hidden_dim=int(config.hidden_dim),
+            pooler_n_layers=int(config.pooler_n_layers),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(

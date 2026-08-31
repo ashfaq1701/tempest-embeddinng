@@ -60,14 +60,28 @@ class BagWeights(nn.Module):
     too and the two effects could not be separated (see the ablation in CLAUDE.md).
     """
 
-    def __init__(self, max_walk_len: int, hidden_dim: int = 32):
+    def __init__(self, max_walk_len: int, hidden_dim: int = 32, n_layers: int = 1):
         super().__init__()
         self.max_walk_len = int(max_walk_len)
         self.hidden = int(hidden_dim)
+        self.n_layers = int(n_layers)
         # 1 normalised age + 1 raw position scalar + 1 radius.
         self.n_feat = 3
-        self.net = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU(),
-                                 nn.Linear(self.hidden, 1))
+        self.net = self._build_mlp(self.n_feat, self.hidden, self.n_layers)
+
+    @staticmethod
+    def _build_mlp(n_feat: int, hidden: int, n_layers: int) -> nn.Module:
+        """MLP with `n_layers` GELU-activated hidden layers (>= 1), then a scalar output.
+
+        n_layers counts HIDDEN layers, so n_layers=1 is the original
+        Linear(n_feat, hidden) -> GELU -> Linear(hidden, 1) and is bit-identical to before; each
+        extra layer inserts another Linear(hidden, hidden) -> GELU before the output.
+        """
+        layers = [nn.Linear(n_feat, hidden), nn.GELU()]
+        for _ in range(n_layers - 1):
+            layers += [nn.Linear(hidden, hidden), nn.GELU()]
+        layers += [nn.Linear(hidden, 1)]
+        return nn.Sequential(*layers)
 
     def forward(self, geom: "PoincareManifold", tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
@@ -92,13 +106,13 @@ class LinkPredHead(nn.Module):
 
     def __init__(self, num_nodes: int, d_emb: int, max_walk_len: int,
                  init_irange: float = 1e-3, use_pop_bias: bool = False,
-                 hidden_dim: int = 32):
+                 hidden_dim: int = 32, pooler_n_layers: int = 1):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.use_pop_bias = bool(use_pop_bias)
         self.geom = PoincareManifold()
-        self.bag_weights = BagWeights(max_walk_len, hidden_dim)
+        self.bag_weights = BagWeights(max_walk_len, hidden_dim, pooler_n_layers)
 
         # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
