@@ -18,7 +18,6 @@ import numpy as np
 import torch
 
 from link_property_prediction.data import Loaded, concat_splits, create_batches
-from link_property_prediction.data_stats import full_span
 from link_property_prediction.evaluator import make_suite
 from link_property_prediction.trainer import Trainer, TrainerConfig
 from link_property_prediction.utils import seed_all
@@ -152,13 +151,9 @@ def main() -> Dict[str, Any]:
 
     # Negative-sampling pool, computed by the suite from the full train split.
     dst_pool = suite.dst_pool()
-    t_full = full_span(np.concatenate(
-        [train_sp.timestamps, val_sp.timestamps, test_sp.timestamps]))
-
     print(f"  num_nodes:     {num_nodes:,}")
     _pool_kind = "destinations (bipartite)" if args.is_bipartite else "nodes (non-bipartite)"
     print(f"  neg_pool:      {len(dst_pool):,} unique {_pool_kind}")
-    print(f"  T_full:        {t_full:.0f}")
     print(f"  train edges:   {len(train_sp.sources):,}")
     print(f"  val edges:     {len(val_sp.sources):,}")
     print(f"  test edges:    {len(test_sp.sources):,}")
@@ -194,7 +189,6 @@ def main() -> Dict[str, Any]:
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,
-        t_full=t_full,
         walk_bias=args.walk_bias,
         start_bias=args.start_bias,
         t2nv_p=args.t2nv_p,

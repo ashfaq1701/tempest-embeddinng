@@ -42,9 +42,6 @@ class TrainerConfig:
     # Pooler MLP width. The feature count is fixed by max_walk_len: 1 normalised age +
     # max_walk_len one-hot position slots + 1 radius.
     # Pooler MLP width. Feature count is fixed by max_walk_len (1 age + L one-hot + 1 rad).
-    # Full-dataset span (all splits), for the TimeEncoder's log-age normaliser.
-    t_full: float = 1.0
-
     # Pooler feature widths, then the MLP width. n_feat = d_time + d_pos + 1 (rad).
     d_time: int = 16
     d_pos: int = 4
@@ -86,7 +83,6 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             max_walk_len=int(config.max_walk_len),
-            t_full=float(config.t_full),
             use_pop_bias=bool(config.use_pop_bias),
             d_time=int(config.d_time),
             d_pos=int(config.d_pos),

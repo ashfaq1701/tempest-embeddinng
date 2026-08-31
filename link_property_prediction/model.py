@@ -7,8 +7,8 @@ a constant scale.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over an
 MLP of [time_enc(age) | hop_enc(hop) | rad] at a fixed hidden width. The time encoding is a fixed
-cos/sin ladder over log-age normalised by log1p(T_full), so it is absolutely anchored and no batch
-statistic enters the pooler. Learned head params: geo_temp, the MLP pooler, and num_nodes popularity scalars
+cos/sin ladder over log-age normalised by a CONSTANT, so it is a pure function of age -- no batch
+statistic and no dataset statistic enter the pooler at all. Learned head params: geo_temp, the MLP pooler, and num_nodes popularity scalars
 when on."""
 
 
@@ -49,16 +49,21 @@ class TimeEncoder(nn.Module):
     roughly a day. Working in log-age gives uniform resolution per decade
     instead, and matches the heavy-tailed inter-event distribution.
 
-    Normalising by log1p(t_full) puts every age in [0, 1]. The full dataset
-    span is used rather than the training span because ages are measured back
-    from a query cutoff, so test-time ages exceed the training span and would
-    push u past 1.
+    LMAX is a fixed constant rather than a dataset statistic. log1p of an
+    elapsed time in seconds is bounded by arithmetic, not by measurement: one
+    second is 0.69, one year is 17.3, three centuries is 23.0, so dividing by
+    24 normalises every age without looking at the data. This keeps the
+    encoder a pure function of age, which matters in a streaming setting where
+    any adaptive divisor would make the same age encode differently over time
+    and invalidate what the model has already learned.
 
     Frequencies are fixed: the gradient of cos(xw) wrt w scales with x, which
     destabilises training on large timestamps (Cong et al., ICLR 2023).
     """
 
-    def __init__(self, time_dim: int, t_full: float, lam_min: float = 0.05,
+    LMAX = 24.0     # log1p(1e10 s) = 23.03, about 317 years
+
+    def __init__(self, time_dim: int, lam_min: float = 0.05,
                  lam_max: float = 2.0):
         super().__init__()
         time_dim = int(time_dim)
@@ -70,7 +75,6 @@ class TimeEncoder(nn.Module):
                 f"need 0 < lam_min <= lam_max, got {lam_min} and {lam_max}")
         self.time_dim = time_dim
         self.n_per = time_dim - 1
-        self.lmax = math.log1p(max(float(t_full), 1.0))
 
         k = (self.n_per + 1) // 2                        # frequencies, ceil
         i = torch.arange(k, dtype=torch.float32) / max(k - 1, 1)
@@ -79,7 +83,7 @@ class TimeEncoder(nn.Module):
 
     def forward(self, ages: torch.Tensor) -> torch.Tensor:
         """ages [...] (non-negative seconds) -> [..., time_dim] in [-1, 1]."""
-        u = torch.log1p(ages.clamp_min(0).float()) / self.lmax      # [...]
+        u = (torch.log1p(ages.clamp_min(0).float()) / self.LMAX).clamp_max(1.0)
         wu = u.unsqueeze(-1) * self.w                               # [..., k]
         # interleave cos_i, sin_i so an odd tail drops only the last sine
         pairs = torch.stack([torch.cos(wu), torch.sin(wu)], dim=-1).flatten(-2)
@@ -91,9 +95,9 @@ class BagWeights(nn.Module):
     """Pooling weights = softmax(MLP([time_enc(age) | hop_enc(hop) | rad])).
 
     Features (`rad` is detached, so the pooler reads geometry but does not backprop through it):
-      time_enc -- TimeEncoder(age): d_time fixed features over log-age normalised by
-                  log1p(T_full). Absolutely anchored -- a given age maps to the same vector in
-                  every batch and on every dataset, and no batch statistic enters the pooler.
+      time_enc -- TimeEncoder(age): d_time fixed features over log-age normalised by the
+                  constant LMAX = 24. Absolutely anchored and dataset-independent -- a given age
+                  maps to the same vector in every batch, on every dataset, forever.
       hop_enc  -- a learned embedding of the hop index. walk_tokens builds positions as
                   (lens - arange).clamp_min(0) with lens <= max_walk_len, so the values are
                   0..max_walk_len with 0 meaning padding -- hence max_walk_len + 1 rows and
@@ -109,12 +113,12 @@ class BagWeights(nn.Module):
     too and the two effects could not be separated (see the ablation in CLAUDE.md).
     """
 
-    def __init__(self, max_walk_len: int, t_full: float, d_time: int = 16, d_pos: int = 4,
+    def __init__(self, max_walk_len: int, d_time: int = 16, d_pos: int = 4,
                  hidden_dim: int = 32):
         super().__init__()
         self.max_walk_len = int(max_walk_len)
         self.hidden = int(hidden_dim)
-        self.time = TimeEncoder(d_time, t_full)
+        self.time = TimeEncoder(d_time)
         # +1 row for the padding index 0; real hops are 1..max_walk_len.
         self.pos = nn.Embedding(self.max_walk_len + 1, int(d_pos), padding_idx=0)
         nn.init.normal_(self.pos.weight, std=0.02)
@@ -140,7 +144,7 @@ class BagWeights(nn.Module):
 class LinkPredHead(nn.Module):
     """E is a ManifoldParameter; the pooling weights carry no learned parameters."""
 
-    def __init__(self, num_nodes: int, d_emb: int, max_walk_len: int, t_full: float,
+    def __init__(self, num_nodes: int, d_emb: int, max_walk_len: int,
                  init_irange: float = 1e-3, use_pop_bias: bool = False,
                  d_time: int = 16, d_pos: int = 4, hidden_dim: int = 32):
         super().__init__()
@@ -148,7 +152,7 @@ class LinkPredHead(nn.Module):
         self.d_emb = int(d_emb)
         self.use_pop_bias = bool(use_pop_bias)
         self.geom = PoincareManifold()
-        self.bag_weights = BagWeights(max_walk_len, t_full, d_time, d_pos, hidden_dim)
+        self.bag_weights = BagWeights(max_walk_len, d_time, d_pos, hidden_dim)
 
         # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
