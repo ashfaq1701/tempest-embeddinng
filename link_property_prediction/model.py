@@ -1,12 +1,14 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = geo_temp * (-d_H(P_u, P_v)).
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = -rad(P_u) * rad(P_v) * d_H(P_u, P_v).
 
-The distance term is scaled by a learned geo_temp (init 1.0). The score is purely geometric: there
-is no per-node popularity term.
+The score is purely geometric and carries NO learned scalar at all -- the distance is scaled by the
+product of the two centroids' hyperbolic radii instead of by a learned temperature. The radius
+product is a per-PAIR adaptive temperature: pairs whose centroids sit far from the origin have
+their distance amplified, pairs near the origin have it damped.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over an
 MLP of [log1p(age) | raw position | rad] at a fixed hidden width. Nothing is standardised: log1p
 is a fixed function of the age alone, so no batch-dependent or dataset-derived quantity enters
-the pooler. Learned head params: geo_temp and the MLP pooler."""
+the pooler. Learned head params: the MLP pooler alone."""
 
 
 import geoopt
@@ -102,8 +104,6 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
-
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
         nodes = tokens.nodes.clamp_min(0).clone()
@@ -119,7 +119,10 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = geo_temp * (-geo), the distance scaled by geo_temp."""
+
+        score = -rad(P_u) * rad(P_v) * d_H(P_u, P_v). The radii are NOT detached here (unlike the
+        pooler's `rad` feature): they carry gradient, so the score can be sharpened by pushing
+        centroids outward as well as by moving them apart."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -127,4 +130,6 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        return self.geo_temp * (-geo)                                           # [B, C] scaled distance
+        r_u = self.geom.dist0(p_u).unsqueeze(1)                                 # [B, 1] source radius
+        r_v = self.geom.dist0(p_v)                                              # [B, C] candidate radii
+        return -(r_u * r_v * geo)                                               # [B, C]
