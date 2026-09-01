@@ -1,43 +1,50 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = -d_H(P_u, P_v) / rad(P_v).
+"""Centroid-to-centroid head on the Poincaré ball:
 
-The geodesic distance normalised by the CANDIDATE's hyperbolic radius alone. No learned scalar of
-any kind, and no source-radius term.
+    s(u,v) = geo_temp * ( -d_H(P_u, P_v) / (rad(P_u) + rad(P_v)) )
 
-Why rad(P_u) is absent. It is a per-row positive constant, so it cannot reorder candidates: the
-argsort of -d/(rad_u*rad_v) and of -d/rad_v are IDENTICAL. It contributes exactly nothing to the
-ranking. What it does contribute is the last free-sharpening channel. Softmax is only
-SHIFT-invariant, not scale-invariant, so any per-row positive factor moves the cross-entropy while
-leaving the MRR alone -- and with rad(P_u) in the denominator a GLOBAL rescale of E sharpens the
-softmax for free (verified float64, scale every embedding by k, argsort unchanged throughout:
-    k     = 1      0.2     0.01    1e-3
-    d/(rad_u*rad_v) spread = 2.35   11.89   237.9   2378.6     <- runaway
-    d/rad_v         spread = 1.4517 1.4280  1.4271  1.4271     <- pinned
-). Dropping rad(P_u) makes the score DEGREE-0: numerator and denominator both scale linearly, so
-contracting or expanding the embedding changes the logits by nothing. Exact in the small-radius
-limit; ~2% drift by |x| ~ 0.45, where hyperbolic scaling stops behaving like a similarity.
+A bounded, scale-invariant tree-similarity, sharpened by ONE global learned temperature. This is
+the SimCLR/CLIP/InfoNCE shape -- bounded similarity divided by a temperature -- with the normalised
+Gromov product standing in for cosine.
 
-The two forms this replaces both had a rank-neutral scale channel and both used it:
-  -rad_u * rad_v * d   sharpens by EXPANDING  (margin ~ k^3). Measured: link -50% for +0.069 test.
-  -d / (rad_u * rad_v) sharpens by CONTRACTING (margin ~ 1/k). Did not actually fire, but was open.
+WHAT THE SIMILARITY IS. The Gromov product (u|v)_o = (rad_u + rad_v - d)/2 is, in a tree, the depth
+of u and v's lowest common ancestor as seen from the origin. Verified identity:
 
-The price, which is real and has no mitigation here: there is now NO temperature channel at all.
-Sharpness is fixed by the configuration's shape, and the logit spread is bounded by
-2*rad(P_u)/rad(P_v) (triangle inequality through the origin). So the head cannot sharpen over
-training, and it cannot do what a learned global temperature does -- concentrate gradient on
-unsolved queries as it rises (measured on the geo_temp head: gradient mass on an unsolved row goes
-23% -> 98% -> 100% as T goes 1 -> 5 -> 15). Nothing here focuses on hard examples. If this arm
-underperforms with a healthy geometry, restoring a single GLOBAL learned T -- s = -T*d/rad(P_v) --
-is the indicated next step: global T is self-regulating where a per-row radius is not, because
-correctly- and incorrectly-ranked rows pull it in opposite directions on one shared scalar.
+    d / (rad_u + rad_v)  ==  1 - 2*(u|v)_o / (rad_u + rad_v)
 
-rad(P_v) itself IS rank-relevant and is the point: ranking is by log d(P_u,P_v) - log rad(P_v), a
-distance ranking plus an additive per-candidate radial bias. Near-origin candidates are penalised
-(d/rad_v -> infinity as rad_v -> 0), so unlike the product form this favours peripheral candidates.
+so minimising it maximises the SHARE of each node's root-path that the two have in common. That is
+the tree analogue of cosine similarity, and the natural similarity for a hyperbolic embedding.
+
+WHY EVERY TERM EARNS ITS PLACE.
+  scale-invariant -- numerator and denominator are both degree-1, so contracting or expanding E
+    changes the logits by nothing. Neither of the two exploits measured on earlier heads exists:
+    -rad_u*rad_v*d sharpened by EXPANDING (margin ~ k^3; it fired -- link -50% for +0.069 test),
+    -d/(rad_u*rad_v) could sharpen by CONTRACTING (margin ~ 1/k).
+  rad_u is RANK-RELEVANT here, unlike in the product/quotient forms where it was a per-row constant
+    that could not reorder anything and existed only to leak temperature. Additively it does not
+    factor out: d/dr_u of d_i/(r_u+r_v_i) = -d_i/(r_u+r_v_i)^2 differs per candidate.
+
+WHY THE TEMPERATURE IS MANDATORY, NOT OPTIONAL. The similarity is bounded in [0,1] by the triangle
+inequality through the origin, and the EFFECTIVE spread over real pairs is far smaller -- measured
+~0.25 at moderate radii, falling to 0.10 near the boundary. Un-tempered, that caps cross-entropy
+about 0.16-0.24 below chance (log 6 = 1.792), i.e. structurally incapable of confidence. The
+preceding arm removed the temperature entirely and stalled at link 1.60 / test 0.2529, the worst of
+four heads, with headroom it could not use. Bounded similarity through a softmax needs a
+temperature for exactly the reason cosine does in contrastive learning.
+
+WHY A GLOBAL SCALAR IS SAFE WHERE A PER-ROW RADIUS WAS NOT. A per-row temperature lets each query
+move its own knob in its own favour and nothing cancels -- that is the free lunch. One shared
+scalar is self-regulating: correctly-ranked rows push it up, incorrectly-ranked rows push it down,
+on the same parameter (verified: 6 correct rows want T up, 2 wrong rows outvote them). It also
+supplies the focusing the un-tempered head lacked -- gradient mass on an unsolved row goes
+23% -> 98% -> 100% as T goes 1 -> 5 -> 15.
+
+geo_temp is LINEAR, init 1.0, exactly as the geo_temp*(-d) baseline parameterises it, so this head
+differs from that baseline in the SIMILARITY FUNCTION ALONE.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over an
 MLP of [log1p(age) | raw position | rad] at a fixed hidden width. Nothing is standardised: log1p
 is a fixed function of the age alone, so no batch-dependent or dataset-derived quantity enters
-the pooler. Learned head params: the MLP pooler alone."""
+the pooler. Learned head params: geo_temp and the MLP pooler."""
 
 
 import geoopt
@@ -148,6 +155,10 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
+        # ONE global temperature. Linear, init 1.0 -- identical parameterisation to the
+        # geo_temp*(-d) baseline, so the similarity function is the only variable between them.
+        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
         nodes = tokens.nodes.clamp_min(0).clone()
@@ -164,9 +175,9 @@ class LinkPredHead(nn.Module):
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
 
-        score = -d_H(P_u, P_v) / rad(P_v). rad(P_v) is NOT detached here (unlike the pooler's `rad`
-        feature): it carries gradient. There is no rad(P_u) term -- it is a per-row constant that
-        cannot reorder candidates, and removing it makes the score scale-invariant."""
+        score = geo_temp * ( -d_H(P_u,P_v) / (rad(P_u) + rad(P_v)) ). Neither radius is detached
+        here (unlike the pooler's `rad` feature): both carry gradient, and both are rank-relevant
+        because the sum does not factor out of the row."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -174,8 +185,10 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        # clamp_min is a NaN guard for a centroid landing exactly on the origin (a bag whose tokens
-        # cancel). At irange 1e-3 the pooled radii run ~0.02, so 1e-9 never binds in normal
-        # operation -- the scale is set by irange, not by this floor.
-        r_v = self.geom.dist0(p_v).clamp_min(1e-9)                              # [B, C] candidate radii
-        return -(geo / r_v)                                                     # [B, C]
+        r_u = self.geom.dist0(p_u).unsqueeze(1)                                 # [B, 1] source radius
+        r_v = self.geom.dist0(p_v)                                              # [B, C] candidate radii
+        # clamp_min is a NaN guard for BOTH centroids landing exactly on the origin, the only way
+        # the sum can vanish. It does not set any scale: the score is degree-0, so the embedding
+        # scale cancels and irange cannot affect sharpness the way it did on the quotient head.
+        sim = geo / (r_u + r_v).clamp_min(1e-9)                                 # [B, C] in [0,1]
+        return self.geo_temp * (-sim)                                           # [B, C]
