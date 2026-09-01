@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr-manifold", default=1e-3, type=float,
                    help="Learning rate for the manifold parameters -- the embedding table E, which "
                         "takes Riemannian steps on the Poincare ball.")
-    p.add_argument("--lr-net", default=1e-2, type=float,
+    p.add_argument("--lr-net", default=5e-3, type=float,
                    help="Learning rate for everything else: the distance temperature and the NN "
                         "pooler. Adam steps a parameter by ~lr regardless of gradient size, so "
                         "these ~162 parameters would otherwise slew as slowly as the whole "

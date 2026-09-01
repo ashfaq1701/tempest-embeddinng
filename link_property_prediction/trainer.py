@@ -56,7 +56,7 @@ class TrainerConfig:
     # geoopt.ManifoldParameter (the embedding table E) rides `lr_manifold`; every other parameter
     # -- the distance temperature and the NN pooler -- rides `lr_net`.
     lr_manifold: float = 1e-3
-    lr_net: float = 1e-2
+    lr_net: float = 5e-3
 
     # Run control.
     num_epochs: int = 50
