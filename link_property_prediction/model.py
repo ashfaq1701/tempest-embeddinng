@@ -41,7 +41,8 @@ class TimeEncoder(nn.Module):
     """GraphMixer/TGAT cosine time encoding: cos(w * t + b), w a fixed geometric frequency ladder.
 
     The ladder is 1 / 10^linspace(0, 9, time_dim), i.e. angular frequencies from 1 down to 1e-9, so
-    channel i has period 2*pi*10^(9i/(time_dim-1)). Both w and b are trainable by default.
+    channel i has period 2*pi*10^(9i/(time_dim-1)). w and b are FROZEN -- the ladder is a fixed
+    basis and there is no option to train it.
 
     KNOWN HAZARD ON A COARSE TIMESTAMP GRID, measured previously on this project (commit 7c7c112a):
     a channel whose period is shorter than twice the grid spacing is below Nyquist and cannot
@@ -53,17 +54,16 @@ class TimeEncoder(nn.Module):
     to be sub-Nyquist here. See the run header for the measured count.
     """
 
-    def __init__(self, time_dim: int, parameter_requires_grad: bool = True):
+    def __init__(self, time_dim: int):
         super().__init__()
         self.time_dim = int(time_dim)
         self.w = nn.Linear(1, self.time_dim)
+        # FROZEN. The ladder is a fixed basis, not something to fit: requires_grad=False on both
+        # tensors, with no flag to turn it back on.
         self.w.weight = nn.Parameter(
             torch.from_numpy(1 / 10 ** np.linspace(0, 9, self.time_dim, dtype=np.float32))
-            .reshape(self.time_dim, -1))
-        self.w.bias = nn.Parameter(torch.zeros(self.time_dim))
-        if not parameter_requires_grad:
-            self.w.weight.requires_grad = False
-            self.w.bias.requires_grad = False
+            .reshape(self.time_dim, -1), requires_grad=False)
+        self.w.bias = nn.Parameter(torch.zeros(self.time_dim), requires_grad=False)
 
     def forward(self, timestamps: torch.Tensor) -> torch.Tensor:
         """timestamps [B, L] -> [B, L, time_dim]."""
