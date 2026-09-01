@@ -52,9 +52,11 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. One RiemannianAdam param group at a single `lr`: the
-    # embedding tables, the distance temperature and the NN pooler all step at the same rate.
-    lr: float = 1e-3
+    # Constant lr, no weight decay. Two RiemannianAdam param groups, split on the MANIFOLD:
+    # geoopt.ManifoldParameter (the embedding table E) rides `lr_manifold`; every other parameter
+    # -- the distance temperature and the NN pooler -- rides `lr_net`.
+    lr_manifold: float = 1e-3
+    lr_net: float = 1e-2
 
     # Run control.
     num_epochs: int = 50
@@ -93,10 +95,28 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # One param group at a single lr: Riemannian update for E, standard Adam for the rest.
-        self.opt = geoopt.optim.RiemannianAdam(
-            self.model.parameters(), lr=float(config.lr), stabilize=10,
-        )
+        # Two param groups, split on the MANIFOLD rather than by name or module:
+        #   lr_manifold -- every geoopt.ManifoldParameter, i.e. the embedding table E. These take
+        #                  Riemannian steps on the Poincare ball, and their scale is bounded by the
+        #                  ball itself: measured on WikiLink, |E|mean runs to 0.9+ and saturates
+        #                  against the boundary at 1.0, after which the objective can no longer be
+        #                  reduced by expanding them.
+        #   lr_net      -- everything else: the distance temperature and the NN pooler. Ordinary
+        #                  Adam, unbounded, and only ~162 parameters against E's tens of millions.
+        #
+        # Adam moves a parameter by ~lr per step regardless of gradient magnitude, so at a shared
+        # rate those 162 numbers slew as slowly as the whole table. Splitting on ManifoldParameter
+        # rather than on `self.model.E` means a second manifold tensor added later lands in the
+        # right group automatically, and renaming a module cannot silently empty either group.
+        man = [p for p in self.model.parameters() if isinstance(p, geoopt.ManifoldParameter)]
+        man_ids = {id(p) for p in man}
+        net = [p for p in self.model.parameters() if id(p) not in man_ids]
+        groups = []
+        if man:
+            groups.append({"params": man, "lr": float(config.lr_manifold)})
+        if net:
+            groups.append({"params": net, "lr": float(config.lr_net)})
+        self.opt = geoopt.optim.RiemannianAdam(groups, lr=float(config.lr_manifold), stabilize=10)
 
     # Full-graph ingestion (once, up front)
 
@@ -168,7 +188,8 @@ class Trainer:
 
         return {
             "link": float(link_loss.detach()),
-            "lr": float(self.opt.param_groups[0]["lr"]),
+            "lr_manifold": float(self.opt.param_groups[0]["lr"]),
+            "lr_net": float(self.opt.param_groups[-1]["lr"]),
         }
 
     # Geometry probe
@@ -292,7 +313,8 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
-                f"lr={self.opt.param_groups[0]['lr']:.0e}  "
+                f"lr_m={self.opt.param_groups[0]['lr']:.0e}  "
+                f"lr_n={self.opt.param_groups[-1]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
 
