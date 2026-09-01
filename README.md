@@ -10,7 +10,6 @@ link_property_prediction/
   data.py           SplitData / Loaded / Batch + chronological batcher
   evaluator.py      Evaluator + DataSuite ABCs, make_suite
   tgb_seq_eval.py   TGB-Seq loader, fixed eval negatives, TGB-Seq evaluator
-  data_stats.py     train-split statistics
   negatives.py      uniform negative sampler
   walks.py          Tempest walk-sampler wrapper
   walk_tokens.py    per-query walk token bags
