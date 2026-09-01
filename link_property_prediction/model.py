@@ -1,32 +1,44 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = -d_H(P_u, P_v) / (rad(P_u) * rad(P_v)).
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = -d_H(P_u, P_v) / rad(P_v).
 
-RADIUS-NORMALISED distance. No learned scalar of any kind. The radii divide rather than multiply,
-which is the whole point: it closes the rank-neutral temperature channel that the multiplicative
-form leaves open.
+The geodesic distance normalised by the CANDIDATE's hyperbolic radius alone. No learned scalar of
+any kind, and no source-radius term.
 
-Why the division and not the product (measured in float64, see the commit message):
-  Ranking within a query row is invariant to any POSITIVE MULTIPLICATIVE row constant, so rad(P_u)
-  -- fixed across the row's candidates -- cannot change the MRR either way. But softmax is only
-  SHIFT-invariant, not scale-invariant, so rad(P_u) DOES move the cross-entropy. Under the product
-  form that is a free lunch: grow rad(P_u) on queries already ranked correctly and the loss falls
-  with zero ranking gain (verified: r_u 2e-3 -> 2.9 takes max softmax prob 0.167 -> 0.982 with the
-  argsort unchanged; and the YouTube run drove link -50% for +0.069 test).
-  Under the QUOTIENT form the same move cancels. As P_u -> origin the temperature 1/rad(P_u) blows
-  up, but d_H(P_u,P_v) -> rad(P_v), so d/rad(P_v) -> 1 for EVERY candidate and the ranking signal
-  collapses at the same rate. Verified: rad(P_u) swept over 1e-9..1.1 (temperature 0.9 -> 5e8)
-  leaves the logit spread pinned at 0.037 and max prob at 0.170. The loss can then only be reduced
-  by genuinely improving the ranking.
+Why rad(P_u) is absent. It is a per-row positive constant, so it cannot reorder candidates: the
+argsort of -d/(rad_u*rad_v) and of -d/rad_v are IDENTICAL. It contributes exactly nothing to the
+ranking. What it does contribute is the last free-sharpening channel. Softmax is only
+SHIFT-invariant, not scale-invariant, so any per-row positive factor moves the cross-entropy while
+leaving the MRR alone -- and with rad(P_u) in the denominator a GLOBAL rescale of E sharpens the
+softmax for free (verified float64, scale every embedding by k, argsort unchanged throughout:
+    k     = 1      0.2     0.01    1e-3
+    d/(rad_u*rad_v) spread = 2.35   11.89   237.9   2378.6     <- runaway
+    d/rad_v         spread = 1.4517 1.4280  1.4271  1.4271     <- pinned
+). Dropping rad(P_u) makes the score DEGREE-0: numerator and denominator both scale linearly, so
+contracting or expanding the embedding changes the logits by nothing. Exact in the small-radius
+limit; ~2% drift by |x| ~ 0.45, where hyperbolic scaling stops behaving like a similarity.
 
-The price, which is real: the triangle inequality through the origin gives
-|rad_u - rad_v| <= d <= rad_u + rad_v, so the achievable logit spread is bounded by 2 / rad(P_v).
-Sharpness therefore DEGRADES as the embedding expands (ceiling 9.97 at |x|=0.1, 1.82 at |x|=0.5,
-0.68 at |x|=0.9). This head can only be sharp while E stays compact -- the opposite pressure to
-the product form, which sought the boundary.
+The two forms this replaces both had a rank-neutral scale channel and both used it:
+  -rad_u * rad_v * d   sharpens by EXPANDING  (margin ~ k^3). Measured: link -50% for +0.069 test.
+  -d / (rad_u * rad_v) sharpens by CONTRACTING (margin ~ 1/k). Did not actually fire, but was open.
+
+The price, which is real and has no mitigation here: there is now NO temperature channel at all.
+Sharpness is fixed by the configuration's shape, and the logit spread is bounded by
+2*rad(P_u)/rad(P_v) (triangle inequality through the origin). So the head cannot sharpen over
+training, and it cannot do what a learned global temperature does -- concentrate gradient on
+unsolved queries as it rises (measured on the geo_temp head: gradient mass on an unsolved row goes
+23% -> 98% -> 100% as T goes 1 -> 5 -> 15). Nothing here focuses on hard examples. If this arm
+underperforms with a healthy geometry, restoring a single GLOBAL learned T -- s = -T*d/rad(P_v) --
+is the indicated next step: global T is self-regulating where a per-row radius is not, because
+correctly- and incorrectly-ranked rows pull it in opposite directions on one shared scalar.
+
+rad(P_v) itself IS rank-relevant and is the point: ranking is by log d(P_u,P_v) - log rad(P_v), a
+distance ranking plus an additive per-candidate radial bias. Near-origin candidates are penalised
+(d/rad_v -> infinity as rad_v -> 0), so unlike the product form this favours peripheral candidates.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over an
 MLP of [log1p(age) | raw position | rad] at a fixed hidden width. Nothing is standardised: log1p
 is a fixed function of the age alone, so no batch-dependent or dataset-derived quantity enters
 the pooler. Learned head params: the MLP pooler alone."""
+
 
 import geoopt
 import torch
@@ -125,9 +137,10 @@ class LinkPredHead(nn.Module):
         #     irange 1e-3 -> rad(pooled) 0.021, maxprob 0.976   <- SATURATED at step 0
         #     irange 2e-2 -> rad(pooled) 0.064, maxprob 0.569
         #     irange 5e-2 -> rad(pooled) 0.155, maxprob 0.344
-        # The radii are in a DENOMINATOR now, so at 1e-3 the head opens as a near-hard argmax:
-        # gradients vanish on all but the top candidate, and d/dr_u of d/(r_u*r_v) =
-        # -d/(r_u^2 * r_v) is ~1e6, which is a blow-up risk on a manifold parameter in epoch 1.
+        # rad(P_v) is in a DENOMINATOR, so a small init still means large radial gradients
+        # (d/dr_v of d/r_v = -d/r_v^2). Dropping rad(P_u) removes one factor of 1/r, so this arm
+        # opens FLATTER than the two-radius quotient did -- measured below. The two-radius arm
+        # survived irange 1e-3 without NaN, so this one should comfortably.
         # If epoch 1 diverges or NaNs, raise this before concluding anything about the score.
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
@@ -151,9 +164,9 @@ class LinkPredHead(nn.Module):
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
 
-        score = -d_H(P_u, P_v) / (rad(P_u) * rad(P_v)). The radii are NOT detached here (unlike the
-        pooler's `rad` feature): they carry gradient. rad(P_u) is constant across a row so it
-        cannot move the ranking; rad(P_v) is the rank-relevant radial channel."""
+        score = -d_H(P_u, P_v) / rad(P_v). rad(P_v) is NOT detached here (unlike the pooler's `rad`
+        feature): it carries gradient. There is no rad(P_u) term -- it is a per-row constant that
+        cannot reorder candidates, and removing it makes the score scale-invariant."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -163,7 +176,6 @@ class LinkPredHead(nn.Module):
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
         # clamp_min is a NaN guard for a centroid landing exactly on the origin (a bag whose tokens
         # cancel). At irange 1e-3 the pooled radii run ~0.02, so 1e-9 never binds in normal
-        # operation -- the scale is set by irange above, not by this floor.
-        r_u = self.geom.dist0(p_u).clamp_min(1e-9).unsqueeze(1)                 # [B, 1] source radius
+        # operation -- the scale is set by irange, not by this floor.
         r_v = self.geom.dist0(p_v).clamp_min(1e-9)                              # [B, C] candidate radii
-        return -(geo / (r_u * r_v))                                             # [B, C]
+        return -(geo / r_v)                                                     # [B, C]
