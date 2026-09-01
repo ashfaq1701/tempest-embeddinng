@@ -1,7 +1,16 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = geo_temp * (-d_H(P_u, P_v)).
+"""Centroid-to-centroid head on the Poincaré ball:
 
-The distance term is scaled by a learned geo_temp (init 1.0). The score is purely geometric: there
-is no per-node popularity term.
+    s(u,v) = -TimeConditionedTemperature(t_query) * d_H(P_u, P_v)
+
+The distance is scaled by a TIME-DEPENDENT TEMPERATURE: a small MLP over the cosine encoding of
+the query's own cutoff timestamp, replacing the single learned scalar geo_temp. The scale the
+model applies is therefore a function of WHEN the query happens, not one global constant -- it can
+sharpen in dense periods and flatten in sparse ones.
+
+The temperature is constant across a query's candidate row, so like geo_temp it cannot reorder
+candidates: it is a pure temperature, and its effect is on the cross-entropy and the gradients,
+not the MRR of a fixed embedding. Unlike geo_temp it is SHARED ACROSS QUERIES only through the
+network weights, so different query times get different scales.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over an
 MLP of [TimeEncoder(age) | hop embedding | rad] at a fixed hidden width. Nothing is standardised:
@@ -68,6 +77,39 @@ class TimeEncoder(nn.Module):
     def forward(self, timestamps: torch.Tensor) -> torch.Tensor:
         """timestamps [B, L] -> [B, L, time_dim]."""
         return torch.cos(self.w(timestamps.unsqueeze(dim=2)))
+
+
+class TimeConditionedTemperature(nn.Module):
+    """Per-query distance temperature as a function of the query's cutoff time.
+
+        temp(t) = MLP(TimeEncoder(t)),   MLP = Linear(d_time, hidden) -> GELU -> Linear(hidden, 1)
+
+    Replaces the single learned scalar geo_temp. The input is the query's own cutoff timestamp, so
+    every query in a batch can receive a different scale while the row itself keeps one constant --
+    which is what makes this a temperature and not a ranking signal.
+
+    The TimeEncoder is FROZEN, like the pooler's: the ladder is a fixed basis and only the MLP on
+    top of it is fitted.
+
+    UNCONSTRAINED SIGN, deliberately, and it is the failure mode to watch. Nothing forces the
+    output positive. The score is -temp(t) * d, so a NEGATIVE temp INVERTS that query's ranking --
+    farther candidates score higher. geo_temp started at exactly 1.0 and could only drift; this
+    starts wherever the random MLP init lands, which straddles zero. The trainer logs the batch
+    mean/min/max each epoch so a negative branch is visible rather than silent.
+    """
+
+    def __init__(self, d_time: int, hidden_dim: int):
+        super().__init__()
+        self.d_time = int(d_time)
+        self.time_enc = TimeEncoder(self.d_time)
+        self.net = nn.Sequential(nn.Linear(self.d_time, int(hidden_dim)), nn.GELU(),
+                                 nn.Linear(int(hidden_dim), 1))
+
+    def forward(self, cutoffs: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """cutoffs [B] -> temp [B, 1], broadcastable over the candidate row."""
+        t = cutoffs.to(dtype).unsqueeze(0)                                      # [1, B]
+        enc = self.time_enc(t).squeeze(0)                                       # [B, d_time]
+        return self.net(enc)                                                    # [B, 1]
 
 
 class BagWeights(nn.Module):
@@ -140,7 +182,9 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+        # Time-dependent temperature, replacing the scalar geo_temp. Shares hidden_dim with the
+        # pooler MLP: no separate flag was added, so a --hidden-dim sweep moves both.
+        self.geo_temp_net = TimeConditionedTemperature(d_time, hidden_dim)
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
@@ -157,7 +201,8 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = geo_temp * (-geo), the distance scaled by geo_temp."""
+        score = -temp(t_query) * geo. The temperature comes from the SOURCE bag's cutoff, which
+        every candidate in the row shares, so it scales the row without reordering it."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -165,4 +210,11 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        return self.geo_temp * (-geo)                                           # [B, C] scaled distance
+        temp = self.geo_temp_net(src_tokens.cutoffs, p_u.dtype)                 # [B, 1] per-query
+        # Stash batch stats for the epoch line: an unconstrained temp can go NEGATIVE, which
+        # inverts that query's ranking, and that must be visible rather than silent.
+        with torch.no_grad():
+            t = temp.detach()
+            self._temp_stats = (float(t.mean()), float(t.min()), float(t.max()),
+                                float((t < 0).to(t.dtype).mean()))
+        return -temp * geo                                                      # [B, C]

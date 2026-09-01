@@ -193,6 +193,12 @@ class Trainer:
             parts.append(f"temp={float(self.model.temperature):.3f}")
         if hasattr(self.model, "geo_temp"):
             parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
+        st = getattr(self.model, "_temp_stats", None)
+        if st is not None:
+            # Time-dependent temperature over the last batch. `neg` is the fraction of queries whose
+            # temperature went negative -- those rows have an INVERTED ranking, so it is logged.
+            mean, lo, hi, neg = st
+            parts.append(f"temp mean={mean:.3f} [{lo:.3f}, {hi:.3f}] neg={neg:.1%}")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad
