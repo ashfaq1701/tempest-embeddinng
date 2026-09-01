@@ -58,6 +58,7 @@ class TrainerConfig:
     # Constant lr, no weight decay. One RiemannianAdam param group at a single `lr`: the
     # embedding tables, the distance temperature and the NN pooler all step at the same rate.
     lr: float = 1e-3
+    lr_pooler: float = 1e-2
 
     # Run control.
     num_epochs: int = 50
@@ -97,10 +98,24 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # One param group at a single lr: Riemannian update for E, standard Adam for the rest.
-        self.opt = geoopt.optim.RiemannianAdam(
-            self.model.parameters(), lr=float(config.lr), stabilize=10,
-        )
+        # Two param groups, split by identity: the NN pooler rides `lr_pooler`; everything else
+        # -- the embedding tables, the distance temperature, pop_bias when on -- stays at `lr`.
+        #
+        # Adam moves a parameter by ~lr per step regardless of gradient magnitude, so the pooler's
+        # ~162 parameters and a 143M-row embedding table otherwise slew at the same rate. The
+        # pooler decides which walk tokens the centroid listens to; when its first-layer weights
+        # have to travel before the feature is usable at all, that travel is measured in epochs at
+        # the embedding lr and in fractions of one at 1e-2.
+        #
+        # Split by identity rather than by name, so renaming a module cannot silently empty the
+        # fast group; if the head carries no pooler at all this degrades to a single group.
+        pooler = list(self.model.bag_weights.parameters())
+        pooler_ids = {id(p) for p in pooler}
+        rest = [p for p in self.model.parameters() if id(p) not in pooler_ids]
+        groups = [{"params": rest, "lr": float(config.lr)}]
+        if pooler:
+            groups.append({"params": pooler, "lr": float(config.lr_pooler)})
+        self.opt = geoopt.optim.RiemannianAdam(groups, lr=float(config.lr), stabilize=10)
 
     # Full-graph ingestion (once, up front)
 
@@ -173,6 +188,7 @@ class Trainer:
         return {
             "link": float(link_loss.detach()),
             "lr": float(self.opt.param_groups[0]["lr"]),
+            "lr_pooler": float(self.opt.param_groups[-1]["lr"]),
         }
 
     # Geometry probe
