@@ -52,11 +52,9 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. Two RiemannianAdam param groups, split on the MANIFOLD:
-    # geoopt.ManifoldParameter (the embedding table E) rides `lr_manifold`; every other parameter
-    # -- the distance temperature and the NN pooler -- rides `lr_net`.
-    lr_manifold: float = 1e-3
-    lr_net: float = 5e-3
+    # Constant lr, no weight decay. TWO OPTIMISERS at one shared rate, split on the manifold:
+    # RiemannianAdam for geoopt.ManifoldParameter (E), Adafactor for everything else.
+    lr: float = 1e-3
 
     # Run control.
     num_epochs: int = 50
@@ -95,28 +93,32 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # Two param groups, split on the MANIFOLD rather than by name or module:
-        #   lr_manifold -- every geoopt.ManifoldParameter, i.e. the embedding table E. These take
-        #                  Riemannian steps on the Poincare ball, and their scale is bounded by the
-        #                  ball itself: measured on WikiLink, |E|mean runs to 0.9+ and saturates
-        #                  against the boundary at 1.0, after which the objective can no longer be
-        #                  reduced by expanding them.
-        #   lr_net      -- everything else: the distance temperature and the NN pooler. Ordinary
-        #                  Adam, unbounded, and only ~162 parameters against E's tens of millions.
+        # TWO OPTIMISERS, split on the manifold rather than by name or module:
+        #   opt     -- RiemannianAdam over every geoopt.ManifoldParameter, i.e. the embedding
+        #              table E. These take Riemannian steps on the Poincare ball and `stabilize`
+        #              projects them back onto it periodically.
+        #   opt_net -- Adafactor over everything else: the distance temperature and the NN pooler.
         #
-        # Adam moves a parameter by ~lr per step regardless of gradient magnitude, so at a shared
-        # rate those 162 numbers slew as slowly as the whole table. Splitting on ManifoldParameter
-        # rather than on `self.model.E` means a second manifold tensor added later lands in the
-        # right group automatically, and renaming a module cannot silently empty either group.
+        # Why a different algorithm rather than a second lr group. Adam moves a parameter by ~lr
+        # per step REGARDLESS of its magnitude, so one rate cannot serve geo_temp (which lives at
+        # 10-170) and pooler weights (which live at ~0.5) at once -- measured, Adam moved all three
+        # of a 0.5 / 5 / 100-scale tensor by the same absolute 0.500 over 50 steps, i.e. 100% /
+        # 10% / 0.5% of their own scale. Adafactor moved each by 39.5% of its scale. Its factored
+        # second moment tracks the gradient's own scale, so the update is scale-free, and d=1.0
+        # clips the update RMS so a spike cannot blow it up.
+        #
+        # NOTE torch's Adafactor is a simplified port: it has no relative_step or scale_parameter
+        # argument (those are in the original paper and HuggingFace's version). The scale-free
+        # behaviour above comes from the factored second moment plus update clipping, and was
+        # verified empirically on this version rather than assumed from the paper.
+        #
+        # Both optimisers share `lr`. That is the point: with a scale-free update rule the rate no
+        # longer has to be re-picked per parameter magnitude.
         man = [p for p in self.model.parameters() if isinstance(p, geoopt.ManifoldParameter)]
         man_ids = {id(p) for p in man}
         net = [p for p in self.model.parameters() if id(p) not in man_ids]
-        groups = []
-        if man:
-            groups.append({"params": man, "lr": float(config.lr_manifold)})
-        if net:
-            groups.append({"params": net, "lr": float(config.lr_net)})
-        self.opt = geoopt.optim.RiemannianAdam(groups, lr=float(config.lr_manifold), stabilize=10)
+        self.opt = geoopt.optim.RiemannianAdam(man, lr=float(config.lr), stabilize=10)
+        self.opt_net = torch.optim.Adafactor(net, lr=float(config.lr)) if net else None
 
     # Full-graph ingestion (once, up front)
 
@@ -183,13 +185,16 @@ class Trainer:
         loss = link_loss
 
         self.opt.zero_grad(set_to_none=True)
+        if self.opt_net is not None:
+            self.opt_net.zero_grad(set_to_none=True)
         loss.backward()
         self.opt.step()
+        if self.opt_net is not None:
+            self.opt_net.step()
 
         return {
             "link": float(link_loss.detach()),
-            "lr_manifold": float(self.opt.param_groups[0]["lr"]),
-            "lr_net": float(self.opt.param_groups[-1]["lr"]),
+            "lr": float(self.opt.param_groups[0]["lr"]),
         }
 
     # Geometry probe
@@ -313,8 +318,7 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
-                f"lr_m={self.opt.param_groups[0]['lr']:.0e}  "
-                f"lr_n={self.opt.param_groups[-1]['lr']:.0e}  "
+                f"lr={self.opt.param_groups[0]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
 

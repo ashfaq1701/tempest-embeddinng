@@ -68,14 +68,11 @@ def parse_args() -> argparse.Namespace:
                    help="Eval negatives per positive (tgb-seq val only).")
 
     # ── Optimisation / training ─────────────────────────────────────
-    p.add_argument("--lr-manifold", default=1e-3, type=float,
-                   help="Learning rate for the manifold parameters -- the embedding table E, which "
-                        "takes Riemannian steps on the Poincare ball.")
-    p.add_argument("--lr-net", default=5e-3, type=float,
-                   help="Learning rate for everything else: the distance temperature and the NN "
-                        "pooler. Adam steps a parameter by ~lr regardless of gradient size, so "
-                        "these ~162 parameters would otherwise slew as slowly as the whole "
-                        "embedding table.")
+    p.add_argument("--lr", default=1e-3, type=float,
+                   help="Learning rate, shared by both optimisers: RiemannianAdam over the "
+                        "manifold parameters and Adafactor over everything else. Adafactor's "
+                        "update is scale-free, so one rate serves parameters of very different "
+                        "magnitudes.")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
@@ -194,8 +191,7 @@ def main() -> Dict[str, Any]:
         start_bias=args.start_bias,
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
-        lr_manifold=args.lr_manifold,
-        lr_net=args.lr_net,
+        lr=args.lr,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 
