@@ -118,7 +118,7 @@ class Trainer:
         man_ids = {id(p) for p in man}
         net = [p for p in self.model.parameters() if id(p) not in man_ids]
         self.opt = geoopt.optim.RiemannianAdam(man, lr=float(config.lr), stabilize=10)
-        self.opt_net = torch.optim.Adafactor(net, lr=float(config.lr)) if net else None
+        self.opt_net = torch.optim.Adafactor(net, lr=float(config.lr))
 
     # Full-graph ingestion (once, up front)
 
@@ -185,12 +185,10 @@ class Trainer:
         loss = link_loss
 
         self.opt.zero_grad(set_to_none=True)
-        if self.opt_net is not None:
-            self.opt_net.zero_grad(set_to_none=True)
+        self.opt_net.zero_grad(set_to_none=True)
         loss.backward()
         self.opt.step()
-        if self.opt_net is not None:
-            self.opt_net.step()
+        self.opt_net.step()
 
         return {
             "link": float(link_loss.detach()),
