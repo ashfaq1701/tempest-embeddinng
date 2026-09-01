@@ -94,7 +94,7 @@ class BagWeights(nn.Module):
     """
 
     def __init__(self, max_walk_len: int, hidden_dim: int = 32,
-                 d_time: int = 32, d_hop: int = 8):
+                 d_time: int = 32, d_hop: int = 4):
         super().__init__()
         self.max_walk_len = int(max_walk_len)
         self.hidden = int(hidden_dim)
@@ -126,7 +126,7 @@ class LinkPredHead(nn.Module):
 
     def __init__(self, num_nodes: int, d_emb: int, max_walk_len: int,
                  init_irange: float = 1e-3, hidden_dim: int = 32,
-                 d_time: int = 32, d_hop: int = 8):
+                 d_time: int = 32, d_hop: int = 4):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)

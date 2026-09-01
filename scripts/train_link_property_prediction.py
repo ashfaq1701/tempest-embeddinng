@@ -95,7 +95,7 @@ def parse_args() -> argparse.Namespace:
                         "count so a feature change does not also move pooler capacity.")
     p.add_argument("--d-time", default=32, type=int,
                    help="Channels in the cosine time encoding of the token age.")
-    p.add_argument("--d-hop", default=8, type=int,
+    p.add_argument("--d-hop", default=4, type=int,
                    help="Channels in the learned hop-index embedding (table has max_walk_len+1 rows).")
 
     # ── Post-training outputs ───────────────────────────────────────

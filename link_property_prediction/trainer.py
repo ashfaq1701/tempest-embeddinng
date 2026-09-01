@@ -42,7 +42,7 @@ class TrainerConfig:
 
     # Pooler encoder widths: cosine time encoding of the age, learned embedding of the hop index.
     d_time: int = 32
-    d_hop: int = 8
+    d_hop: int = 4
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
