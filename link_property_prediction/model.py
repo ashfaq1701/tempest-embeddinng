@@ -1,15 +1,32 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = -rad(P_u) * rad(P_v) * d_H(P_u, P_v).
+"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = -d_H(P_u, P_v) / (rad(P_u) * rad(P_v)).
 
-The score is purely geometric and carries NO learned scalar at all -- the distance is scaled by the
-product of the two centroids' hyperbolic radii instead of by a learned temperature. The radius
-product is a per-PAIR adaptive temperature: pairs whose centroids sit far from the origin have
-their distance amplified, pairs near the origin have it damped.
+RADIUS-NORMALISED distance. No learned scalar of any kind. The radii divide rather than multiply,
+which is the whole point: it closes the rank-neutral temperature channel that the multiplicative
+form leaves open.
+
+Why the division and not the product (measured in float64, see the commit message):
+  Ranking within a query row is invariant to any POSITIVE MULTIPLICATIVE row constant, so rad(P_u)
+  -- fixed across the row's candidates -- cannot change the MRR either way. But softmax is only
+  SHIFT-invariant, not scale-invariant, so rad(P_u) DOES move the cross-entropy. Under the product
+  form that is a free lunch: grow rad(P_u) on queries already ranked correctly and the loss falls
+  with zero ranking gain (verified: r_u 2e-3 -> 2.9 takes max softmax prob 0.167 -> 0.982 with the
+  argsort unchanged; and the YouTube run drove link -50% for +0.069 test).
+  Under the QUOTIENT form the same move cancels. As P_u -> origin the temperature 1/rad(P_u) blows
+  up, but d_H(P_u,P_v) -> rad(P_v), so d/rad(P_v) -> 1 for EVERY candidate and the ranking signal
+  collapses at the same rate. Verified: rad(P_u) swept over 1e-9..1.1 (temperature 0.9 -> 5e8)
+  leaves the logit spread pinned at 0.037 and max prob at 0.170. The loss can then only be reduced
+  by genuinely improving the ranking.
+
+The price, which is real: the triangle inequality through the origin gives
+|rad_u - rad_v| <= d <= rad_u + rad_v, so the achievable logit spread is bounded by 2 / rad(P_v).
+Sharpness therefore DEGRADES as the embedding expands (ceiling 9.97 at |x|=0.1, 1.82 at |x|=0.5,
+0.68 at |x|=0.9). This head can only be sharp while E stays compact -- the opposite pressure to
+the product form, which sought the boundary.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over an
 MLP of [log1p(age) | raw position | rad] at a fixed hidden width. Nothing is standardised: log1p
 is a fixed function of the age alone, so no batch-dependent or dataset-derived quantity enters
 the pooler. Learned head params: the MLP pooler alone."""
-
 
 import geoopt
 import torch
@@ -98,6 +115,20 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(max_walk_len, hidden_dim)
 
         # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
+        #
+        # irange stays at 1e-3, unchanged from the multiplicative head, so this arm is a
+        # SINGLE-VARIABLE change against it (product -> quotient) with the init held fixed.
+        # Be aware of what that costs, measured at d=64 through the real pooled path (rad of the
+        # POOLED centroid, which runs ~1/3 of the per-node rad since a midpoint of ~10 random
+        # tokens sits closer to the origin; maxprob = largest softmax weight over a 1+5 row,
+        # uniform = 0.167):
+        #     irange 1e-3 -> rad(pooled) 0.021, maxprob 0.976   <- SATURATED at step 0
+        #     irange 2e-2 -> rad(pooled) 0.064, maxprob 0.569
+        #     irange 5e-2 -> rad(pooled) 0.155, maxprob 0.344
+        # The radii are in a DENOMINATOR now, so at 1e-3 the head opens as a near-hard argmax:
+        # gradients vanish on all but the top candidate, and d/dr_u of d/(r_u*r_v) =
+        # -d/(r_u^2 * r_v) is ~1e6, which is a blow-up risk on a manifold parameter in epoch 1.
+        # If epoch 1 diverges or NaNs, raise this before concluding anything about the score.
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
             init = self.geom.manifold.projx(
@@ -120,9 +151,9 @@ class LinkPredHead(nn.Module):
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
 
-        score = -rad(P_u) * rad(P_v) * d_H(P_u, P_v). The radii are NOT detached here (unlike the
-        pooler's `rad` feature): they carry gradient, so the score can be sharpened by pushing
-        centroids outward as well as by moving them apart."""
+        score = -d_H(P_u, P_v) / (rad(P_u) * rad(P_v)). The radii are NOT detached here (unlike the
+        pooler's `rad` feature): they carry gradient. rad(P_u) is constant across a row so it
+        cannot move the ranking; rad(P_v) is the rank-relevant radial channel."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -130,6 +161,9 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        r_u = self.geom.dist0(p_u).unsqueeze(1)                                 # [B, 1] source radius
-        r_v = self.geom.dist0(p_v)                                              # [B, C] candidate radii
-        return -(r_u * r_v * geo)                                               # [B, C]
+        # clamp_min is a NaN guard for a centroid landing exactly on the origin (a bag whose tokens
+        # cancel). At irange 1e-3 the pooled radii run ~0.02, so 1e-9 never binds in normal
+        # operation -- the scale is set by irange above, not by this floor.
+        r_u = self.geom.dist0(p_u).clamp_min(1e-9).unsqueeze(1)                 # [B, 1] source radius
+        r_v = self.geom.dist0(p_v).clamp_min(1e-9)                              # [B, C] candidate radii
+        return -(geo / (r_u * r_v))                                             # [B, C]
