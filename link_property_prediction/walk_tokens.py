@@ -17,7 +17,12 @@ class WalkTokens:
     seeds: torch.Tensor                             # [Q]      query/source node u (kept even when cold)
     cutoffs: torch.Tensor                           # [Q]      exclusive cutoff t per query
     nodes: torch.Tensor                             # [Q, T]   walk node ids; padding = -1
-    ages: torch.Tensor                              # [Q, T]   cutoff - t_edge; seed = 0, ctx >= 1, pad = -1
+    timestamps: torch.Tensor                        # [Q, T]   t_edge of the edge leaving this token.
+                                                    #          Tempest's INT64_MAX seed sentinel is
+                                                    #          resolved to the query cutoff here (the
+                                                    #          seed has no outgoing edge); padding = -1.
+                                                    #          Age is cutoff - t_edge, computed by the
+                                                    #          consumer, not stored.
     positions: torch.Tensor                         # [Q, T]   hop from seed: 1 = seed, ..., lens = oldest; pad 0
     mask: torch.Tensor                              # [Q, T]   bool, real slots (nodes != -1), incl. seed
     seed_mask: torch.Tensor                         # [Q, T]   bool, ONLY the seed's walk-origin slot
@@ -60,32 +65,36 @@ def build_query_walk_tokens(
     nodes = wd.nodes.to(device=device, dtype=torch.int64).reshape(q, k, length)        # [Q, K, L]
     node_mask = nodes != -1
 
-    # AGE = cutoff - t_edge: seed sentinel -> cutoff (age 0), real edges >= 1, padding -> -1.
+    # RAW EDGE TIMESTAMPS. Tempest marks the seed slot with INT64_MAX (no outgoing edge there);
+    # that sentinel is resolved to the query cutoff HERE rather than downstream, because
+    # cutoff - INT64_MAX overflows int64. Padding stays -1. The cutoff is EXCLUSIVE, so every real
+    # edge has t_edge < cutoff and the seed is the only slot at t_edge == cutoff.
     ts = wd.timestamps.to(device=device, dtype=torch.int64).reshape(q, k, length)
     edge_ts = torch.where(ts == _TS_SENTINEL, cutoffs_t.view(q, 1, 1), ts)
-    ages = cutoffs_t.view(q, 1, 1) - edge_ts
-    ages = torch.where(node_mask, ages, torch.full_like(ages, -1))
+    edge_ts = torch.where(node_mask, edge_ts, torch.full_like(edge_ts, -1))
 
     # HOP from seed: pos = lens - array_index (walks stored oldest->seed); padding -> 0.
     lens = node_mask.sum(dim=-1, keepdim=True)                                          # [Q, K, 1]
     arange = torch.arange(length, device=device).view(1, 1, length)
     positions = (lens - arange).clamp_min(0)
 
-    seed_mask = node_mask & (ages == 0)
+    # The seed is the only real slot sitting at t_edge == cutoff (exclusive cutoff, so every
+    # context edge is strictly earlier). Equivalent to the old `ages == 0` test.
+    seed_mask = node_mask & (edge_ts == cutoffs_t.view(q, 1, 1))
 
     # Per-token edge features; seed slot (age 0) and padding forced to [0]*d_ef.
     edge_features = None
     if wd.edge_feats is not None:
         d_ef = int(wd.edge_feats.shape[-1])
         ef = wd.edge_feats.to(device=device, dtype=torch.float32).reshape(q, k, length, d_ef)
-        real = (node_mask & (ages != 0)).unsqueeze(-1)
+        real = (node_mask & (edge_ts != cutoffs_t.view(q, 1, 1))).unsqueeze(-1)
         edge_features = (ef * real).reshape(q, k * length, d_ef)                        # [Q, T, d_ef]
 
     return WalkTokens(
         seeds_t,
         cutoffs_t,
         nodes.reshape(q, -1),               # [Q, T]
-        ages.reshape(q, -1),
+        edge_ts.reshape(q, -1),
         positions.reshape(q, -1),
         node_mask.reshape(q, -1),
         seed_mask.reshape(q, -1),

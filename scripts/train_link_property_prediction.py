@@ -93,6 +93,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hidden-dim", default=32, type=int,
                    help="Hidden width of the pooler MLP. Pinned independently of the feature "
                         "count so a feature change does not also move pooler capacity.")
+    p.add_argument("--d-time", default=32, type=int,
+                   help="Channels in the cosine time encoding of the token age.")
+    p.add_argument("--d-hop", default=8, type=int,
+                   help="Channels in the learned hop-index embedding (table has max_walk_len+1 rows).")
 
     # ── Post-training outputs ───────────────────────────────────────
     p.add_argument("--export-best-embedding-table", action="store_true",
@@ -180,6 +184,8 @@ def main() -> Dict[str, Any]:
 
         d_emb=args.d_emb,
         hidden_dim=args.hidden_dim,
+        d_time=args.d_time,
+        d_hop=args.d_hop,
 
         K_train=args.k_train,
 

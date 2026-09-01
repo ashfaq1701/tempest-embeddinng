@@ -36,10 +36,13 @@ class TrainerConfig:
     # Embedding dimension.
     d_emb: int = 64
 
-    # Pooler MLP width. The feature count is fixed by max_walk_len: 1 normalised age +
-    # max_walk_len one-hot position slots + 1 radius.
-    # Pooler MLP width. Feature count is fixed by max_walk_len (1 age + L one-hot + 1 rad).
+    # Pooler MLP width, pinned independently of the feature count so a feature change does not
+    # also move pooler capacity. Feature count is d_time + d_hop + 1 (rad).
     hidden_dim: int = 32
+
+    # Pooler encoder widths: cosine time encoding of the age, learned embedding of the hop index.
+    d_time: int = 32
+    d_hop: int = 8
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
@@ -78,6 +81,8 @@ class Trainer:
             d_emb=int(config.d_emb),
             max_walk_len=int(config.max_walk_len),
             hidden_dim=int(config.hidden_dim),
+            d_time=int(config.d_time),
+            d_hop=int(config.d_hop),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(
