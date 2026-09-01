@@ -19,10 +19,10 @@ random MLP init lands, which straddles zero. Measured over 8192 real-scale YouTu
 
 At seed 42, the seed this project runs, HALF the queries begin with an inverted ranking, and the
 fraction swings from 9% to 97% across seeds -- so this head's init is far more seed-sensitive than
-the scalar it replaces. forward() stashes the batch mean/min/max and negative fraction, and the
-epoch line prints them as `temp mean=... [lo, hi] neg=...%`, so the recovery (or lack of it) is
-visible from epoch 1. If it does not recover, constraining the output positive -- softplus, or
-1 + net(...) -- is the fix, and is deliberately not applied here. The scale the
+the scalar it replaces. The sign is NOT constrained and the temperature is NOT logged, so a negative
+branch is silent: nothing in the epoch line will show it. If a run underperforms, dumping the
+temperature over the eval cutoffs is the first check, and constraining the output positive
+(softplus, or 1 + net(...)) is the fix. The scale the
 model applies is therefore a function of WHEN the query happens, not one global constant -- it can
 sharpen in dense periods and flatten in sparse ones.
 
@@ -201,10 +201,4 @@ class LinkPredHead(nn.Module):
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
         t_enc = self.bag_weights.time_enc(src_tokens.cutoffs.to(p_u.dtype).unsqueeze(0))
         temp = self.geo_temp_net(t_enc.squeeze(0))                              # [B, 1] per-query
-        # Stash batch stats for the epoch line: an unconstrained temp can go NEGATIVE, which
-        # inverts that query's ranking, and that must be visible rather than silent.
-        with torch.no_grad():
-            t = temp.detach()
-            self._temp_stats = (float(t.mean()), float(t.min()), float(t.max()),
-                                float((t < 0).to(t.dtype).mean()))
         return -temp * geo                                                      # [B, C]
