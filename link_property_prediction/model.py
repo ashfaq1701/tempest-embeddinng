@@ -1,9 +1,28 @@
 """Centroid-to-centroid head on the Poincaré ball:
 
-    s(u,v) = -TimeConditionedTemperature(t_query) * d_H(P_u, P_v)
+    s(u,v) = -geo_temp_net(TimeEncoder(t_query)) * d_H(P_u, P_v)
 
-The distance is scaled by a TIME-DEPENDENT TEMPERATURE: a small MLP over the cosine encoding of
-the query's own cutoff timestamp, replacing the single learned scalar geo_temp. The scale the
+The distance is scaled by a TIME-DEPENDENT TEMPERATURE: `geo_temp_net`, a
+Linear -> GELU -> Linear MLP over the cosine encoding of the query's own cutoff timestamp,
+replacing the single learned scalar geo_temp. It reads the pooler's frozen TimeEncoder rather than
+carrying a second copy of the same fixed basis.
+
+UNCONSTRAINED SIGN, deliberately -- and at init this is NOT a corner case. The score is -temp * d,
+so a NEGATIVE temperature INVERTS that query's ranking: farther candidates score higher. geo_temp
+started at exactly +1.0 for every seed and could only drift from there; this starts wherever the
+random MLP init lands, which straddles zero. Measured over 8192 real-scale YouTube cutoffs:
+
+  seed 42   mean -0.0022  min -0.4562  max +0.3239   50.8% NEGATIVE
+  seed  0   mean -0.0879  min -0.6701  max +0.3327   73.1%
+  seed  1   mean -0.1414  min -0.4471  max +0.1715   96.9%
+  seed  3   mean +0.1330  min -0.2724  max +0.4559    9.3%
+
+At seed 42, the seed this project runs, HALF the queries begin with an inverted ranking, and the
+fraction swings from 9% to 97% across seeds -- so this head's init is far more seed-sensitive than
+the scalar it replaces. forward() stashes the batch mean/min/max and negative fraction, and the
+epoch line prints them as `temp mean=... [lo, hi] neg=...%`, so the recovery (or lack of it) is
+visible from epoch 1. If it does not recover, constraining the output positive -- softplus, or
+1 + net(...) -- is the fix, and is deliberately not applied here. The scale the
 model applies is therefore a function of WHEN the query happens, not one global constant -- it can
 sharpen in dense periods and flatten in sparse ones.
 
@@ -79,39 +98,6 @@ class TimeEncoder(nn.Module):
         return torch.cos(self.w(timestamps.unsqueeze(dim=2)))
 
 
-class TimeConditionedTemperature(nn.Module):
-    """Per-query distance temperature as a function of the query's cutoff time.
-
-        temp(t) = MLP(TimeEncoder(t)),   MLP = Linear(d_time, hidden) -> GELU -> Linear(hidden, 1)
-
-    Replaces the single learned scalar geo_temp. The input is the query's own cutoff timestamp, so
-    every query in a batch can receive a different scale while the row itself keeps one constant --
-    which is what makes this a temperature and not a ranking signal.
-
-    The TimeEncoder is FROZEN, like the pooler's: the ladder is a fixed basis and only the MLP on
-    top of it is fitted.
-
-    UNCONSTRAINED SIGN, deliberately, and it is the failure mode to watch. Nothing forces the
-    output positive. The score is -temp(t) * d, so a NEGATIVE temp INVERTS that query's ranking --
-    farther candidates score higher. geo_temp started at exactly 1.0 and could only drift; this
-    starts wherever the random MLP init lands, which straddles zero. The trainer logs the batch
-    mean/min/max each epoch so a negative branch is visible rather than silent.
-    """
-
-    def __init__(self, d_time: int, hidden_dim: int):
-        super().__init__()
-        self.d_time = int(d_time)
-        self.time_enc = TimeEncoder(self.d_time)
-        self.net = nn.Sequential(nn.Linear(self.d_time, int(hidden_dim)), nn.GELU(),
-                                 nn.Linear(int(hidden_dim), 1))
-
-    def forward(self, cutoffs: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        """cutoffs [B] -> temp [B, 1], broadcastable over the candidate row."""
-        t = cutoffs.to(dtype).unsqueeze(0)                                      # [1, B]
-        enc = self.time_enc(t).squeeze(0)                                       # [B, d_time]
-        return self.net(enc)                                                    # [B, 1]
-
-
 class BagWeights(nn.Module):
     """Pooling weights = softmax(MLP([TimeEncoder(age) | hop_emb(hop) | rad])).
 
@@ -182,9 +168,12 @@ class LinkPredHead(nn.Module):
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
-        # Time-dependent temperature, replacing the scalar geo_temp. Shares hidden_dim with the
-        # pooler MLP: no separate flag was added, so a --hidden-dim sweep moves both.
-        self.geo_temp_net = TimeConditionedTemperature(d_time, hidden_dim)
+        # Time-dependent distance temperature, replacing the scalar geo_temp: an MLP over the
+        # cosine encoding of the query's own cutoff. Reuses the pooler's TimeEncoder, which is
+        # frozen and stateless, so there is one fixed basis in the head rather than two copies.
+        # Shares hidden_dim with the pooler MLP; no separate flag, so --hidden-dim moves both.
+        self.geo_temp_net = nn.Sequential(nn.Linear(d_time, hidden_dim), nn.GELU(),
+                                          nn.Linear(hidden_dim, 1))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
@@ -210,7 +199,8 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        temp = self.geo_temp_net(src_tokens.cutoffs, p_u.dtype)                 # [B, 1] per-query
+        t_enc = self.bag_weights.time_enc(src_tokens.cutoffs.to(p_u.dtype).unsqueeze(0))
+        temp = self.geo_temp_net(t_enc.squeeze(0))                              # [B, 1] per-query
         # Stash batch stats for the epoch line: an unconstrained temp can go NEGATIVE, which
         # inverts that query's ranking, and that must be visible rather than silent.
         with torch.no_grad():
