@@ -1,40 +1,45 @@
-"""Centroid-to-centroid head on the Poincaré ball:
+"""Centroid-to-centroid head on the Poincaré ball -- the HYPERBOLIC TRIANGLE RATIO:
 
-    s(u,v) = -d_H(P_u, P_v) / (rad(P_u) + rad(P_v))
+    s(u,v) = ( rad(P_v) - d_H(P_u, P_v) ) / rad(P_u)
 
-The normalised Gromov product, with NO temperature and no learned scalar of any kind.
-161 head params: the pooler MLP alone.
+161 head params: the pooler MLP alone. No learned scalar of any kind.
 
-THE SIMILARITY. (u|v)_o = (rad_u + rad_v - d)/2 is the Gromov product -- in a tree, the depth of
-u and v's lowest common ancestor seen from the origin. Verified identity:
+WHAT IT IS. The numerator is the Gromov product with the source term dropped: the exact product is
+(u|v)_o = (rad_u + rad_v - d)/2, and rad_u is constant within a query, so under the per-query
+softmax CE it adds the same constant to every candidate and cancels from the loss AND the gradient
+(sum_c dL/ds_c = 0 for softmax CE). What remains, rad_v - d, ranks by candidate DEPTH minus
+distance: a deep candidate is allowed to be proportionally farther away.
 
-    d/(rad_u + rad_v)  ==  1 - 2*(u|v)_o/(rad_u + rad_v)
+The denominator then reintroduces rad_u as a PER-QUERY TEMPERATURE. It cannot reorder candidates
+-- it is a per-row positive divisor -- but softmax is only shift-invariant, not scale-invariant, so
+it modulates the entropy of each query's distribution by the source's depth.
 
-so this ranks by the SHARE of each node's root-path the two have in common: the tree analogue of
-cosine similarity. Bounded in [0,1] by the triangle inequality through the origin.
+MEASURED PROPERTIES, so this run is read against what was actually checked rather than the claim.
 
-Scale-invariant (numerator and denominator both degree-1), so a global rescale of E cannot sharpen
-the softmax -- neither the EXPANSION exploit of -rad_u*rad_v*d (margin ~ k^3; it fired, link -50%
-for +0.069 test) nor the CONTRACTION exploit of -d/(rad_u*rad_v) (margin ~ 1/k) exists here. And
-unlike those two forms rad_u is RANK-RELEVANT: additively it does not factor out of the row, since
-d/dr_u of d_i/(r_u+r_v_i) = -d_i/(r_u+r_v_i)^2 differs per candidate.
+  Scale-response: NOT exactly degree-0. Rescaling all of E by k gives spread 0.4547 / 0.4383 /
+  0.3720 / 0.1648 at k = 0.25 / 0.5 / 1 / 2 -- a 2.8x fall as the embedding expands. Degree-0
+  holds only in the Euclidean limit; at real radii d grows faster than linearly, so there is a
+  mild CONTRACTION incentive. Weaker than -d/(rad_u*rad_v), but present.
 
-WHY THE TEMPERATURE WAS REMOVED AGAIN, and what it costs. The tempered version of this head
-(e9b417d3, geo_temp linear init 1.0) scored 0.3928 on YouTube and its failure mode was
-MEMORISATION: link fell to 0.0914 while val peaked at ep12 and then declined for five straight
-epochs. The temperature is what made that possible -- it is the only thing that can turn a bounded
-similarity into confident predictions. Capping confidence may therefore act as a regulariser and
-keep the geometry improving rather than the logits sharpening.
+  The depth modulation is REAL BUT SMALL. Over 100 candidates with the source moved from
+  |p_u| = 0.05 to 0.95 (rad_u 0.10 -> 3.66) the entropy runs 4.5958 -> 4.6047 against a uniform
+  4.6052: directionally as claimed (deeper source -> flatter ranking) but a 0.009-nat effect.
+  What rad_u genuinely does is INVERT the spread ordering across source depths -- without the
+  division spread runs 0.056 -> 0.428 -> 0.485 as the source deepens, with it 0.552 -> 0.532 ->
+  0.130. That is a real change to the ranking function, not a cosmetic one.
 
-The cost is structural and should be read before interpreting this run. The similarity's effective
-spread is ~0.25 at moderate radii (measured [0.5555, 0.8136] at init) and 0.10 near the boundary,
-and even a well-separated configuration cannot exceed spread 1. That caps cross-entropy roughly
-0.16-0.47 below chance (log 6 = 1.792) -- it can never reach the tempered arm's 0.091. It also
-removes gradient focusing: on the geo_temp head, gradient mass on an unsolved row goes 23% -> 98%
--> 100% as T goes 1 -> 5 -> 15, and with no T every example keeps roughly equal weight forever.
-The previous un-tempered head (-d/rad_v) stalled at link 1.60 / test 0.2529, the worst of five
-arms, for exactly this reason -- though it also lacked a rank-relevant rad_u and chased the
-boundary, neither of which applies here.
+  It is NOT the free-lunch channel a per-row temperature usually is. The model cannot move rad_u
+  independently of the numerator: as P_u -> origin, d -> rad_v so (rad_v - d) -> 0 at rate
+  rad_u*cos(theta), and the ratio tends to cos(theta). Measured, rad_u swept 6.2e-1 down to
+  2.0e-7: spread stays 0.4644 / 0.4527 / 0.4514 and maxprob 0.1442 / 0.1408 / 0.1408. Self-
+  limiting, unlike -rad_u*rad_v*d where the same knob ran away (maxprob 0.167 -> 0.982).
+
+THE RISK, stated before launch. Absolute spread is only ~0.13-0.55 across 100 candidates, i.e. a
+near-uniform softmax. Both previous un-tempered heads sat in exactly that regime and underfit:
+-d/(rad_u+rad_v) scored 0.2969 and -d/rad_v 0.2529, each stalling by ep6 with link parked ~0.3
+below chance and nothing focusing gradient on unsolved queries. A global temperature
+(s = T * (rad_v - d)/rad_u) would address that and is deliberately NOT included here -- this arm
+runs the formula as stated, so the temperature becomes a clean one-variable follow-up.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over an
 MLP of [log1p(age) | raw position | rad] at a fixed hidden width. Nothing is standardised: log1p
@@ -166,9 +171,9 @@ class LinkPredHead(nn.Module):
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
 
-        score = -d_H(P_u,P_v) / (rad(P_u) + rad(P_v)). Neither radius is detached here (unlike the
-        pooler's `rad` feature): both carry gradient, and both are rank-relevant because the sum
-        does not factor out of the row."""
+        score = (rad(P_v) - d_H(P_u,P_v)) / rad(P_u). Neither radius is detached here (unlike the
+        pooler's `rad` feature): both carry gradient. rad(P_v) is rank-relevant; rad(P_u) is a
+        per-row divisor that sets the query's softmax temperature but cannot reorder."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -181,4 +186,7 @@ class LinkPredHead(nn.Module):
         # clamp_min is a NaN guard for BOTH centroids landing exactly on the origin, the only way
         # the sum can vanish. It does not set any scale: the score is degree-0, so the embedding
         # scale cancels and irange cannot affect sharpness the way it did on the quotient head.
-        return -(geo / (r_u + r_v).clamp_min(1e-9))                             # [B, C], sim in [0,1]
+        # clamp_min guards a source centroid sitting exactly at the origin (rad_u = 0), the only
+        # divide-by-zero here. Pooled radii run ~0.02 at irange 1e-3, so 1e-9 never binds in
+        # normal operation.
+        return (r_v - geo) / r_u.clamp_min(1e-9)                                # [B, C]
