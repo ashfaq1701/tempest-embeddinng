@@ -74,9 +74,8 @@ class BagWeights(nn.Module):
     too and the two effects could not be separated (see the ablation in CLAUDE.md).
     """
 
-    def __init__(self, max_walk_len: int, hidden_dim: int = 32):
+    def __init__(self, hidden_dim: int = 32):
         super().__init__()
-        self.max_walk_len = int(max_walk_len)
         self.hidden = int(hidden_dim)
         # 1 normalised age + 1 raw position scalar + 1 magnitude.
         self.n_feat = 3
@@ -105,7 +104,7 @@ class LinkPredHead(nn.Module):
     """E is an ordinary nn.Parameter initialised inside the unit ball; the pooling weights carry
     no learned parameters."""
 
-    def __init__(self, num_nodes: int, d_emb: int, max_walk_len: int,
+    def __init__(self, num_nodes: int, d_emb: int,
                  init_radius: float = 1.0, use_pop_bias: bool = False,
                  hidden_dim: int = 32):
         super().__init__()
@@ -113,7 +112,7 @@ class LinkPredHead(nn.Module):
         self.d_emb = int(d_emb)
         self.use_pop_bias = bool(use_pop_bias)
         self.geom = EuclideanManifold()
-        self.bag_weights = BagWeights(max_walk_len, hidden_dim)
+        self.bag_weights = BagWeights(hidden_dim)
 
         # Uniform inside the ball of radius `init_radius`: a uniform DIRECTION (normalised
         # isotropic Gaussian) times a radius drawn as R * U^(1/d). The 1/d exponent is what makes

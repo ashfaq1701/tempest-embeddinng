@@ -2,7 +2,7 @@
 `make_suite` factory. The only suite is TGB-Seq, implemented in
 `tgb_seq_eval.py`."""
 import abc
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 
@@ -13,8 +13,8 @@ class Evaluator(abc.ABC):
     """Supplies per-positive negatives and the suite's native per-positive metric."""
 
     @abc.abstractmethod
-    def sample_negatives(self, batch: Batch) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        """`(neg_src_list, neg_tgt_list)` — one negative array per positive (K may vary)."""
+    def sample_negatives(self, batch: Batch) -> List[np.ndarray]:
+        """`neg_tgt_list` — one negative-destination array per positive (K may vary)."""
 
     @abc.abstractmethod
     def score_to_metric(self, pos_score: float, neg_scores: np.ndarray) -> float:
