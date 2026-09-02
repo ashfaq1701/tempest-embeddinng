@@ -17,8 +17,10 @@ class WalkData(NamedTuple):
     timestamps: torch.Tensor   # [N*K, L] int64; timestamps[p] = time of edge
                                # (nodes[p], nodes[p+1]); INT64_MAX sentinel at
                                # the seed slot (lens-1); padding = -1
-    lens: torch.Tensor         # [N*K] int64
-    seeds: torch.Tensor        # [N] int64
+    lens: torch.Tensor         # [N*K] int64; walk length. Not read by the model (which
+                               # recomputes it from the node mask) but IS the contract
+                               # tests/test_walk_edge_feats.py checks edge-feature
+                               # pairing against, so it stays.
     K: int                     # walks per seed
     edge_feats: Optional[torch.Tensor] = None
                                # [N*K, L, d_ef] float32, or None if no edge feats.
@@ -114,7 +116,6 @@ class WalkGenerator:
             nodes=nodes_t,
             timestamps=torch.from_numpy(np.asarray(ts).astype(np.int64)),
             lens=torch.from_numpy(np.asarray(lens).astype(np.int64)),
-            seeds=torch.from_numpy(seed_arr.astype(np.int64)),
             K=nw,
             edge_feats=edge_feats,
         )

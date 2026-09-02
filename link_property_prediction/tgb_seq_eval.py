@@ -4,7 +4,7 @@ VAL negatives are built once from `UniformNegativeSampler` at `k_eval` (fixed &
 seeded); TEST uses the shipped `test_ns` verbatim. Timestamps are cast to
 monotone int64 for Tempest's per-query cutoff.
 """
-from typing import List, Tuple
+from typing import List
 
 import numpy as np
 
@@ -66,8 +66,7 @@ def build_eval_negatives(split: SplitData, dst_pool: np.ndarray,
     sampler = UniformNegativeSampler(num_neg_per_pos=k_eval, dst_pool=dst_pool, seed=seed)
     whole = Batch(src=split.sources, tgt=split.destinations,
                   ts=split.timestamps, edge_feat=None)
-    _, neg_tgt = sampler.sample(whole)                    # [N_pos, k_eval]
-    return neg_tgt.astype(np.int32)
+    return sampler.sample(whole).astype(np.int32)         # [N_pos, k_eval]
 
 
 class TGBSeqEvaluator(Evaluator):
@@ -86,13 +85,11 @@ class TGBSeqEvaluator(Evaluator):
     def reset(self) -> None:
         self._cursor = 0
 
-    def sample_negatives(self, batch: Batch) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    def sample_negatives(self, batch: Batch) -> List[np.ndarray]:
         b = len(batch.src)
         rows = self._neg_dst[self._cursor:self._cursor + b]
         self._cursor += b
-        neg_tgt_list = [rows[i] for i in range(b)]
-        neg_src_list = [np.full(rows.shape[1], batch.src[i], dtype=np.int32) for i in range(b)]
-        return neg_src_list, neg_tgt_list
+        return [rows[i] for i in range(b)]
 
     def score_to_metric(self, pos_score: float, neg_scores: np.ndarray) -> float:
         pos = np.asarray([pos_score], dtype=np.float64)
