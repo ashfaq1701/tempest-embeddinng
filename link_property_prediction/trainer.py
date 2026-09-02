@@ -79,7 +79,6 @@ class Trainer:
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
-            max_walk_len=int(config.max_walk_len),
             use_pop_bias=bool(config.use_pop_bias),
             hidden_dim=int(config.hidden_dim),
         ).to(self.device)
@@ -151,7 +150,7 @@ class Trainer:
         B = len(batch.src)
 
         # Full graph already ingested; each query walks with cutoff = t (EXCLUSIVE).
-        _, neg_tgt = self.neg_sampler_train.sample(batch)              # [B, K_train]
+        neg_tgt = self.neg_sampler_train.sample(batch)                 # [B, K_train]
         src_t = torch.from_numpy(batch.src.astype(np.int64)).to(device)
         cand_np = np.concatenate(
             [batch.tgt.astype(np.int64)[:, None],
@@ -161,13 +160,11 @@ class Trainer:
 
         logits = self._score(src_t, cand_t, t_query_t)                            # [B, 1+K]
         target = torch.zeros(B, dtype=torch.long, device=device)
+        # link CE only; E trains end-to-end through the monotone head (no detach).
         link_loss = F.cross_entropy(logits, target)
 
-        # loss = link CE only; E trained end-to-end through the monotone head (no detach).
-        loss = link_loss
-
         self.opt.zero_grad(set_to_none=True)
-        loss.backward()
+        link_loss.backward()
         self.opt.step()
 
         return {
@@ -198,8 +195,7 @@ class Trainer:
 
     # Eval — strict-causal, no_grad
 
-    def _eval(self, evaluator: Evaluator, batches: Iterable[Batch],
-              recorder: Any = None) -> float:
+    def _eval(self, evaluator: Evaluator, batches: Iterable[Batch]) -> float:
         self.model.eval()
         # Rewind the fixed-negative cursor so every eval pass sees the same negatives.
         # Must precede the first sample_negatives call.
@@ -208,16 +204,11 @@ class Trainer:
         with torch.no_grad():
             for batch in batches:
                 B = len(batch.src)
-                if recorder is not None:
-                    recorder.before_batch(batch)
-
                 # Full graph already in Tempest; per-query cutoff keeps every walk causal.
                 if B == 0:
-                    if recorder is not None:
-                        recorder.after_batch(batch)
                     continue
 
-                _, neg_tgt_list = evaluator.sample_negatives(batch)
+                neg_tgt_list = evaluator.sample_negatives(batch)
                 counts = [int(arr.shape[0]) for arr in neg_tgt_list]
                 max_K = max(counts) if counts else 0
 
@@ -237,12 +228,7 @@ class Trainer:
                     rr = evaluator.score_to_metric(
                         float(logits[i, 0]), logits[i, 1:1 + counts[i]])
                     total += rr
-                    if recorder is not None:
-                        recorder.on_positive(batch, i, rr)
                 n += B
-
-                if recorder is not None:
-                    recorder.after_batch(batch)
         return total / max(n, 1)
 
     # Snapshot / restore (early-stop)
