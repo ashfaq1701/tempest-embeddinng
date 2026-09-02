@@ -1,12 +1,19 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = geo_temp * (-d_H(P_u, P_v)).
+"""Centroid-to-centroid head on the Poincaré ball: the symmetric SMOOTHED GROMOV PRODUCT.
 
-The distance term is scaled by a learned geo_temp (init 1.0). The score is purely geometric: there
-is no per-node popularity term.
+s(u,v) = G = -1/2 * log( e^-2r_u + e^-2r_v + (1 - e^-2r_u)(1 - e^-2r_v) * sin^2(theta/2) )
+
+with r_x = dist0(P_x) the hyperbolic radius and theta the origin-angle between P_u and P_v. G is a
+soft-min of (r_u, r_v, -log sin(theta/2)): the cross-entropy gradient flows into whichever term is
+the bottleneck, so a node expands its radius only when its own radius is the smallest term (i.e. the
+candidate is within ~2 e^-r of its direction) and rotates otherwise. Candidate depth enters as a
+CEILING (G <= min(r_u, r_v)) not a bonus, so no additive term can be grown to buy rank -- there is
+no route for a popularity bias. The score is unbounded above along aligned rays, so the softmax can
+sharpen without a learned scale: beta is FIXED at 1, there are no per-node scalars and no temperature.
+The dead ratio head s = temp*(r_v-geo)/r_u was exactly 2G/r_u - 1; the division was the whole problem.
 
 P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over an
-MLP of [log1p(age) | raw position | rad] at a fixed hidden width. Nothing is standardised: log1p
-is a fixed function of the age alone, so no batch-dependent or dataset-derived quantity enters
-the pooler. Learned head params: geo_temp and the MLP pooler."""
+MLP of [log1p(age) | raw position | rad] at a fixed hidden width. Learned head params: the MLP pooler
+only (the decoder G is parameter-free)."""
 
 
 import geoopt
@@ -22,10 +29,6 @@ class PoincareManifold:
 
     def __init__(self, c: float = 1.0):
         self.manifold = geoopt.PoincareBall(c=c)
-
-    def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Elementwise geodesic distance, broadcasting over leading dims. LOWER = closer."""
-        return self.manifold.dist(x, y)
 
     def dist0(self, x: torch.Tensor) -> torch.Tensor:
         """Hyperbolic radius: geodesic distance from the origin (0 at center, large near boundary)."""
@@ -101,8 +104,7 @@ class LinkPredHead(nn.Module):
             init = self.geom.manifold.projx(
                 (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
-
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+        # No head scalars: G is parameter-free and beta is fixed at 1 (see module docstring).
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
@@ -117,14 +119,35 @@ class LinkPredHead(nn.Module):
         w = self.bag_weights(self.geom, tokens, x, valid)                       # [Q, T] sums to 1, 0 on padding
         return self.geom.midpoint(x, w)                                         # [Q, d]
 
+    @staticmethod
+    def _gromov_score(r_u: torch.Tensor, n_u: torch.Tensor,
+                      r_v: torch.Tensor, n_v: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+        """Symmetric smoothed Gromov product G, evaluated as a pure logsumexp soft-min.
+
+        r_* are radii broadcast to [B, C]; n_* are unit directions ([B, 1, d] vs [B, C, d]). Returns
+        G [B, C] = -1/2 logsumexp(-2 r_u, -2 r_v, log(1-e^-2r_u) + log(1-e^-2r_v) + log sin^2(th/2)).
+        expm1 gives 1 - e^-2r stably; sin^2(theta/2) = ||n_u - n_v||^2 / 4 is stable at small angle.
+        """
+        log_a = torch.log(((n_u - n_v) ** 2).sum(-1) / 4 + eps)                 # [B, C] log sin^2(th/2)
+        log_1mw_u = torch.log(-torch.expm1(-2.0 * r_u))                         # [B, C] log(1 - e^-2r_u)
+        log_1mw_v = torch.log(-torch.expm1(-2.0 * r_v))                         # [B, C] log(1 - e^-2r_v)
+        terms = torch.stack([-2.0 * r_u, -2.0 * r_v,
+                             log_1mw_u + log_1mw_v + log_a], dim=-1)            # [B, C, 3]
+        return -0.5 * torch.logsumexp(terms, dim=-1)                            # [B, C]
+
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = geo_temp * (-geo), the distance scaled by geo_temp."""
+        logit = G(u,v), the symmetric smoothed Gromov product (beta fixed at 1). r_x = dist0(P_x) is
+        the hyperbolic radius; the direction n_x = P_x/||P_x|| gives the origin-angle theta."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
         b, d = p_u.shape
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
-        geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        return self.geo_temp * (-geo)                                           # [B, C] scaled distance
+        # Radii (clamped off 0 so log(1 - e^-2r) is finite) and unit directions from the centroids.
+        r_u = self.geom.dist0(p_u).clamp_min(1e-3).unsqueeze(1).expand(b, c)    # [B, C] source radius
+        r_v = self.geom.dist0(p_v).clamp_min(1e-3)                              # [B, C] candidate radii
+        n_u = (p_u / p_u.norm(dim=-1, keepdim=True).clamp_min(1e-12)).unsqueeze(1)  # [B, 1, d]
+        n_v = p_v / p_v.norm(dim=-1, keepdim=True).clamp_min(1e-12)             # [B, C, d]
+        return self._gromov_score(r_u, n_u, r_v, n_v)                          # [B, C]
