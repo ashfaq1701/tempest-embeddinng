@@ -1,18 +1,31 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = geo_temp * (-d_H(P_u, P_v)) [+ pop_bias[v]].
+"""Centroid-to-centroid head on the unit hypersphere: s(u,v) = geo_temp * cos(P_u, P_v) [+ pop_bias[v]].
 
-The distance term is scaled by a learned geo_temp (init 1.0). When the popularity channel is on, a
-learned per-node scalar pop_bias[v] (zero-init, so it contributes exactly 0 at step 0) is added at
-FIXED unit weight -- the model sharpens the geometry via geo_temp while popularity rides alongside at
-a constant scale.
+Spherical counterpart of the Poincare-ball head. Closeness is cosine SIMILARITY, so the sign
+flips relative to the ball: there the score was geo_temp * (-d_H) because distance is lower =
+closer, here it is geo_temp * cos because similarity is higher = closer. The similarity is
+scaled by a learned geo_temp (init 1.0). When the popularity channel is on, a learned per-node
+scalar pop_bias[v] (zero-init, so it contributes exactly 0 at step 0) is added at FIXED unit
+weight.
 
-P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over an
-MLP of [log1p(age) | raw position | rad] at a fixed hidden width. Nothing is standardised: log1p
-is a fixed function of the age alone, so no batch-dependent or dataset-derived quantity enters
-the pooler. Learned head params: geo_temp, the MLP pooler, and num_nodes popularity scalars
-when on."""
+P_x is the weighted spherical mean of x's walk-token bag -- the weighted Euclidean sum
+renormalised back onto the sphere. The pooling weights are a softmax over an MLP of
+[log1p(age) | raw position | norm] at a fixed hidden width. Nothing is standardised: log1p is a
+fixed function of the age alone, so no batch-dependent or dataset-derived quantity enters the
+pooler. Learned head params: geo_temp, the MLP pooler, and num_nodes popularity scalars when on.
+
+E IS NOT CONSTRAINED TO THE SPHERE. It is initialised uniformly on it, but left an ordinary
+nn.Parameter so its magnitude is free to move. That is deliberate and load-bearing for the
+`norm` feature: on a constrained sphere every |E[v]| is exactly 1, so the pooler's third
+feature would be a CONSTANT and the channel dead. Leaving the magnitude free makes |E[v]| a
+learned per-node scalar the pooler can actually read. The geometry is unaffected -- cosine
+similarity is scale-invariant, and the spherical mean renormalises -- so only the pooler
+feature and the norm's own dynamics depend on this choice.
+
+A consequence worth knowing: with E a plain nn.Parameter, geoopt's RiemannianAdam falls back
+to its Euclidean default manifold for it (identity egrad2rgrad, x+u retraction), i.e. it is
+plain Adam on E. No optimizer change is needed for this head."""
 
 
-import geoopt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,35 +33,46 @@ import torch.nn.functional as F
 from .walk_tokens import WalkTokens
 
 
-class PoincareManifold:
-    """Poincaré-ball geometry (c=1). `manifold` is kept for E's init + RiemannianAdam."""
+class SphereManifold:
+    """Unit-hypersphere geometry. Every operation is plain torch -- the sphere needs no
+    manifold library: its projection IS normalisation, and autograd through that normalisation
+    reproduces the tangent projection exactly."""
 
-    def __init__(self, c: float = 1.0):
-        self.manifold = geoopt.PoincareBall(c=c)
+    def similarity(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Cosine similarity, broadcasting over leading dims. HIGHER = closer.
 
-    def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Elementwise geodesic distance, broadcasting over leading dims. LOWER = closer."""
-        return self.manifold.dist(x, y)
+        Replaces the ball's geodesic `dist`. On the unit sphere this is the inner product, and
+        it is a monotone function of the geodesic distance arccos(<x,y>), so ranking by it is
+        equivalent to ranking by angle -- without arccos's vanishing gradient at the poles."""
+        return F.cosine_similarity(x, y, dim=-1)
 
-    def dist0(self, x: torch.Tensor) -> torch.Tensor:
-        """Hyperbolic radius: geodesic distance from the origin (0 at center, large near boundary)."""
-        return self.manifold.dist0(x)
+    def norm(self, x: torch.Tensor) -> torch.Tensor:
+        """Euclidean magnitude. Replaces the ball's `dist0` (hyperbolic radius).
+
+        Meaningful only because E is left unconstrained -- see the module docstring."""
+        return x.norm(dim=-1)
 
     def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        """Weighted gyro-midpoint: x [Q,T,d], w [Q,T] -> [Q,d]."""
-        return self.manifold.weighted_midpoint(x, weights=w, reducedim=[-2], dim=-1, keepdim=False)
+        """Weighted spherical mean: x [Q,T,d], w [Q,T] -> [Q,d] on the unit sphere.
+
+        The weighted Euclidean sum renormalised back onto the sphere. This is the standard
+        extrinsic (chordal) mean; it agrees with the intrinsic Karcher mean for concentrated
+        bags and is closed-form, where the Karcher mean needs an inner iteration."""
+        return F.normalize((w.unsqueeze(-1) * x).sum(dim=-2), dim=-1)
 
 
 class BagWeights(nn.Module):
-    """Pooling weights = softmax(MLP([age_norm | onehot(position) | rad])).
+    """Pooling weights = softmax(MLP([age_norm | raw position | norm])).
 
-    Features (`rad` is detached, so the pooler reads geometry but does not backprop through it):
+    Features (`norm` is detached, so the pooler reads geometry but does not backprop through it):
       age      -- log1p(age). NOT standardised: log1p is a fixed function of the age alone, so
                   the feature stays absolutely anchored and no batch-dependent quantity enters
                   the pooler.
       pos      -- the RAW hop index as one scalar, 1..max_walk_len, padding 0. Padded slots are
                   masked out of the softmax, so their value never matters.
-      rad      -- geodesic distance from the origin: the token's hyperbolic radius
+      norm     -- the token's Euclidean magnitude |E[v]|. The spherical counterpart of the
+                  ball head's `rad`. It is informative ONLY because E is left off the sphere
+                  (module docstring): on a constrained sphere it would be identically 1.
 
     Position is a RAW SCALAR here, not one-hot. One-hot lets the first Linear learn an arbitrary
     per-hop weight; a scalar forces the response to be affine in the hop index, so the pooler can
@@ -64,12 +88,12 @@ class BagWeights(nn.Module):
         super().__init__()
         self.max_walk_len = int(max_walk_len)
         self.hidden = int(hidden_dim)
-        # 1 normalised age + 1 raw position scalar + 1 radius.
+        # 1 normalised age + 1 raw position scalar + 1 magnitude.
         self.n_feat = 3
         self.net = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU(),
                                  nn.Linear(self.hidden, 1))
 
-    def forward(self, geom: "PoincareManifold", tokens: WalkTokens, x: torch.Tensor,
+    def forward(self, geom: "SphereManifold", tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
         # log1p compresses ages that span orders of magnitude and are heavily right-skewed
@@ -81,31 +105,37 @@ class BagWeights(nn.Module):
         age = torch.log1p(tokens.ages.clamp_min(0).to(x.dtype)).unsqueeze(-1)   # [Q, T, 1]
         # RAW hop index: 1 = seed .. max_walk_len = oldest, padding 0. Masked out below.
         pos = tokens.positions.unsqueeze(-1).to(x.dtype)                        # [Q, T, 1]
-        rad = geom.dist0(x.detach()).unsqueeze(-1)                              # [Q, T, 1]
-        feat = torch.cat([age, pos, rad], dim=-1).to(x.dtype)                   # [Q, T, 3]
+        norm = geom.norm(x.detach()).unsqueeze(-1)                              # [Q, T, 1]
+        feat = torch.cat([age, pos, norm], dim=-1).to(x.dtype)                  # [Q, T, 3]
         logits = self.net(feat).squeeze(-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
 
 class LinkPredHead(nn.Module):
-    """E is a ManifoldParameter; the pooling weights carry no learned parameters."""
+    """E is an ordinary nn.Parameter initialised on the sphere; the pooling weights carry no
+    learned parameters."""
 
     def __init__(self, num_nodes: int, d_emb: int, max_walk_len: int,
-                 init_irange: float = 1e-3, use_pop_bias: bool = False,
-                 hidden_dim: int = 32):
+                 use_pop_bias: bool = False, hidden_dim: int = 32):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.use_pop_bias = bool(use_pop_bias)
-        self.geom = PoincareManifold()
+        self.geom = SphereManifold()
         self.bag_weights = BagWeights(max_walk_len, hidden_dim)
 
-        # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
+        # Spread init: directions UNIFORM on the unit sphere. Normalising an isotropic Gaussian
+        # is the standard way to sample the sphere uniformly -- normalising a uniform CUBE would
+        # bias mass towards the corners. The sphere is compact and homogeneous, so there is no
+        # boundary to stay away from and the ball head's near-origin init has no analogue: a
+        # near-origin cluster here would just be a near-degenerate direction set.
+        #
+        # E is a plain nn.Parameter, NOT constrained to the sphere. Magnitudes start at exactly 1
+        # and are then free to move, which is what makes the pooler's `norm` feature live. See
+        # the module docstring.
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            init = self.geom.manifold.projx(
-                (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
-        self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
+            self.E.weight.copy_(F.normalize(torch.randn(self.num_nodes, self.d_emb), dim=-1))
 
         # Learned per-node popularity scalar, zero-init: the channel contributes exactly 0 at step 0,
         # so turning it on cannot perturb the starting point.
@@ -116,7 +146,7 @@ class LinkPredHead(nn.Module):
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
-        """Bag -> P [Q,d], the pooling-weighted gyro-midpoint of the walk-token cloud."""
+        """Bag -> P [Q,d], the pooling-weighted spherical mean of the walk-token cloud."""
         nodes = tokens.nodes.clamp_min(0).clone()
         valid = tokens.mask.clone()
         cold = ~valid.any(dim=-1)                                               # all-padding walk -> use seed
@@ -130,16 +160,17 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = geo_temp * (-geo) [+ pop_bias[v]]  (distance scaled by geo_temp; the learned per-node
-        popularity scalar, when on, added at fixed unit weight)."""
+        score = geo_temp * cos [+ pop_bias[v]]  (similarity scaled by geo_temp; the learned per-node
+        popularity scalar, when on, added at fixed unit weight). NOTE the sign: cosine similarity is
+        HIGHER = closer, so there is no negation here, unlike the ball head's geo_temp * (-d_H)."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
         b, d = p_u.shape
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
-        geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        score = self.geo_temp * (-geo)                                         # [B, C] scaled distance term
+        sim = self.geom.similarity(p_u.unsqueeze(1), p_v)                       # [B, C] cosine similarity
+        score = self.geo_temp * sim                                             # [B, C] scaled similarity
         if self.use_pop_bias:
             v_nodes = cand_tokens.seeds.view(b, c)                              # [B, C] candidate node ids
             score = score + self.pop_bias(v_nodes).squeeze(-1)
