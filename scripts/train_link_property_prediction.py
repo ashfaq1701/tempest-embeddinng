@@ -45,6 +45,9 @@ def parse_args() -> argparse.Namespace:
     # ── Model ───────────────────────────────────────────────────────
     p.add_argument("--d-emb", default=64, type=int,
                    help="Embedding dimension.")
+    p.add_argument("--use-pop-bias", action="store_true",
+                   help="Score a learned per-node popularity scalar (zero-init) alongside the distance, "
+                        "mixed by the learned weight vector w.")
 
     # ── Walks ───────────────────────────────────────────────────────
     p.add_argument("--num-walks-per-node", default=5, type=int,
@@ -172,6 +175,7 @@ def main() -> Dict[str, Any]:
         dst_pool=dst_pool,
 
         d_emb=args.d_emb,
+        use_pop_bias=args.use_pop_bias,
         hidden_dim=args.hidden_dim,
 
         K_train=args.k_train,
