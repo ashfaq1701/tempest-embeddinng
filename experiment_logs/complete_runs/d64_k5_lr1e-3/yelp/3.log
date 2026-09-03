@@ -1,0 +1,72 @@
+# dataset=Yelp (19.8M edges, BIPARTITE)
+# d_emb=64 k_train=5 lr=1e-3 seed=42  patience 5  cap 100  --use-pop-bias
+# experiment=archive_d64k5_popbias cell=d64_k5 tag=run_3  (archived as 3.log)
+# branch=master commit=df0d6f8d
+# replicate 3 of 3; replicates 1 and 2 are produced by other agents on other machines.
+# part of the sweep driven by scripts/run_archive_d64k5_popbias.sh; see ../../DRIVER.log
+# started=2026-09-03 06:41:16
+# cmd: /its/home/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq --dataset Yelp --d-emb 64 --k-train 5 --lr 1e-3 --num-epochs 100 --early-stop-patience 5 --use-pop-bias --is-bipartite --use-gpu --use-gpu-tempest 
+
+=== tempest-embedding training ===
+dataset: Yelp
+device:  cuda
+seed:    42
+loaded (tgb-seq) in 4.3s
+  num_nodes:     1,743,770
+  neg_pool:      405,081 unique destinations (bipartite)
+  train edges:   17,025,551
+  val edges:     1,702,388
+  test edges:    1,032,354
+
+=== Config ===
+  num_nodes: 1743770
+  dst_pool: <ndarray shape=(405081,) dtype=int32>
+  d_emb: 64
+  use_pop_bias: True
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 100
+  early_stop_patience: 5
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:          111,601,280
+  head params:        1,743,932
+  TOTAL trainable:  113,345,212
+
+=== Training ===
+  Ingested full graph into Tempest: 19,760,293 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=0.7864  lr=1e-03  train 1157.5s  |E|mean=0.104  |E|max=0.591  geo_temp=15.973  val 0.6033  test 0.5837 (new best)  eval 145.3s
+epoch 2/100  link=0.2477  lr=1e-03  train 1164.3s  |E|mean=0.136  |E|max=0.585  geo_temp=19.311  val 0.6467  test 0.6269 (new best)  eval 142.0s
+epoch 3/100  link=0.1920  lr=1e-03  train 1165.5s  |E|mean=0.162  |E|max=0.603  geo_temp=19.349  val 0.6611  test 0.6386 (new best)  eval 139.7s
+epoch 4/100  link=0.1593  lr=1e-03  train 1164.2s  |E|mean=0.187  |E|max=0.638  geo_temp=19.183  val 0.6688  test 0.6427 (new best)  eval 141.3s
+epoch 5/100  link=0.1360  lr=1e-03  train 1161.9s  |E|mean=0.210  |E|max=0.675  geo_temp=18.972  val 0.6662  patience 1/5  eval 139.3s
+epoch 6/100  link=0.1185  lr=1e-03  train 1135.1s  |E|mean=0.231  |E|max=0.704  geo_temp=18.605  val 0.6675  patience 2/5  eval 139.2s
+epoch 7/100  link=0.1044  lr=1e-03  train 1124.4s  |E|mean=0.252  |E|max=0.758  geo_temp=18.261  val 0.6728  test 0.6391 (new best)  eval 139.4s
+epoch 8/100  link=0.0934  lr=1e-03  train 1166.7s  |E|mean=0.271  |E|max=0.794  geo_temp=17.936  val 0.6703  patience 1/5  eval 134.0s
+epoch 9/100  link=0.0844  lr=1e-03  train 1165.2s  |E|mean=0.290  |E|max=0.793  geo_temp=17.547  val 0.6722  patience 2/5  eval 133.8s
+epoch 10/100  link=0.0768  lr=1e-03  train 1121.4s  |E|mean=0.307  |E|max=0.793  geo_temp=17.267  val 0.6721  patience 3/5  eval 134.0s
+epoch 11/100  link=0.0706  lr=1e-03  train 1118.4s  |E|mean=0.324  |E|max=0.794  geo_temp=16.979  val 0.6717  patience 4/5  eval 133.9s
+epoch 12/100  link=0.0653  lr=1e-03  train 1137.2s  |E|mean=0.340  |E|max=0.795  geo_temp=16.729  val 0.6734  test 0.6338 (new best)  eval 133.9s
+epoch 13/100  link=0.0613  lr=1e-03  train 1140.0s  |E|mean=0.356  |E|max=0.803  geo_temp=16.382  val 0.6707  patience 1/5  eval 138.0s
+epoch 14/100  link=0.0575  lr=1e-03  train 1137.7s  |E|mean=0.371  |E|max=0.809  geo_temp=16.183  val 0.6669  patience 2/5  eval 137.9s
+epoch 15/100  link=0.0546  lr=1e-03  train 1120.6s  |E|mean=0.385  |E|max=0.823  geo_temp=15.896  val 0.6651  patience 3/5  eval 130.4s
+epoch 16/100  link=0.0521  lr=1e-03  train 1120.5s  |E|mean=0.398  |E|max=0.831  geo_temp=15.704  val 0.6649  patience 4/5  eval 130.3s
+epoch 17/100  link=0.0498  lr=1e-03  train 1120.9s  |E|mean=0.411  |E|max=0.838  geo_temp=15.426  val 0.6634  patience 5/5  eval 130.3s
+  restored best weights from epoch 12 (val 0.6734, test 0.6338)
+
+=== Final results ===
+  dataset:           Yelp
+  seed:              42
+  stopped_at_epoch:  12
+  best_val_mrr:      0.6734
+  best_test_mrr:     0.6338
