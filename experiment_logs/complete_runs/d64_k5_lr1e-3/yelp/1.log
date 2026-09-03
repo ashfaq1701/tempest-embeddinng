@@ -1,0 +1,74 @@
+# suite cell: dataset=Yelp experiment=complete_runs cell=d64_k5 tag=run_1
+#   d_emb=64 k_train=5 lr=1e-3 patience=5 seed=42 POP-BIAS=ON
+#   edges=19.8M bipartite=yes  (flag: '--is-bipartite')
+# branch=master commit=cc487ba
+# started=2026-09-03 07:46:19
+# cmd: /mnt/nfs2/inf/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq \
+#        --dataset Yelp --d-emb 64 --k-train 5 --lr 1e-3 --use-pop-bias \
+#        --num-epochs 50 --early-stop-patience 5 \
+#        --use-gpu --use-gpu-tempest --is-bipartite
+
+=== tempest-embedding training ===
+dataset: Yelp
+device:  cuda
+seed:    42
+loaded (tgb-seq) in 14.9s
+  num_nodes:     1,743,770
+  neg_pool:      405,081 unique destinations (bipartite)
+  train edges:   17,025,551
+  val edges:     1,702,388
+  test edges:    1,032,354
+
+=== Config ===
+  num_nodes: 1743770
+  dst_pool: <ndarray shape=(405081,) dtype=int32>
+  d_emb: 64
+  use_pop_bias: True
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 50
+  early_stop_patience: 5
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:          111,601,280
+  head params:        1,743,932
+  TOTAL trainable:  113,345,212
+
+=== Training ===
+  Ingested full graph into Tempest: 19,760,293 edges (once; per-query cutoff enforces causality)
+epoch 1/50  link=0.7861  lr=1e-03  train 1469.2s  |E|mean=0.105  |E|max=0.617  geo_temp=16.007  val 0.6011  test 0.5814 (new best)  eval 157.5s
+epoch 2/50  link=0.2477  lr=1e-03  train 1384.9s  |E|mean=0.136  |E|max=0.642  geo_temp=19.542  val 0.6438  test 0.6242 (new best)  eval 142.3s
+epoch 3/50  link=0.1913  lr=1e-03  train 1367.8s  |E|mean=0.163  |E|max=0.665  geo_temp=19.554  val 0.6590  test 0.6373 (new best)  eval 127.3s
+epoch 4/50  link=0.1585  lr=1e-03  train 1368.0s  |E|mean=0.187  |E|max=0.699  geo_temp=19.338  val 0.6677  test 0.6428 (new best)  eval 128.5s
+epoch 5/50  link=0.1352  lr=1e-03  train 1366.7s  |E|mean=0.210  |E|max=0.731  geo_temp=19.057  val 0.6632  patience 1/5  eval 127.4s
+epoch 6/50  link=0.1177  lr=1e-03  train 1367.7s  |E|mean=0.231  |E|max=0.759  geo_temp=18.730  val 0.6655  patience 2/5  eval 126.0s
+epoch 7/50  link=0.1038  lr=1e-03  train 1357.6s  |E|mean=0.252  |E|max=0.789  geo_temp=18.379  val 0.6712  test 0.6388 (new best)  eval 126.4s
+epoch 8/50  link=0.0929  lr=1e-03  train 1344.8s  |E|mean=0.271  |E|max=0.818  geo_temp=18.040  val 0.6688  patience 1/5  eval 128.1s
+epoch 9/50  link=0.0840  lr=1e-03  train 1343.5s  |E|mean=0.290  |E|max=0.838  geo_temp=17.623  val 0.6707  patience 2/5  eval 128.2s
+epoch 10/50  link=0.0766  lr=1e-03  train 1342.6s  |E|mean=0.308  |E|max=0.858  geo_temp=17.320  val 0.6725  test 0.6340 (new best)  eval 125.2s
+epoch 11/50  link=0.0704  lr=1e-03  train 1341.0s  |E|mean=0.325  |E|max=0.877  geo_temp=17.034  val 0.6725  patience 1/5  eval 125.8s
+epoch 12/50  link=0.0652  lr=1e-03  train 1337.1s  |E|mean=0.341  |E|max=0.878  geo_temp=16.794  val 0.6740  test 0.6311 (new best)  eval 127.6s
+epoch 13/50  link=0.0611  lr=1e-03  train 1336.4s  |E|mean=0.356  |E|max=0.884  geo_temp=16.444  val 0.6709  patience 1/5  eval 126.8s
+epoch 14/50  link=0.0574  lr=1e-03  train 1335.9s  |E|mean=0.371  |E|max=0.884  geo_temp=16.270  val 0.6680  patience 2/5  eval 125.0s
+epoch 15/50  link=0.0546  lr=1e-03  train 1336.9s  |E|mean=0.385  |E|max=0.884  geo_temp=15.954  val 0.6650  patience 3/5  eval 127.1s
+epoch 16/50  link=0.0521  lr=1e-03  train 1335.2s  |E|mean=0.399  |E|max=0.884  geo_temp=15.766  val 0.6670  patience 4/5  eval 128.4s
+epoch 17/50  link=0.0499  lr=1e-03  train 1335.9s  |E|mean=0.412  |E|max=0.888  geo_temp=15.492  val 0.6626  patience 5/5  eval 127.7s
+  restored best weights from epoch 12 (val 0.6740, test 0.6311)
+
+=== Final results ===
+  dataset:           Yelp
+  seed:              42
+  stopped_at_epoch:  12
+  best_val_mrr:      0.6740
+  best_test_mrr:     0.6311
+=== rc=0 finished=2026-09-03 14:57:40 ===
