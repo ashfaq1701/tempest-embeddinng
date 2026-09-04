@@ -1,0 +1,70 @@
+# suite cell: dataset=Patent experiment=complete_runs cell=d64_k5 tag=run_1
+#   d_emb=64 k_train=5 lr=1e-3 patience=5 seed=42 POP-BIAS=ON
+#   edges=10.8M bipartite=no  (flag: 'none')
+# branch=master commit=cc487ba
+# started=2026-09-02 23:10:56
+# cmd: /mnt/nfs2/inf/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq \
+#        --dataset Patent --d-emb 64 --k-train 5 --lr 1e-3 --use-pop-bias \
+#        --num-epochs 50 --early-stop-patience 5 \
+#        --use-gpu --use-gpu-tempest 
+
+=== tempest-embedding training ===
+dataset: Patent
+device:  cuda
+seed:    42
+loaded (tgb-seq) in 11.6s
+  num_nodes:     2,241,785
+  neg_pool:      1,840,152 unique nodes (non-bipartite)
+  train edges:   9,096,058
+  val edges:     1,039,438
+  test edges:    683,323
+
+=== Config ===
+  num_nodes: 2241785
+  dst_pool: <ndarray shape=(1840152,) dtype=int32>
+  d_emb: 64
+  use_pop_bias: True
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 50
+  early_stop_patience: 5
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:          143,474,240
+  head params:        2,241,947
+  TOTAL trainable:  145,716,187
+
+=== Training ===
+  Ingested full graph into Tempest: 10,818,819 edges (once; per-query cutoff enforces causality)
+epoch 1/50  link=1.7086  lr=1e-03  train 919.1s  |E|mean=0.068  |E|max=0.245  geo_temp=7.211  val 0.0722  test 0.0474 (new best)  eval 83.0s
+epoch 2/50  link=1.2372  lr=1e-03  train 917.8s  |E|mean=0.115  |E|max=0.356  geo_temp=16.594  val 0.0947  test 0.1137 (new best)  eval 77.2s
+epoch 3/50  link=0.7173  lr=1e-03  train 911.3s  |E|mean=0.144  |E|max=0.414  geo_temp=25.510  val 0.1111  test 0.2046 (new best)  eval 77.1s
+epoch 4/50  link=0.3732  lr=1e-03  train 911.2s  |E|mean=0.162  |E|max=0.466  geo_temp=34.045  val 0.1161  test 0.2020 (new best)  eval 75.6s
+epoch 5/50  link=0.1851  lr=1e-03  train 910.1s  |E|mean=0.175  |E|max=0.524  geo_temp=42.381  val 0.1196  test 0.2060 (new best)  eval 77.5s
+epoch 6/50  link=0.0914  lr=1e-03  train 909.6s  |E|mean=0.184  |E|max=0.597  geo_temp=50.619  val 0.1203  test 0.2134 (new best)  eval 74.4s
+epoch 7/50  link=0.0473  lr=1e-03  train 910.8s  |E|mean=0.191  |E|max=0.625  geo_temp=58.782  val 0.1210  test 0.2172 (new best)  eval 73.8s
+epoch 8/50  link=0.0267  lr=1e-03  train 912.0s  |E|mean=0.196  |E|max=0.657  geo_temp=66.833  val 0.1216  test 0.2136 (new best)  eval 77.7s
+epoch 9/50  link=0.0166  lr=1e-03  train 913.8s  |E|mean=0.201  |E|max=0.677  geo_temp=74.660  val 0.1202  patience 1/5  eval 74.8s
+epoch 10/50  link=0.0113  lr=1e-03  train 915.0s  |E|mean=0.205  |E|max=0.680  geo_temp=81.933  val 0.1203  patience 2/5  eval 75.1s
+epoch 11/50  link=0.0082  lr=1e-03  train 917.9s  |E|mean=0.208  |E|max=0.680  geo_temp=88.101  val 0.1178  patience 3/5  eval 74.5s
+epoch 12/50  link=0.0063  lr=1e-03  train 923.1s  |E|mean=0.211  |E|max=0.680  geo_temp=92.814  val 0.1142  patience 4/5  eval 87.7s
+epoch 13/50  link=0.0051  lr=1e-03  train 942.5s  |E|mean=0.213  |E|max=0.682  geo_temp=96.353  val 0.1110  patience 5/5  eval 89.2s
+  restored best weights from epoch 8 (val 0.1216, test 0.2136)
+
+=== Final results ===
+  dataset:           Patent
+  seed:              42
+  stopped_at_epoch:  8
+  best_val_mrr:      0.1216
+  best_test_mrr:     0.2136
+=== rc=0 finished=2026-09-03 02:53:57 ===

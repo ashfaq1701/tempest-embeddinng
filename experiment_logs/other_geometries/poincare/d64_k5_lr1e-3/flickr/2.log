@@ -1,0 +1,74 @@
+# sweep cell: dataset=Flickr experiment=complete_runs cell=d64_k5 tag=run_2 (archived as experiment_logs/complete_runs/d64_k5/flickr/2.log)
+#   d_emb=64 k_train=5 lr=1e-3 patience=5 seed=42 POP-BIAS=ON
+#   edges=7.22M bipartite=no  (flag: 'none')
+# branch=master commit=75d2884
+# head (from model.py): Centroid-to-centroid head on the Poincaré ball: s(u,v) = geo_temp * (-d_H(P_u, P_v)) [+ pop_bias[v]].  The distance term is scaled by a learned geo_temp (init 1.0). When the popularity channel is on, 
+# started=2026-09-02 22:03:14
+# cmd: /mnt/nfs2/inf/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq \
+#        --dataset Flickr --d-emb 64 --k-train 5 --lr 1e-3 --use-pop-bias \
+#        --num-epochs 50 --early-stop-patience 5 --seed 42 \
+#        --use-gpu --use-gpu-tempest 
+
+=== tempest-embedding training ===
+dataset: Flickr
+device:  cuda
+seed:    42
+loaded (tgb-seq) in 7.2s
+  num_nodes:     233,837
+  neg_pool:      233,836 unique nodes (non-bipartite)
+  train edges:   5,738,138
+  val edges:     875,742
+  test edges:    609,679
+
+=== Config ===
+  num_nodes: 233837
+  dst_pool: <ndarray shape=(233836,) dtype=int32>
+  d_emb: 64
+  use_pop_bias: True
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 50
+  early_stop_patience: 5
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:           14,965,568
+  head params:          233,999
+  TOTAL trainable:   15,199,567
+
+=== Training ===
+  Ingested full graph into Tempest: 7,223,559 edges (once; per-query cutoff enforces causality)
+epoch 1/50  link=1.0821  lr=1e-03  train 150.4s  |E|mean=0.193  |E|max=0.378  geo_temp=6.437  val 0.4702  test 0.4389 (new best)  eval 73.8s
+epoch 2/50  link=0.4682  lr=1e-03  train 146.0s  |E|mean=0.239  |E|max=0.448  geo_temp=9.565  val 0.5502  test 0.5148 (new best)  eval 76.3s
+epoch 3/50  link=0.3452  lr=1e-03  train 144.6s  |E|mean=0.263  |E|max=0.505  geo_temp=11.936  val 0.5926  test 0.5551 (new best)  eval 78.1s
+epoch 4/50  link=0.2731  lr=1e-03  train 146.7s  |E|mean=0.281  |E|max=0.554  geo_temp=14.183  val 0.6185  test 0.5815 (new best)  eval 76.5s
+epoch 5/50  link=0.2200  lr=1e-03  train 146.0s  |E|mean=0.296  |E|max=0.593  geo_temp=16.471  val 0.6358  test 0.5987 (new best)  eval 75.8s
+epoch 6/50  link=0.1801  lr=1e-03  train 144.1s  |E|mean=0.309  |E|max=0.638  geo_temp=18.697  val 0.6479  test 0.6117 (new best)  eval 78.5s
+epoch 7/50  link=0.1513  lr=1e-03  train 145.2s  |E|mean=0.322  |E|max=0.665  geo_temp=20.684  val 0.6579  test 0.6222 (new best)  eval 78.0s
+epoch 8/50  link=0.1313  lr=1e-03  train 145.9s  |E|mean=0.333  |E|max=0.674  geo_temp=22.241  val 0.6624  test 0.6274 (new best)  eval 75.8s
+epoch 9/50  link=0.1166  lr=1e-03  train 152.3s  |E|mean=0.344  |E|max=0.676  geo_temp=23.445  val 0.6639  test 0.6284 (new best)  eval 82.4s
+epoch 10/50  link=0.1052  lr=1e-03  train 151.9s  |E|mean=0.354  |E|max=0.681  geo_temp=24.377  val 0.6695  test 0.6349 (new best)  eval 82.6s
+epoch 11/50  link=0.0977  lr=1e-03  train 155.6s  |E|mean=0.364  |E|max=0.683  geo_temp=24.954  val 0.6696  test 0.6351 (new best)  eval 79.2s
+epoch 12/50  link=0.0910  lr=1e-03  train 152.4s  |E|mean=0.374  |E|max=0.703  geo_temp=25.383  val 0.6647  patience 1/5  eval 80.8s
+epoch 13/50  link=0.0861  lr=1e-03  train 153.4s  |E|mean=0.384  |E|max=0.715  geo_temp=25.625  val 0.6630  patience 2/5  eval 79.1s
+epoch 14/50  link=0.0818  lr=1e-03  train 154.3s  |E|mean=0.393  |E|max=0.722  geo_temp=25.728  val 0.6677  patience 3/5  eval 79.8s
+epoch 15/50  link=0.0783  lr=1e-03  train 168.6s  |E|mean=0.402  |E|max=0.733  geo_temp=25.776  val 0.6614  patience 4/5  eval 86.4s
+epoch 16/50  link=0.0756  lr=1e-03  train 168.4s  |E|mean=0.411  |E|max=0.750  geo_temp=25.698  val 0.6625  patience 5/5  eval 86.2s
+  restored best weights from epoch 11 (val 0.6696, test 0.6351)
+
+=== Final results ===
+  dataset:           Flickr
+  seed:              42
+  stopped_at_epoch:  11
+  best_val_mrr:      0.6696
+  best_test_mrr:     0.6351
+=== rc=0 finished=2026-09-02 23:15:22 ===

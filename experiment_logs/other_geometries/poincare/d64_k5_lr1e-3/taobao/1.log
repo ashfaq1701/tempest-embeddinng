@@ -1,0 +1,66 @@
+# suite cell: dataset=Taobao experiment=complete_runs cell=d64_k5 tag=run_1
+#   d_emb=64 k_train=5 lr=1e-3 patience=5 seed=42 POP-BIAS=ON
+#   edges=18.85M bipartite=yes  (flag: '--is-bipartite')
+# branch=master commit=cc487ba
+# started=2026-09-03 04:11:24
+# cmd: /mnt/nfs2/inf/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq \
+#        --dataset Taobao --d-emb 64 --k-train 5 --lr 1e-3 --use-pop-bias \
+#        --num-epochs 50 --early-stop-patience 5 \
+#        --use-gpu --use-gpu-tempest --is-bipartite
+
+=== tempest-embedding training ===
+dataset: Taobao
+device:  cuda
+seed:    42
+loaded (tgb-seq) in 27.8s
+  num_nodes:     1,623,634
+  neg_pool:      863,016 unique destinations (bipartite)
+  train edges:   13,981,096
+  val edges:     2,466,625
+  test edges:    2,406,071
+
+=== Config ===
+  num_nodes: 1623634
+  dst_pool: <ndarray shape=(863016,) dtype=int32>
+  d_emb: 64
+  use_pop_bias: True
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 50
+  early_stop_patience: 5
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:          103,912,576
+  head params:        1,623,796
+  TOTAL trainable:  105,536,372
+
+=== Training ===
+  Ingested full graph into Tempest: 18,853,792 edges (once; per-query cutoff enforces causality)
+epoch 1/50  link=1.2256  lr=1e-03  train 1231.9s  |E|mean=0.111  |E|max=0.501  geo_temp=15.176  val 0.4979  test 0.4916 (new best)  eval 247.6s
+epoch 2/50  link=0.6041  lr=1e-03  train 1138.9s  |E|mean=0.151  |E|max=0.539  geo_temp=25.017  val 0.5648  test 0.5559 (new best)  eval 227.3s
+epoch 3/50  link=0.4140  lr=1e-03  train 1147.7s  |E|mean=0.181  |E|max=0.548  geo_temp=29.265  val 0.5781  test 0.5639 (new best)  eval 218.3s
+epoch 4/50  link=0.2981  lr=1e-03  train 1138.6s  |E|mean=0.206  |E|max=0.549  geo_temp=32.922  val 0.5784  test 0.5594 (new best)  eval 226.0s
+epoch 5/50  link=0.2202  lr=1e-03  train 1130.9s  |E|mean=0.229  |E|max=0.550  geo_temp=36.171  val 0.5745  patience 1/5  eval 215.3s
+epoch 6/50  link=0.1649  lr=1e-03  train 1120.1s  |E|mean=0.248  |E|max=0.551  geo_temp=39.026  val 0.5723  patience 2/5  eval 206.3s
+epoch 7/50  link=0.1263  lr=1e-03  train 1088.5s  |E|mean=0.266  |E|max=0.558  geo_temp=41.438  val 0.5690  patience 3/5  eval 186.1s
+epoch 8/50  link=0.0996  lr=1e-03  train 1040.0s  |E|mean=0.281  |E|max=0.578  geo_temp=43.324  val 0.5624  patience 4/5  eval 182.0s
+epoch 9/50  link=0.0816  lr=1e-03  train 1039.0s  |E|mean=0.295  |E|max=0.595  geo_temp=44.474  val 0.5639  patience 5/5  eval 179.0s
+  restored best weights from epoch 4 (val 0.5784, test 0.5594)
+
+=== Final results ===
+  dataset:           Taobao
+  seed:              42
+  stopped_at_epoch:  4
+  best_val_mrr:      0.5784
+  best_test_mrr:     0.5594
+=== rc=0 finished=2026-09-03 07:46:19 ===

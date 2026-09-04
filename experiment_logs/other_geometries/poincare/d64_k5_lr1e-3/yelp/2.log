@@ -1,0 +1,75 @@
+# sweep cell: dataset=Yelp experiment=complete_runs cell=d64_k5 tag=run_2 (archived as experiment_logs/complete_runs/d64_k5/yelp/2.log)
+#   d_emb=64 k_train=5 lr=1e-3 patience=5 seed=42 POP-BIAS=ON
+#   edges=19.8M bipartite=yes  (flag: '--is-bipartite')
+# branch=master commit=cc487ba
+# head (from model.py): Centroid-to-centroid head on the Poincaré ball: s(u,v) = geo_temp * (-d_H(P_u, P_v)) [+ pop_bias[v]].  The distance term is scaled by a learned geo_temp (init 1.0). When the popularity channel is on, 
+# started=2026-09-03 09:52:01
+# cmd: /mnt/nfs2/inf/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq \
+#        --dataset Yelp --d-emb 64 --k-train 5 --lr 1e-3 --use-pop-bias \
+#        --num-epochs 50 --early-stop-patience 5 --seed 42 \
+#        --use-gpu --use-gpu-tempest --is-bipartite
+
+=== tempest-embedding training ===
+dataset: Yelp
+device:  cuda
+seed:    42
+loaded (tgb-seq) in 9.8s
+  num_nodes:     1,743,770
+  neg_pool:      405,081 unique destinations (bipartite)
+  train edges:   17,025,551
+  val edges:     1,702,388
+  test edges:    1,032,354
+
+=== Config ===
+  num_nodes: 1743770
+  dst_pool: <ndarray shape=(405081,) dtype=int32>
+  d_emb: 64
+  use_pop_bias: True
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 50
+  early_stop_patience: 5
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:          111,601,280
+  head params:        1,743,932
+  TOTAL trainable:  113,345,212
+
+=== Training ===
+  Ingested full graph into Tempest: 19,760,293 edges (once; per-query cutoff enforces causality)
+epoch 1/50  link=0.7850  lr=1e-03  train 1366.2s  |E|mean=0.104  |E|max=0.579  geo_temp=15.973  val 0.6038  test 0.5839 (new best)  eval 128.3s
+epoch 2/50  link=0.2470  lr=1e-03  train 1362.9s  |E|mean=0.135  |E|max=0.569  geo_temp=19.246  val 0.6473  test 0.6274 (new best)  eval 128.8s
+epoch 3/50  link=0.1919  lr=1e-03  train 1362.5s  |E|mean=0.162  |E|max=0.594  geo_temp=19.289  val 0.6607  test 0.6376 (new best)  eval 126.1s
+epoch 4/50  link=0.1594  lr=1e-03  train 1362.7s  |E|mean=0.187  |E|max=0.622  geo_temp=19.202  val 0.6682  test 0.6427 (new best)  eval 129.9s
+epoch 5/50  link=0.1360  lr=1e-03  train 1361.6s  |E|mean=0.209  |E|max=0.662  geo_temp=18.951  val 0.6650  patience 1/5  eval 124.8s
+epoch 6/50  link=0.1185  lr=1e-03  train 1357.5s  |E|mean=0.231  |E|max=0.701  geo_temp=18.605  val 0.6678  patience 2/5  eval 125.0s
+epoch 7/50  link=0.1045  lr=1e-03  train 1356.6s  |E|mean=0.251  |E|max=0.745  geo_temp=18.281  val 0.6734  test 0.6410 (new best)  eval 125.0s
+epoch 8/50  link=0.0935  lr=1e-03  train 1357.7s  |E|mean=0.271  |E|max=0.777  geo_temp=17.957  val 0.6717  patience 1/5  eval 124.9s
+epoch 9/50  link=0.0845  lr=1e-03  train 1359.8s  |E|mean=0.290  |E|max=0.777  geo_temp=17.574  val 0.6716  patience 2/5  eval 125.0s
+epoch 10/50  link=0.0770  lr=1e-03  train 1360.1s  |E|mean=0.307  |E|max=0.777  geo_temp=17.297  val 0.6711  patience 3/5  eval 125.5s
+epoch 11/50  link=0.0707  lr=1e-03  train 1358.6s  |E|mean=0.324  |E|max=0.779  geo_temp=17.019  val 0.6716  patience 4/5  eval 125.0s
+epoch 12/50  link=0.0654  lr=1e-03  train 1360.2s  |E|mean=0.340  |E|max=0.779  geo_temp=16.775  val 0.6744  test 0.6325 (new best)  eval 124.9s
+epoch 13/50  link=0.0614  lr=1e-03  train 1360.4s  |E|mean=0.356  |E|max=0.786  geo_temp=16.406  val 0.6709  patience 1/5  eval 127.2s
+epoch 14/50  link=0.0576  lr=1e-03  train 1357.9s  |E|mean=0.371  |E|max=0.799  geo_temp=16.221  val 0.6677  patience 2/5  eval 127.4s
+epoch 15/50  link=0.0547  lr=1e-03  train 1357.6s  |E|mean=0.385  |E|max=0.812  geo_temp=15.926  val 0.6680  patience 3/5  eval 124.7s
+epoch 16/50  link=0.0523  lr=1e-03  train 1358.3s  |E|mean=0.398  |E|max=0.826  geo_temp=15.736  val 0.6654  patience 4/5  eval 125.1s
+epoch 17/50  link=0.0499  lr=1e-03  train 1358.8s  |E|mean=0.411  |E|max=0.836  geo_temp=15.481  val 0.6617  patience 5/5  eval 125.5s
+  restored best weights from epoch 12 (val 0.6744, test 0.6325)
+
+=== Final results ===
+  dataset:           Yelp
+  seed:              42
+  stopped_at_epoch:  12
+  best_val_mrr:      0.6744
+  best_test_mrr:     0.6325
+=== rc=0 finished=2026-09-03 17:01:11 ===

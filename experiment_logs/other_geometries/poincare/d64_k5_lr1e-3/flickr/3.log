@@ -1,0 +1,71 @@
+# dataset=Flickr (7.22M edges, NON-bipartite)
+# d_emb=64 k_train=5 lr=1e-3 seed=42  patience 5  cap 100  --use-pop-bias
+# experiment=archive_d64k5_popbias cell=d64_k5 tag=run_3  (archived as 3.log)
+# branch=master commit=df0d6f8d
+# replicate 3 of 3; replicates 1 and 2 are produced by other agents on other machines.
+# part of the sweep driven by scripts/run_archive_d64k5_popbias.sh; see ../../DRIVER.log
+# started=2026-09-02 22:00:38
+# cmd: /its/home/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq --dataset Flickr --d-emb 64 --k-train 5 --lr 1e-3 --num-epochs 100 --early-stop-patience 5 --use-pop-bias  --use-gpu --use-gpu-tempest 
+
+=== tempest-embedding training ===
+dataset: Flickr
+device:  cuda
+seed:    42
+loaded (tgb-seq) in 1.7s
+  num_nodes:     233,837
+  neg_pool:      233,836 unique nodes (non-bipartite)
+  train edges:   5,738,138
+  val edges:     875,742
+  test edges:    609,679
+
+=== Config ===
+  num_nodes: 233837
+  dst_pool: <ndarray shape=(233836,) dtype=int32>
+  d_emb: 64
+  use_pop_bias: True
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 100
+  early_stop_patience: 5
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:           14,965,568
+  head params:          233,999
+  TOTAL trainable:   15,199,567
+
+=== Training ===
+  Ingested full graph into Tempest: 7,223,559 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=1.0820  lr=1e-03  train 123.4s  |E|mean=0.193  |E|max=0.384  geo_temp=6.438  val 0.4701  test 0.4386 (new best)  eval 73.7s
+epoch 2/100  link=0.4682  lr=1e-03  train 115.5s  |E|mean=0.240  |E|max=0.451  geo_temp=9.565  val 0.5500  test 0.5145 (new best)  eval 73.5s
+epoch 3/100  link=0.3451  lr=1e-03  train 127.9s  |E|mean=0.263  |E|max=0.501  geo_temp=11.938  val 0.5927  test 0.5552 (new best)  eval 73.4s
+epoch 4/100  link=0.2731  lr=1e-03  train 123.9s  |E|mean=0.281  |E|max=0.548  geo_temp=14.180  val 0.6179  test 0.5806 (new best)  eval 73.4s
+epoch 5/100  link=0.2201  lr=1e-03  train 123.6s  |E|mean=0.296  |E|max=0.593  geo_temp=16.471  val 0.6359  test 0.5992 (new best)  eval 71.3s
+epoch 6/100  link=0.1802  lr=1e-03  train 130.5s  |E|mean=0.309  |E|max=0.640  geo_temp=18.692  val 0.6478  test 0.6118 (new best)  eval 71.4s
+epoch 7/100  link=0.1514  lr=1e-03  train 129.9s  |E|mean=0.322  |E|max=0.666  geo_temp=20.678  val 0.6553  test 0.6195 (new best)  eval 71.4s
+epoch 8/100  link=0.1314  lr=1e-03  train 131.2s  |E|mean=0.333  |E|max=0.674  geo_temp=22.233  val 0.6638  test 0.6293 (new best)  eval 71.4s
+epoch 9/100  link=0.1166  lr=1e-03  train 120.8s  |E|mean=0.344  |E|max=0.675  geo_temp=23.429  val 0.6650  test 0.6299 (new best)  eval 71.4s
+epoch 10/100  link=0.1053  lr=1e-03  train 112.5s  |E|mean=0.354  |E|max=0.678  geo_temp=24.356  val 0.6695  test 0.6354 (new best)  eval 71.7s
+epoch 11/100  link=0.0977  lr=1e-03  train 116.4s  |E|mean=0.365  |E|max=0.681  geo_temp=24.945  val 0.6720  test 0.6379 (new best)  eval 71.4s
+epoch 12/100  link=0.0911  lr=1e-03  train 122.8s  |E|mean=0.374  |E|max=0.704  geo_temp=25.367  val 0.6667  patience 1/5  eval 71.6s
+epoch 13/100  link=0.0862  lr=1e-03  train 110.5s  |E|mean=0.384  |E|max=0.716  geo_temp=25.605  val 0.6658  patience 2/5  eval 71.4s
+epoch 14/100  link=0.0819  lr=1e-03  train 110.5s  |E|mean=0.393  |E|max=0.729  geo_temp=25.700  val 0.6670  patience 3/5  eval 71.4s
+epoch 15/100  link=0.0784  lr=1e-03  train 112.2s  |E|mean=0.403  |E|max=0.735  geo_temp=25.753  val 0.6625  patience 4/5  eval 71.3s
+epoch 16/100  link=0.0756  lr=1e-03  train 114.8s  |E|mean=0.412  |E|max=0.752  geo_temp=25.664  val 0.6640  patience 5/5  eval 71.3s
+  restored best weights from epoch 11 (val 0.6720, test 0.6379)
+
+=== Final results ===
+  dataset:           Flickr
+  seed:              42
+  stopped_at_epoch:  11
+  best_val_mrr:      0.6720
+  best_test_mrr:     0.6379

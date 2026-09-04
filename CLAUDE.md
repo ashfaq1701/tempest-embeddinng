@@ -138,3 +138,51 @@ is still behind the rule it replaces on this dataset.
 +0.0006 val flickers kept resetting patience and walked the checkpointed number down to 0.5551
 — a 0.0054 loss to drift. `rad+dev` drifted 0.0000. Always record both test@val-checkpoint and
 max test; ranking on the printed `best_test_mrr` alone is not like-for-like across arms.
+
+## Effective walk length per dataset (measured, 2026-09-03)
+
+How deep a backward walk actually gets before it runs out of causal history, as opposed
+to the cap it was allowed. Train split ingested into Tempest, 20k seed nodes drawn
+uniformly from the nodes appearing in train, K=5 backward walks each = 100k walks per
+dataset, `max_walk_len=80`, ExponentialWeight start and walk bias, no cutoff time, seed
+42. Numbers are `WalkData.lens`, cross-checked against the padding mask on all 800k
+walks (exact agreement). Reproduce with `scripts/walk_length_stats.py`.
+
+| dataset | train edges | mean | std | max | p50 | p90 | p99 | % at cap 80 | % >= 5 |
+|---|---|---|---|---|---|---|---|---|---|
+| GoogleLocal | 1,802,833 | 8.22 | 5.51 | 65 | 7 | 15 | 27 | 0.00 | 72.4 |
+| YouTube | 2,730,407 | 8.15 | 5.53 | 61 | 7 | 16 | 26 | 0.00 | 69.8 |
+| Flickr | 5,738,138 | 9.81 | 9.87 | 71 | 6 | 24 | 45 | 0.00 | 57.2 |
+| Patent | 9,096,058 | 2.20 | 0.47 | 9 | 2 | 3 | 4 | 0.00 | 0.3 |
+| ML-20M | 14,000,091 | 47.40 | 29.33 | 80 | 45 | 80 | 80 | 36.43 | 98.6 |
+| Taobao | 13,981,096 | 17.49 | 11.01 | 80 | 15 | 33 | 51 | 0.01 | 93.0 |
+| Yelp | 17,025,551 | 16.03 | 12.51 | 80 | 13 | 33 | 58 | 0.11 | 87.4 |
+| WikiLink | 27,635,253 | 8.27 | 5.94 | 53 | 7 | 16 | 28 | 0.00 | 67.7 |
+
+Minimum length is 2 in every dataset; no walk returns the seed alone.
+
+**Patent walks are structurally dead at length 2.** Mean 2.20, max 9 over 100k walks, and
+only 0.3% reach length 5. It is a citation graph: an edge points at prior art, so one
+backward step lands on a node whose own citations are almost all *later* than the cutoff
+and the walk has nowhere causal left to go. This is a better explanation for Patent's
+outlier MRR (0.2140 against 0.63-0.69 elsewhere) than anything in the model — the bag is
+the seed plus one neighbour. **Raising `--max-walk-len` on Patent cannot help**; the
+history is not there to walk. Depth-oriented changes should exclude Patent, and a Patent
+regression in a depth experiment is not evidence about depth.
+
+**ML-20M is right-censored at the cap**: 36% of walks hit 80, so the true mean exceeds
+47.4 and this row is a lower bound. 110k active nodes carry 14M edges (~127 per node), so
+a walk essentially never exhausts its history.
+
+**Training at the default `--max-walk-len 5` truncates most reachable history.** The
+`% >= 5` column is the fraction of walks the default cap cuts: 98.6% ML-20M, 93% Taobao,
+87% Yelp, ~70% GoogleLocal/YouTube/WikiLink, 0.3% Patent. Whether depth *helps* is
+untested — this only establishes the headroom exists everywhere except Patent.
+
+**Bipartite structure raises reachable depth**, but sparsity beats it: ML-20M 47.4,
+Taobao 17.5, Yelp 16.0 against 8.2-9.8 for the non-bipartite sets, with bipartite
+GoogleLocal the exception at 8.22 — it is also the sparsest at 1.8M edges over 474k nodes.
+
+Active-node counts (nodes appearing in train): GoogleLocal 473,580; YouTube 402,422;
+Flickr 233,836; Patent 1,840,152; ML-20M 110,431; Taobao 1,623,633; Yelp 1,743,769;
+WikiLink 1,361,972.

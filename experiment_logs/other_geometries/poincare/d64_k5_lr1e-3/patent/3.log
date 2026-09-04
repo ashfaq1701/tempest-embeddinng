@@ -1,0 +1,72 @@
+# dataset=Patent (10.8M edges, NON-bipartite)
+# d_emb=64 k_train=5 lr=1e-3 seed=42  patience 5  cap 100  --use-pop-bias
+# experiment=archive_d64k5_popbias cell=d64_k5 tag=run_3  (archived as 3.log)
+# branch=master commit=df0d6f8d
+# replicate 3 of 3; replicates 1 and 2 are produced by other agents on other machines.
+# part of the sweep driven by scripts/run_archive_d64k5_popbias.sh; see ../../DRIVER.log
+# started=2026-09-02 23:01:15
+# cmd: /its/home/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq --dataset Patent --d-emb 64 --k-train 5 --lr 1e-3 --num-epochs 100 --early-stop-patience 5 --use-pop-bias  --use-gpu --use-gpu-tempest 
+
+=== tempest-embedding training ===
+dataset: Patent
+device:  cuda
+seed:    42
+loaded (tgb-seq) in 3.2s
+  num_nodes:     2,241,785
+  neg_pool:      1,840,152 unique nodes (non-bipartite)
+  train edges:   9,096,058
+  val edges:     1,039,438
+  test edges:    683,323
+
+=== Config ===
+  num_nodes: 2241785
+  dst_pool: <ndarray shape=(1840152,) dtype=int32>
+  d_emb: 64
+  use_pop_bias: True
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 100
+  early_stop_patience: 5
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:          143,474,240
+  head params:        2,241,947
+  TOTAL trainable:  145,716,187
+
+=== Training ===
+  Ingested full graph into Tempest: 10,818,819 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=1.7086  lr=1e-03  train 753.2s  |E|mean=0.068  |E|max=0.245  geo_temp=7.212  val 0.0722  test 0.0476 (new best)  eval 82.7s
+epoch 2/100  link=1.2373  lr=1e-03  train 748.0s  |E|mean=0.115  |E|max=0.355  geo_temp=16.594  val 0.0924  test 0.1087 (new best)  eval 82.7s
+epoch 3/100  link=0.7172  lr=1e-03  train 749.5s  |E|mean=0.144  |E|max=0.412  geo_temp=25.514  val 0.1111  test 0.2010 (new best)  eval 79.3s
+epoch 4/100  link=0.3731  lr=1e-03  train 749.8s  |E|mean=0.162  |E|max=0.467  geo_temp=34.050  val 0.1173  test 0.1953 (new best)  eval 72.6s
+epoch 5/100  link=0.1852  lr=1e-03  train 749.9s  |E|mean=0.175  |E|max=0.523  geo_temp=42.388  val 0.1216  test 0.1992 (new best)  eval 79.3s
+epoch 6/100  link=0.0914  lr=1e-03  train 749.9s  |E|mean=0.184  |E|max=0.588  geo_temp=50.625  val 0.1227  test 0.2059 (new best)  eval 72.5s
+epoch 7/100  link=0.0472  lr=1e-03  train 749.7s  |E|mean=0.191  |E|max=0.615  geo_temp=58.785  val 0.1226  patience 1/5  eval 79.3s
+epoch 8/100  link=0.0267  lr=1e-03  train 749.9s  |E|mean=0.196  |E|max=0.636  geo_temp=66.844  val 0.1230  test 0.2166 (new best)  eval 79.1s
+epoch 9/100  link=0.0166  lr=1e-03  train 749.6s  |E|mean=0.201  |E|max=0.660  geo_temp=74.666  val 0.1235  test 0.2170 (new best)  eval 72.5s
+epoch 10/100  link=0.0112  lr=1e-03  train 731.9s  |E|mean=0.205  |E|max=0.662  geo_temp=81.990  val 0.1237  test 0.2166 (new best)  eval 78.9s
+epoch 11/100  link=0.0083  lr=1e-03  train 742.2s  |E|mean=0.208  |E|max=0.666  geo_temp=88.135  val 0.1248  test 0.2175 (new best)  eval 72.6s
+epoch 12/100  link=0.0064  lr=1e-03  train 749.9s  |E|mean=0.211  |E|max=0.666  geo_temp=92.850  val 0.1251  test 0.2140 (new best)  eval 79.1s
+epoch 13/100  link=0.0051  lr=1e-03  train 735.1s  |E|mean=0.213  |E|max=0.667  geo_temp=96.317  val 0.1238  patience 1/5  eval 72.6s
+epoch 14/100  link=0.0042  lr=1e-03  train 729.8s  |E|mean=0.215  |E|max=0.669  geo_temp=99.040  val 0.1245  patience 2/5  eval 72.8s
+epoch 15/100  link=0.0035  lr=1e-03  train 730.3s  |E|mean=0.217  |E|max=0.670  geo_temp=100.916  val 0.1250  patience 3/5  eval 72.9s
+epoch 16/100  link=0.0031  lr=1e-03  train 729.9s  |E|mean=0.219  |E|max=0.670  geo_temp=101.948  val 0.1231  patience 4/5  eval 72.5s
+epoch 17/100  link=0.0026  lr=1e-03  train 729.2s  |E|mean=0.221  |E|max=0.670  geo_temp=103.057  val 0.1240  patience 5/5  eval 72.5s
+  restored best weights from epoch 12 (val 0.1251, test 0.2140)
+
+=== Final results ===
+  dataset:           Patent
+  seed:              42
+  stopped_at_epoch:  12
+  best_val_mrr:      0.1251
+  best_test_mrr:     0.2140
