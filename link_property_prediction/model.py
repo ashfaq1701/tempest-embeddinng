@@ -1,11 +1,12 @@
-"""Centroid-to-centroid head on the Poincaré ball: s(u,v) = geo_temp * (-d_H(P_u, P_v)) [+ pop_bias[v]].
+"""Centroid-to-centroid head on the LORENTZ hyperboloid: s(u,v) = geo_temp * (-d_H(P_u, P_v)) [+ pop_bias[v]].
 
-The distance term is scaled by a learned geo_temp (init 1.0). When the popularity channel is on, a
+Lorentz model (k=1), isometric to the Poincaré ball but with no finite coordinate boundary. The
+distance term is scaled by a learned geo_temp (init 1.0). When the popularity channel is on, a
 learned per-node scalar pop_bias[v] (zero-init, so it contributes exactly 0 at step 0) is added at
 FIXED unit weight -- the model sharpens the geometry via geo_temp while popularity rides alongside at
 a constant scale.
 
-P_x is the weighted gyro-midpoint of x's walk-token bag; the pooling weights are a softmax over an
+P_x is the weighted Lorentzian centroid of x's walk-token bag; the pooling weights are a softmax over an
 MLP of [log1p(age) | raw position | rad] at a fixed hidden width. Nothing is standardised: log1p
 is a fixed function of the age alone, so no batch-dependent or dataset-derived quantity enters
 the pooler. Learned head params: geo_temp, the MLP pooler, and num_nodes popularity scalars
@@ -20,23 +21,32 @@ import torch.nn.functional as F
 from .walk_tokens import WalkTokens
 
 
-class PoincareManifold:
-    """Poincaré-ball geometry (c=1). `manifold` is kept for E's init + RiemannianAdam."""
+class LorentzManifold:
+    """Lorentz (hyperboloid) geometry (k=1) -- the isometric alternative to the Poincaré ball with no
+    finite coordinate boundary (points extend to x_0 -> inf instead of ||x|| -> 1, so distances and
+    gradients stay well-conditioned far from the vertex). Points are in R^{d+1} on the upper sheet
+    <x,x>_L = -1, x_0 > 0, where the Minkowski inner product is <x,y>_L = -x_0 y_0 + sum_i x_i y_i and
+    TIME is coordinate 0. `manifold` is kept for E's init + RiemannianAdam."""
 
-    def __init__(self, c: float = 1.0):
-        self.manifold = geoopt.PoincareBall(c=c)
+    def __init__(self, k: float = 1.0):
+        self.manifold = geoopt.Lorentz(k=k)
 
     def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Elementwise geodesic distance, broadcasting over leading dims. LOWER = closer."""
         return self.manifold.dist(x, y)
 
     def dist0(self, x: torch.Tensor) -> torch.Tensor:
-        """Hyperbolic radius: geodesic distance from the origin (0 at center, large near boundary)."""
+        """Hyperbolic radius: geodesic distance from the vertex (0 at the vertex, grows outward)."""
         return self.manifold.dist0(x)
 
     def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        """Weighted gyro-midpoint: x [Q,T,d], w [Q,T] -> [Q,d]."""
-        return self.manifold.weighted_midpoint(x, weights=w, reducedim=[-2], dim=-1, keepdim=False)
+        """Weighted LORENTZIAN centroid: x [Q,T,d+1], w [Q,T] -> [Q,d+1]. The centroid minimising the
+        weighted squared Lorentzian distance is the weighted Minkowski sum renormalised onto the
+        sheet: mu = s / sqrt(-<s,s>_L), s = sum_t w_t x_t. s is time-like (<s,s>_L < 0) for any convex
+        combination of upper-sheet points, so the sqrt is real; the clamp is numerical safety only."""
+        s = (w.unsqueeze(-1) * x).sum(dim=-2)                              # [Q, d+1] weighted Minkowski sum
+        mink = -s[..., :1] ** 2 + (s[..., 1:] ** 2).sum(-1, keepdim=True)  # [Q, 1] <s,s>_L  (< 0)
+        return s / (-mink).clamp_min(1e-9).sqrt()
 
 
 class BagWeights(nn.Module):
@@ -68,7 +78,7 @@ class BagWeights(nn.Module):
         self.net = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU(),
                                  nn.Linear(self.hidden, 1))
 
-    def forward(self, geom: "PoincareManifold", tokens: WalkTokens, x: torch.Tensor,
+    def forward(self, geom: "LorentzManifold", tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
         """x [Q,T,d], valid [Q,T] -> w [Q,T] summing to 1, 0 on padding."""
         # log1p compresses ages that span orders of magnitude and are heavily right-skewed
@@ -96,14 +106,16 @@ class LinkPredHead(nn.Module):
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.use_pop_bias = bool(use_pop_bias)
-        self.geom = PoincareManifold()
+        self.geom = LorentzManifold()
         self.bag_weights = BagWeights(hidden_dim)
 
-        # Near-origin init: uniform(-irange, irange) per coord -> r ~ 2*irange*sqrt(d/3).
-        self.E = nn.Embedding(self.num_nodes, self.d_emb)
+        # Near-VERTEX init (Nickel & Kiela 2018, the Lorentz analog of the ball's near-origin init):
+        # projx a small uniform ambient point onto the sheet -- the direct analog of the ball init,
+        # just in R^{d_emb+1} (1 time + d_emb space). projx sets x_0 to satisfy <x,x>_L = -1.
+        self.E = nn.Embedding(self.num_nodes, self.d_emb + 1)
         with torch.no_grad():
             init = self.geom.manifold.projx(
-                (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * float(init_irange))
+                (torch.rand(self.num_nodes, self.d_emb + 1) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
         # Learned per-node popularity scalar, zero-init: the channel contributes exactly 0 at step 0,
