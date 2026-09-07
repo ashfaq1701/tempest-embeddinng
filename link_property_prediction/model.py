@@ -44,8 +44,9 @@ class BagWeights(nn.Module):
 
 class LinkPredHead(nn.Module):
 
-    def __init__(self, num_nodes: int, d_emb: int,
-                 init_irange: float = 1e-3, hidden_dim: int = 32):
+    INIT_IRANGE = 1e-3
+
+    def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
@@ -55,7 +56,7 @@ class LinkPredHead(nn.Module):
         self.E = nn.Embedding(self.num_nodes, self.d_emb + 1)
         with torch.no_grad():
             init = self.geom.manifold.projx(
-                (torch.rand(self.num_nodes, self.d_emb + 1) * 2 - 1) * float(init_irange))
+                (torch.rand(self.num_nodes, self.d_emb + 1) * 2 - 1) * self.INIT_IRANGE)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
