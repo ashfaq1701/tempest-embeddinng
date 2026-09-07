@@ -14,7 +14,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
-import geoopt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -95,8 +94,8 @@ class Trainer:
         )
 
         # One param group at a single lr: Riemannian update for E, standard Adam for the rest.
-        self.opt = geoopt.optim.RiemannianAdam(
-            self.model.parameters(), lr=float(config.lr), stabilize=10,
+        self.opt = torch.optim.Adam(
+            self.model.parameters(), lr=float(config.lr),
         )
 
     # Full-graph ingestion (once, up front)
