@@ -91,6 +91,7 @@ class Trainer:
             max_walk_len=config.max_walk_len,
             temporal_node2vec_p=config.t2nv_p,
             temporal_node2vec_q=config.t2nv_q,
+            seed=config.seed,
         )
         self.neg_sampler_train = UniformNegativeSampler(
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,

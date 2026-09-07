@@ -51,6 +51,7 @@ def main() -> None:
         start_bias="ExponentialWeight",
         num_walks_per_node=args.k,
         max_walk_len=args.mwl,
+        seed=args.seed,
     )
     wg.add_edges(tr.sources, tr.destinations, tr.timestamps, None)
     print(f"[{args.dataset}] ingested {n_edges:,} edges ({time.time()-t1:.1f}s)", flush=True)

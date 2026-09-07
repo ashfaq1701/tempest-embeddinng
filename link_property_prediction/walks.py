@@ -40,6 +40,7 @@ class WalkGenerator:
         max_time_capacity: int = -1,
         temporal_node2vec_p: float = 4.0,
         temporal_node2vec_q: float = 0.25,
+        seed: Optional[int] = None,
     ):
         # Build node2vec adjacency only when a node2vec bias is requested; p/q
         # are the return / in-out params, inert for other biases.
@@ -54,11 +55,13 @@ class WalkGenerator:
             timescale_bound=timescale_bound,
             max_time_capacity=max_time_capacity,
             shuffle_walk_order=False,
+            global_seed=seed,
         )
         self.walk_bias = walk_bias
         self.start_bias = start_bias
         self.num_walks_per_node = int(num_walks_per_node)
         self.max_walk_len = int(max_walk_len)
+        self.seed = seed
 
     def add_edges(self, src: np.ndarray, tgt: np.ndarray, ts: np.ndarray,
                   edge_feat: Optional[np.ndarray] = None) -> None:
