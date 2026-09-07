@@ -1,4 +1,3 @@
-import geoopt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,21 +5,16 @@ import torch.nn.functional as F
 from .walk_tokens import WalkTokens
 
 
-class LorentzManifold:
-
-    def __init__(self, k: float = 1.0):
-        self.manifold = geoopt.Lorentz(k=k)
+class EuclideanManifold:
 
     def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return self.manifold.dist(x, y)
+        return (x - y).norm(dim=-1)
 
-    def dist0(self, x: torch.Tensor) -> torch.Tensor:
-        return self.manifold.dist0(x)
+    def norm(self, x: torch.Tensor) -> torch.Tensor:
+        return x.norm(dim=-1)
 
     def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        s = (w.unsqueeze(-1) * x).sum(dim=-2)
-        mink = -s[..., :1] ** 2 + (s[..., 1:] ** 2).sum(-1, keepdim=True)
-        return s / (-mink).clamp_min(1e-9).sqrt()
+        return (w.unsqueeze(-1) * x).sum(dim=-2)
 
 
 class BagWeights(nn.Module):
@@ -32,31 +26,30 @@ class BagWeights(nn.Module):
         self.net = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU(),
                                  nn.Linear(self.hidden, 1))
 
-    def forward(self, geom: "LorentzManifold", tokens: WalkTokens, x: torch.Tensor,
+    def forward(self, geom: "EuclideanManifold", tokens: WalkTokens, x: torch.Tensor,
                 valid: torch.Tensor) -> torch.Tensor:
         age = torch.log1p(tokens.ages.clamp_min(0).to(x.dtype)).unsqueeze(-1)
         pos = tokens.positions.unsqueeze(-1).to(x.dtype)
-        rad = geom.dist0(x.detach()).unsqueeze(-1)
-        feat = torch.cat([age, pos, rad], dim=-1).to(x.dtype)
+        norm = geom.norm(x.detach()).unsqueeze(-1)
+        feat = torch.cat([age, pos, norm], dim=-1).to(x.dtype)
         logits = self.net(feat).squeeze(-1)
         return torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
 
 
 class LinkPredHead(nn.Module):
 
-    def __init__(self, num_nodes: int, d_emb: int,
-                 init_irange: float = 1e-3, hidden_dim: int = 32):
+    def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
-        self.geom = LorentzManifold()
+        self.geom = EuclideanManifold()
         self.bag_weights = BagWeights(hidden_dim)
 
-        self.E = nn.Embedding(self.num_nodes, self.d_emb + 1)
+        self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            init = self.geom.manifold.projx(
-                (torch.rand(self.num_nodes, self.d_emb + 1) * 2 - 1) * float(init_irange))
-        self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
+            direction = F.normalize(torch.randn(self.num_nodes, self.d_emb), dim=-1)
+            radius = torch.rand(self.num_nodes, 1).pow(1.0 / self.d_emb)
+            self.E.weight.copy_(direction * radius)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
@@ -79,5 +72,5 @@ class LinkPredHead(nn.Module):
         b, d = p_u.shape
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)
-        geo = self.geom.dist(p_u.unsqueeze(1), p_v)
-        return self.geo_temp * (-geo)
+        dist = self.geom.dist(p_u.unsqueeze(1), p_v)
+        return self.geo_temp * (-dist)
