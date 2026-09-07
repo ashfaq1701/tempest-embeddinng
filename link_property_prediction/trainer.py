@@ -59,7 +59,7 @@ class TrainerConfig:
     lr: float = 1e-3
 
     # Run control.
-    num_epochs: int = 50
+    num_epochs: int = 100
     early_stop_patience: int = 5
 
     # System.

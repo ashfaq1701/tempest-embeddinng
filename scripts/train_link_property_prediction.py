@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
                    help="Val/test eval batch size.")
-    p.add_argument("--num-epochs", default=50, type=int,
+    p.add_argument("--num-epochs", default=100, type=int,
                    help="Max training epochs.")
     p.add_argument("--early-stop-patience", default=5, type=int,
                    help="Early-stop patience in epochs.")
