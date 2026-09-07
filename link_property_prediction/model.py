@@ -1,10 +1,8 @@
-"""Centroid-to-centroid head on the LORENTZ hyperboloid: s(u,v) = geo_temp * (-d_H(P_u, P_v)) [+ pop_bias[v]].
+"""Centroid-to-centroid head on the LORENTZ hyperboloid: s(u,v) = geo_temp * (-d_H(P_u, P_v)).
 
 Lorentz model (k=1), isometric to the Poincaré ball but with no finite coordinate boundary. The
-distance term is scaled by a learned geo_temp (init 1.0). When the popularity channel is on, a
-learned per-node scalar pop_bias[v] (zero-init, so it contributes exactly 0 at step 0) is added at
-FIXED unit weight -- the model sharpens the geometry via geo_temp while popularity rides alongside at
-a constant scale.
+distance term is scaled by a learned geo_temp (init 1.0). The score is the scaled geodesic distance
+and nothing else.
 
 P_x is the weighted Lorentzian centroid of x's walk-token bag; the pooling weights are a softmax over an
 MLP of [log1p(age) | raw position | rad] at a fixed hidden width. Nothing is standardised: log1p
@@ -100,12 +98,10 @@ class LinkPredHead(nn.Module):
     """E is a ManifoldParameter; the pooling weights carry no learned parameters."""
 
     def __init__(self, num_nodes: int, d_emb: int,
-                 init_irange: float = 1e-3, use_pop_bias: bool = False,
-                 hidden_dim: int = 32):
+                 init_irange: float = 1e-3, hidden_dim: int = 32):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
-        self.use_pop_bias = bool(use_pop_bias)
         self.geom = LorentzManifold()
         self.bag_weights = BagWeights(hidden_dim)
 
@@ -117,12 +113,6 @@ class LinkPredHead(nn.Module):
             init = self.geom.manifold.projx(
                 (torch.rand(self.num_nodes, self.d_emb + 1) * 2 - 1) * float(init_irange))
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
-
-        # Learned per-node popularity scalar, zero-init: the channel contributes exactly 0 at step 0,
-        # so turning it on cannot perturb the starting point.
-        if self.use_pop_bias:
-            self.pop_bias = nn.Embedding(self.num_nodes, 1)
-            nn.init.zeros_(self.pop_bias.weight)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
@@ -141,8 +131,7 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """src = B source queries; cand = B*C candidate queries, query-major. -> [B, C].
-        score = geo_temp * (-geo) [+ pop_bias[v]]  (distance scaled by geo_temp; the learned per-node
-        popularity scalar, when on, added at fixed unit weight)."""
+        score = geo_temp * (-geo): the geodesic distance scaled by the learned temperature."""
         emb = self.E.weight
         p_u = self.pool(src_tokens, emb)                                        # [B, d]
         p_v = self.pool(cand_tokens, emb)                                       # [B*C, d]
@@ -150,8 +139,4 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)                                                 # [B, C, d]
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                            # [B, C] geodesic distance
-        score = self.geo_temp * (-geo)                                         # [B, C] scaled distance term
-        if self.use_pop_bias:
-            v_nodes = cand_tokens.seeds.view(b, c)                              # [B, C] candidate node ids
-            score = score + self.pop_bias(v_nodes).squeeze(-1)
-        return score
+        return self.geo_temp * (-geo)                                           # [B, C] scaled distance

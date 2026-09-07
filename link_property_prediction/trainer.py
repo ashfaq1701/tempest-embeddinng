@@ -37,7 +37,6 @@ class TrainerConfig:
     d_emb: int = 64
 
     # Score a learned per-node popularity scalar (zero-init) alongside the distance, mixed by w.
-    use_pop_bias: bool = False
 
     # Pooler MLP width. The feature count is fixed by max_walk_len: 1 normalised age +
     # max_walk_len one-hot position slots + 1 radius.
@@ -79,7 +78,6 @@ class Trainer:
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
-            use_pop_bias=bool(config.use_pop_bias),
             hidden_dim=int(config.hidden_dim),
         ).to(self.device)
 
