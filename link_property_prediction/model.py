@@ -1,15 +1,3 @@
-"""Centroid-to-centroid head on the LORENTZ hyperboloid: s(u,v) = geo_temp * (-d_H(P_u, P_v)).
-
-Lorentz model (k=1), isometric to the Poincaré ball but with no finite coordinate boundary. The
-distance term is scaled by a learned geo_temp (init 1.0). The score is the scaled geodesic distance
-and nothing else.
-
-P_x is the weighted Lorentzian centroid of x's walk-token bag; the pooling weights are a softmax over an
-MLP of [log1p(age) | raw position | rad] at a fixed hidden width. Nothing is standardised: log1p
-is a fixed function of the age alone, so no batch-dependent or dataset-derived quantity enters
-the pooler. Learned head params: geo_temp and the MLP pooler."""
-
-
 import geoopt
 import torch
 import torch.nn as nn
