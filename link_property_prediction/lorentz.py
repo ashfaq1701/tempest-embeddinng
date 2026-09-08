@@ -24,33 +24,6 @@ parameterisation rather than as a check.
 Being a `geoopt.Manifold`, it drives geoopt's RiemannianSGD / RiemannianAdam
 unchanged: `retr_transp`, `expmap_transp` and `component_inner` come from the
 base class, so no optimizer code is needed.
-
-WHAT IS THE PAPER'S AND WHAT IS OURS
-------------------------------------
-The paper specifies no epsilons, no clamps, no domain guards and no
-hyperparameters; it argues only that d_l has no fraction and so avoids the
-Poincare boundary blow-up. Every guard below is therefore OURS, and each is
-marked `# GUARD (not in the paper)` with the failure it prevents.
-
-SCOPE -- what this does NOT do
-------------------------------
-This class is the geometry, exactly. It bounds nothing. Deriving x0 makes the
-constraint hold at any radius, which extends the usable range (measured: fp32
-storage survives r=12 where geoopt.Lorentz NaNs at r=9), but a diverging
-optimizer still walks out of float64's range near r ~ 19. Bounding the
-trajectory is a separate concern and is deliberately not handled here.
-
-CURVATURE
----------
-The paper is k=1 throughout: it defines only <x,x>_L = -1, mentions curvature
-once in passing ("constant negative sectional curvature"), and never
-parameterises, tunes or ablates it. The `k` argument below is geoopt's
-convention (<x,x>_L = -k, curvature -1/k), carried over because the ambient
-wrapper in model.py that this class replaces exposes it. At k != 1 there is
-nothing in the paper to be
-faithful to; those formulas are cross-validated against geoopt.Lorentz(k)
-instead (dist/dist0/expmap/egrad2rgrad agree to <= 4e-15 for k in
-[0.25, 4.0]).
 """
 
 from __future__ import annotations
@@ -75,7 +48,8 @@ class LorentzManifold(geoopt.Manifold):
     Parameters
     ----------
     k : curvature parameter; the sheet is <x,x>_L = -k with sectional
-        curvature -1/k. k=1 is the paper. See CURVATURE above.
+        curvature -1/k. k=1 is the paper, which never parameterises
+        curvature; k != 1 follows geoopt's convention.
     """
 
     name = "LorentzManifold"
