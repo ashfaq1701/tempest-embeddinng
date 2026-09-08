@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     # ── Model ───────────────────────────────────────────────────────
     p.add_argument("--d-emb", default=64, type=int,
                    help="Embedding dimension.")
-    p.add_argument("--num-walks-per-node", default=5, type=int,
+    p.add_argument("--num-walks-per-node", default=10, type=int,
                    help="Walks per query node.")
     p.add_argument("--max-walk-len", default=5, type=int,
                    help="Max walk length.")

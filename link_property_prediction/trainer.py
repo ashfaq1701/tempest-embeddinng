@@ -47,7 +47,7 @@ class TrainerConfig:
     K_train: int = 5
 
     # Walks: BACKWARD only, undirected; two-sided (source and every candidate).
-    num_walks_per_node: int = 5
+    num_walks_per_node: int = 10
     max_walk_len: int = 5
     walk_bias: str = "ExponentialWeight"
     start_bias: str = "ExponentialWeight"
