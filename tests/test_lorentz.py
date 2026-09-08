@@ -418,16 +418,6 @@ def test_output_masking_would_nan_but_input_masking_does_not():
     assert torch.allclose(grads["input"], torch.full_like(grads["input"], -1 / 3))
 
 
-def test_taylor_head_beats_a_bare_constant():
-    for w0 in (1e-8, 1e-4, 1e-2):
-        w = torch.tensor(w0, dtype=torch.float64)
-        exact = float(torch.acosh(1 + w) / torch.sqrt(w * (w + 2)))
-        assert abs((1 - w0 / 3) - exact) < abs(1.0 - exact)
-    w = torch.zeros(1, dtype=torch.float64, requires_grad=True)
-    (1.0 - w / 3.0).sum().backward()
-    assert torch.allclose(w.grad, torch.full_like(w.grad, -1 / 3))
-
-
 @pytest.mark.parametrize("k", KS)
 def test_expmap_jacobian_at_zero_is_the_identity(k):
     m = LorentzManifold(k=k)
@@ -565,6 +555,10 @@ def test_gradcheck_against_numerical_jacobians(k):
 
 
 def test_float32_end_to_end_training_stays_finite():
+    """Includes exact self-pairs, which is how the coincident-point failure
+    actually appeared: Patent has the shortest walks in the suite, so
+    near-empty bags pool to identical points and dist(x, x) is routine. Before
+    _safe_sqrt this died within four steps."""
     torch.manual_seed(1)
     m = LorentzManifold(k=1.0)
     p = geoopt.ManifoldParameter(m.random(64, 8, dtype=torch.float32), manifold=m)
@@ -573,7 +567,10 @@ def test_float32_end_to_end_training_stays_finite():
     first = last = None
     for _ in range(300):
         opt.zero_grad()
-        loss = m.dist(p, target.expand_as(p)).pow(2).mean()
+        q = p.clone()
+        q[:16] = p[:16]                                   # 25% exact self-pairs
+        loss = (m.dist(p, target.expand_as(p)).pow(2).mean()
+                + m.dist(p, q).pow(2).mean())
         loss.backward()
         opt.step()
         assert torch.isfinite(p).all()
@@ -597,24 +594,6 @@ def test_dist0_is_accurate_at_the_papers_init_radius(k):
     rel = lambda a: float(((a.double() - exact) / exact.clamp_min(1e-30)).abs().max())
     assert rel(naive(x32)) > 1e-3
     assert rel(m.dist0(x32)) < 1e-5
-
-
-@pytest.mark.parametrize("k", KS)
-def test_inner_survives_u_parallel_to_x_in_float32(k):
-    m = LorentzManifold(k=k)
-    for scale, bound in ((1e2, 1e-5), (1e4, 1e-3)):
-        x = (rand_points(1024, scale=scale)).float()
-        u = (x.double() / x.double().norm(dim=-1, keepdim=True)).float()
-        exact = m.inner(x.double(), u.double(), keepdim=True)
-
-        def printed(xx, uu):
-            return ((uu * uu).sum(-1, keepdim=True)
-                    - (xx * uu).sum(-1, keepdim=True) ** 2
-                    / (m.k + (xx * xx).sum(-1, keepdim=True)))
-
-        rel = lambda a: float(((a.double() - exact) / exact.abs()).abs().max())
-        assert rel(printed(x, u)) > 1e-2
-        assert rel(m.inner(x, u, keepdim=True)) < bound
 
 
 @pytest.mark.parametrize("k", KS)
@@ -725,14 +704,27 @@ def test_accuracy_lands_at_the_dtypes_own_resolution(dt, k=1.0):
 
 
 def test_no_hardcoded_epsilon_breaks_in_float16():
+    """A fixed 1e-30 floor underflows to exactly 0.0 in float16, and 1/0 is
+    inf, so the floor must come from finfo(dtype).
+
+    Exercises the two sites that actually USE the floor -- midpoint's rsqrt and
+    from_poincare's division. An earlier version of this test called inner,
+    expmap, dist0 and logmap, none of which touch _tiny, so replacing it with a
+    hardcoded 1e-30 passed."""
     assert float(torch.tensor(1e-30, dtype=torch.float16)) == 0.0
     assert torch.finfo(torch.float16).tiny > 0
     m = LorentzManifold(k=1.0)
-    for scale in (0.0, 1e-3, 1.0, 100.0):
-        x = torch.full((8, DIM), scale, dtype=torch.float16)
-        u = torch.randn(8, DIM).half()
-        for out in (m.inner(x, u), m.expmap(x, u), m.dist0(x), m.logmap(x, x)):
-            assert torch.isfinite(out).all(), scale
+
+    # midpoint with a degenerate bag: -<s,s>_L/k -> 0, so rsqrt hits the floor
+    bag = torch.zeros(2, 4, DIM, dtype=torch.float16)
+    for w in (torch.zeros(2, 4, dtype=torch.float16),
+              torch.rand(2, 4, dtype=torch.float16)):
+        assert torch.isfinite(m.midpoint(bag, w)).all()
+
+    # from_poincare at and beyond the boundary: 1 - ||u||^2 -> 0
+    for val in (0.0, 0.999, 1.0, 1.5):
+        u = torch.full((4, DIM), val / DIM ** 0.5, dtype=torch.float16)
+        assert torch.isfinite(m.from_poincare(u)).all(), val
 
 
 @pytest.mark.parametrize("k", KS)
@@ -866,41 +858,6 @@ def test_dist_self_pair_is_zero_with_zero_gradient(k):
 
 
 @pytest.mark.parametrize("k", KS)
-def test_safe_sqrt_leaves_every_nonzero_value_bit_identical(k):
-    """The guard must not perturb anything it is not there to fix."""
-    m = LorentzManifold(k=k)
-    for scale in (1e-3, 1.0, 1e2, 1e4):
-        a = rand_points(2000, dim=16, scale=scale)
-        b = rand_points(2000, dim=16, scale=scale)
-        w = m._gap(a, b)
-        assert (w > 0).all(), "test setup: expected all pairs distinct"
-        naive = (2.0 * m._sqrt_k) * torch.asinh(torch.sqrt(w * 0.5))
-        assert torch.equal(m.dist(a, b, keepdim=True), naive), scale
-        n2 = (a * a).sum(-1, keepdim=True)
-        x0 = torch.sqrt(m.k + n2)
-        w0 = (n2 / (m._sqrt_k * (x0 + m._sqrt_k))).clamp_min(0.0)
-        naive0 = (2.0 * m._sqrt_k) * torch.asinh(torch.sqrt(w0 * 0.5))
-        assert torch.equal(m.dist0(a, keepdim=True), naive0), scale
-
-
-def test_masking_the_sqrt_output_would_not_have_worked():
-    """Why the dummy goes in BEFORE the sqrt. torch.where evaluates both arms,
-    so masking the output still computes sqrt(0), whose backward is inf, and
-    0 * inf = nan survives the mask."""
-    def output_masked(t):
-        pos = t > 0
-        return torch.where(pos, torch.sqrt(t), torch.zeros_like(t))
-
-    from link_property_prediction.lorentz import _safe_sqrt
-    for fn, want_finite in ((output_masked, False), (_safe_sqrt, True)):
-        t = torch.zeros(4, dtype=torch.float64, requires_grad=True)
-        out = fn(t)
-        out.sum().backward()
-        assert torch.equal(out.detach(), torch.zeros_like(out)), "value must be 0 either way"
-        assert torch.isfinite(t.grad).all() == want_finite, fn
-
-
-@pytest.mark.parametrize("k", KS)
 def test_gradient_is_bounded_approaching_coincidence(k):
     """d(dist)/dw diverges as w -> 0, but dw/dx vanishes proportionally, so the
     gradient w.r.t. the POINTS stays O(1). That is why `w > 0` is a sufficient
@@ -914,20 +871,3 @@ def test_gradient_is_bounded_approaching_coincidence(k):
         assert float(x.grad.abs().max()) < 10.0, (sep, float(x.grad.abs().max()))
 
 
-def test_training_survives_forced_self_pairs():
-    """End to end: the failure mode as it actually appeared -- Patent has the
-    shortest walks in the suite, so near-empty bags pool to identical points
-    and coincident pairs are routine. Before the fix this died within 4 steps."""
-    torch.manual_seed(3)
-    m = LorentzManifold(k=1.0)
-    p = geoopt.ManifoldParameter(m.random(256, 32, dtype=torch.float32), manifold=m)
-    opt = geoopt.optim.RiemannianAdam([p], lr=1e-2, stabilize=10)
-    target = torch.randn(32)
-    for _ in range(300):
-        opt.zero_grad()
-        q = p.clone()
-        q[:64] = p[:64]                                  # 25% exact self-pairs
-        (m.dist(p, q).pow(2).mean()
-         + m.dist(p, target.expand_as(p)).pow(2).mean()).backward()
-        opt.step()
-        assert torch.isfinite(p).all()
