@@ -43,7 +43,7 @@ class LinkPredHead(nn.Module):
         # embedding table is d wide, not d+1.
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            init = (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * self.INIT_IRANGE
+            init = self.geom.random(self.num_nodes, self.d_emb, irange=self.INIT_IRANGE)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
