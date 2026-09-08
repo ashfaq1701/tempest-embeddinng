@@ -45,8 +45,9 @@ CURVATURE
 The paper is k=1 throughout: it defines only <x,x>_L = -1, mentions curvature
 once in passing ("constant negative sectional curvature"), and never
 parameterises, tunes or ablates it. The `k` argument below is geoopt's
-convention (<x,x>_L = -k, curvature -1/k), carried over because the existing
-LorentzManifold exposes it. At k != 1 there is nothing in the paper to be
+convention (<x,x>_L = -k, curvature -1/k), carried over because the ambient
+wrapper in model.py that this class replaces exposes it. At k != 1 there is
+nothing in the paper to be
 faithful to; those formulas are cross-validated against geoopt.Lorentz(k)
 instead (dist/dist0/expmap/egrad2rgrad agree to <= 4e-15 for k in
 [0.25, 4.0]).
@@ -61,14 +62,14 @@ import geoopt
 import torch
 from torch import Tensor
 
-__all__ = ["IntrinsicLorentz"]
+__all__ = ["LorentzManifold"]
 
 # cosh/sinh overflow guards; float64 cosh overflows near 710.
 _MAX_SINH_ARG = 700.0
 _TINY = 1e-30
 
 
-class IntrinsicLorentz(geoopt.Manifold):
+class LorentzManifold(geoopt.Manifold):
     """Lorentz model in intrinsic coordinates. Points are x' in R^n.
 
     Parameters
@@ -77,7 +78,7 @@ class IntrinsicLorentz(geoopt.Manifold):
         curvature -1/k. k=1 is the paper. See CURVATURE above.
     """
 
-    name = "IntrinsicLorentz"
+    name = "LorentzManifold"
     ndim = 1
     reversible = False
 
