@@ -32,10 +32,24 @@ hyperparameters; it argues only that d_l has no fraction and so avoids the
 Poincare boundary blow-up. Every guard below is therefore OURS, and each is
 marked `# GUARD (not in the paper)` with the failure it prevents.
 
-`r_max` (radius cap) is OURS and defaults to None, i.e. off, so the class is
-the paper's geometry unmodified. The cap is a floating-point policy, not
-geometry: at r_max=None this class is exact but a diverging optimizer can still
-walk it out of float32's usable range (r ~ 9.0) and then float64's (r ~ 19.1).
+SCOPE -- what this does NOT do
+------------------------------
+This class is the geometry, exactly. It bounds nothing. Deriving x0 makes the
+constraint hold at any radius, which extends the usable range (measured: fp32
+storage survives r=12 where geoopt.Lorentz NaNs at r=9), but a diverging
+optimizer still walks out of float64's range near r ~ 19. Bounding the
+trajectory is a separate concern and is deliberately not handled here.
+
+CURVATURE
+---------
+The paper is k=1 throughout: it defines only <x,x>_L = -1, mentions curvature
+once in passing ("constant negative sectional curvature"), and never
+parameterises, tunes or ablates it. The `k` argument below is geoopt's
+convention (<x,x>_L = -k, curvature -1/k), carried over because the existing
+LorentzManifold exposes it. At k != 1 there is nothing in the paper to be
+faithful to; those formulas are cross-validated against geoopt.Lorentz(k)
+instead (dist/dist0/expmap/egrad2rgrad agree to <= 4e-15 for k in
+[0.25, 4.0]).
 """
 
 from __future__ import annotations
@@ -60,47 +74,23 @@ class IntrinsicLorentz(geoopt.Manifold):
     Parameters
     ----------
     k : curvature parameter; the sheet is <x,x>_L = -k with sectional
-        curvature -1/k. k=1 is the paper.
-    r_max : optional cap on hyperbolic radius. None (default) = the paper's
-        unbounded manifold. OURS, not the paper's.
+        curvature -1/k. k=1 is the paper. See CURVATURE above.
     """
 
     name = "IntrinsicLorentz"
     ndim = 1
     reversible = False
 
-    def __init__(self, k: float = 1.0, r_max: Optional[float] = None) -> None:
+    def __init__(self, k: float = 1.0) -> None:
         super().__init__()
         if k <= 0:
             raise ValueError(f"k must be positive, got {k}")
         # kept in float64: every internal computation runs at this precision
         self.register_buffer("k", torch.as_tensor(float(k), dtype=torch.float64))
-        self.r_max = r_max
 
     # ------------------------------------------------------------------
     # internals: the lift x' -> (x0, x') that Eq. 6 defines
     # ------------------------------------------------------------------
-    @property
-    def _max_space(self) -> Optional[float]:
-        """||x'|| corresponding to r_max, since ||x'|| = sqrt(k) sinh(r)."""
-        if self.r_max is None:
-            return None
-        return math.sqrt(float(self.k)) * math.sinh(self.r_max)
-
-    def _cap(self, x: Tensor) -> Tensor:
-        """Radial projection to r_max, direction preserved. OURS.
-
-        The Lorentz analogue of Nickel & Kiela (2017)'s Poincare
-        proj(t) = t/||t|| - eps -- but note the difference in kind: there the
-        bound is a FEASIBILITY constraint (outside the ball is not the space),
-        here it is a PRECISION policy (the point stays perfectly valid).
-        """
-        m = self._max_space
-        if m is None:
-            return x
-        n = x.norm(dim=-1, keepdim=True)
-        return x * (m / n.clamp_min(_TINY)).clamp(max=1.0)
-
     def _x0(self, x64: Tensor) -> Tensor:
         """Eq. 6: x0 = sqrt(k + ||x'||^2). float64 in, float64 out."""
         return torch.sqrt(self.k + (x64 * x64).sum(-1, keepdim=True))
@@ -132,10 +122,12 @@ class IntrinsicLorentz(geoopt.Manifold):
     def projx(self, x: Tensor) -> Tensor:
         """Point onto the manifold.
 
-        Identity up to `_cap`: by Eq. 6 EVERY x' in R^n is a valid point, so
-        unlike the Poincare ball there is no feasibility projection to make.
+        The IDENTITY: by Eq. 6 every x' in R^n is a valid point, so unlike the
+        Poincare ball there is no feasibility projection to make. geoopt calls
+        this at `stabilize` intervals to repair drift; here there is no drift
+        to repair, because x0 is never stored.
         """
-        return self._cap(x)
+        return x
 
     def proju(self, x: Tensor, u: Tensor) -> Tensor:
         """Vector onto T_x. Identity: in this chart T_x is all of R^n, because
@@ -190,7 +182,7 @@ class IntrinsicLorentz(geoopt.Manifold):
                            torch.sinh(t) * sk / nrm.clamp_min(_TINY),
                            torch.ones_like(nrm))
         out = torch.cosh(t) * X + coef * U
-        return self._cap(out[..., 1:]).to(x.dtype)
+        return out[..., 1:].to(x.dtype)
 
     def retr(self, x: Tensor, u: Tensor) -> Tensor:
         """The exponential map is closed form, so it IS the retraction. This is
