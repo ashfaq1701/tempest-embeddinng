@@ -783,3 +783,151 @@ def test_midpoint_float32_loss_is_small_and_stays_on_manifold():
             assert float(((a.double() - b).abs() / b.abs().clamp_min(1e-12)).max()) < 5e-3
             P = m._lift(a.double())
             assert ((lip(P, P) + 1.0).abs() / (P[..., 0] ** 2)).max() < 1e-6
+
+
+# ======================================================================
+# 14. degenerate-input gradients
+#
+# The class of bug this section exists for: sqrt(t) has an INFINITE derivative
+# at t == 0, so any operation whose sqrt argument can be exactly zero returns
+# a finite value with a NaN gradient, and one such pair poisons the whole
+# batch. Zero is reachable from real data here -- coincident points, a zero
+# tangent vector, the origin -- so it is the common case, not a corner.
+#
+# This is a SWEEP rather than a handful of cases on purpose. dist() shipped
+# broken while logmap() and expmap() were already guarded, because the earlier
+# suite tested those two and not dist. Enumerating (operation, degenerate
+# input) for every public op is what makes that omission impossible.
+# ======================================================================
+def _deg_cases(k=1.0):
+    """(label, callable, tensors-that-must-have-finite-grads) at each op's
+    degenerate input."""
+    m = LorentzManifold(k=k)
+    D = 8
+    def pt(s=1.0):
+        return (torch.randn(6, D, dtype=torch.float64) * s).requires_grad_(True)
+    out = []
+
+    x = pt(); y = x.detach().clone().requires_grad_(True)
+    out.append(("dist(x, x)", lambda: m.dist(x, y), (x, y)))
+
+    z = torch.zeros(6, D, dtype=torch.float64, requires_grad=True)
+    out.append(("dist0(origin)", lambda: m.dist0(z), (z,)))
+
+    a = pt(); b = a.detach().clone().requires_grad_(True)
+    out.append(("logmap(x, x)", lambda: m.logmap(a, b), (a, b)))
+
+    c = pt(); u0 = torch.zeros(6, D, dtype=torch.float64, requires_grad=True)
+    out.append(("expmap(x, 0)", lambda: m.expmap(c, u0), (c, u0)))
+
+    e = pt(); f = e.detach().clone().requires_grad_(True); v = pt()
+    out.append(("transp(x, x, v)", lambda: m.transp(e, f, v), (e, f, v)))
+
+    g = torch.zeros(6, D, dtype=torch.float64, requires_grad=True); h = pt()
+    out.append(("inner(origin, u)", lambda: m.inner(g, h), (g, h)))
+
+    i = pt(); j = torch.zeros(6, D, dtype=torch.float64, requires_grad=True)
+    out.append(("inner(x, 0)", lambda: m.inner(i, j), (i, j)))
+
+    bag = (torch.randn(4, 5, D, dtype=torch.float64)).requires_grad_(True)
+    zw = torch.zeros(4, 5, dtype=torch.float64, requires_grad=True)
+    out.append(("midpoint(bag, zeros)", lambda: m.midpoint(bag, zw), (bag, zw)))
+
+    o1 = torch.zeros(6, D, dtype=torch.float64, requires_grad=True)
+    out.append(("to_poincare(origin)", lambda: m.to_poincare(o1), (o1,)))
+    o2 = torch.zeros(6, D, dtype=torch.float64, requires_grad=True)
+    out.append(("from_poincare(origin)", lambda: m.from_poincare(o2), (o2,)))
+    return out
+
+
+@pytest.mark.parametrize("k", KS)
+def test_no_operation_nans_its_gradient_at_a_degenerate_input(k):
+    for label, fn, tensors in _deg_cases(k):
+        fn().sum().backward()
+        for t in tensors:
+            assert t.grad is not None, label
+            assert torch.isfinite(t.grad).all(), f"{label}: NaN/inf gradient"
+
+
+@pytest.mark.parametrize("k", KS)
+def test_dist_self_pair_is_zero_with_zero_gradient(k):
+    """The specific regression: dist(x, x) used to return 0.0 with a NaN
+    gradient. Zero is the correct subgradient -- a self-distance is already at
+    the function's minimum."""
+    m = LorentzManifold(k=k)
+    for dt in (torch.float32, torch.float64):
+        x = (torch.randn(64, 16, dtype=dt) * 1e-3).requires_grad_(True)
+        y = x.detach().clone()
+        d = m.dist(x, y)
+        d.sum().backward()
+        assert float(d.abs().max()) == 0.0, dt
+        assert torch.isfinite(x.grad).all(), dt
+        assert float(x.grad.abs().max()) == 0.0, dt
+
+
+@pytest.mark.parametrize("k", KS)
+def test_safe_sqrt_leaves_every_nonzero_value_bit_identical(k):
+    """The guard must not perturb anything it is not there to fix."""
+    m = LorentzManifold(k=k)
+    for scale in (1e-3, 1.0, 1e2, 1e4):
+        a = rand_points(2000, dim=16, scale=scale)
+        b = rand_points(2000, dim=16, scale=scale)
+        w = m._gap(a, b)
+        assert (w > 0).all(), "test setup: expected all pairs distinct"
+        naive = (2.0 * m._sqrt_k) * torch.asinh(torch.sqrt(w * 0.5))
+        assert torch.equal(m.dist(a, b, keepdim=True), naive), scale
+        n2 = (a * a).sum(-1, keepdim=True)
+        x0 = torch.sqrt(m.k + n2)
+        w0 = (n2 / (m._sqrt_k * (x0 + m._sqrt_k))).clamp_min(0.0)
+        naive0 = (2.0 * m._sqrt_k) * torch.asinh(torch.sqrt(w0 * 0.5))
+        assert torch.equal(m.dist0(a, keepdim=True), naive0), scale
+
+
+def test_masking_the_sqrt_output_would_not_have_worked():
+    """Why the dummy goes in BEFORE the sqrt. torch.where evaluates both arms,
+    so masking the output still computes sqrt(0), whose backward is inf, and
+    0 * inf = nan survives the mask."""
+    def output_masked(t):
+        pos = t > 0
+        return torch.where(pos, torch.sqrt(t), torch.zeros_like(t))
+
+    from link_property_prediction.lorentz import _safe_sqrt
+    for fn, want_finite in ((output_masked, False), (_safe_sqrt, True)):
+        t = torch.zeros(4, dtype=torch.float64, requires_grad=True)
+        out = fn(t)
+        out.sum().backward()
+        assert torch.equal(out.detach(), torch.zeros_like(out)), "value must be 0 either way"
+        assert torch.isfinite(t.grad).all() == want_finite, fn
+
+
+@pytest.mark.parametrize("k", KS)
+def test_gradient_is_bounded_approaching_coincidence(k):
+    """d(dist)/dw diverges as w -> 0, but dw/dx vanishes proportionally, so the
+    gradient w.r.t. the POINTS stays O(1). That is why `w > 0` is a sufficient
+    predicate and no _tiny floor is needed here."""
+    m = LorentzManifold(k=k)
+    for sep in (1e-3, 1e-6, 1e-9, 1e-12, 1e-15):
+        x = (torch.randn(256, 16, dtype=torch.float64) * 1e-3).requires_grad_(True)
+        y = x.detach() + sep
+        m.dist(x, y).sum().backward()
+        assert torch.isfinite(x.grad).all(), sep
+        assert float(x.grad.abs().max()) < 10.0, (sep, float(x.grad.abs().max()))
+
+
+def test_training_survives_forced_self_pairs():
+    """End to end: the failure mode as it actually appeared -- Patent has the
+    shortest walks in the suite, so near-empty bags pool to identical points
+    and coincident pairs are routine. Before the fix this died within 4 steps."""
+    torch.manual_seed(3)
+    m = LorentzManifold(k=1.0)
+    p = geoopt.ManifoldParameter(m.random(256, 32, dtype=torch.float32), manifold=m)
+    opt = geoopt.optim.RiemannianAdam([p], lr=1e-2, stabilize=10)
+    target = torch.randn(32)
+    for _ in range(300):
+        opt.zero_grad()
+        q = p.clone()
+        q[:64] = p[:64]                                  # 25% exact self-pairs
+        (m.dist(p, q).pow(2).mean()
+         + m.dist(p, target.expand_as(p)).pow(2).mean()).backward()
+        opt.step()
+        assert torch.isfinite(p).all()
