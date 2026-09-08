@@ -3,24 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
-
-
-class LorentzManifold:
-
-    def __init__(self, k: float = 1.0):
-        self.manifold = geoopt.Lorentz(k=k)
-
-    def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return self.manifold.dist(x, y)
-
-    def dist0(self, x: torch.Tensor) -> torch.Tensor:
-        return self.manifold.dist0(x)
-
-    def midpoint(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        s = (w.unsqueeze(-1) * x).sum(dim=-2)
-        mink = -s[..., :1] ** 2 + (s[..., 1:] ** 2).sum(-1, keepdim=True)
-        return s / (-mink).clamp_min(1e-9).sqrt()
 
 
 class BagWeights(nn.Module):
@@ -54,11 +38,13 @@ class LinkPredHead(nn.Module):
         torch.manual_seed(seed)
         self.bag_weights = BagWeights(hidden_dim)
 
-        self.E = nn.Embedding(self.num_nodes, self.d_emb + 1)
+        # Intrinsic coordinates: a point IS x' in R^d. The time coordinate is
+        # derived in float64 inside the manifold and never stored, so the
+        # embedding table is d wide, not d+1.
+        self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            init = self.geom.manifold.projx(
-                (torch.rand(self.num_nodes, self.d_emb + 1) * 2 - 1) * self.INIT_IRANGE)
-        self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom.manifold)
+            init = (torch.rand(self.num_nodes, self.d_emb) * 2 - 1) * self.INIT_IRANGE
+        self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
