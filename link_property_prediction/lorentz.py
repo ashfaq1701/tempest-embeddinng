@@ -217,6 +217,12 @@ class IntrinsicLorentz(geoopt.Manifold):
         returns NEGATIVE distances (149/400 pairs at ||E||=139) once the radius
         grows. Same value, different conditioning -- verified against Eq. 5 as
         printed, and against geoopt.Lorentz.dist, to 8.9e-16 in float64.
+
+        Calibration: those negatives are a float32 phenomenon. Because _lift
+        upcasts, Eq. 5 as printed also stays non-negative THROUGH THIS MODULE
+        out to |E| ~ 9e6 -- so at the radii we reach it is the float64 lift,
+        not this rewrite, doing the work. The rewrite is insurance for a
+        narrower internal dtype, not the load-bearing part.
         """
         X, Y = self._lift(x), self._lift(y)
         d0 = X[..., :1] - Y[..., :1]
