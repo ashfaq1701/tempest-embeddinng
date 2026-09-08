@@ -46,11 +46,12 @@ class LinkPredHead(nn.Module):
 
     INIT_IRANGE = 1e-3
 
-    def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32):
+    def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
         self.geom = LorentzManifold()
+        torch.manual_seed(seed)
         self.bag_weights = BagWeights(hidden_dim)
 
         self.E = nn.Embedding(self.num_nodes, self.d_emb + 1)

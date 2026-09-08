@@ -79,6 +79,7 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             hidden_dim=int(config.hidden_dim),
+            seed=int(config.seed),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(
