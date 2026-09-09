@@ -40,6 +40,7 @@ class WalkGenerator:
         max_time_capacity: int = -1,
         temporal_node2vec_p: float = 4.0,
         temporal_node2vec_q: float = 0.25,
+        seed: Optional[int] = None,
     ):
         # Build node2vec adjacency only when a node2vec bias is requested; p/q
         # are the return / in-out params, inert for other biases.
@@ -54,6 +55,12 @@ class WalkGenerator:
             timescale_bound=timescale_bound,
             max_time_capacity=max_time_capacity,
             shuffle_walk_order=False,
+            # Seeds Tempest's own RNG. Without it Tempest draws a fresh random seed
+            # per process, so walks differ run-to-run even at a fixed torch/numpy
+            # seed -- the walk substrate was the last unseeded source of variance.
+            # Needs tempest-rw >= 1.0.5; earlier versions accept global_seed but
+            # never thread it into the CPU sampler or the shuffles.
+            global_seed=(None if seed is None else int(seed)),
         )
         self.walk_bias = walk_bias
         self.start_bias = start_bias
