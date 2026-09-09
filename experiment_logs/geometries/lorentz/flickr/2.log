@@ -1,0 +1,69 @@
+# dataset=Flickr  intrinsic Lorentz manifold (lorentz.LorentzManifold)
+#   d_emb=64 k_train=5 num_walks_per_node=10 lr=1e-3 patience=5 seed=43
+#   edges=7.22M bipartite=no  (flag: 'none')
+# branch=feature/lorentz-custom commit=ace2b11
+# host=artemis-a40-01.local  archived as experiment_logs/geometries/lorentz/flickr/2.log
+# E is nn.Embedding(N, d) -- intrinsic coords, x0 derived, never stored
+# r_mean/r_max are HYPERBOLIC RADIUS, not the ambient |E| of pre-wiring logs
+# seed 43 here is NOT the seed 43 of pre-wiring runs: the init RNG differs
+# started=2026-09-09 00:32:59
+
+=== tempest-embedding training ===
+dataset: Flickr
+device:  cuda
+seed:    43
+loaded (tgb-seq) in 2.4s
+  num_nodes:     233,837
+  neg_pool:      233,836 unique nodes (non-bipartite)
+  train edges:   5,738,138
+  val edges:     875,742
+  test edges:    609,679
+
+=== Config ===
+  num_nodes: 233837
+  dst_pool: <ndarray shape=(233836,) dtype=int32>
+  d_emb: 64
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 10
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 100
+  early_stop_patience: 5
+  seed: 43
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:           14,965,568
+  head params:              162
+  TOTAL trainable:   14,965,730
+
+=== Training ===
+  Ingested full graph into Tempest: 7,223,559 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=1.3024  lr=1e-03  train 172.2s  r_mean=0.331  r_max=1.399  geo_temp=5.779  val 0.2789  test 0.2577 (new best)  eval 97.5s
+epoch 2/100  link=0.6565  lr=1e-03  train 171.5s  r_mean=0.495  r_max=1.381  geo_temp=9.894  val 0.5122  test 0.4875 (new best)  eval 99.3s
+epoch 3/100  link=0.3909  lr=1e-03  train 171.4s  r_mean=0.571  r_max=1.481  geo_temp=13.399  val 0.5903  test 0.5623 (new best)  eval 99.3s
+epoch 4/100  link=0.2768  lr=1e-03  train 172.0s  r_mean=0.618  r_max=1.604  geo_temp=16.341  val 0.6192  test 0.5915 (new best)  eval 99.2s
+epoch 5/100  link=0.2145  lr=1e-03  train 171.6s  r_mean=0.655  r_max=1.685  geo_temp=18.748  val 0.6355  test 0.6071 (new best)  eval 103.0s
+epoch 6/100  link=0.1752  lr=1e-03  train 171.7s  r_mean=0.687  r_max=1.751  geo_temp=20.725  val 0.6457  test 0.6160 (new best)  eval 103.7s
+epoch 7/100  link=0.1488  lr=1e-03  train 170.9s  r_mean=0.716  r_max=1.837  geo_temp=22.346  val 0.6497  test 0.6180 (new best)  eval 102.5s
+epoch 8/100  link=0.1304  lr=1e-03  train 170.8s  r_mean=0.744  r_max=1.903  geo_temp=23.617  val 0.6509  test 0.6176 (new best)  eval 103.7s
+epoch 9/100  link=0.1171  lr=1e-03  train 171.1s  r_mean=0.770  r_max=1.933  geo_temp=24.651  val 0.6448  patience 1/5  eval 102.9s
+epoch 10/100  link=0.1075  lr=1e-03  train 170.9s  r_mean=0.796  r_max=1.943  geo_temp=25.365  val 0.6474  patience 2/5  eval 102.4s
+epoch 11/100  link=0.1001  lr=1e-03  train 171.2s  r_mean=0.821  r_max=1.991  geo_temp=25.846  val 0.6485  patience 3/5  eval 102.9s
+epoch 12/100  link=0.0942  lr=1e-03  train 170.9s  r_mean=0.845  r_max=2.018  geo_temp=26.172  val 0.6455  patience 4/5  eval 102.6s
+epoch 13/100  link=0.0891  lr=1e-03  train 171.1s  r_mean=0.868  r_max=2.058  geo_temp=26.397  val 0.6381  patience 5/5  eval 102.9s
+  restored best weights from epoch 8 (val 0.6509, test 0.6176)
+
+=== Final results ===
+  dataset:           Flickr
+  seed:              43
+  stopped_at_epoch:  8
+  best_val_mrr:      0.6509
+  best_test_mrr:     0.6176
+=== rc=0 finished=2026-09-09 01:41:42 ===
