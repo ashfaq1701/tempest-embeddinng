@@ -71,8 +71,8 @@ def _safe_sqrt(t: Tensor) -> Tensor:
         cannot reach 0 (_x0, where the argument is k + ||x'||^2 >= k > 0).
     """
     pos = t > 0
-    return torch.where(pos, torch.sqrt(torch.where(pos, t, torch.ones_like(t))),
-                       torch.zeros_like(t))
+    out = torch.where(pos, torch.sqrt(torch.where(pos, t, torch.ones_like(t))), torch.zeros_like(t))
+    return torch.where(torch.isnan(t), t, out)
 
 
 def _tiny(t: Tensor) -> float:
@@ -314,23 +314,35 @@ class LorentzManifold(geoopt.Manifold):
 
             mu = s / sqrt(-<s,s>_L / k),   s = sum_t w_t x_t
 
-        x [..., T, n], w [..., T] -> [..., n]. This minimises squared
-        Lorentzian distance, not squared geodesic distance, so it is not the
-        Riemannian barycenter (which has no closed form). The /k is
-        load-bearing: without it the result is off-manifold for k != 1.
+        x [..., T, n], w [..., T] -> [..., n]. Minimises squared Lorentzian
+        distance, not squared geodesic distance, so it is not the Riemannian
+        barycenter (no closed form). The /k is load-bearing for k != 1.
 
-        Scale invariant in w, so unnormalised non-negative weights are valid.
-        The central quantity s0^2 - ||s'||^2 cancels and no O(T) rearrangement
-        removes it, so this is the one operation that loses accuracy in
-        float32; pass float64 if that matters. A degenerate bag (zero or
-        near-cancelling weights) is floored, not rejected, and returns a
-        meaningless point near the origin.
+        neg = -<s,s>_L / k is formed as s0^2 - ||s'||^2, which cancels: it is
+        Eq. 6 applied to a weighted sum, and for a bag whose weight sits on
+        one point at radius r the two terms are ~ (w sinh r)^2 while the
+        result is O((sum w)^2). This is the one O(T n) operation that loses
+        accuracy in float32; the pairwise form is exact but O(T^2 n).
+
+        Floor. For valid points and non-negative weights,
+        neg = sum_tu w_t w_u (1 + gap_tu) >= (sum_t w_t)^2, with equality iff
+        all points coincide. That is the smallest legitimate value, so the
+        floor is (sum w)^2: a no-op on every valid input at every scale, and
+        a bound of 1/(sum w) on the multiplier when cancellation drives the
+        computed neg to 0 or below. A floor at 1 is wrong for weights that do
+        not sum to 1: neg scales as c^2 and s as c, so the ratio is invariant
+        only while the floor does not fire; one point with weight 0.5 has
+        neg = 0.25, would be floored to 1, and would come back at half its
+        radius, off the manifold. The inner clamp handles the all-zero bag
+        (0/0). With the floor the degenerate result is s/(sum w), the
+        Euclidean mean of the x'_t: finite, near the bag, off-manifold.
         """
         wu = w.unsqueeze(-1)
         s0 = (wu * self._x0(x)).sum(dim=-2)
         s = (wu * x).sum(dim=-2)
         neg = (s0 * s0 - (s * s).sum(-1, keepdim=True)) * self._inv_k
-        return s * neg.clamp_min(_tiny(s)).rsqrt()
+        wsum = w.sum(-1, keepdim=True)
+        return s * neg.clamp_min((wsum * wsum).clamp_min(_tiny(neg))).rsqrt()
 
     def to_poincare(self, x: Tensor) -> Tensor:
         """Eq. 11: x'/(x0 + sqrt(k)), giving unit Poincare ball coordinates."""
