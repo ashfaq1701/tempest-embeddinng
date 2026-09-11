@@ -97,9 +97,9 @@ class Trainer:
         )
 
         # Lazy Adam: a row outside the batch is neither moved nor decayed until it next
-        # appears. The dense optimiser stepped all N rows every batch. E is a plain
-        # Parameter here, so SparseRiemannianAdam uses geoopt's default Euclidean
-        # manifold; the sphere constraint comes from F.normalize, not the optimiser.
+        # appears. The dense optimiser stepped all N rows every batch. E is a
+        # ManifoldParameter on geoopt.Sphere, so the update is Riemannian and the
+        # retraction is what keeps it on the sphere.
         E = self.model.E.weight
         euclidean = [p for p in self.model.parameters() if p is not E]
         self.opt_E = geoopt.optim.SparseRiemannianAdam([E], lr=float(config.lr))

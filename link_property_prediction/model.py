@@ -1,3 +1,4 @@
+import geoopt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,13 +38,17 @@ class LinkPredHead(nn.Module):
         torch.manual_seed(seed)
         self.bag_weights = BagWeights(hidden_dim)
 
-        # E is unconstrained (plain nn.Embedding), initialised ON the unit sphere. Leaving the
-        # magnitude free is what makes the pooler's `norm` feature live -- on a constrained sphere
-        # every |E[v]| would be 1 and the feature dead. cosine similarity is scale-invariant and the
-        # spherical mean renormalises, so only the norm feature depends on this.
+        # E is CONSTRAINED to the sphere: a ManifoldParameter on geoopt.Sphere, initialised
+        # with the manifold's own uniform measure. The optimiser now keeps it there by
+        # retraction rather than F.normalize doing it downstream.
+        #
+        # This kills the pooler's `norm` feature: |E[v]| == 1 for every v, so BagWeights'
+        # third input is a constant and only [age, pos] carry signal.
+        self.geom = geoopt.Sphere()
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            self.E.weight.copy_(F.normalize(torch.randn(self.num_nodes, self.d_emb), dim=-1))
+            init = self.geom.random_uniform(self.num_nodes, self.d_emb)
+        self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
