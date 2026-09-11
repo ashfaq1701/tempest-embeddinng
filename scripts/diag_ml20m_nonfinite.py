@@ -48,7 +48,11 @@ from link_property_prediction.lorentz import LorentzManifold     # noqa: E402
 PHASE = "init"
 BATCH_RECS: List[Dict[str, Any]] = []
 CTX: Dict[str, Any] = {}
-STATE = {"epoch": 1, "batch": 0, "fired": False, "max_step": 0.0,
+# Recording is armed ONLY inside a training step. Eval runs ~365 batches with
+# K_eval=100 negatives, i.e. candidate tensors of ~646MB each; recording there
+# accumulated references and OOM'd the 47GiB card during epoch 1's eval. Eval is
+# also not under investigation -- the crash is in the train forward.
+STATE = {"epoch": 1, "batch": 0, "fired": False, "active": False, "max_step": 0.0,
          "max_step_where": None, "outdir": None}
 MANIFOLD_METHODS = ["_x0", "_gap", "inner", "egrad2rgrad", "expmap", "retr",
                     "transp", "dist", "dist0", "midpoint", "projx", "proju", "logmap"]
@@ -62,7 +66,7 @@ def _flag(t: torch.Tensor) -> Optional[torch.Tensor]:
 
 
 def _rec(name: str, out: Any, inputs: Dict[str, Any]) -> None:
-    if STATE["fired"]:
+    if STATE["fired"] or not STATE["active"]:
         return
     outs = out if isinstance(out, (tuple, list)) else (out,)
     flags = [f for f in (_flag(o) for o in outs) if f is not None]
@@ -282,7 +286,7 @@ def install_midpoint_probe() -> None:
     orig = LorentzManifold.midpoint
 
     def midpoint(self, x, w):
-        if not STATE["fired"]:
+        if not STATE["fired"] and STATE["active"]:
             with torch.no_grad():
                 wu = w.unsqueeze(-1)
                 x0 = self._x0(x)
@@ -321,7 +325,7 @@ def install_manifold_wrappers() -> None:
         def make(mname: str, orig):
             def wrapped(self, *a, **kw):
                 out = orig(self, *a, **kw)
-                if not STATE["fired"]:
+                if not STATE["fired"] and STATE["active"]:
                     names = ("x", "u", "v", "w")
                     ins = {names[i] if i < len(names) else f"arg{i}": v
                            for i, v in enumerate(a)}
@@ -429,6 +433,7 @@ def install_trainer_wrapper(start_epoch: int) -> None:
         if STATE["fired"]:
             return step_orig(self, batch)
         BATCH_RECS.clear()
+        STATE["active"] = True          # disarmed again before we return, so eval records nothing
         CTX["geom"] = self.model.geom
         CTX["E"] = self.model.E
         CTX["opt"] = self.opt
@@ -487,8 +492,15 @@ def install_trainer_wrapper(start_epoch: int) -> None:
                                "note": "optimiser phase",
                                "max_step_this_run": STATE["max_step"]})
         PHASE = "idle"
-        return {"link": float(link_loss.detach()),
-                "lr": float(self.opt.param_groups[0]["lr"])}
+        out = {"link": float(link_loss.detach()),
+               "lr": float(self.opt.param_groups[0]["lr"])}
+        # Drop every tensor reference: holding graph nodes across batches keeps
+        # activations alive and was what exhausted the card during eval.
+        STATE["active"] = False
+        BATCH_RECS.clear()
+        for k in ("tokens_src", "tokens_cand", "last_w"):
+            CTX.pop(k, None)
+        return out
 
     Trainer._train_step = _train_step
 
