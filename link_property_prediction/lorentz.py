@@ -43,32 +43,14 @@ _SIXTH = 1.0 / 6.0
 
 
 def _safe_sqrt(t: Tensor) -> Tensor:
-    """sqrt(t) with a ZERO gradient at t == 0 instead of an infinite one.
+    """sqrt(t) with a zero gradient at t == 0 instead of an infinite one.
 
-    d(sqrt t)/dt = 1/(2 sqrt t) diverges at 0, so any sqrt whose argument can
-    be exactly 0 poisons the whole batch's gradient with NaN. That is not a
-    corner case here: t == 0 means "the two points coincide" (dist) or "the
-    point is the origin" (dist0), both of which real data produces.
-
-    The dummy MUST be substituted before the sqrt. torch.where evaluates both
-    arms and only then selects, so masking the OUTPUT still computes sqrt(0),
-    whose backward is inf, and 0 * inf = nan survives the mask. Feeding 1.0
-    into the masked lanes keeps that arm well conditioned, and since
-    ones_like(t) is a constant those lanes contribute exactly zero gradient.
-
-    Zero is the right subgradient here rather than an arbitrary choice: t == 0
-    is the minimum of the distance, so the function is already at its floor.
-
-    Three idioms appear in this module for the same hazard, and they are not
-    interchangeable:
-      * this one, when 0 is a LEGITIMATE input and the correct gradient
-        contribution is 0 or a known finite limit (dist, dist0; expmap and
-        logmap hand-roll it because they also need a Taylor limit for the
-        surrounding coefficient);
-      * clamp_min(_tiny(...)), when 0 means the CALLER passed something
-        degenerate and any finite answer will do (midpoint, from_poincare);
-      * nothing at all, which is only correct when the argument provably
-        cannot reach 0 (_x0, where the argument is k + ||x'||^2 >= k > 0).
+    1/(2 sqrt t) diverges at 0, poisoning the batch's gradient with NaN, and
+    t == 0 is legitimate here: coincident points (dist) or the origin (dist0).
+    Zero is the right subgradient -- t == 0 is the minimum. The dummy must be
+    substituted BEFORE the sqrt: torch.where evaluates both arms, so masking
+    the output still runs sqrt(0), whose backward is inf and 0 * inf = nan
+    survives. A real NaN in t is propagated, not sent to the zero branch.
     """
     pos = t > 0
     out = torch.where(pos, torch.sqrt(torch.where(pos, t, torch.ones_like(t))), torch.zeros_like(t))
