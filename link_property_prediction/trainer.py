@@ -165,7 +165,6 @@ class Trainer:
 
         self.opt.zero_grad(set_to_none=True)
         link_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.E.weight, 1.0)
         self.opt.step()
 
         return {
