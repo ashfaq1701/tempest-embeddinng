@@ -72,9 +72,16 @@ def _rec(name: str, out: Any, inputs: Dict[str, Any]) -> None:
     flags = [f for f in (_flag(o) for o in outs) if f is not None]
     if not flags:
         return
+    # Input flags are computed NOW, at call time. RiemannianAdam does
+    # point.copy_(new_point) after retr (radam.py:68), so a held reference to
+    # E.weight reads the POST-write value at dump time. The first run reported
+    # "inputs already non-finite" purely from that aliasing and drew the wrong
+    # conclusion. The recorded flag is the truth; the live tensor is not.
+    in_flags = {k: _flag(v) for k, v in inputs.items()}
     BATCH_RECS.append({"name": name, "phase": PHASE, "flag": flags[0] if len(flags) == 1
                        else torch.stack(flags).any(),
-                       "out": out, "inputs": inputs})
+                       "out": out, "inputs": inputs,
+                       "in_flags": {k: f for k, f in in_flags.items() if f is not None}})
 
 
 def _num(t: Any) -> Dict[str, Any]:
@@ -147,20 +154,24 @@ def dump_and_stop(rec: Dict[str, Any], all_recs: List[Dict[str, Any]],
     p(f"non-finite rows (first 20): {rows}")
     p("")
     p("--- INPUTS (is the origin here, or upstream?) ---")
+    p("NOTE: 'at_call' is the finiteness flag recorded AT CALL TIME and is authoritative.")
+    p("      'live' re-reads the tensor now; for E.weight in the optim phase it has since")
+    p("      been overwritten by point.copy_(new_point) (radam.py:68) and will falsely")
+    p("      appear non-finite. Trust at_call.")
     upstream = []
     for k, v in rec["inputs"].items():
         s = _num(v)
-        p(f"[{k}] {json.dumps(s)}")
-        if torch.is_tensor(v) and v.is_floating_point() and (s.get("n_nan", 0) or
-                                                             s.get("n_posinf", 0) or
-                                                             s.get("n_neginf", 0)):
+        f = rec.get("in_flags", {}).get(k)
+        at_call = ("non-finite" if bool(f) else "finite") if f is not None else "n/a"
+        p(f"[{k}] at_call={at_call}  live={json.dumps(s)}")
+        if f is not None and bool(f):
             upstream.append(k)
     p("")
     if upstream:
-        p(f"*** INPUTS {upstream} ARE ALREADY NON-FINITE -- this op REPORTS, it did not ORIGINATE.")
-        p("*** The origin is upstream. Recorded op order for this batch follows.")
+        p(f"*** INPUTS {upstream} WERE ALREADY NON-FINITE AT CALL TIME -- this op REPORTS,")
+        p("*** it did not ORIGINATE. The origin is upstream; see the op order below.")
     else:
-        p("*** ALL INPUTS FINITE -- this op ORIGINATED the non-finite value.")
+        p("*** ALL INPUTS FINITE AT CALL TIME -- this op ORIGINATED the non-finite value.")
     p("")
     p("--- recorded op order this batch (first 60) ---")
     for i, r in enumerate(all_recs[:60]):
@@ -222,6 +233,15 @@ def dump_and_stop(rec: Dict[str, Any], all_recs: List[Dict[str, Any]],
         if tk is None:
             continue
         p("")
+        # Only meaningful if the failing tensor is indexed in the SAME space as the
+        # bag. The first run dumped candidate-bag row 3084 for a failure in node 3084
+        # of an [num_nodes, d] tensor -- a coincidental index collision, not evidence.
+        o_rows = o.shape[0] if torch.is_tensor(o) and o.dim() else -1
+        if o_rows != tk["nodes"].shape[0]:
+            p(f"--- {side} token bag: SKIPPED -- failing tensor has {o_rows} rows, "
+              f"bag has {tk['nodes'].shape[0]}. Row indices are in different spaces; "
+              f"dumping them would be a coincidental collision, not evidence. ---")
+            continue
         p(f"--- {side} token bag (rows implicated: {rows[:5]}) ---")
         try:
             for r in rows[:5]:
@@ -525,6 +545,44 @@ def install_trainer_wrapper(start_epoch: int) -> None:
                   f"|x'|max={deg['norm_max']:.4e} "
                   f"geo_temp={float(self.model.geo_temp):.4f} "
                   f"max_geo_step={STATE['max_step']:.4e}", flush=True)
+        # ---- Adam ratio check -------------------------------------------------
+        # ||m||_x / sqrt(v), both in METRIC units: ||m||_x = sqrt(inner(x,m,m)) via
+        # the manifold, and v = exp_avg_sq, which geoopt fills from
+        # component_inner(point, grad) -- i.e. inner(x,g,g) broadcast across the row,
+        # so sqrt(v) is the Riemannian RMS gradient norm. Plain Adam bounds this ratio
+        # near (1-b1)/sqrt(1-b2) = 3.16. If the transport fix is the whole story this
+        # must stay under ~3.2 for the top-radius nodes through epoch 14; if it does
+        # not, there is a second corruption path.
+        try:
+            with torch.no_grad():
+                Wd = self.model.E.weight.detach()
+                stE = self.opt.state.get(self.model.E.weight, {})
+                m, vsq = stE.get("exp_avg"), stE.get("exp_avg_sq")
+                if m is not None and vsq is not None:
+                    rr = self.model.geom.dist0(Wd)
+                    top = torch.topk(torch.nan_to_num(rr, nan=-1.0), k=20).indices
+                    xs, ms = Wd[top], m[top]
+                    m_riem = self.model.geom.inner(xs, ms, keepdim=True).clamp_min(0).sqrt().squeeze(-1)
+                    v_row = (vsq[top].mean(dim=-1) if vsq.dim() > 1 else vsq[top]).clamp_min(0).sqrt()
+                    ratio = m_riem / v_row.clamp_min(1e-20)
+                    fin = torch.isfinite(ratio)
+                    worst = float(ratio[fin].max()) if bool(fin.any()) else float("nan")
+                    # The raw ratio is NOT bias-corrected, so it runs hot for the first
+                    # few thousand steps while 1-b2^t is far from 1. What matters here is
+                    # order of magnitude: the crashing run hit 3.07e3 and 7.38e3 at ep13,
+                    # three decades over, not a factor of 1.4.
+                    print(f"[diag] adam-ratio ep{STATE['epoch']}: "
+                          f"max||m||_x/sqrt(v) over top-20 by radius = {worst:.4e} "
+                          f"(bound ~3.2; early epochs run hot, bias correction)  "
+                          f"{'OK' if worst <= 3.2 else 'OVER'}",
+                          flush=True)
+                    for j in range(min(3, top.numel())):
+                        print(f"[diag]    node {int(top[j]):7d}  r={float(rr[top[j]]):8.4f}  "
+                              f"||m||_x={float(m_riem[j]):.4e}  sqrt(v)={float(v_row[j]):.4e}  "
+                              f"ratio={float(ratio[j]):.4e}", flush=True)
+        except Exception as e:
+            print(f"[diag] adam-ratio check failed: {type(e).__name__}: {e}", flush=True)
+
         ep_done = STATE["epoch"]
         STATE["epoch"] += 1
         STATE["batch"] = 0

@@ -272,19 +272,52 @@ class LorentzManifold(geoopt.Manifold):
     def transp(self, x: Tensor, y: Tensor, v: Tensor) -> Tensor:
         """Parallel transport T_x -> T_y:
 
-            PT(v) = v + <y,v>_L / (k - <x,y>_L) * (x + y)
+            PT(v) = v + <Y-X, V>_L / (k (2 + w)) * (x + y)
 
-        Required by any optimizer with momentum, since the buffer is a tangent
-        vector at a point that moves. Two substitutions avoid forming a small
-        number as a difference of large ones: k - <x,y>_L = k(2 + w), and
-        <Y,V>_L = <Y-X,V>_L since <X,V>_L = 0. The gap is inlined because d and
-        d0 are needed again for <Y-X,V>_L.
+        with k - <X,Y>_L = k(2 + w) and <Y,V>_L = <Y-X,V>_L since <X,V>_L = 0.
+
+        <Y-X,V>_L is NOT formed as (d.v) - d0 (x.v)/x0. For momentum with a
+        radial component v_r and a radial step delta both terms are delta*v_r
+        and the true difference is delta*v_r*k/x0^2; at r = 11.4 that is 250x
+        below float32 rounding, so the computed value is noise. That noise
+        multiplies (x + y) ~ 2||x'|| and lands in the radial momentum, ~3% per
+        transport at r = 11.4, systematically, and the resulting longer step
+        makes the next error larger. That loop is how a 6.7e-3 step became
+        149.8 and overflowed cosh in expmap.
+
+        Split v and d into radial and tangential parts about n = x'/||x'||.
+        With P = d.(x+y) = 2||x'|| d_r + ||d||^2 (difference first), d0 = y0 - x0
+        = P/(y0 + x0), and the identity k + x0 y0 - ||x'||^2 = 2k + x0 d0,
+
+            <Y-X,V>_L = v_r [d_r (2k + x0 d0) - ||x'|| ||d||^2] / (x0 (x0 + y0))
+                        + d_perp . v_perp
+
+        The bracket is exact to ~eps ||x'|| delta / (2k) relative (0.8% at
+        r = 11.4, delta = 3), which enters the transported momentum scaled by
+        the step and is immaterial. d_perp.v_perp is used rather than d.v_perp
+        because v_perp computed as v - v_r n carries an n-component of size
+        eps v_r, and d_r times that is again the noise term. Measured over 300
+        radial transports at r = 11.4 in float32 the Riemannian norm of the
+        momentum is preserved to 0.3%, against 0 or +12% for the previous form.
+        Agrees with the previous form to 1e-9 in float64 at r <= 5.
+
+        At the origin n = 0, so v_r = d_r = 0, the bracket term vanishes and
+        yv = d.v, which is the correct limit.
         """
         x0, y0 = self._x0(x), self._x0(y)
         d = y - x
-        d0 = (d * (y + x)).sum(-1, keepdim=True) / (y0 + x0)
-        w = (((d * d).sum(-1, keepdim=True) - d0 * d0) * self._half_inv_k).clamp_min(0.0)
-        yv = (d * v).sum(-1, keepdim=True) - d0 * ((x * v).sum(-1, keepdim=True) / x0)
+        big_p = (d * (x + y)).sum(-1, keepdim=True)
+        d0 = big_p / (y0 + x0)
+        dd = (d * d).sum(-1, keepdim=True)
+        w = ((dd - d0 * d0) * self._half_inv_k).clamp_min(0.0)
+        nx = x.norm(dim=-1, keepdim=True)
+        n = x / nx.clamp_min(_tiny(nx))
+        vr = (n * v).sum(-1, keepdim=True)
+        vperp = v - vr * n
+        dr = (n * d).sum(-1, keepdim=True)
+        dperp = d - dr * n
+        bracket = (dr * (2.0 * self.k + x0 * d0) - nx * dd) / (x0 * (x0 + y0))
+        yv = vr * bracket + (dperp * vperp).sum(-1, keepdim=True)
         coef = yv / (self.k * (2.0 + w))
         return torch.addcmul(v, coef, x + y)
 
