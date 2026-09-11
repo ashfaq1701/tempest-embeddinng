@@ -54,8 +54,8 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. One RiemannianAdam param group at a single `lr`: the
-    # embedding tables, the distance temperature and the NN pooler all step at the same rate.
+    # Constant lr, no weight decay. Both optimisers share it, so E, the distance
+    # temperature and the NN pooler all step at the same rate.
     lr: float = 1e-3
 
     # Run control.
@@ -96,10 +96,14 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # One param group at a single lr: Riemannian update for E, standard Adam for the rest.
-        self.opt = geoopt.optim.RiemannianAdam(
-            self.model.parameters(), lr=float(config.lr), stabilize=10,
-        )
+        # Lazy Adam: a row outside the batch is neither moved nor decayed until it next
+        # appears. The dense optimiser stepped all N rows every batch. E is a plain
+        # Parameter here, so SparseRiemannianAdam uses geoopt's default Euclidean
+        # manifold; the sphere constraint comes from F.normalize, not the optimiser.
+        E = self.model.E.weight
+        euclidean = [p for p in self.model.parameters() if p is not E]
+        self.opt_E = geoopt.optim.SparseRiemannianAdam([E], lr=float(config.lr))
+        self.opt = torch.optim.Adam(euclidean, lr=float(config.lr))
 
     # Full-graph ingestion (once, up front)
 
@@ -164,8 +168,10 @@ class Trainer:
         link_loss = F.cross_entropy(logits, target)
 
         self.opt.zero_grad(set_to_none=True)
+        self.opt_E.zero_grad(set_to_none=True)
         link_loss.backward()
         self.opt.step()
+        self.opt_E.step()
 
         return {
             "link": float(link_loss.detach()),
