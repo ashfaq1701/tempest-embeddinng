@@ -56,7 +56,9 @@ class LinkPredHead(nn.Module):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
 
-        x = F.embedding(nodes, emb)
+        # sparse=True feeds SparseRiemannianAdam. The flag belongs here, not on the
+        # nn.Embedding constructor: self.E is never called, only its .weight is read.
+        x = F.embedding(nodes, emb, sparse=True)
         w = self.bag_weights(self.geom, tokens, x, valid)
         return self.geom.midpoint(x, w)
 
