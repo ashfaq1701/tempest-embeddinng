@@ -176,17 +176,14 @@ class Trainer:
 
     @torch.no_grad()
     def _geometry_probe(self) -> Dict[str, float]:
-        """Boundary watch: mean and max HYPERBOLIC RADIUS of E.
+        """Boundary watch: mean and max Euclidean norm of E.
 
-        Was the Euclidean norm of the ambient (d+1)-vector. Under intrinsic
-        coordinates that vector no longer exists and ||x'|| = sqrt(k) sinh(r)
-        is not comparable to it, so this reports r = dist0(x) directly. r is
-        the quantity that matters anyway: float32 storage of an ambient point
-        loses the manifold constraint near r = 9, and float64 near r = 19.
-        Logged as r_mean/r_max, NOT |E|mean/|E|max -- old logs are on the other
-        scale and must not be compared line-for-line.
+        The sphere head leaves E unconstrained (initialised on the unit sphere,
+        magnitude then free), so |E[v]| is the meaningful per-node magnitude --
+        the same quantity the pooler reads as its `norm` feature. Logged as
+        r_mean/r_max.
         """
-        r = self.model.geom.dist0(self.model.E.weight.detach())
+        r = self.model.E.weight.detach().norm(dim=-1)
         return {"max_norm": float(r.max()), "mean_norm": float(r.mean())}
 
     @torch.no_grad()
