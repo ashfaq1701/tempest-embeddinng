@@ -372,7 +372,11 @@ class LorentzManifold(geoopt.Manifold):
         dd = (d * d).sum(-1, keepdim=True)
         w = ((dd - d0 * d0) * self._half_inv_k).clamp_min(0.0)
         nx = x.norm(dim=-1, keepdim=True)
-        n = x / nx.clamp_min(_tiny(nx))
+        # nx = sqrt(sum x^2) and the squares underflow: below |x| ~ 3.7e-23 in float32
+        # every x^2 rounds to zero and nx reports 0 for a nonzero vector. Floor at
+        # sqrt(tiny), the smallest |x| whose square is still representable, not at tiny --
+        # that would give n = x/1.18e-38 ~ 1e15 instead of a unit vector.
+        n = x / nx.clamp_min(math.sqrt(_tiny(nx)))
         vr = (n * v).sum(-1, keepdim=True)
         vperp = v - vr * n
         dr = (n * d).sum(-1, keepdim=True)
