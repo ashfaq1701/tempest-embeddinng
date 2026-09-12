@@ -70,8 +70,8 @@ def _tiny(t: Tensor) -> float:
 # Those positions are already numerically meaningless -- past the wall the
 # stored x' no longer satisfies <x,x>_L = -k -- so projx pulls the detached tail
 # back to the cloud edge and leaves every other row untouched.
-_SHAVE_K = 2.0           # fence = p50 + K*(p99.9 - p50): robust z-score, cloud body as scale
-_SHAVE_PULL_Q = 0.999    # pull flagged rows back to this radius quantile (the cloud edge)
+_SHAVE_K = 2.0           # fence = p50 + K*(pull_q - p50): robust z-score, cloud body as scale
+_SHAVE_PULL_Q = 0.9999   # cloud-edge quantile: the fence anchor and the pull target
 
 
 class LorentzManifold(geoopt.Manifold):
@@ -146,13 +146,16 @@ class LorentzManifold(geoopt.Manifold):
         where it was.
 
         The fence is purely stat-driven -- there is NO fixed radius. It is
-        p50 + K*(p99.9 - p50) over the table's own radii, a robust z-score with
-        the cloud body (p99.9 - p50) as the scale. This is relative, not
+        p50 + K*(p99.99 - p50) over the table's own radii, a robust z-score with
+        the cloud body (p99.99 - p50) as the scale. This is relative, not
         absolute: it moves only what is detached *from the cloud*, so a cloud
         that legitimately spreads outward is preserved, not collapsed. Since
-        fence = 2 p99.9 - p50 > p99.9 >= max for a smooth cloud, projx is
+        fence = 2 p99.99 - p50 > p99.99 >= max for a smooth cloud, projx is
         identity on any healthy table -- at any radius, of any size -- and moves
-        rows only when a genuinely detached tail sits above the fence.
+        rows only when a genuinely detached tail sits above the fence. The
+        p99.99 anchor keeps rejection to the far tail; it needs enough points to
+        estimate cleanly (fine on the >=233k-node target datasets, where the top
+        0.01% is 23+ nodes).
 
         Deliberately no absolute/dtype radius cap: an absolute cap cannot tell a
         legitimately spread cloud from a detached outlier, and would flatten the
