@@ -136,29 +136,38 @@ class LorentzManifold(geoopt.Manifold):
     # ------------------------------------------------------------------
     # geoopt.Manifold API (the abstract set)
     # ------------------------------------------------------------------
+    def _dtype_radius_limit(self, x: Tensor) -> Tensor:
+        """Radius past which `k + ||x'||^2 == ||x'||^2` in x's dtype: x0 then
+        collapses onto ||x'|| and the point sits on the light cone numerically,
+        not the hyperboloid. That happens once ||x'||^2 ~ k/eps. This is the
+        hard ceiling the stat-driven fence is capped by, so a table that has
+        drifted wholesale can never place the fence itself past the wall. It is
+        dtype-derived, not a float32 constant: ~8.7 in float32, ~18.7 in
+        float64, so the class stays dtype-agnostic."""
+        norm_limit = math.sqrt(self.k / torch.finfo(x.dtype).eps)
+        r = self._sqrt_k * math.asinh(norm_limit * self._inv_sqrt_k)
+        return torch.tensor(r, dtype=x.dtype, device=x.device)
+
     def projx(self, x: Tensor) -> Tensor:
         """Outlier shave -- not identity. geoopt calls projx at `stabilize`
         intervals to repair points that have drifted off the manifold. In this
-        chart the drift is not a lost x0 (x0 is derived, never stored) but a rare
-        node detaching to a large radius, where transp's residual reignites an
-        Adam feedback loop and expmap overflows (ML-20M seed 5). We pull the
-        detached tail back to the cloud edge and leave every other row exactly
-        where it was.
+        chart the drift is not a lost x0 (x0 is derived, never stored) but a
+        radius past the float32 resolution wall, where transp's residual
+        reignites an Adam feedback loop and expmap overflows (ML-20M seed 5).
+        Rows out there are already meaningless -- <x,x>_L = -k no longer holds
+        numerically -- so we pull the detached tail back to the cloud edge and
+        leave every other row exactly where it was.
 
-        The fence is purely stat-driven -- there is NO fixed radius. It is
-        p50 + K*(p99.9 - p50) over the table's own radii, a robust z-score with
-        the cloud body (p99.9 - p50) as the scale. This is relative, not
-        absolute: it moves only what is detached *from the cloud*, so a cloud
-        that legitimately spreads outward is preserved, not collapsed. Since
-        fence = 2 p99.9 - p50 > p99.9 >= max for a smooth cloud, projx is
-        identity on any healthy table -- at any radius, of any size -- and moves
-        rows only when a genuinely detached tail sits above the fence.
+        The fence is stat-driven, no fixed radius: p50 + K*(p99.9 - p50) over
+        the table's own radii (a robust z-score using the cloud body as scale),
+        capped by the dtype's resolution limit. It is identity on a healthy
+        table -- if nothing sits past the fence, x is returned unchanged -- so
+        the only rows it ever moves are a genuinely detached tail.
 
-        Deliberately no absolute/dtype radius cap: an absolute cap cannot tell a
-        legitimately spread cloud from a detached outlier, and would flatten the
-        former onto a sphere (verified: a healthy cloud at r=10 collapses under a
-        cap at 8.66). Bounding the trajectory absolutely, if ever needed, belongs
-        at the optimiser/training level, not here.
+        No row-count threshold, so small graphs are protected too: a healthy
+        cloud of any size keeps its max below the fence (fence = 2 p99.9 - p50 >
+        p99.9), and a small graph with a runaway node still has it caught by the
+        dtype cap even where too few points make the stat fence unreliable.
         """
         # torch.quantile supports only float32/64, so estimate the fence there;
         # never downcast float64. The rescale and the output stay in x's dtype,
@@ -168,6 +177,7 @@ class LorentzManifold(geoopt.Manifold):
         median = torch.quantile(r, 0.5)
         cloud_edge = torch.quantile(r, _SHAVE_PULL_Q)             # p99.9
         fence = median + _SHAVE_K * (cloud_edge - median)
+        fence = torch.minimum(fence, self._dtype_radius_limit(x).to(r.dtype))
 
         outlier = r > fence
         if not bool(outlier.any()):
@@ -176,7 +186,8 @@ class LorentzManifold(geoopt.Manifold):
         # Pull each flagged row inward along its own ray to the cloud-edge
         # radius. ||x'|| = sqrt(k) sinh(r / sqrt(k)) inverts dist0 exactly, so
         # rescaling the norm sets the radius with no change of direction.
-        target_norm = self._sqrt_k * torch.sinh(cloud_edge * self._inv_sqrt_k)
+        target_radius = torch.minimum(cloud_edge, fence)
+        target_norm = self._sqrt_k * torch.sinh(target_radius * self._inv_sqrt_k)
         norm = x.norm(dim=-1, keepdim=True).clamp_min(_tiny(x))
         pulled = x * (target_norm.to(x.dtype) / norm)
         return torch.where(outlier.unsqueeze(-1), pulled, x)
