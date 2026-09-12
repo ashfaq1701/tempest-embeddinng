@@ -76,6 +76,9 @@ def parse_args() -> argparse.Namespace:
                    help="Max training epochs.")
     p.add_argument("--early-stop-patience", default=5, type=int,
                    help="Early-stop patience in epochs.")
+    p.add_argument("--weight-decay-e", default=1e-8, type=float,
+                   help="Weight decay applied to the E embedding param group in RiemannianAdam "
+                        "(shrink toward the vertex); other params (temperature, pooler) get none.")
 
     # ── System ──────────────────────────────────────────────────────
     p.add_argument("--seed", default=42, type=int,
@@ -183,6 +186,7 @@ def main() -> Dict[str, Any]:
         lr=args.lr,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
+        weight_decay_e=args.weight_decay_e,
 
         seed=args.seed,
         use_gpu=args.use_gpu,

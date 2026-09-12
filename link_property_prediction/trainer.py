@@ -54,9 +54,10 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. One RiemannianAdam param group at a single `lr`: the
-    # embedding tables, the distance temperature and the NN pooler all step at the same rate.
+    # Constant lr for every param. Two RiemannianAdam groups differing only in weight decay:
+    # E carries `weight_decay_e` (shrink toward the vertex), the temperature and NN pooler none.
     lr: float = 1e-3
+    weight_decay_e: float = 1e-8
 
     # Run control.
     num_epochs: int = 100
@@ -96,9 +97,17 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # One param group at a single lr: Riemannian update for E, standard Adam for the rest.
+        # Two groups at a single lr: Riemannian update for E (with weight decay), standard
+        # Adam for the temperature and pooler (none). geoopt applies group["weight_decay"] as
+        # grad += wd * point before egrad2rgrad, i.e. a shrink toward the vertex on E.
+        e_param = self.model.E.weight
+        other_params = [p for p in self.model.parameters() if p is not e_param]
         self.opt = geoopt.optim.RiemannianAdam(
-            self.model.parameters(), lr=float(config.lr), stabilize=10,
+            [
+                {"params": [e_param], "weight_decay": float(config.weight_decay_e)},
+                {"params": other_params},   # weight_decay omitted -> geoopt default 0
+            ],
+            lr=float(config.lr), stabilize=10,
         )
 
     # Full-graph ingestion (once, up front)
