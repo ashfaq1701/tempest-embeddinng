@@ -883,7 +883,7 @@ def test_gradient_is_bounded_approaching_coincidence(k):
 # row exactly where it was. Fence = p50 + K*(p99.9 - p50), capped by the dtype's
 # resolution limit. See the projx docstring.
 # ----------------------------------------------------------------------
-from link_property_prediction.lorentz import _SHAVE_K, _SHAVE_PULL_Q
+from link_property_prediction.lorentz import _SHAVE_PULL_Q
 
 
 def _points_at_radii(m, radii, dim=DIM, dtype=torch.float64):
@@ -897,36 +897,18 @@ def _points_at_radii(m, radii, dim=DIM, dtype=torch.float64):
 
 
 @pytest.mark.parametrize("k", KS)
-def test_projx_protects_small_graphs(k):
-    """No row-count threshold: a small graph (a few hundred nodes) is handled
-    too. Run in float32, the training dtype. A healthy small cloud is returned
-    untouched (its max is below the fence), but a small graph with a runaway
-    node past the wall still has it caught -- by the dtype cap, the backstop
-    where too few points make the stat fence unreliable -- so it can never sit
-    past the wall."""
-    m = LorentzManifold(k=k)
-    healthy = _points_at_radii(m, torch.rand(200) * 2.0, dtype=torch.float32)
-    assert torch.equal(m.projx(healthy.clone()), healthy)
-
-    with_runaway = healthy.clone()
-    with_runaway[5] = _points_at_radii(m, torch.tensor([20.0]), dtype=torch.float32)[0]
-    out = m.projx(with_runaway.clone())
-    moved = (with_runaway - out).norm(dim=-1) > 0
-    assert torch.nonzero(moved).flatten().tolist() == [5]
-    assert torch.equal(out[~moved], with_runaway[~moved])
-    assert float(m.dist0(out).max()) <= float(m._dtype_radius_limit(out)) + 1e-2
-
-
-@pytest.mark.parametrize("k", KS)
-def test_projx_is_identity_on_a_healthy_cloud(k):
-    """A cloud with no detached tail -- every radius below the fence -- is
-    returned bit-identical. projx only ever moves genuine outliers."""
+@pytest.mark.parametrize("center", [1.0, 6.0, 10.0])
+def test_projx_is_identity_on_a_healthy_cloud(k, center):
+    """A cloud with no detached tail is returned bit-identical -- AT ANY RADIUS,
+    including well past the float32 degeneracy wall (~8.66). The fence is
+    relative (2 p99.9 - p50 > max for a smooth cloud), so a cloud that
+    legitimately spreads outward is preserved, not collapsed onto a sphere --
+    the failure an absolute radius cap would cause. Regression for that bug."""
     m = LorentzManifold(k=k)
     torch.manual_seed(1)
-    radii = torch.rand(4000) * 2.0                           # tight, in [0, 2], no tail
-    x = _points_at_radii(m, radii)
-    out = m.projx(x.clone())
-    assert torch.equal(out, x)
+    radii = center + (torch.rand(4000) * 2.0 - 1.0)          # tight band [center-1, center+1]
+    x = _points_at_radii(m, radii, dtype=torch.float32)
+    assert torch.equal(m.projx(x.clone()), x)
 
 
 @pytest.mark.parametrize("k", KS)
@@ -952,11 +934,8 @@ def test_projx_shaves_only_the_detached_tail_and_preserves_the_cloud(k):
     assert set(torch.nonzero(moved).flatten().tolist()) == set(outliers)
     assert torch.equal(out[~moved], x[~moved])
 
-    # they were pulled INWARD, to the p99.9 cloud edge (= the pull target)
-    p50 = torch.quantile(r0, 0.5)
-    p999 = torch.quantile(r0, _SHAVE_PULL_Q)
-    fence = torch.minimum(p50 + _SHAVE_K * (p999 - p50), m._dtype_radius_limit(x))
-    target = torch.minimum(p999, fence)
+    # they were pulled INWARD, to the p99.9 cloud edge (the pull target)
+    target = torch.quantile(r0, _SHAVE_PULL_Q)
     assert torch.allclose(r1[moved], target.to(r1.dtype), atol=1e-4)
     assert float(r1[moved].max()) < float(r0[moved].min())
 
@@ -975,33 +954,12 @@ def test_projx_is_idempotent(k):
     assert torch.equal(once, twice)
 
 
-def test_dtype_radius_limit_is_dtype_derived_and_scales_with_k():
-    """The hard ceiling is read from the dtype, not hardcoded: float64 resolves
-    a larger radius than float32, and both scale with sqrt(k)."""
-    for k in KS:
-        m = LorentzManifold(k=k)
-        f32 = m._dtype_radius_limit(torch.zeros(1, dtype=torch.float32))
-        f64 = m._dtype_radius_limit(torch.zeros(1, dtype=torch.float64))
-        assert float(f64) > float(f32)
-        # sqrt(k) * asinh(sqrt(k/eps)/sqrt(k)), checked against a direct recompute
-        eps = torch.finfo(torch.float32).eps
-        expect = m._sqrt_k * math.asinh(math.sqrt(m.k / eps) / m._sqrt_k)
-        assert abs(float(f32) - expect) < 1e-4
-    assert float(LorentzManifold(1.0)._dtype_radius_limit(torch.zeros(1))) == pytest.approx(8.664, abs=1e-2)
-
-
-def test_projx_never_leaves_a_row_past_the_dtype_wall():
-    """Even a heavy tail whose stat fence would land past the resolution wall is
-    capped: after projx no row exceeds _dtype_radius_limit, so a wholesale drift
-    cannot place a point on the light cone. Run in float32, where the wall bites."""
-    m = LorentzManifold(k=1.0)
+@pytest.mark.parametrize("k", KS)
+def test_projx_preserves_a_broad_cloud_no_absolute_cap(k):
+    """A broad, gap-free cloud spanning 0-12 -- far past the old dtype cap of
+    8.66 -- is returned bit-identical. There is no absolute radius clamp: only a
+    detached tail is moved, and a smoothly-spread distribution has none."""
+    m = LorentzManifold(k=k)
     torch.manual_seed(4)
-    n = 4000
-    # cloud in [0,2] plus a heavy tail at 15-20 -> spread fence >> dtype limit
-    radii = torch.rand(n) * 2.0
-    radii[:300] = 15.0 + torch.rand(300) * 5.0
-    x = _points_at_radii(m, radii, dtype=torch.float32)
-    out = m.projx(x.clone())
-    limit = float(m._dtype_radius_limit(x))
-    assert float(m.dist0(out).max()) <= limit + 1e-3
-    assert torch.isfinite(out).all()
+    x = _points_at_radii(m, torch.rand(20000) * 12.0, dtype=torch.float32)
+    assert torch.equal(m.projx(x.clone()), x)
