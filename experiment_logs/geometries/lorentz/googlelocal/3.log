@@ -1,0 +1,98 @@
+# dataset=GoogleLocal (1.91M edges, BIPARTITE)
+# geometry=lorentz  replicate=3  seed=5  (archived as 3.log)
+# d_emb=64 k_train=5 num_walks_per_node=5 lr=1e-3 patience 5 cap 100; no popularity channel
+# branch=master commit=07dcc1e6  tempest-rw=1.0.6
+# code: (sum w)^2 midpoint floor, NaN-propagating _safe_sqrt, NO radius clamp, NO grad clip, transp fixed
+# driven by scripts/run_lorentz_sweep_r3_fresh.sh (UNTRACKED); see ../DRIVER.log
+# started=2026-09-12 02:58:27
+# cmd: /its/home/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq --dataset GoogleLocal --d-emb 64 --k-train 5 --num-walks-per-node 5 --lr 1e-3 --seed 5 --early-stop-patience 5 --is-bipartite --use-gpu --use-gpu-tempest
+
+=== tempest-embedding training ===
+dataset: GoogleLocal
+device:  cuda
+seed:    5
+loaded (tgb-seq) in 0.6s
+  num_nodes:     473,581
+  neg_pool:      267,336 unique destinations (bipartite)
+  train edges:   1,802,833
+  val edges:     67,588
+  test edges:    43,546
+
+=== Config ===
+  num_nodes: 473581
+  dst_pool: <ndarray shape=(267336,) dtype=int32>
+  d_emb: 64
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 100
+  early_stop_patience: 5
+  seed: 5
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:           30,309,184
+  head params:              162
+  TOTAL trainable:   30,309,346
+
+=== Training ===
+  Ingested full graph into Tempest: 1,913,967 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=1.7321  lr=1e-03  train 68.6s  r_mean=0.062  r_max=0.518  geo_temp=3.546  val 0.2682  test 0.2431 (new best)  eval 5.6s
+epoch 2/100  link=1.3925  lr=1e-03  train 68.6s  r_mean=0.112  r_max=0.643  geo_temp=5.750  val 0.3384  test 0.3078 (new best)  eval 5.6s
+epoch 3/100  link=1.0763  lr=1e-03  train 68.6s  r_mean=0.154  r_max=0.689  geo_temp=7.565  val 0.3845  test 0.3531 (new best)  eval 5.6s
+epoch 4/100  link=0.8172  lr=1e-03  train 68.6s  r_mean=0.191  r_max=0.702  geo_temp=9.244  val 0.4351  test 0.3991 (new best)  eval 5.6s
+epoch 5/100  link=0.6143  lr=1e-03  train 68.4s  r_mean=0.225  r_max=0.719  geo_temp=10.834  val 0.4776  test 0.4395 (new best)  eval 5.6s
+epoch 6/100  link=0.4606  lr=1e-03  train 68.4s  r_mean=0.255  r_max=0.719  geo_temp=12.368  val 0.5155  test 0.4769 (new best)  eval 5.6s
+epoch 7/100  link=0.3472  lr=1e-03  train 68.6s  r_mean=0.281  r_max=0.733  geo_temp=13.865  val 0.5453  test 0.5092 (new best)  eval 5.6s
+epoch 8/100  link=0.2628  lr=1e-03  train 68.6s  r_mean=0.304  r_max=0.754  geo_temp=15.341  val 0.5684  test 0.5330 (new best)  eval 5.6s
+epoch 9/100  link=0.2011  lr=1e-03  train 68.5s  r_mean=0.324  r_max=0.764  geo_temp=16.799  val 0.5881  test 0.5518 (new best)  eval 5.6s
+epoch 10/100  link=0.1552  lr=1e-03  train 68.3s  r_mean=0.340  r_max=0.763  geo_temp=18.253  val 0.6043  test 0.5696 (new best)  eval 5.6s
+epoch 11/100  link=0.1205  lr=1e-03  train 68.4s  r_mean=0.355  r_max=0.764  geo_temp=19.702  val 0.6161  test 0.5810 (new best)  eval 5.6s
+epoch 12/100  link=0.0945  lr=1e-03  train 65.8s  r_mean=0.367  r_max=0.786  geo_temp=21.152  val 0.6334  test 0.6006 (new best)  eval 5.6s
+epoch 13/100  link=0.0753  lr=1e-03  train 64.8s  r_mean=0.378  r_max=0.808  geo_temp=22.604  val 0.6432  test 0.6122 (new best)  eval 5.6s
+epoch 14/100  link=0.0612  lr=1e-03  train 66.3s  r_mean=0.387  r_max=0.829  geo_temp=24.058  val 0.6506  test 0.6183 (new best)  eval 5.6s
+epoch 15/100  link=0.0510  lr=1e-03  train 68.4s  r_mean=0.395  r_max=0.849  geo_temp=25.507  val 0.6547  test 0.6241 (new best)  eval 5.6s
+epoch 16/100  link=0.0431  lr=1e-03  train 68.5s  r_mean=0.403  r_max=0.864  geo_temp=26.963  val 0.6599  test 0.6299 (new best)  eval 5.6s
+epoch 17/100  link=0.0374  lr=1e-03  train 68.5s  r_mean=0.409  r_max=0.869  geo_temp=28.422  val 0.6624  test 0.6333 (new best)  eval 5.5s
+epoch 18/100  link=0.0328  lr=1e-03  train 68.6s  r_mean=0.415  r_max=0.884  geo_temp=29.872  val 0.6684  test 0.6387 (new best)  eval 5.5s
+epoch 19/100  link=0.0289  lr=1e-03  train 68.7s  r_mean=0.421  r_max=0.895  geo_temp=31.331  val 0.6680  patience 1/5  eval 5.5s
+epoch 20/100  link=0.0261  lr=1e-03  train 66.7s  r_mean=0.426  r_max=0.900  geo_temp=32.778  val 0.6701  test 0.6400 (new best)  eval 5.5s
+epoch 21/100  link=0.0238  lr=1e-03  train 68.4s  r_mean=0.431  r_max=0.900  geo_temp=34.190  val 0.6717  test 0.6422 (new best)  eval 5.5s
+epoch 22/100  link=0.0218  lr=1e-03  train 64.8s  r_mean=0.436  r_max=0.901  geo_temp=35.595  val 0.6735  test 0.6440 (new best)  eval 5.5s
+epoch 23/100  link=0.0203  lr=1e-03  train 64.9s  r_mean=0.440  r_max=0.901  geo_temp=36.943  val 0.6731  patience 1/5  eval 5.5s
+epoch 24/100  link=0.0186  lr=1e-03  train 64.9s  r_mean=0.444  r_max=0.904  geo_temp=38.276  val 0.6714  patience 2/5  eval 5.5s
+epoch 25/100  link=0.0174  lr=1e-03  train 64.9s  r_mean=0.448  r_max=0.904  geo_temp=39.560  val 0.6737  test 0.6446 (new best)  eval 5.5s
+epoch 26/100  link=0.0167  lr=1e-03  train 65.0s  r_mean=0.451  r_max=0.904  geo_temp=40.710  val 0.6747  test 0.6442 (new best)  eval 5.5s
+epoch 27/100  link=0.0157  lr=1e-03  train 65.0s  r_mean=0.455  r_max=0.905  geo_temp=41.825  val 0.6720  patience 1/5  eval 5.5s
+epoch 28/100  link=0.0152  lr=1e-03  train 65.0s  r_mean=0.458  r_max=0.905  geo_temp=42.757  val 0.6748  test 0.6451 (new best)  eval 5.5s
+epoch 29/100  link=0.0140  lr=1e-03  train 65.0s  r_mean=0.461  r_max=0.905  geo_temp=43.702  val 0.6741  patience 1/5  eval 5.5s
+epoch 30/100  link=0.0138  lr=1e-03  train 65.0s  r_mean=0.464  r_max=0.905  geo_temp=44.513  val 0.6693  patience 2/5  eval 5.5s
+epoch 31/100  link=0.0132  lr=1e-03  train 65.0s  r_mean=0.467  r_max=0.917  geo_temp=45.205  val 0.6654  patience 3/5  eval 5.5s
+epoch 32/100  link=0.0125  lr=1e-03  train 65.0s  r_mean=0.470  r_max=0.925  geo_temp=45.873  val 0.6748  test 0.6469 (new best)  eval 5.5s
+epoch 33/100  link=0.0121  lr=1e-03  train 65.0s  r_mean=0.473  r_max=0.925  geo_temp=46.492  val 0.6774  test 0.6481 (new best)  eval 5.5s
+epoch 34/100  link=0.0116  lr=1e-03  train 67.9s  r_mean=0.475  r_max=0.925  geo_temp=47.034  val 0.6780  test 0.6488 (new best)  eval 5.5s
+epoch 35/100  link=0.0113  lr=1e-03  train 66.0s  r_mean=0.478  r_max=0.925  geo_temp=47.484  val 0.6785  test 0.6505 (new best)  eval 5.5s
+epoch 36/100  link=0.0108  lr=1e-03  train 64.7s  r_mean=0.481  r_max=0.931  geo_temp=47.921  val 0.6773  patience 1/5  eval 5.5s
+epoch 37/100  link=0.0106  lr=1e-03  train 64.5s  r_mean=0.483  r_max=0.931  geo_temp=48.262  val 0.6803  test 0.6518 (new best)  eval 5.5s
+epoch 38/100  link=0.0101  lr=1e-03  train 65.4s  r_mean=0.486  r_max=0.939  geo_temp=48.650  val 0.6674  patience 1/5  eval 5.5s
+epoch 39/100  link=0.0100  lr=1e-03  train 66.8s  r_mean=0.488  r_max=0.939  geo_temp=48.958  val 0.6818  test 0.6535 (new best)  eval 5.5s
+epoch 40/100  link=0.0095  lr=1e-03  train 68.3s  r_mean=0.491  r_max=0.941  geo_temp=49.275  val 0.6724  patience 1/5  eval 5.5s
+epoch 41/100  link=0.0094  lr=1e-03  train 68.6s  r_mean=0.493  r_max=0.956  geo_temp=49.498  val 0.6732  patience 2/5  eval 5.5s
+epoch 42/100  link=0.0089  lr=1e-03  train 68.7s  r_mean=0.496  r_max=0.984  geo_temp=49.788  val 0.6770  patience 3/5  eval 5.5s
+epoch 43/100  link=0.0086  lr=1e-03  train 68.6s  r_mean=0.498  r_max=0.984  geo_temp=50.088  val 0.6716  patience 4/5  eval 5.5s
+epoch 44/100  link=0.0086  lr=1e-03  train 68.6s  r_mean=0.501  r_max=0.994  geo_temp=50.278  val 0.6805  patience 5/5  eval 5.5s
+  restored best weights from epoch 39 (val 0.6818, test 0.6535)
+
+=== Final results ===
+  dataset:           GoogleLocal
+  seed:              5
+  stopped_at_epoch:  39
+  best_val_mrr:      0.6818
+  best_test_mrr:     0.6535

@@ -1,0 +1,74 @@
+# dataset=WikiLink (34.2M edges, NON-bipartite)
+# geometry=lorentz  replicate=3  seed=5  (archived as 3.log)
+# d_emb=64 k_train=5 num_walks_per_node=5 lr=1e-3 patience 5 cap 100; no popularity channel
+# branch=master commit=07dcc1e6  tempest-rw=1.0.6
+# code: (sum w)^2 midpoint floor, NaN-propagating _safe_sqrt, NO radius clamp, NO grad clip, transp fixed
+# driven by scripts/run_lorentz_sweep_r3_fresh.sh (UNTRACKED); see ../DRIVER.log
+# started=2026-09-13 03:59:34
+# cmd: /its/home/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq --dataset WikiLink --d-emb 64 --k-train 5 --num-walks-per-node 5 --lr 1e-3 --seed 5 --early-stop-patience 5  --use-gpu --use-gpu-tempest
+
+=== tempest-embedding training ===
+dataset: WikiLink
+device:  cuda
+seed:    5
+loaded (tgb-seq) in 7.0s
+  num_nodes:     1,361,973
+  neg_pool:      1,361,972 unique nodes (non-bipartite)
+  train edges:   27,635,253
+  val edges:     3,455,476
+  test edges:    3,073,045
+
+=== Config ===
+  num_nodes: 1361973
+  dst_pool: <ndarray shape=(1361972,) dtype=int32>
+  d_emb: 64
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 100
+  early_stop_patience: 5
+  seed: 5
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:           87,166,272
+  head params:              162
+  TOTAL trainable:   87,166,434
+
+=== Training ===
+  Ingested full graph into Tempest: 34,163,774 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=1.2112  lr=1e-03  train 2363.1s  r_mean=0.488  r_max=1.284  geo_temp=14.160  val 0.4465  test 0.4394 (new best)  eval 300.1s
+epoch 2/100  link=0.5285  lr=1e-03  train 2358.1s  r_mean=0.734  r_max=1.567  geo_temp=16.339  val 0.5927  test 0.5831 (new best)  eval 294.7s
+epoch 3/100  link=0.3396  lr=1e-03  train 2331.3s  r_mean=0.930  r_max=1.799  geo_temp=14.039  val 0.6253  test 0.6164 (new best)  eval 294.2s
+epoch 4/100  link=0.2659  lr=1e-03  train 2362.8s  r_mean=1.118  r_max=2.045  geo_temp=12.190  val 0.6409  test 0.6324 (new best)  eval 293.7s
+epoch 5/100  link=0.2257  lr=1e-03  train 2363.2s  r_mean=1.301  r_max=2.353  geo_temp=10.795  val 0.6497  test 0.6415 (new best)  eval 275.1s
+epoch 6/100  link=0.2009  lr=1e-03  train 2324.8s  r_mean=1.483  r_max=2.578  geo_temp=9.732  val 0.6556  test 0.6477 (new best)  eval 275.1s
+epoch 7/100  link=0.1854  lr=1e-03  train 2347.5s  r_mean=1.663  r_max=2.830  geo_temp=8.917  val 0.6602  test 0.6520 (new best)  eval 275.2s
+epoch 8/100  link=0.1753  lr=1e-03  train 2343.8s  r_mean=1.843  r_max=3.054  geo_temp=8.307  val 0.6628  test 0.6546 (new best)  eval 278.9s
+epoch 9/100  link=0.1691  lr=1e-03  train 2353.0s  r_mean=2.023  r_max=3.281  geo_temp=7.812  val 0.6643  test 0.6561 (new best)  eval 295.2s
+epoch 10/100  link=0.1652  lr=1e-03  train 2329.8s  r_mean=2.204  r_max=3.622  geo_temp=7.440  val 0.6660  test 0.6576 (new best)  eval 295.4s
+epoch 11/100  link=0.1630  lr=1e-03  train 2358.6s  r_mean=2.384  r_max=3.958  geo_temp=7.148  val 0.6664  test 0.6580 (new best)  eval 295.0s
+epoch 12/100  link=0.1618  lr=1e-03  train 2363.0s  r_mean=2.566  r_max=4.273  geo_temp=6.938  val 0.6673  test 0.6587 (new best)  eval 276.1s
+epoch 13/100  link=0.1614  lr=1e-03  train 2335.9s  r_mean=2.747  r_max=4.538  geo_temp=6.778  val 0.6676  test 0.6589 (new best)  eval 275.7s
+epoch 14/100  link=0.1617  lr=1e-03  train 2336.5s  r_mean=2.929  r_max=4.889  geo_temp=6.649  val 0.6681  test 0.6592 (new best)  eval 275.4s
+epoch 15/100  link=0.1620  lr=1e-03  train 2350.1s  r_mean=3.112  r_max=5.138  geo_temp=6.553  val 0.6682  test 0.6592 (new best)  eval 281.3s
+epoch 16/100  link=0.1628  lr=1e-03  train 2343.9s  r_mean=3.294  r_max=5.396  geo_temp=6.459  val 0.6681  patience 1/5  eval 295.5s
+epoch 17/100  link=0.1638  lr=1e-03  train 2323.8s  r_mean=3.477  r_max=5.668  geo_temp=6.384  val 0.6680  patience 2/5  eval 294.6s
+epoch 18/100  link=0.1649  lr=1e-03  train 2337.2s  r_mean=3.660  r_max=5.833  geo_temp=6.323  val 0.6679  patience 3/5  eval 295.5s
+epoch 19/100  link=0.1661  lr=1e-03  train 2341.5s  r_mean=3.843  r_max=5.964  geo_temp=6.273  val 0.6681  patience 4/5  eval 276.1s
+epoch 20/100  link=0.1673  lr=1e-03  train 2349.8s  r_mean=4.027  r_max=6.230  geo_temp=6.216  val 0.6679  patience 5/5  eval 275.6s
+  restored best weights from epoch 15 (val 0.6682, test 0.6592)
+
+=== Final results ===
+  dataset:           WikiLink
+  seed:              5
+  stopped_at_epoch:  15
+  best_val_mrr:      0.6682
+  best_test_mrr:     0.6592
