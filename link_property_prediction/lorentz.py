@@ -63,17 +63,6 @@ def _tiny(t: Tensor) -> float:
     return torch.finfo(t.dtype).tiny
 
 
-# Outlier-shave policy for projx (invoked by geoopt's `stabilize`). A few rare
-# nodes drift to a radius where float32 stops resolving the tangential
-# displacements parallel transport needs; there transp's residual reignites an
-# Adam momentum feedback loop and expmap overflows (the ML-20M seed-5 crash).
-# Those positions are already numerically meaningless -- past the wall the
-# stored x' no longer satisfies <x,x>_L = -k -- so projx pulls the detached tail
-# back to the cloud edge and leaves every other row untouched.
-_SHAVE_K = 2.0           # fence = p50 + K*(p99.9 - p50): robust z-score, cloud body as scale
-_SHAVE_PULL_Q = 0.999    # pull flagged rows back to this radius quantile (the cloud edge)
-
-
 class LorentzManifold(geoopt.Manifold):
     """Lorentz model in intrinsic coordinates. Points are x' in R^n.
 
@@ -137,49 +126,10 @@ class LorentzManifold(geoopt.Manifold):
     # geoopt.Manifold API (the abstract set)
     # ------------------------------------------------------------------
     def projx(self, x: Tensor) -> Tensor:
-        """Outlier shave -- not identity. geoopt calls projx at `stabilize`
-        intervals to repair points that have drifted off the manifold. In this
-        chart the drift is not a lost x0 (x0 is derived, never stored) but a rare
-        node detaching to a large radius, where transp's residual reignites an
-        Adam feedback loop and expmap overflows (ML-20M seed 5). We pull the
-        detached tail back to the cloud edge and leave every other row exactly
-        where it was.
-
-        The fence is purely stat-driven -- there is NO fixed radius. It is
-        p50 + K*(p99.9 - p50) over the table's own radii, a robust z-score with
-        the cloud body (p99.9 - p50) as the scale. This is relative, not
-        absolute: it moves only what is detached *from the cloud*, so a cloud
-        that legitimately spreads outward is preserved, not collapsed. Since
-        fence = 2 p99.9 - p50 > p99.9 >= max for a smooth cloud, projx is
-        identity on any healthy table -- at any radius, of any size -- and moves
-        rows only when a genuinely detached tail sits above the fence.
-
-        Deliberately no absolute/dtype radius cap: an absolute cap cannot tell a
-        legitimately spread cloud from a detached outlier, and would flatten the
-        former onto a sphere (verified: a healthy cloud at r=10 collapses under a
-        cap at 8.66). Bounding the trajectory absolutely, if ever needed, belongs
-        at the optimiser/training level, not here.
-        """
-        # torch.quantile supports only float32/64, so estimate the fence there;
-        # never downcast float64. The rescale and the output stay in x's dtype,
-        # so this is still a pure dtype passthrough.
-        radius = self.dist0(x)
-        r = radius if radius.dtype in (torch.float32, torch.float64) else radius.float()
-        median = torch.quantile(r, 0.5)
-        cloud_edge = torch.quantile(r, _SHAVE_PULL_Q)             # p99.9
-        fence = median + _SHAVE_K * (cloud_edge - median)
-
-        outlier = r > fence
-        if not bool(outlier.any()):
-            return x
-
-        # Pull each flagged row inward along its own ray to the cloud-edge
-        # radius. ||x'|| = sqrt(k) sinh(r / sqrt(k)) inverts dist0 exactly, so
-        # rescaling the norm sets the radius with no change of direction.
-        target_norm = self._sqrt_k * torch.sinh(cloud_edge * self._inv_sqrt_k)
-        norm = x.norm(dim=-1, keepdim=True).clamp_min(_tiny(x))
-        pulled = x * (target_norm.to(x.dtype) / norm)
-        return torch.where(outlier.unsqueeze(-1), pulled, x)
+        """Identity. By Eq. 6 every x' in R^n is a valid point, so unlike the
+        Poincare ball there is no feasibility projection, and no drift for
+        geoopt's `stabilize` to repair."""
+        return x
 
     def proju(self, x: Tensor, u: Tensor) -> Tensor:
         """Identity. T_x is all of R^n here: the constraint <x,v>_L = 0 is
