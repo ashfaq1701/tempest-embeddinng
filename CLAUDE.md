@@ -186,3 +186,78 @@ GoogleLocal the exception at 8.22 — it is also the sparsest at 1.8M edges over
 Active-node counts (nodes appearing in train): GoogleLocal 473,580; YouTube 402,422;
 Flickr 233,836; Patent 1,840,152; ML-20M 110,431; Taobao 1,623,633; Yelp 1,743,769;
 WikiLink 1,361,972.
+
+## The gap to CRAFT (measured, 2026-09-13)
+
+CRAFT, "Future Link Prediction Without Memory or Aggregation" (arXiv 2505.19408), is the
+current state of the art on TGB-Seq and the bar this work has to clear. Its numbers below are
+Table 2 of the paper, mean of 3 runs, MRR in **percent**. SGNN-HN is included because it
+**beats CRAFT on two datasets** — GoogleLocal and YouTube — so "the bar" is the better of the
+two, not CRAFT alone.
+
+**CRAFT does not report Patent.** It evaluates seven TGB-Seq datasets; Patent is ours only.
+No claim of the form "we beat CRAFT on Patent" can be made.
+
+### Current master, seed 5 — the honest column
+
+Ours is `best_test_mrr` (val-selected) from `experiment_logs/geometries/lorentz/*/3.log`,
+commit `07dcc1e6`, d=64 K=5 lr=1e-3 patience 5, no popularity channel, single seed.
+
+| dataset | ours (seed 5) | stop ep | SGNN-HN | CRAFT | bar | **Δ vs bar** | % walks ≥5 |
+|---|---|---|---|---|---|---|---|
+| GoogleLocal | **65.35** | 39 | 62.88 | 62.35 | 62.88 | **+2.47** ✅ | 72.4 |
+| Flickr | **62.51** | 13 | 60.15 | 62.34 | 62.34 | **+0.17** ✅ | 57.2 |
+| YouTube | 56.26 | 19 | 59.64 | 58.92 | 59.64 | −3.38 ❌ | 69.8 |
+| WikiLink | 65.92 | 15 | 69.37 | 75.48 | 75.48 | −9.56 ❌ | 67.7 |
+| Yelp | 62.04 | 14 | 69.34 | 72.69 | 72.69 | −10.65 ❌ | 87.4 |
+| ML-20M | 24.29 | 7 | 33.12 | 35.91 | 35.91 | −11.62 ❌ | 98.6 |
+| Taobao | 53.13 | 4 | 68.58 | 70.68 | 70.68 | −17.55 ❌ | 93.0 |
+| Patent | 22.63 | 13 | — | — | — | (not reported) | 0.3 |
+
+**Standing: 2 of 7.** Total deficit across the five losses is 52.8 MRR points.
+
+### Historical bests — do not quote these as current
+
+The older per-dataset records in `[[tgb-seq-datasets-and-leaderboard]]` give a much better
+4-of-7, but they are **not this architecture**: they mix seeds, carry a per-node popularity
+bias table (`head params` ~= one scalar per node), and come from scorer variants the author
+reports as *unstable* — they climbed and then fell sharply. They are an existence proof that
+the headroom is real, not a result we can currently reproduce or submit.
+
+| dataset | historical best | Δ vs bar | seed-5 best | Δ vs bar |
+|---|---|---|---|---|
+| GoogleLocal | 67.48 | +4.60 | 65.35 | +2.47 |
+| WikiLink | 79.04 | **+3.56** | 65.92 | **−9.56** |
+| YouTube | 62.37 | +2.73 | 56.26 | −3.38 |
+| Flickr | 64.91 | +2.57 | 62.51 | +0.17 |
+| Yelp | 67.74 | −4.95 | 62.04 | −10.65 |
+| Taobao | 62.64 | −8.04 | 53.13 | −17.55 |
+| ML-20M | 24.65 | −11.26 | 24.29 | −11.62 |
+
+### What the two columns disagree about, and why it matters
+
+**WikiLink is the whole disagreement.** It swings +3.56 to −9.56, by far the largest move, and
+the cause is visible in the logs: the record run reached **ep44**, the seed-5 run stopped at
+**ep15**. WikiLink is not converged at seed 5 — it is stopped early by patience on a curve that
+was still climbing. Before reading WikiLink as a CRAFT loss, re-run it long.
+
+**This kills the walk-truncation story as stated.** Sorting by `% walks ≥5`, the historical
+column gave a perfect win/loss split at ~75% truncation. The seed-5 column does not: WikiLink
+sits at 67.7% truncation and loses by 9.56, in between two wins. Truncation still separates the
+three worst deficits (Yelp/Taobao/ML-20M, all ≥87%) from everything else, and depth remains
+worth testing there — but it is no longer a single-axis explanation, and Patent must stay out of
+any depth conclusion (its walks are structurally dead at length 2).
+
+**Taobao is the largest single deficit (−17.55) and the shortest run (stop ep4).** Deficit and
+early stopping correlate across the whole table. That is a confound: an under-trained run and a
+capacity-limited one look identical in this column. ML-20M is the one place it has been checked
+— its val genuinely saturates and declines after ep7, so there the deficit is real. Taobao and
+WikiLink have not been checked.
+
+### Where to attack first
+
+ML-20M: biggest *verified* deficit, cheapest to iterate (242 s/epoch, stops by ep12, ~55 min a
+run, against Taobao's 1381 s and Yelp's 1780 s), and the extreme point on truncation. Find the
+mechanism there, then **confirm on Taobao before believing it generalises** — ML-20M is an
+outlier in density too (127 edges/node against Taobao ~8.6 and Yelp ~9.8), so a fix that
+exploits deep dense history need not transfer.
