@@ -68,5 +68,6 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)
+        d0_u = self.geom.dist0(p_u).unsqueeze(1)
         d0_v = self.geom.dist0(p_v)
-        return self.w[0] * (-geo) + self.w[1] * d0_v
+        return self.w[0] * (-geo) + self.w[1] * (d0_u * d0_v)

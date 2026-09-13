@@ -1,0 +1,68 @@
+#!/bin/bash
+# YouTube d=64 K=5: pooler on [zscore(log1p(age)) | one-hot position | rad], single lr, linear temp.
+PY=/its/home/ms2420/tempest-embeddinng/venv/bin/python
+WD=/its/home/ms2420/tempest-embeddinng
+LOG=$WD/logs/rawpos/d64_k5/run_1/YouTube.log
+cd "$WD" || exit 1
+mkdir -p "$(dirname "$LOG")"
+SHA=$(git rev-parse --short HEAD); BRANCH=$(git rev-parse --abbrev-ref HEAD)
+DIRTY=$(git status --porcelain --untracked-files=no | head -1)
+CMD="$PY -u scripts/train_link_property_prediction.py --data-suite tgb-seq --dataset YouTube \
+--d-emb 64 --k-train 5 --lr 1e-3 --num-epochs 50 --early-stop-patience 5 \
+--use-gpu --use-gpu-tempest"
+{
+  echo "# dataset=YouTube (NON-bipartite) d_emb=64 k_train=5  lr=1e-3 (SINGLE group)  NO pop bias  seed=42"
+  echo "# experiment=rawpos cell=d64_k5 tag=run_1"
+  echo "# branch=$BRANCH commit=$SHA"
+  [ -n "$DIRTY" ] && echo "# WARNING: uncommitted tracked changes -- SHA does not describe the code that ran"
+  echo "# head: score = geo_temp * (-d_H), geo_temp LINEAR init 1.0"
+  echo "#       pooling = softmax(MLP([zscore(log1p(age)) | rawpos | rad])), width 32, depth 1"
+  echo "#       n_feat = 3 ([age_norm | raw pos | rad])   ->   162 head params"
+  echo "#"
+  echo "# THE ONE VARIABLE vs logs/logage_zscore (0.5793 max / 0.5757 ckpt): position encoding."
+  echo "#   One-hot over hop 1..5 is replaced by the RAW hop index as a single scalar. The age"
+  echo "#   feature is unchanged -- log1p then z-score. Seed, d, K, lr, patience, optimiser and"
+  echo "#   score all match. n_feat 7 -> 3, head params 290 -> 162."
+  echo "#"
+  echo "# WHAT IS GIVEN UP: one-hot lets the first Linear learn an arbitrary per-hop weight, so it"
+  echo "#   can single out the seed slot or any individual depth. A raw scalar forces the response"
+  echo "#   to be affine in the hop index -- only a monotone depth preference is expressible."
+  echo "#   With max_walk_len 5 that collapses 5 free parameters per hidden unit into 1."
+  echo "#"
+  echo "# NOTE WHERE 162 PARAMS LANDS: that is exactly the count of the OLD raw-scalar pooler"
+  echo "#   [rec, pos, rad], which reached 0.5551 ckpt / 0.5605 max and beat every encoded variant"
+  echo "#   except log temp. The difference is that this arm has NO dataset-derived time constant:"
+  echo "#   rec was age/mnia, and mnia mis-scales by 47x across the suite (median age/mnia runs"
+  echo "#   0.10 GoogleLocal to 4.74 Flickr). So this is close to a direct test of whether the"
+  echo "#   scale-free age transform beats a fixed mnia scale at equal parameter count."
+  echo "#"
+  echo "# WATCH: (a) ESCAPE EPOCH -- both log1p arms escaped at ep13 regardless of scaling, six"
+  echo "#   epochs before the control and without the geo_temp surge. If this one escapes at ep13"
+  echo "#   too, the escape is the age transform and position encoding is irrelevant to it;"
+  echo "#   (b) the plateau vs 0.5793 -- the z-score ablation showed post-escape climb is where"
+  echo "#   feature quality shows up, not the escape itself."
+  echo "#"
+  echo "# BASELINES, all YouTube d=64 K=5 seed 42, identical except where named:"
+  echo "#   encoded pooler, single lr, floored ladder : 0.5457  stop 50 (cap)  762 par  <- CONTROL"
+  echo "#   log1p + z-score + ONE-HOT pos             : 0.5793 max / 0.5757 ckpt, 290 par  <- THE CONTROL"
+  echo "#   log1p ONLY + one-hot (z-score ablation)   : 0.5617 max = ckpt, stop ep18, 290 par"
+  echo "#   encoded pooler, single lr, aliased ladder : 0.5487  stop ep42      762 par"
+  echo "#   encoded pooler, LOG temp                  : 0.5609  stop ep25      762 par  <- our best"
+  echo "#   encoded pooler, lr-temp split             : 0.5537  stop ep15      762 par"
+  echo "#   two-term score w.[-d, r_u*r_v]            : 0.5324 @ep31 (killed, still rising)"
+  echo "#   RAW-SCALAR pooler [rec,pos,rad], 1 group  : 0.5551 ckpt / 0.5605 max, 162 par"
+  echo "#   fixed-rule pooling, 2-param head          : 0.5752  stop ep17    <- best in repo"
+  echo "#   LB #1 GraphMixer                          : 0.5887"
+  echo "#"
+  echo "# WATCH: (a) escape epoch -- control ep19-20, log temp ep11-12, 2-param reference none;"
+  echo "#   (b) geo_temp -- LINEAR and single-group here, so expect the slow crawl toward ~44 by"
+  echo "#   ep40 rather than the ~79 the faster arms reached;  (c) whether 290 params beat 762;"
+  echo "#   (d) val/test drift, which has been 0.0000 on recent arms."
+  echo "# Record BOTH test@val-checkpoint AND max test observed."
+  echo "# ~100 s/epoch; recent YouTube runs went 15-50 epochs, so budget 30-90 min."
+  echo "# started=$(date '+%F %T')"
+  echo "# cmd: $CMD"
+  echo
+} > "$LOG"
+PYTHONUNBUFFERED=1 $CMD >> "$LOG" 2>&1
+echo "[$(date '+%F %T')] DONE rc=$?  $(grep -E 'stopped_at_epoch|best_val_mrr|best_test_mrr' "$LOG" | tr -s ' ' | tr '\n' ' ')" >> "$LOG"

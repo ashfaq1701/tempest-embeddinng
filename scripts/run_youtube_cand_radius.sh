@@ -1,0 +1,77 @@
+#!/bin/bash
+# YouTube d=64 K=5: distance normalised by the CANDIDATE radius only.
+#   s(u,v) = -d_H(P_u,P_v) / rad(P_v)
+PY=/its/home/ms2420/tempest-embeddinng/venv/bin/python
+WD=/its/home/ms2420/tempest-embeddinng
+LOG=$WD/logs/cand_radius/d64_k5/run_1/YouTube.log
+cd "$WD" || exit 1
+mkdir -p "$(dirname "$LOG")"
+SHA=$(git rev-parse --short HEAD); BRANCH=$(git rev-parse --abbrev-ref HEAD)
+DIRTY=$(git status --porcelain --untracked-files=no | head -1)
+CMD="$PY -u scripts/train_link_property_prediction.py --data-suite tgb-seq --dataset YouTube \
+--d-emb 64 --k-train 5 --lr 1e-3 --num-epochs 50 --early-stop-patience 5 \
+--use-gpu --use-gpu-tempest"
+{
+  echo "# dataset=YouTube (NON-bipartite) d_emb=64 k_train=5  lr=1e-3 (single group)  seed=42"
+  echo "# experiment=cand_radius cell=d64_k5 tag=run_1"
+  echo "# branch=$BRANCH commit=$SHA"
+  [ -n "$DIRTY" ] && echo "# WARNING: uncommitted tracked changes -- SHA does not describe the code that ran"
+  echo "# head: score = -d_H(P_u,P_v) / rad(P_v)   <- candidate radius ONLY, no learned scalar"
+  echo "#       161 head params: the pooler MLP alone. init_irange 1e-3, unchanged."
+  echo "#       pooling = softmax(MLP([log1p(age) | raw pos | rad])), width 32, unchanged"
+  echo "#"
+  echo "# ONE VARIABLE vs the two-radius quotient (2bb5ea36): rad(P_u) is REMOVED."
+  echo "#"
+  echo "# WHY. rad(P_u) is a per-row positive constant so it CANNOT reorder candidates -- verified,"
+  echo "#   argsort of -d/(rad_u*rad_v) and of -d/rad_v are identical. It contributes zero to the"
+  echo "#   ranking. But softmax is only SHIFT-invariant, not scale-invariant, so a per-row factor"
+  echo "#   moves the CE while leaving the MRR alone. With rad(P_u) present a GLOBAL rescale of E is"
+  echo "#   free sharpening; without it the score is DEGREE-0 and a rescale does nothing at all."
+  echo "#   Verified float64, scale every embedding by k, argsort unchanged throughout:"
+  echo "#     k                      = 1        0.2      0.01     1e-3"
+  echo "#     d/(rad_u*rad_v) spread = 2.35     11.89    237.9    2378.6   <- runaway"
+  echo "#     d/rad_v         spread = 1.4517   1.4280   1.4271   1.4271   <- PINNED"
+  echo "#   The product arm sharpened by EXPANDING (margin ~ k^3, and it did: link -50% for +0.069"
+  echo "#   test). The two-radius quotient could sharpen by CONTRACTING (margin ~ 1/k; the channel"
+  echo "#   was open but never fired). Neither direction exists in this form."
+  echo "#"
+  echo "# INIT: the saturation problem is GONE, not tuned away -- a consequence of degree-0. At the"
+  echo "#   SAME irange 1e-3 that gave the two-radius quotient init CE 39.19 / maxprob 0.968 /"
+  echo "#   |grad E|max 3.3e2, this measures CE 1.7870 vs log(6)=1.7918 (chance to 3 dp),"
+  echo "#   maxprob 0.1906, |grad E|max 0.95. Scale cannot set sharpness when the score is degree-0."
+  echo "#"
+  echo "# THE KNOWN COST, and the main thing this run is testing. There is now NO temperature"
+  echo "#   channel of any kind. Sharpness is fixed by the configuration's SHAPE, bounded by"
+  echo "#   2*rad(P_u)/rad(P_v), so the head cannot sharpen over training and NOTHING concentrates"
+  echo "#   gradient on hard examples -- the service a rising global geo_temp performs (measured on"
+  echo "#   that head: gradient mass on an unsolved row 23% -> 98% -> 100% as T goes 1 -> 5 -> 15)."
+  echo "#   >>> WATCH link. If it stalls high and flat while val also stalls, the missing"
+  echo "#   >>> temperature is the cause, and s = -T*d/rad(P_v) with ONE GLOBAL learned T is the"
+  echo "#   >>> indicated follow-up. A global T is self-regulating where a per-row radius is not:"
+  echo "#   >>> correct and wrong rows pull it in opposite directions on the same scalar."
+  echo "#"
+  echo "# WHAT rad(P_v) DOES, since it is now the only geometric modifier: ranking is"
+  echo "#   log d(P_u,P_v) - log rad(P_v), i.e. distance ranking plus an ADDITIVE per-candidate"
+  echo "#   radial bias. Near-origin candidates are penalised (d/rad_v -> inf as rad_v -> 0), so"
+  echo "#   this favours PERIPHERAL candidates -- the opposite sign to the product form."
+  echo "#"
+  echo "# REFERENCES (YouTube d=64 K=5 seed 42, no pop bias, same pooler):"
+  echo "#   geo_temp * (-d)        : 0.5625 @ep21  <- THE BASELINE (logage_scalar run_2)"
+  echo "#   -d / (rad_u * rad_v)   : 0.4399 @ep8   <- two-radius quotient, killed ep11"
+  echo "#   -rad_u * rad_v * d     : 0.4264 @ep19  <- product arm, killed ep19"
+  echo "#   best no-pop arm        : 0.5793 (logage_zscore)"
+  echo "#   LB #1 GraphMixer       : 0.5887"
+  echo "#"
+  echo "# WATCH: (a) link, per the KNOWN COST above -- it is the primary read on this run;"
+  echo "#   (b) |E|mean should now be IRRELEVANT to sharpness -- if the geometry still drifts hard"
+  echo "#   in one direction, something outside this analysis is driving it;  (c) record BOTH max"
+  echo "#   test and test@val-checkpoint;  (d) both prior arms had fast ep1-5 and lost -- the"
+  echo "#   quotient reached the product arm's whole 19-epoch result by ep5 and still finished"
+  echo "#   0.123 behind the baseline. Do not call this before the baseline's ep17 escape window."
+  echo "# ~100 s/epoch (70 train + 28 eval)."
+  echo "# started=$(date '+%F %T')"
+  echo "# cmd: $CMD"
+  echo
+} > "$LOG"
+PYTHONUNBUFFERED=1 $CMD >> "$LOG" 2>&1
+echo "[$(date '+%F %T')] DONE rc=$?  $(grep -E 'stopped_at_epoch|best_val_mrr|best_test_mrr' "$LOG" | tr -s ' ' | tr '\n' ' ')" >> "$LOG"

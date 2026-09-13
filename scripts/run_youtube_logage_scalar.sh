@@ -1,0 +1,70 @@
+#!/bin/bash
+# YouTube d=64 K=5: pooler on [log1p(age) | one-hot position | rad], single lr, linear temp.
+PY=/its/home/ms2420/tempest-embeddinng/venv/bin/python
+WD=/its/home/ms2420/tempest-embeddinng
+LOG=$WD/logs/logage_scalar/d64_k5/run_1/YouTube.log
+cd "$WD" || exit 1
+mkdir -p "$(dirname "$LOG")"
+SHA=$(git rev-parse --short HEAD); BRANCH=$(git rev-parse --abbrev-ref HEAD)
+DIRTY=$(git status --porcelain --untracked-files=no | head -1)
+CMD="$PY -u scripts/train_link_property_prediction.py --data-suite tgb-seq --dataset YouTube \
+--d-emb 64 --k-train 5 --lr 1e-3 --num-epochs 50 --early-stop-patience 5 \
+--use-gpu --use-gpu-tempest"
+{
+  echo "# dataset=YouTube (NON-bipartite) d_emb=64 k_train=5  lr=1e-3 (SINGLE group)  NO pop bias  seed=42"
+  echo "# experiment=logage_scalar cell=d64_k5 tag=run_1"
+  echo "# branch=$BRANCH commit=$SHA"
+  [ -n "$DIRTY" ] && echo "# WARNING: uncommitted tracked changes -- SHA does not describe the code that ran"
+  echo "# head: score = geo_temp * (-d_H), geo_temp LINEAR init 1.0"
+  echo "#       pooling = softmax(MLP([log1p(age) | rawpos | rad])), width 32, depth 1"
+  echo "#       n_feat = 3 ([age_norm | raw pos | rad])   ->   162 head params"
+  echo "#"
+  echo "# NO STANDARDISATION ANYWHERE. Features are [log1p(age) | raw pos 1..5 | rad], all on"
+  echo "#   their natural scales. This drops the cross-bag z-score from BOTH scalar features."
+  echo "#"
+  echo "# WHY: absolute anchoring. log1p is a fixed monotone function of the age alone, so a given"
+  echo "#   age maps to the same value in every batch and on every dataset (verified: 72,724 s ->"
+  echo "#   11.194441 regardless of batch composition). The per-batch z-score destroyed that --"
+  echo "#   it rescales every batch to mean 0 / std 1, so a candidate with a fresh history and one"
+  echo "#   with a decade-old history become indistinguishable. On a dataset whose source bags are"
+  echo "#   almost all cold, the candidate bag ABSOLUTE staleness is the only temporal signal in"
+  echo "#   the score. (That evidence is from another agent Patent runs; those logs are not on"
+  echo "#   this machine and are UNVERIFIED here.)"
+  echo "#"
+  echo "# WHAT IS KNOWINGLY GIVEN UP: unit scale. The age channel runs mean ~12.3 std ~2.7 against"
+  echo "#   a position of 1..5 and a rad of mean 0.23-0.57. A dedicated ablation measured the age"
+  echo "#   z-score as worth 0.0176 max test on YouTube (0.5793 -> 0.5617) with one-hot position,"
+  echo "#   so this may cost something similar. The trade is deliberate."
+  echo "#"
+  echo "# THE PREDICTION: YouTube should LOSE roughly 0.015-0.020 versus the standardised arms,"
+  echo "#   landing near 0.56, because YouTube bags are richly occupied on both sides (57%/49%)"
+  echo "#   so relative within-bag ordering is sufficient there and conditioning is what matters."
+  echo "#   The payoff is expected on Patent, not here. A YouTube result NEAR 0.579 would mean"
+  echo "#   the conditioning cost is smaller than the ablation implied and the trade is free."
+  echo "#"
+  echo "# BASELINES, all YouTube d=64 K=5 seed 42, identical except where named:"
+  echo "#   encoded pooler, single lr, floored ladder : 0.5457  stop 50 (cap)  762 par  <- CONTROL"
+  echo "#   log1p + z-score + ONE-HOT pos             : 0.5793 max / 0.5757 ckpt, 290 par"
+  echo "#   log1p + z-score + z-scored SCALAR pos     : 0.5787 max @ep17 (killed, not converged), 162 par  <- NEAREST ARM"
+  echo "#   log1p ONLY + one-hot (z-score ablation)   : 0.5617 max = ckpt, stop ep18, 290 par  <- CLOSEST PRIOR"
+  echo "#   log1p ONLY + one-hot (z-score ablation)   : 0.5617 max = ckpt, stop ep18, 290 par"
+  echo "#   encoded pooler, single lr, aliased ladder : 0.5487  stop ep42      762 par"
+  echo "#   encoded pooler, LOG temp                  : 0.5609  stop ep25      762 par  <- our best"
+  echo "#   encoded pooler, lr-temp split             : 0.5537  stop ep15      762 par"
+  echo "#   two-term score w.[-d, r_u*r_v]            : 0.5324 @ep31 (killed, still rising)"
+  echo "#   RAW-SCALAR pooler [rec,pos,rad], 1 group  : 0.5551 ckpt / 0.5605 max, 162 par"
+  echo "#   fixed-rule pooling, 2-param head          : 0.5752  stop ep17    <- best in repo"
+  echo "#   LB #1 GraphMixer                          : 0.5887"
+  echo "#"
+  echo "# WATCH: (a) escape epoch -- control ep19-20, log temp ep11-12, 2-param reference none;"
+  echo "#   (b) geo_temp -- LINEAR and single-group here, so expect the slow crawl toward ~44 by"
+  echo "#   ep40 rather than the ~79 the faster arms reached;  (c) whether 290 params beat 762;"
+  echo "#   (d) val/test drift, which has been 0.0000 on recent arms."
+  echo "# Record BOTH test@val-checkpoint AND max test observed."
+  echo "# ~100 s/epoch; recent YouTube runs went 15-50 epochs, so budget 30-90 min."
+  echo "# started=$(date '+%F %T')"
+  echo "# cmd: $CMD"
+  echo
+} > "$LOG"
+PYTHONUNBUFFERED=1 $CMD >> "$LOG" 2>&1
+echo "[$(date '+%F %T')] DONE rc=$?  $(grep -E 'stopped_at_epoch|best_val_mrr|best_test_mrr' "$LOG" | tr -s ' ' | tr '\n' ' ')" >> "$LOG"
