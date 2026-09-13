@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import LinkPredHead
-from .negatives import UniformNegativeSampler
+from .negatives import PopularityNegativeSampler
 from .walk_tokens import build_query_walk_tokens
 from .walks import WalkGenerator
 
@@ -32,6 +32,9 @@ class TrainerConfig:
     # Dataset-derived.
     num_nodes: int
     dst_pool: np.ndarray
+    # Per-node count of appearances as a train destination, for popularity-weighted
+    # negative sampling. Indexed by node id, length num_nodes.
+    dst_counts: np.ndarray
 
     # Embedding dimension.
     d_emb: int = 64
@@ -92,8 +95,13 @@ class Trainer:
             temporal_node2vec_q=config.t2nv_q,
             seed=int(config.seed),
         )
-        self.neg_sampler_train = UniformNegativeSampler(
-            num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
+        # Training negatives are popularity-weighted (count**0.75), NOT uniform. Eval
+        # negatives stay uniform -- tgb_seq_eval builds them with UniformNegativeSampler,
+        # matching TGB-Seq's shipped test_ns. Train and eval therefore see different
+        # negative distributions by design on this branch; that is the experiment.
+        self.neg_sampler_train = PopularityNegativeSampler(
+            num_neg_per_pos=config.K_train, dst_pool=config.dst_pool,
+            counts=config.dst_counts, alpha=0.75, seed=config.seed,
         )
 
         # One param group at a single lr: Riemannian update for E, standard Adam for the rest.

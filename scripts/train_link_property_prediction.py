@@ -140,6 +140,9 @@ def main() -> Dict[str, Any]:
 
     # Negative-sampling pool, computed by the suite from the full train split.
     dst_pool = suite.dst_pool()
+    # Per-node train-destination counts, for popularity-weighted training negatives.
+    dst_counts = np.bincount(
+        np.asarray(loaded.train.destinations, dtype=np.int64), minlength=num_nodes)
 
     print(f"  num_nodes:     {num_nodes:,}")
     _pool_kind = "destinations (bipartite)" if args.is_bipartite else "nodes (non-bipartite)"
@@ -168,6 +171,7 @@ def main() -> Dict[str, Any]:
     config = TrainerConfig(
         num_nodes=num_nodes,
         dst_pool=dst_pool,
+        dst_counts=dst_counts,
 
         d_emb=args.d_emb,
         hidden_dim=args.hidden_dim,
