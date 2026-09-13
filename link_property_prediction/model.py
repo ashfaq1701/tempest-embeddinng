@@ -46,7 +46,7 @@ class LinkPredHead(nn.Module):
             init = self.geom.random(self.num_nodes, self.d_emb, irange=self.INIT_IRANGE)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+        self.w = nn.Parameter(torch.tensor([1.0, 1.0]))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         nodes = tokens.nodes.clamp_min(0).clone()
@@ -68,4 +68,5 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)
-        return self.geo_temp * (-geo)
+        d0_v = self.geom.dist0(p_v)
+        return self.w[0] * (-geo) + self.w[1] * d0_v
