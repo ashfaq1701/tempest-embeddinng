@@ -1,0 +1,89 @@
+# dataset=Patent experiment=lorentz_projx_shave cell=d64_k5_wpn5_mwl5_lr1e-3 tag=run_2_seed42
+#   intrinsic Lorentz manifold, midpoint (sum w)^2 floor, NO projx radius clamp,
+#   NO grad clip, NO weight decay, rewritten transp (radial/tangential split).
+#   projx SHAVES a detached radius tail (3e2260e, relative-only since 7436020):
+#   fence = p50 + 2*(p99.9 - p50), rows past it rescaled to the p99.9 radius,
+#   applied by geoopt every stabilize=10 steps. Identity on a healthy cloud.
+#   OPTIMISER: one dense RiemannianAdam over all params (sparse reverted, 65ca114).
+#   Head: geo_temp * (-d_H). No popularity channel.
+#   d_emb=64 k_train=5 num_walks_per_node=5 max_walk_len=5 (both EXPLICIT) lr=1e-3
+#   patience=5 num_epochs=100 hidden=32 seed=42
+#   edges=10.8M bipartite=no  (flag: 'none')
+# branch=master commit=07dcc1e
+#   lorentz.py md5=c63ad280c4b966af0c50c2a58bc298c8
+#   model.py   md5=c6d22976e93632a1c69cc79e99a3f942
+#   trainer.py md5=35d7386bd55c7acb3e0f29e62aa0d2b8
+#   (shared NFS tree: another session may check out a different branch mid-run,
+#    so these pin the code that was actually imported)
+# r_mean/r_max are HYPERBOLIC RADIUS, not the ambient |E| of pre-wiring logs
+# host=artemis-a40-14.local  SLURM_JOB_ID=11346382  archive target experiment_logs/geometries/lorentz/patent/2.log
+# started=2026-09-12 06:02:00
+# cmd: venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq \
+#        --dataset Patent --d-emb 64 --k-train 5 --num-walks-per-node 5 --max-walk-len 5 \
+#        --lr 1e-3 --num-epochs 100 --early-stop-patience 5 --seed 42 \
+#        --use-gpu --use-gpu-tempest 
+
+=== tempest-embedding training ===
+dataset: Patent
+device:  cuda
+seed:    42
+loaded (tgb-seq) in 4.0s
+  num_nodes:     2,241,785
+  neg_pool:      1,840,152 unique nodes (non-bipartite)
+  train edges:   9,096,058
+  val edges:     1,039,438
+  test edges:    683,323
+
+=== Config ===
+  num_nodes: 2241785
+  dst_pool: <ndarray shape=(1840152,) dtype=int32>
+  d_emb: 64
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 100
+  early_stop_patience: 5
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:          143,474,240
+  head params:              162
+  TOTAL trainable:  143,474,402
+
+=== Training ===
+  Ingested full graph into Tempest: 10,818,819 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=1.7415  lr=1e-03  train 1443.5s  r_mean=0.136  r_max=0.504  geo_temp=8.392  val 0.0893  test 0.1387 (new best)  eval 73.4s
+epoch 2/100  link=1.2684  lr=1e-03  train 1442.5s  r_mean=0.236  r_max=0.740  geo_temp=17.883  val 0.0996  test 0.1908 (new best)  eval 73.2s
+epoch 3/100  link=0.7025  lr=1e-03  train 1442.2s  r_mean=0.297  r_max=0.858  geo_temp=26.718  val 0.1083  test 0.2112 (new best)  eval 72.9s
+epoch 4/100  link=0.3586  lr=1e-03  train 1442.0s  r_mean=0.334  r_max=0.880  geo_temp=35.129  val 0.1130  test 0.2110 (new best)  eval 72.9s
+epoch 5/100  link=0.1788  lr=1e-03  train 1441.9s  r_mean=0.359  r_max=0.922  geo_temp=43.399  val 0.1132  test 0.1998 (new best)  eval 72.9s
+epoch 6/100  link=0.0895  lr=1e-03  train 1441.9s  r_mean=0.378  r_max=0.971  geo_temp=51.606  val 0.1174  test 0.2007 (new best)  eval 72.9s
+epoch 7/100  link=0.0471  lr=1e-03  train 1441.9s  r_mean=0.392  r_max=1.010  geo_temp=59.754  val 0.1277  test 0.2089 (new best)  eval 73.0s
+epoch 8/100  link=0.0273  lr=1e-03  train 1441.8s  r_mean=0.403  r_max=1.038  geo_temp=67.779  val 0.1263  patience 1/5  eval 73.0s
+epoch 9/100  link=0.0173  lr=1e-03  train 1441.8s  r_mean=0.412  r_max=1.056  geo_temp=75.546  val 0.1244  patience 2/5  eval 72.9s
+epoch 10/100  link=0.0118  lr=1e-03  train 1441.6s  r_mean=0.420  r_max=1.076  geo_temp=82.762  val 0.1256  patience 3/5  eval 72.9s
+epoch 11/100  link=0.0088  lr=1e-03  train 1441.2s  r_mean=0.427  r_max=1.077  geo_temp=88.738  val 0.1259  patience 4/5  eval 72.9s
+epoch 12/100  link=0.0068  lr=1e-03  train 1441.2s  r_mean=0.433  r_max=1.087  geo_temp=93.254  val 0.1281  test 0.2154 (new best)  eval 72.8s
+epoch 13/100  link=0.0055  lr=1e-03  train 1441.3s  r_mean=0.438  r_max=1.094  geo_temp=96.566  val 0.1346  test 0.2344 (new best)  eval 72.8s
+epoch 14/100  link=0.0045  lr=1e-03  train 1440.9s  r_mean=0.443  r_max=1.094  geo_temp=99.037  val 0.1297  patience 1/5  eval 72.9s
+epoch 15/100  link=0.0038  lr=1e-03  train 1440.7s  r_mean=0.447  r_max=1.099  geo_temp=100.864  val 0.1286  patience 2/5  eval 71.9s
+epoch 16/100  link=0.0033  lr=1e-03  train 1440.3s  r_mean=0.451  r_max=1.101  geo_temp=101.940  val 0.1272  patience 3/5  eval 72.0s
+epoch 17/100  link=0.0028  lr=1e-03  train 1441.8s  r_mean=0.455  r_max=1.103  geo_temp=102.873  val 0.1322  patience 4/5  eval 71.9s
+epoch 18/100  link=0.0025  lr=1e-03  train 1441.8s  r_mean=0.459  r_max=1.104  geo_temp=103.548  val 0.1136  patience 5/5  eval 71.9s
+  restored best weights from epoch 13 (val 0.1346, test 0.2344)
+
+=== Final results ===
+  dataset:           Patent
+  seed:              42
+  stopped_at_epoch:  13
+  best_val_mrr:      0.1346
+  best_test_mrr:     0.2344
+=== rc=0 finished=2026-09-12 13:43:51 ===

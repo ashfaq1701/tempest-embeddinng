@@ -1,0 +1,81 @@
+# dataset=Taobao experiment=lorentz_projx_shave cell=d64_k5_wpn5_mwl5_lr1e-3 tag=run_1_seed3
+#   intrinsic Lorentz manifold, midpoint (sum w)^2 floor, NO projx radius clamp,
+#   NO grad clip, NO weight decay, rewritten transp (radial/tangential split).
+#   projx SHAVES a detached radius tail (3e2260e, relative-only since 7436020):
+#   fence = p50 + 2*(p99.9 - p50), rows past it rescaled to the p99.9 radius,
+#   applied by geoopt every stabilize=10 steps. Identity on a healthy cloud.
+#   OPTIMISER: one dense RiemannianAdam over all params (sparse reverted, 65ca114).
+#   Head: geo_temp * (-d_H). No popularity channel.
+#   d_emb=64 k_train=5 num_walks_per_node=5 max_walk_len=5 (both EXPLICIT) lr=1e-3
+#   patience=5 num_epochs=100 hidden=32 seed=3
+#   edges=18.85M bipartite=yes  (flag: '--is-bipartite')
+# branch=master commit=07dcc1e
+#   lorentz.py md5=c63ad280c4b966af0c50c2a58bc298c8
+#   model.py   md5=c6d22976e93632a1c69cc79e99a3f942
+#   trainer.py md5=35d7386bd55c7acb3e0f29e62aa0d2b8
+#   (shared NFS tree: another session may check out a different branch mid-run,
+#    so these pin the code that was actually imported)
+# r_mean/r_max are HYPERBOLIC RADIUS, not the ambient |E| of pre-wiring logs
+# host=artemis-a40-13.local  SLURM_JOB_ID=11346381  archive target experiment_logs/geometries/lorentz/taobao/1.log
+# started=2026-09-12 16:00:51
+# cmd: venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq \
+#        --dataset Taobao --d-emb 64 --k-train 5 --num-walks-per-node 5 --max-walk-len 5 \
+#        --lr 1e-3 --num-epochs 100 --early-stop-patience 5 --seed 3 \
+#        --use-gpu --use-gpu-tempest --is-bipartite
+
+=== tempest-embedding training ===
+dataset: Taobao
+device:  cuda
+seed:    3
+loaded (tgb-seq) in 17.1s
+  num_nodes:     1,623,634
+  neg_pool:      863,016 unique destinations (bipartite)
+  train edges:   13,981,096
+  val edges:     2,466,625
+  test edges:    2,406,071
+
+=== Config ===
+  num_nodes: 1623634
+  dst_pool: <ndarray shape=(863016,) dtype=int32>
+  d_emb: 64
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 100
+  early_stop_patience: 5
+  seed: 3
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:          103,912,576
+  head params:              162
+  TOTAL trainable:  103,912,738
+
+=== Training ===
+  Ingested full graph into Tempest: 18,853,792 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=1.3273  lr=1e-03  train 1628.6s  r_mean=0.234  r_max=0.925  geo_temp=15.416  val 0.4507  test 0.4421 (new best)  eval 179.4s
+epoch 2/100  link=0.6645  lr=1e-03  train 1627.9s  r_mean=0.322  r_max=1.178  geo_temp=25.351  val 0.5255  test 0.5128 (new best)  eval 178.6s
+epoch 3/100  link=0.4598  lr=1e-03  train 1627.8s  r_mean=0.387  r_max=1.199  geo_temp=28.822  val 0.5482  test 0.5306 (new best)  eval 178.7s
+epoch 4/100  link=0.3398  lr=1e-03  train 1627.6s  r_mean=0.443  r_max=1.300  geo_temp=31.655  val 0.5531  test 0.5298 (new best)  eval 179.1s
+epoch 5/100  link=0.2565  lr=1e-03  train 1627.2s  r_mean=0.494  r_max=1.349  geo_temp=34.347  val 0.5543  test 0.5259 (new best)  eval 178.5s
+epoch 6/100  link=0.1961  lr=1e-03  train 1627.1s  r_mean=0.539  r_max=1.420  geo_temp=36.817  val 0.5494  patience 1/5  eval 178.5s
+epoch 7/100  link=0.1526  lr=1e-03  train 1627.2s  r_mean=0.579  r_max=1.444  geo_temp=39.032  val 0.5445  patience 2/5  eval 178.5s
+epoch 8/100  link=0.1213  lr=1e-03  train 1627.1s  r_mean=0.616  r_max=1.445  geo_temp=40.766  val 0.5427  patience 3/5  eval 178.5s
+epoch 9/100  link=0.0993  lr=1e-03  train 1628.4s  r_mean=0.650  r_max=1.465  geo_temp=42.006  val 0.5464  patience 4/5  eval 177.1s
+epoch 10/100  link=0.0829  lr=1e-03  train 1627.8s  r_mean=0.682  r_max=1.480  geo_temp=42.964  val 0.5442  patience 5/5  eval 177.2s
+  restored best weights from epoch 5 (val 0.5543, test 0.5259)
+
+=== Final results ===
+  dataset:           Taobao
+  seed:              3
+  stopped_at_epoch:  5
+  best_val_mrr:      0.5543
+  best_test_mrr:     0.5259
+=== rc=0 finished=2026-09-12 21:16:55 ===

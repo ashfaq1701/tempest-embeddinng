@@ -1,0 +1,80 @@
+# dataset=Taobao experiment=lorentz_projx_shave cell=d64_k5_wpn5_mwl5_lr1e-3 tag=run_2_seed42
+#   intrinsic Lorentz manifold, midpoint (sum w)^2 floor, NO projx radius clamp,
+#   NO grad clip, NO weight decay, rewritten transp (radial/tangential split).
+#   projx SHAVES a detached radius tail (3e2260e, relative-only since 7436020):
+#   fence = p50 + 2*(p99.9 - p50), rows past it rescaled to the p99.9 radius,
+#   applied by geoopt every stabilize=10 steps. Identity on a healthy cloud.
+#   OPTIMISER: one dense RiemannianAdam over all params (sparse reverted, 65ca114).
+#   Head: geo_temp * (-d_H). No popularity channel.
+#   d_emb=64 k_train=5 num_walks_per_node=5 max_walk_len=5 (both EXPLICIT) lr=1e-3
+#   patience=5 num_epochs=100 hidden=32 seed=42
+#   edges=18.85M bipartite=yes  (flag: '--is-bipartite')
+# branch=master commit=07dcc1e
+#   lorentz.py md5=c63ad280c4b966af0c50c2a58bc298c8
+#   model.py   md5=c6d22976e93632a1c69cc79e99a3f942
+#   trainer.py md5=35d7386bd55c7acb3e0f29e62aa0d2b8
+#   (shared NFS tree: another session may check out a different branch mid-run,
+#    so these pin the code that was actually imported)
+# r_mean/r_max are HYPERBOLIC RADIUS, not the ambient |E| of pre-wiring logs
+# host=artemis-a40-14.local  SLURM_JOB_ID=11346382  archive target experiment_logs/geometries/lorentz/taobao/2.log
+# started=2026-09-12 14:54:44
+# cmd: venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq \
+#        --dataset Taobao --d-emb 64 --k-train 5 --num-walks-per-node 5 --max-walk-len 5 \
+#        --lr 1e-3 --num-epochs 100 --early-stop-patience 5 --seed 42 \
+#        --use-gpu --use-gpu-tempest --is-bipartite
+
+=== tempest-embedding training ===
+dataset: Taobao
+device:  cuda
+seed:    42
+loaded (tgb-seq) in 5.2s
+  num_nodes:     1,623,634
+  neg_pool:      863,016 unique destinations (bipartite)
+  train edges:   13,981,096
+  val edges:     2,466,625
+  test edges:    2,406,071
+
+=== Config ===
+  num_nodes: 1623634
+  dst_pool: <ndarray shape=(863016,) dtype=int32>
+  d_emb: 64
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 100
+  early_stop_patience: 5
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:          103,912,576
+  head params:              162
+  TOTAL trainable:  103,912,738
+
+=== Training ===
+  Ingested full graph into Tempest: 18,853,792 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=1.3259  lr=1e-03  train 1664.6s  r_mean=0.234  r_max=1.006  geo_temp=15.364  val 0.4491  test 0.4406 (new best)  eval 187.4s
+epoch 2/100  link=0.6690  lr=1e-03  train 1664.2s  r_mean=0.322  r_max=1.138  geo_temp=25.347  val 0.5257  test 0.5135 (new best)  eval 186.0s
+epoch 3/100  link=0.4647  lr=1e-03  train 1664.2s  r_mean=0.388  r_max=1.191  geo_temp=28.859  val 0.5517  test 0.5351 (new best)  eval 188.0s
+epoch 4/100  link=0.3438  lr=1e-03  train 1663.9s  r_mean=0.444  r_max=1.323  geo_temp=31.692  val 0.5531  test 0.5304 (new best)  eval 188.4s
+epoch 5/100  link=0.2598  lr=1e-03  train 1664.1s  r_mean=0.495  r_max=1.399  geo_temp=34.344  val 0.5518  patience 1/5  eval 187.9s
+epoch 6/100  link=0.1989  lr=1e-03  train 1664.2s  r_mean=0.540  r_max=1.407  geo_temp=36.781  val 0.5481  patience 2/5  eval 188.0s
+epoch 7/100  link=0.1550  lr=1e-03  train 1663.9s  r_mean=0.581  r_max=1.544  geo_temp=38.945  val 0.5461  patience 3/5  eval 187.7s
+epoch 8/100  link=0.1231  lr=1e-03  train 1664.5s  r_mean=0.618  r_max=1.597  geo_temp=40.761  val 0.5424  patience 4/5  eval 186.4s
+epoch 9/100  link=0.1006  lr=1e-03  train 1662.3s  r_mean=0.652  r_max=1.586  geo_temp=41.998  val 0.5430  patience 5/5  eval 183.2s
+  restored best weights from epoch 4 (val 0.5531, test 0.5304)
+
+=== Final results ===
+  dataset:           Taobao
+  seed:              42
+  stopped_at_epoch:  4
+  best_val_mrr:      0.5531
+  best_test_mrr:     0.5304
+=== rc=0 finished=2026-09-12 19:44:52 ===

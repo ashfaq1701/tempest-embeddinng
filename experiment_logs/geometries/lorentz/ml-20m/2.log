@@ -1,0 +1,84 @@
+# dataset=ML-20M experiment=lorentz_projx_shave cell=d64_k5_wpn5_mwl5_lr1e-3 tag=run_2_seed42
+#   intrinsic Lorentz manifold, midpoint (sum w)^2 floor, NO projx radius clamp,
+#   NO grad clip, NO weight decay, rewritten transp (radial/tangential split).
+#   projx SHAVES a detached radius tail (3e2260e, relative-only since 7436020):
+#   fence = p50 + 2*(p99.9 - p50), rows past it rescaled to the p99.9 radius,
+#   applied by geoopt every stabilize=10 steps. Identity on a healthy cloud.
+#   OPTIMISER: one dense RiemannianAdam over all params (sparse reverted, 65ca114).
+#   Head: geo_temp * (-d_H). No popularity channel.
+#   d_emb=64 k_train=5 num_walks_per_node=5 max_walk_len=5 (both EXPLICIT) lr=1e-3
+#   patience=5 num_epochs=100 hidden=32 seed=42
+#   edges=14.5M bipartite=yes  (flag: '--is-bipartite')
+# branch=master commit=07dcc1e
+#   lorentz.py md5=c63ad280c4b966af0c50c2a58bc298c8
+#   model.py   md5=c6d22976e93632a1c69cc79e99a3f942
+#   trainer.py md5=35d7386bd55c7acb3e0f29e62aa0d2b8
+#   (shared NFS tree: another session may check out a different branch mid-run,
+#    so these pin the code that was actually imported)
+# r_mean/r_max are HYPERBOLIC RADIUS, not the ambient |E| of pre-wiring logs
+# host=artemis-a40-14.local  SLURM_JOB_ID=11346382  archive target experiment_logs/geometries/lorentz/ml-20m/2.log
+# started=2026-09-12 13:43:51
+# cmd: venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq \
+#        --dataset ML-20M --d-emb 64 --k-train 5 --num-walks-per-node 5 --max-walk-len 5 \
+#        --lr 1e-3 --num-epochs 100 --early-stop-patience 5 --seed 42 \
+#        --use-gpu --use-gpu-tempest --is-bipartite
+
+=== tempest-embedding training ===
+dataset: ML-20M
+device:  cuda
+seed:    42
+loaded (tgb-seq) in 3.3s
+  num_nodes:     110,432
+  neg_pool:      9,646 unique destinations (bipartite)
+  train edges:   14,000,091
+  val edges:     364,943
+  test edges:    129,291
+
+=== Config ===
+  num_nodes: 110432
+  dst_pool: <ndarray shape=(9646,) dtype=int32>
+  d_emb: 64
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 100
+  early_stop_patience: 5
+  seed: 42
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:            7,067,648
+  head params:              162
+  TOTAL trainable:    7,067,810
+
+=== Training ===
+  Ingested full graph into Tempest: 14,494,325 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=0.8298  lr=1e-03  train 295.1s  r_mean=0.220  r_max=3.016  geo_temp=6.078  val 0.2275  test 0.2110 (new best)  eval 27.6s
+epoch 2/100  link=0.5701  lr=1e-03  train 294.6s  r_mean=0.247  r_max=3.073  geo_temp=8.784  val 0.2563  test 0.2320 (new best)  eval 27.7s
+epoch 3/100  link=0.5344  lr=1e-03  train 294.5s  r_mean=0.269  r_max=3.271  geo_temp=10.553  val 0.2685  test 0.2369 (new best)  eval 26.3s
+epoch 4/100  link=0.5129  lr=1e-03  train 294.6s  r_mean=0.289  r_max=3.395  geo_temp=12.155  val 0.2723  test 0.2369 (new best)  eval 24.1s
+epoch 5/100  link=0.4963  lr=1e-03  train 294.6s  r_mean=0.306  r_max=3.529  geo_temp=13.592  val 0.2761  test 0.2389 (new best)  eval 27.3s
+epoch 6/100  link=0.4834  lr=1e-03  train 294.6s  r_mean=0.322  r_max=3.679  geo_temp=14.694  val 0.2784  test 0.2392 (new best)  eval 26.4s
+epoch 7/100  link=0.4720  lr=1e-03  train 294.3s  r_mean=0.337  r_max=3.823  geo_temp=15.638  val 0.2793  test 0.2397 (new best)  eval 24.0s
+epoch 8/100  link=0.4630  lr=1e-03  train 293.8s  r_mean=0.350  r_max=4.014  geo_temp=16.406  val 0.2811  test 0.2391 (new best)  eval 27.2s
+epoch 9/100  link=0.4551  lr=1e-03  train 293.5s  r_mean=0.362  r_max=4.113  geo_temp=17.089  val 0.2799  patience 1/5  eval 26.2s
+epoch 10/100  link=0.4480  lr=1e-03  train 293.7s  r_mean=0.374  r_max=4.225  geo_temp=17.696  val 0.2801  patience 2/5  eval 26.2s
+epoch 11/100  link=0.4415  lr=1e-03  train 294.4s  r_mean=0.385  r_max=4.307  geo_temp=18.261  val 0.2780  patience 3/5  eval 26.3s
+epoch 12/100  link=0.4361  lr=1e-03  train 294.5s  r_mean=0.396  r_max=4.471  geo_temp=18.715  val 0.2781  patience 4/5  eval 26.3s
+epoch 13/100  link=0.4306  lr=1e-03  train 294.4s  r_mean=0.406  r_max=4.527  geo_temp=19.171  val 0.2781  patience 5/5  eval 26.3s
+  restored best weights from epoch 8 (val 0.2811, test 0.2391)
+
+=== Final results ===
+  dataset:           ML-20M
+  seed:              42
+  stopped_at_epoch:  8
+  best_val_mrr:      0.2811
+  best_test_mrr:     0.2391
+=== rc=0 finished=2026-09-12 14:54:44 ===
