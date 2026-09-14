@@ -216,43 +216,46 @@ commit `07dcc1e6`, d=64 K=5 lr=1e-3 patience 5, no popularity channel, single se
 
 **Standing: 2 of 7.** Total deficit across the five losses is 52.8 MRR points.
 
-### Historical bests — do not quote these as current
+### The old per-dataset records are withdrawn
 
-The older per-dataset records in `[[tgb-seq-datasets-and-leaderboard]]` give a much better
-4-of-7, but they are **not this architecture**: they mix seeds, carry a per-node popularity
-bias table (`head params` ~= one scalar per node), and come from scorer variants the author
-reports as *unstable* — they climbed and then fell sharply. They are an existence proof that
-the headroom is real, not a result we can currently reproduce or submit.
+Earlier notes carried a much better 4-of-7 against this bar. Those numbers are **not this
+architecture and are not reproducible**: they mix seeds, carry a per-node popularity bias table
+(`head params` ~= one scalar per node), and come from a `[-geo, cos, rad]`-family scorer that is
+now measured to be unstable rather than merely suspected of it.
 
-| dataset | historical best | Δ vs bar | seed-5 best | Δ vs bar |
-|---|---|---|---|---|
-| GoogleLocal | 67.48 | +4.60 | 65.35 | +2.47 |
-| WikiLink | 79.04 | **+3.56** | 65.92 | **−9.56** |
-| YouTube | 62.37 | +2.73 | 56.26 | −3.38 |
-| Flickr | 64.91 | +2.57 | 62.51 | +0.17 |
-| Yelp | 67.74 | −4.95 | 62.04 | −10.65 |
-| Taobao | 62.64 | −8.04 | 53.13 | −17.55 |
-| ML-20M | 24.65 | −11.26 | 24.29 | −11.62 |
+**The instability, measured 2026-09-14** on `w.[-d_H, cos]`, ML-20M seed 5, one variable against
+the baseline. It peaked at **epoch 2** — val 0.2955, test 0.2539, the best of any head tried —
+and never recovered:
 
-### What the two columns disagree about, and why it matters
+| ep | 1 | **2** | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| val | 0.2854 | **0.2955** | 0.2908 | 0.2909 | 0.2936 |
+| link | 0.5936 | 0.4549 | 0.4204 | 0.4018 | 0.3904 |
 
-**WikiLink is the whole disagreement.** It swings +3.56 to −9.56, by far the largest move, and
-the cause is visible in the logs: the record run reached **ep44**, the seed-5 run stopped at
-**ep15**. WikiLink is not converged at seed 5 — it is stopped early by patience on a curve that
-was still climbing. Before reading WikiLink as a CRAFT loss, re-run it long.
+Training loss fell every epoch while validation turned over after one. The mechanism is visible
+in the radius: `cos` is exactly scale-invariant (measured `d(cos)/d(radius) = 3.7e-09`), so it
+gives a cheap **angular** way to separate candidates and the embedding never needs to spread —
+r_mean 0.049 at ep1 against the baseline's 0.225, r_max collapsing to 1.038 while the baseline
+climbed to 3.116. The objective gets solved without geometry, and then there is nothing left to
+generalise with.
 
-**This kills the walk-truncation story as stated.** Sorting by `% walks ≥5`, the historical
-column gave a perfect win/loss split at ~75% truncation. The seed-5 column does not: WikiLink
-sits at 67.7% truncation and loses by 9.56, in between two wins. Truncation still separates the
-three worst deficits (Yelp/Taobao/ML-20M, all ≥87%) from everything else, and depth remains
-worth testing there — but it is no longer a single-axis explanation, and Patent must stay out of
-any depth conclusion (its walks are structurally dead at length 2).
+**Do not quote the old records, and do not treat them as headroom.** A number that survives two
+epochs is not a result.
 
-**Taobao is the largest single deficit (−17.55) and the shortest run (stop ep4).** Deficit and
-early stopping correlate across the whole table. That is a confound: an under-trained run and a
-capacity-limited one look identical in this column. ML-20M is the one place it has been checked
-— its val genuinely saturates and declines after ep7, so there the deficit is real. Taobao and
-WikiLink have not been checked.
+### Two confounds in the seed-5 column
+
+**Deficit and early stopping correlate across the whole table**, which is a confound: an
+under-trained run and a capacity-limited one look identical here. Taobao has the largest deficit
+(−17.55) and the shortest run (**stop ep4**); WikiLink loses 9.56 and stops at **ep15**, where
+an earlier long run on this dataset reached **ep44**. Neither has been checked for convergence.
+ML-20M is the one place it has been: its val genuinely saturates and declines after ep7, so
+there the deficit is real. **Before reading Taobao or WikiLink as capacity losses, run them long.**
+
+**Walk truncation is not a single-axis explanation.** Sorting by `% walks ≥5`, truncation still
+separates the three worst deficits (Yelp/Taobao/ML-20M, all ≥87%) from everything else, and
+depth is worth testing there — but WikiLink sits at 67.7% truncation and still loses by 9.56,
+in between two wins. Patent must stay out of any depth conclusion; its walks are structurally
+dead at length 2.
 
 ### Where to attack first
 
