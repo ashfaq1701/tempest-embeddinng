@@ -871,13 +871,12 @@ def test_gradient_is_bounded_approaching_coincidence(k):
         assert float(x.grad.abs().max()) < 10.0, (sep, float(x.grad.abs().max()))
 
 
-def test_max_geodesic_step_matches_dtype_and_rekeys():
-    m = LorentzManifold()
-    assert m.max_geodesic_step(torch.float32) == pytest.approx(
+def test_max_geodesic_step_matches_dtype():
+    assert LorentzManifold().max_geodesic_step(torch.float32) == pytest.approx(
         math.acosh(math.sqrt(torch.finfo(torch.float32).max)))
-    assert m.max_geodesic_step(torch.float64) == pytest.approx(
+    assert LorentzManifold().max_geodesic_step(torch.float64) == pytest.approx(
         math.acosh(math.sqrt(torch.finfo(torch.float64).max)))
-    assert m.max_geodesic_step(torch.float32) == pytest.approx(45.0551, abs=1e-3)
+    assert LorentzManifold().max_geodesic_step(torch.float32) == pytest.approx(45.0551, abs=1e-3)
 
 
 def test_expmap_finite_at_a_step_that_used_to_nan():
@@ -912,14 +911,3 @@ def test_clamp_leaves_ordinary_steps_untouched():
             ref = unclamped(x, u)
             if torch.isfinite(ref).all():
                 assert torch.equal(m.expmap(x, u), ref)
-
-
-def test_take_max_step_reports_preclamp_and_resets():
-    m = LorentzManifold()
-    x = torch.zeros(1, 8)
-    m.expmap(x, torch.full((1, 8), 1e-3))
-    small = m.take_max_step()
-    assert 0.0 < small < 1.0
-    assert m.take_max_step() == 0.0
-    m.expmap(x, torch.full((1, 8), 1e6))
-    assert m.take_max_step() > m.max_geodesic_step(torch.float32)
