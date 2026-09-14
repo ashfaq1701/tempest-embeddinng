@@ -72,6 +72,31 @@ class WalkGenerator:
         """Ingest edges into Tempest (indexed by time; ingestion order is irrelevant)."""
         self.tempest.add_multiple_edges(src, tgt, ts, edge_features=edge_feat)
 
+    def get_candidate_recency(self, nodes: np.ndarray, cutoff_times: np.ndarray) -> np.ndarray:
+        """Recency (age) = t_query - t_last(v) per node: time since each node's freshest
+        edge strictly before its cutoff, via Tempest get_latest_events_for_nodes.
+        Backward_In_Time counts inbound edges, so a candidate that only ever receives (a
+        bipartite target) is covered. Tempest returns t_last = -1 when the node has no
+        prior edge, so the age is cutoff + 1 there -- maximally stale, the right signal
+        for a cold candidate. nodes int32, cutoff_times int64, equal length; returns an
+        int64 age of the same length."""
+        node_arr = np.ascontiguousarray(nodes, dtype=np.int32)
+        cutoff_arr = np.ascontiguousarray(cutoff_times, dtype=np.int64)
+        _, t_last = self.tempest.get_latest_events_for_nodes(
+            node_arr, cutoff_times=cutoff_arr, direction="Backward_In_Time")
+        return cutoff_arr - t_last
+
+    def get_candidate_popularity(self, nodes: np.ndarray, cutoff_times: np.ndarray) -> np.ndarray:
+        """Popularity = number of edges each node participates in strictly before its
+        cutoff, via Tempest get_node_participation_counts. Backward_In_Time counts inbound
+        edges, i.e. a bipartite target's received interactions; 0 for a node with no prior
+        edge. nodes int32, cutoff_times int64, equal length; returns int64 counts of the
+        same length."""
+        node_arr = np.ascontiguousarray(nodes, dtype=np.int32)
+        cutoff_arr = np.ascontiguousarray(cutoff_times, dtype=np.int64)
+        return self.tempest.get_node_participation_counts(
+            node_arr, cutoff_times=cutoff_arr, direction="Backward_In_Time")
+
     def walks_for_nodes(self, seeds: np.ndarray, max_walk_len: Optional[int] = None,
                         num_walks_per_node: Optional[int] = None,
                         start_bias: Optional[str] = None,
