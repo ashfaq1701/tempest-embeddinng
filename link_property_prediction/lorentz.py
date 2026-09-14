@@ -168,6 +168,23 @@ class LorentzManifold(geoopt.Manifold):
         tangent projection are both absorbed: there is nothing to project."""
         return u + x * ((x * u).sum(-1, keepdim=True) * self._inv_k)
 
+    _max_geodesic_step = None
+    _step_seen = None
+
+    def take_max_step(self) -> float:
+        """Largest geodesic step since the last call, pre-clamp. Resets."""
+        seen = 0.0 if self._step_seen is None else float(self._step_seen)
+        self._step_seen = None
+        return seen
+
+    def max_geodesic_step(self, dtype: torch.dtype) -> float:
+        """Largest t with cosh(t)*||x'|| finite for any x whose own x0 is finite:
+        t = sqrt(k) acosh(sqrt(finfo.max)). 45.055 in float32."""
+        if self._max_geodesic_step is None or self._max_geodesic_step[0] is not dtype:
+            self._max_geodesic_step = (
+                dtype, self._sqrt_k * math.acosh(math.sqrt(torch.finfo(dtype).max)))
+        return self._max_geodesic_step[1]
+
     def expmap(self, x: Tensor, u: Tensor) -> Tensor:
         """Eq. 9, generalised to curvature -1/k. Returns the space part, which
         is cosh(t) x' + coef u.
@@ -176,9 +193,11 @@ class LorentzManifold(geoopt.Manifold):
         geodesic distance travelled, which is what makes a learning rate
         interpretable in hyperbolic units.
 
-        A step large enough to overflow cosh(t)*x0 gives inf rather than
-        raising; `_check_point_on_manifold` reports non-finite values, and a
-        device-side guard would stall the pipeline on every call.
+        t is clamped at `max_geodesic_step`, so the POST above holds only up to
+        that bound. The clamp is unreachable by any finite step the optimiser
+        takes (lr-sized, ~1e-3) and only alters results that would otherwise be
+        inf -- the ML-20M NaN came from a single 149.8 step. A clamp rather than
+        a check because `(t > lim).any()` would sync the device every call.
         """
         qq = self.inner(x, u, keepdim=True).clamp_min(0.0)   # ||v||_L^2
         tsq = qq * self._inv_k                               # t^2
@@ -192,6 +211,9 @@ class LorentzManifold(geoopt.Manifold):
         safe = qq > _tiny(qq)
         nrm = torch.where(safe, qq, torch.ones_like(qq)).sqrt()
         t = nrm * self._inv_sqrt_k
+        seen = t.detach().amax()
+        self._step_seen = seen if self._step_seen is None else torch.maximum(self._step_seen, seen)
+        t = t.clamp_max(self.max_geodesic_step(u.dtype))
         cosh_t = torch.where(safe, torch.cosh(t), 1.0 + tsq * 0.5)
         coef = torch.where(safe, torch.sinh(t) * (self._sqrt_k / nrm),
                            1.0 + tsq * _SIXTH)
