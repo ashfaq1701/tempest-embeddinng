@@ -169,21 +169,13 @@ class LorentzManifold(geoopt.Manifold):
         return u + x * ((x * u).sum(-1, keepdim=True) * self._inv_k)
 
     _max_geodesic_step = None
-    _step_seen = None
-
-    def take_max_step(self) -> float:
-        """Largest geodesic step since the last call, pre-clamp. Resets."""
-        seen = 0.0 if self._step_seen is None else float(self._step_seen)
-        self._step_seen = None
-        return seen
 
     def max_geodesic_step(self, dtype: torch.dtype) -> float:
         """Largest t with cosh(t)*||x'|| finite for any x whose own x0 is finite:
         t = sqrt(k) acosh(sqrt(finfo.max)). 45.055 in float32."""
-        if self._max_geodesic_step is None or self._max_geodesic_step[0] is not dtype:
-            self._max_geodesic_step = (
-                dtype, self._sqrt_k * math.acosh(math.sqrt(torch.finfo(dtype).max)))
-        return self._max_geodesic_step[1]
+        if self._max_geodesic_step is None:
+            self._max_geodesic_step = self._sqrt_k * math.acosh(math.sqrt(torch.finfo(dtype).max))
+        return self._max_geodesic_step
 
     def expmap(self, x: Tensor, u: Tensor) -> Tensor:
         """Eq. 9, generalised to curvature -1/k. Returns the space part, which
@@ -210,10 +202,7 @@ class LorentzManifold(geoopt.Manifold):
         # there; they are kept because they are the correct limits.
         safe = qq > _tiny(qq)
         nrm = torch.where(safe, qq, torch.ones_like(qq)).sqrt()
-        t = nrm * self._inv_sqrt_k
-        seen = t.detach().amax()
-        self._step_seen = seen if self._step_seen is None else torch.maximum(self._step_seen, seen)
-        t = t.clamp_max(self.max_geodesic_step(u.dtype))
+        t = (nrm * self._inv_sqrt_k).clamp_max(self.max_geodesic_step(u.dtype))
         cosh_t = torch.where(safe, torch.cosh(t), 1.0 + tsq * 0.5)
         coef = torch.where(safe, torch.sinh(t) * (self._sqrt_k / nrm),
                            1.0 + tsq * _SIXTH)

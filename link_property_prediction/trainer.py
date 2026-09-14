@@ -300,7 +300,6 @@ class Trainer:
             # Geometry watch: boundary radius (|E|mean vs |E|max).
             g = self._geometry_probe()
             line += f"  r_mean={g['mean_norm']:.3f}  r_max={g['max_norm']:.3f}"
-            line += f"  max_geo_step={self.model.geom.take_max_step():.3g}"
             line += self._head_probe()
 
             if val_evaluator is not None and val_batches_factory is not None:
