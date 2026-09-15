@@ -200,6 +200,9 @@ class Trainer:
             parts.append(f"temp={float(self.model.temperature):.3f}")
         if hasattr(self.model, "geo_temp"):
             parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
+        if hasattr(self.model, "mix"):
+            w = self.model.mix.weight.detach().flatten().tolist()
+            parts.append("w=[" + ",".join(f"{v:.3f}" for v in w) + "]")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad
