@@ -1,0 +1,111 @@
+# dataset=YouTube  d_emb=64 k_train=5 lr=1e-3 seed=5 patience 5 cap 100
+# experiment=duv_cand_pop cell=d64_k5 tag=run_1  (chained; see DRIVER.log)
+# branch=feature/duv-with-cand-pop commit=0578e9e4
+# head: score = mix([-d_H, log1p(cand_popularity)]), Linear(2,1,bias=False), w init [1,0].
+#       163 head params. LOSS: softmax CE, unchanged from master.
+#
+# WHAT IT IS. The master baseline plus ONE extra scalar feature: how many edges the
+#   candidate had strictly before the query cutoff. w init [1,0] means the score STARTS
+#   as exactly the baseline -d_H (geo_temp pinned at 1) with the popularity channel
+#   contributing nothing, so w[1] has to earn its weight rather than being granted it.
+#
+# log1p NOT log. get_candidate_popularity returns 0 for a node with no prior edge and
+#   cold candidates are common; log(0) = -inf would NaN the first batch. log1p maps
+#   0 -> 0, which is also the right inert value for a cold node.
+#
+# THE RISK, STATED UP FRONT. w[1] is inert at init in VALUE but not in GRADIENT:
+#   measured d(CE)/dw = [1.97e-04, 7.65e-01] at init, so the popularity weight carries
+#   ~3900x the gradient of the distance weight and will move immediately. That is NOT
+#   the earned-range profile of d0_u*d0_v, whose gradient was genuinely ~0 (2.3e-07).
+#   Every head on this suite that CAPTURED the score in the first epoch or two finished
+#   badly -- d0v captured at ep1 with w[0] -> -30.6 and scored 0.4567 against the
+#   baseline 0.5626. WATCH w[1] AT EPOCH 1. If it jumps and w[0] collapses, this is
+#   that failure mode and the run can be called early.
+#
+# PRIOR ON POPULARITY. TGB-Seq test negatives are UNIFORM over the destination pool,
+#   popularity-blind: measured corr(log10 train-popularity, log10 test-negative-freq)
+#   = +0.0137 on ML-20M, rare pool nodes averaging 1340.2 appearances against popular
+#   ones at 1340.6. A popularity channel therefore cannot help by exploiting the
+#   negative sampler -- it can only help if popularity genuinely predicts the POSITIVE.
+#   A per-node popularity bias table was also part of the withdrawn historical-best
+#   configs that CLAUDE.md records as unstable. Treat a large early gain with suspicion.
+#
+# SEED-5 BASELINE (commit 07dcc1e6), the number this must beat, val / test / stop-ep:
+#   GoogleLocal 0.6818 / 0.6535 / 44     YouTube  0.6467 / 0.5626 / 19
+#   Flickr      0.6581 / 0.6251 / 13     Patent   0.1262 / 0.2263 / 13
+#   ML-20M      0.2826 / 0.2429 / 7      Taobao   0.5536 / 0.5313 / 4
+#   Yelp        0.6633 / 0.6204 / 14     WikiLink 0.6682 / 0.6592 / 15
+#
+# WATCH: (a) w[1] at ep1-2, see THE RISK above;  (b) w[0] -- if it collapses toward 0
+#   the geometry has been abandoned for the popularity shortcut;  (c) PATENT especially
+#   -- its walks are structurally dead at length 2 (mean 2.20, only 0.3% reach 5), so
+#   the bag is the seed plus one neighbour and a cheap non-geometric feature has the
+#   most room to take over there;  (d) VAL/TEST DRIFT -- on Patent val is a POOR
+#   selector (baseline best val 0.1262 -> test 0.2263, while a recent arm reached a
+#   HIGHER val 0.1276 at a LOWER test 0.2023). Record peak test AND test@val-ckpt.
+#
+# started=2026-09-15 11:46:21
+# cmd: /its/home/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq --dataset YouTube --d-emb 64 --k-train 5 --num-walks-per-node 5 --lr 1e-3 --seed 5 --early-stop-patience 5  --use-gpu --use-gpu-tempest
+
+=== tempest-embedding training ===
+dataset: YouTube
+device:  cuda
+seed:    5
+loaded (tgb-seq) in 0.9s
+  num_nodes:     402,423
+  neg_pool:      402,422 unique nodes (non-bipartite)
+  train edges:   2,730,407
+  val edges:     324,756
+  test edges:    232,865
+
+=== Config ===
+  num_nodes: 402423
+  dst_pool: <ndarray shape=(402422,) dtype=int32>
+  d_emb: 64
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 100
+  early_stop_patience: 5
+  seed: 5
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:           25,755,072
+  head params:              163
+  TOTAL trainable:   25,755,235
+
+=== Training ===
+  Ingested full graph into Tempest: 3,288,028 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=1.3210  lr=1e-03  train 94.6s  r_mean=0.081  r_max=0.874  w=[4.122,0.527]  val 0.5562  test 0.5162 (new best)  eval 27.3s
+epoch 2/100  link=1.0782  lr=1e-03  train 94.0s  r_mean=0.135  r_max=0.771  w=[6.650,0.503]  val 0.5907  test 0.5448 (new best)  eval 27.5s
+epoch 3/100  link=0.8864  lr=1e-03  train 94.2s  r_mean=0.180  r_max=0.833  w=[8.954,0.489]  val 0.6081  test 0.5570 (new best)  eval 27.4s
+epoch 4/100  link=0.7308  lr=1e-03  train 94.1s  r_mean=0.218  r_max=0.851  w=[11.100,0.486]  val 0.6198  test 0.5629 (new best)  eval 27.5s
+epoch 5/100  link=0.6065  lr=1e-03  train 94.0s  r_mean=0.252  r_max=0.856  w=[13.169,0.488]  val 0.6342  test 0.5695 (new best)  eval 27.4s
+epoch 6/100  link=0.5015  lr=1e-03  train 94.0s  r_mean=0.282  r_max=0.867  w=[15.226,0.484]  val 0.6486  test 0.5765 (new best)  eval 27.5s
+epoch 7/100  link=0.4188  lr=1e-03  train 94.1s  r_mean=0.310  r_max=0.902  w=[17.307,0.475]  val 0.6599  test 0.5826 (new best)  eval 27.5s
+epoch 8/100  link=0.3338  lr=1e-03  train 94.3s  r_mean=0.333  r_max=0.954  w=[19.465,0.473]  val 0.6708  test 0.5908 (new best)  eval 27.6s
+epoch 9/100  link=0.2591  lr=1e-03  train 94.1s  r_mean=0.352  r_max=1.027  w=[21.600,0.478]  val 0.6794  test 0.5971 (new best)  eval 27.5s
+epoch 10/100  link=0.2080  lr=1e-03  train 94.2s  r_mean=0.368  r_max=1.039  w=[23.693,0.484]  val 0.6824  test 0.5984 (new best)  eval 26.7s
+epoch 11/100  link=0.1724  lr=1e-03  train 94.2s  r_mean=0.381  r_max=1.103  w=[25.752,0.490]  val 0.6837  test 0.5965 (new best)  eval 26.6s
+epoch 12/100  link=0.1468  lr=1e-03  train 94.2s  r_mean=0.394  r_max=1.130  w=[27.771,0.493]  val 0.6833  patience 1/5  eval 26.8s
+epoch 13/100  link=0.1273  lr=1e-03  train 94.2s  r_mean=0.405  r_max=1.150  w=[29.738,0.496]  val 0.6824  patience 2/5  eval 26.7s
+epoch 14/100  link=0.1127  lr=1e-03  train 94.2s  r_mean=0.415  r_max=1.168  w=[31.628,0.497]  val 0.6813  patience 3/5  eval 26.7s
+epoch 15/100  link=0.1012  lr=1e-03  train 94.2s  r_mean=0.424  r_max=1.170  w=[33.421,0.495]  val 0.6803  patience 4/5  eval 26.7s
+epoch 16/100  link=0.0926  lr=1e-03  train 94.1s  r_mean=0.432  r_max=1.170  w=[35.089,0.486]  val 0.6774  patience 5/5  eval 26.8s
+  restored best weights from epoch 11 (val 0.6837, test 0.5965)
+
+=== Final results ===
+  dataset:           YouTube
+  seed:              5
+  stopped_at_epoch:  11
+  best_val_mrr:      0.6837
+  best_test_mrr:     0.5965
+# finished=2026-09-15 12:22:22  rc=0
