@@ -48,10 +48,12 @@ class LinkPredHead(nn.Module):
             init = self.geom.random(self.num_nodes, self.d_emb, irange=self.INIT_IRANGE)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
-        # Two bias-free Linears, no nonlinearity between them, so W2 @ W1 is a single
+        # No nonlinearity between the two layers, so this collapses to a single
         # 1 x N_FEAT map. Default (random) init, left random.
-        self.mix_in = nn.Linear(self.NUM_FEATURES, self.SCORER_HIDDEN, bias=False)
-        self.mix_out = nn.Linear(self.SCORER_HIDDEN, 1, bias=False)
+        self.mix = nn.Sequential(
+            nn.Linear(self.NUM_FEATURES, self.SCORER_HIDDEN, bias=False),
+            nn.Linear(self.SCORER_HIDDEN, 1, bias=False),
+        )
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         nodes = tokens.nodes.clamp_min(0).clone()
@@ -78,4 +80,4 @@ class LinkPredHead(nn.Module):
         # d0_u is a per-query constant and the head is linear in it, so under softmax CE
         # its gradient is identically zero; it only becomes live under a pointwise loss.
         feats = torch.stack([-geo, d0_u, d0_v], dim=-1)
-        return self.mix_out(self.mix_in(feats)).squeeze(-1)
+        return self.mix(feats).squeeze(-1)

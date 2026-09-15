@@ -200,11 +200,11 @@ class Trainer:
             parts.append(f"temp={float(self.model.temperature):.3f}")
         if hasattr(self.model, "geo_temp"):
             parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
-        if hasattr(self.model, "mix_in") and hasattr(self.model, "mix_out"):
-            # The effective 1 x N_FEAT map, W2 @ W1 -- the only thing that affects the
-            # score. The two factor matrices are not separately meaningful.
-            eff = (self.model.mix_out.weight @ self.model.mix_in.weight).detach().flatten()
-            parts.append("w_eff=[" + ",".join(f"{v:.3f}" for v in eff.tolist()) + "]")
+        if hasattr(self.model, "mix"):
+            # The effective 1 x N_FEAT map: the product of the layer weights, which is the
+            # only thing that affects the score. The factors are not separately meaningful.
+            eff = self.model.mix[1].weight.detach() @ self.model.mix[0].weight.detach()
+            parts.append("w_eff=[" + ",".join(f"{v:.3f}" for v in eff.flatten().tolist()) + "]")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad
