@@ -48,12 +48,10 @@ class LinkPredHead(nn.Module):
             init = self.geom.random(self.num_nodes, self.d_emb, irange=self.INIT_IRANGE)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
-        # GELU between the layers. Without it the stack collapses to a single 1 x N_FEAT
-        # map -- 289 parameters with 3 degrees of freedom -- and can only weight the
-        # features, never relate them. Default (random) init, left random.
+        # No nonlinearity between the two layers, so this collapses to a single
+        # 1 x N_FEAT map. Default (random) init, left random.
         self.mix = nn.Sequential(
             nn.Linear(self.NUM_FEATURES, self.SCORER_HIDDEN, bias=False),
-            nn.GELU(),
             nn.Linear(self.SCORER_HIDDEN, 1, bias=False),
         )
 
@@ -79,8 +77,7 @@ class LinkPredHead(nn.Module):
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)
         d0_u = self.geom.dist0(p_u).unsqueeze(1).expand_as(geo)
         d0_v = self.geom.dist0(p_v)
-        # d0_u is a per-query constant. With the GELU the head is no longer linear in it,
-        # so it no longer cancels under softmax CE the way it did in the linear stack --
-        # it can now modulate the other channels rather than shifting the score.
+        # d0_u is a per-query constant and the head is linear in it, so under softmax CE
+        # its gradient is identically zero; it only becomes live under a pointwise loss.
         feats = torch.stack([-geo, d0_u, d0_v], dim=-1)
         return self.mix(feats).squeeze(-1)
