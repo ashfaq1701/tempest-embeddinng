@@ -869,3 +869,54 @@ def test_gradient_is_bounded_approaching_coincidence(k):
         m.dist(x, y).sum().backward()
         assert torch.isfinite(x.grad).all(), sep
         assert float(x.grad.abs().max()) < 10.0, (sep, float(x.grad.abs().max()))
+
+
+def test_dtype_radius_cap_is_the_precision_bound():
+    """r = sqrt(k) asinh(sqrt(2/eps)): where eps*sinh^2(r) reaches 2 and the
+    Minkowski cancellation stops resolving a unit distance."""
+    m = LorentzManifold()
+    cap = m.dtype_radius_cap(torch.float32)
+    eps = torch.finfo(torch.float32).eps
+    assert cap == pytest.approx(math.sqrt(m.k) * math.asinh(math.sqrt(2.0 / eps)))
+    assert cap == pytest.approx(9.0109, abs=1e-4)
+    assert eps * math.sinh(cap / math.sqrt(m.k)) ** 2 == pytest.approx(2.0, rel=1e-5)
+    # float64 is looser, and the cap must follow the dtype
+    assert LorentzManifold().dtype_radius_cap(torch.float64) == pytest.approx(19.0615, abs=1e-4)
+
+
+def test_dtype_radius_cap_is_cached():
+    m = LorentzManifold()
+    assert m._dtype_radius_cap is None
+    first = m.dtype_radius_cap(torch.float32)
+    assert m._dtype_radius_cap == first
+    # cached: a later dtype does not recompute
+    assert m.dtype_radius_cap(torch.float64) == first
+
+
+def test_projx_caps_radius_and_preserves_direction():
+    m = LorentzManifold()
+    cap = m.dtype_radius_cap(torch.float32)
+    x = torch.randn(16, 8)
+    x = x / x.norm(dim=-1, keepdim=True)
+    for r in (1.0, 8.0, 20.0, 40.0):
+        y = x * math.sinh(r)
+        py = m.projx(y)
+        r_out = torch.asinh(py.norm(dim=-1))
+        assert torch.isfinite(py).all()
+        assert float(r_out.max()) <= cap + 1e-4
+        if r <= cap:                      # inside the cap, projx is the identity
+            assert torch.allclose(py, y, rtol=1e-5, atol=1e-5)
+        else:                             # outside, pulled back along its own ray
+            assert float(r_out.min()) == pytest.approx(cap, abs=1e-3)
+        cos = torch.nn.functional.cosine_similarity(y, py, dim=-1)
+        assert float(cos.min()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_projx_handles_the_origin():
+    """A zero row has no ray to rescale along; it must survive untouched."""
+    m = LorentzManifold()
+    x = torch.zeros(3, 8)
+    x[1, 0] = 1.0
+    px = m.projx(x)
+    assert torch.isfinite(px).all()
+    assert torch.allclose(px, x)
