@@ -200,6 +200,12 @@ class Trainer:
             parts.append(f"temp={float(self.model.temperature):.3f}")
         if hasattr(self.model, "geo_temp"):
             parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
+        if hasattr(self.model, "mix"):
+            # There is no effective weight vector once the map is nonlinear. Log the
+            # per-feature input-weight norms -- how hard each feature drives the first
+            # layer -- and the residual's size relative to the -geo it corrects.
+            w = self.model.mix[0].weight.detach()
+            parts.append("|w_in|=[" + ",".join(f"{v:.3f}" for v in w.norm(dim=0).tolist()) + "]")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad
