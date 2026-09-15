@@ -29,6 +29,8 @@ class BagWeights(nn.Module):
 class LinkPredHead(nn.Module):
 
     INIT_IRANGE = 1e-3
+    NUM_FEATURES = 3
+    SCORER_HIDDEN = 32
 
     def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32, seed: int = 42):
         super().__init__()
@@ -46,7 +48,25 @@ class LinkPredHead(nn.Module):
             init = self.geom.random(self.num_nodes, self.d_emb, irange=self.INIT_IRANGE)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+        # Two Linears, NO nonlinearity between them, so this is mathematically a single
+        # Linear(3,1): W2 @ W1 is 1x3. Depth changes the optimisation dynamics, not the
+        # expressive power. Both layers are bias-free.
+        #
+        # Init. Every W1 row is [1,0,0] and W2 sums to 1, so the effective weight
+        # sum_j W2_j * W1_j is EXACTLY [1,0,0]: the score starts as the plain baseline
+        # -d_H with temperature 1, and the d0_u / d0_v channels start exactly inert.
+        # W2 carries small jitter purely to break symmetry -- dL/dW1[j,:] is proportional
+        # to W2_j, so unequal W2_j makes the hidden rows diverge. With W2 uniform the rows
+        # would receive identical gradients forever and the layer would stay rank-1, i.e.
+        # SCORER_HIDDEN identical copies of one unit.
+        self.mix_in = nn.Linear(self.NUM_FEATURES, self.SCORER_HIDDEN, bias=False)
+        self.mix_out = nn.Linear(self.SCORER_HIDDEN, 1, bias=False)
+        with torch.no_grad():
+            row = torch.zeros(self.NUM_FEATURES)
+            row[0] = 1.0
+            self.mix_in.weight.copy_(row.expand(self.SCORER_HIDDEN, -1))
+            w2 = 1.0 + 0.01 * torch.randn(self.SCORER_HIDDEN)
+            self.mix_out.weight.copy_((w2 / w2.sum()).view(1, -1))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         nodes = tokens.nodes.clamp_min(0).clone()
@@ -68,4 +88,12 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)
-        return self.geo_temp * (-geo)
+        d0_u = self.geom.dist0(p_u).unsqueeze(1).expand_as(geo)
+        d0_v = self.geom.dist0(p_v)
+        # NOTE d0_u is a per-query CONSTANT and this head is linear in it, so under the
+        # softmax CE loss its gradient is identically zero (measured 2.05e-08 on this
+        # suite: softmax row-sums of dL/ds vanish, so any per-row-constant channel gets
+        # nothing). The d0_u channel is inert under CE by construction, not by init, and
+        # only becomes live under a pointwise loss such as BCE.
+        feats = torch.stack([-geo, d0_u, d0_v], dim=-1)
+        return self.mix_out(self.mix_in(feats)).squeeze(-1)
