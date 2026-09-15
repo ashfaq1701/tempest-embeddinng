@@ -29,6 +29,7 @@ class BagWeights(nn.Module):
 class LinkPredHead(nn.Module):
 
     INIT_IRANGE = 1e-3
+    NUM_FEATURES = 2
 
     def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32, seed: int = 42):
         super().__init__()
@@ -46,7 +47,12 @@ class LinkPredHead(nn.Module):
             init = self.geom.random(self.num_nodes, self.d_emb, irange=self.INIT_IRANGE)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+        # Bias-free Linear over [-d_H, log1p(cand_popularity)], init [1, 0]: the score
+        # starts as the plain baseline -d_H and the popularity channel starts INERT, so
+        # it can only earn weight rather than capturing the score at init.
+        self.mix = nn.Linear(self.NUM_FEATURES, 1, bias=False)
+        with torch.no_grad():
+            self.mix.weight.copy_(torch.tensor([[1.0, 0.0]]))
 
     def pool(self, tokens: WalkTokens, emb: torch.Tensor) -> torch.Tensor:
         nodes = tokens.nodes.clamp_min(0).clone()
@@ -68,4 +74,7 @@ class LinkPredHead(nn.Module):
         c = p_v.shape[0] // b
         p_v = p_v.view(b, c, d)
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)
-        return self.geo_temp * (-geo)
+        # log1p, not log: get_candidate_popularity returns 0 for a node with no prior
+        # edge, and log(0) = -inf would NaN the first batch.
+        pop = torch.log1p(cand_tokens.cand_popularity.to(geo.dtype)).view(b, c)
+        return self.mix(torch.stack([-geo, pop], dim=-1)).squeeze(-1)
