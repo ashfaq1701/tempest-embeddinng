@@ -22,6 +22,7 @@ class WalkTokens:
     mask: torch.Tensor                              # [Q, T]   bool, real slots (nodes != -1), incl. seed
     seed_mask: torch.Tensor                         # [Q, T]   bool, ONLY the seed's walk-origin slot
     edge_features: Optional[torch.Tensor] = None    # [Q, T, d_ef]  seed slot + padding zeroed; None if no EF
+    cand_recency: Optional[torch.Tensor] = None     # [Q]      cutoff - t_last(seed); cutoff+1 when cold
 
 
 def build_query_walk_tokens(
@@ -44,7 +45,9 @@ def build_query_walk_tokens(
         t = num_walks_per_node * max_walk_len
         empty_i = torch.empty((0, t), dtype=torch.int64, device=device)
         empty_b = torch.empty((0, t), dtype=torch.bool, device=device)
-        return WalkTokens(seeds_t, cutoffs_t, empty_i, empty_i, empty_i, empty_b, empty_b)
+        empty_1 = torch.empty((0,), dtype=torch.int64, device=device)
+        return WalkTokens(seeds_t, cutoffs_t, empty_i, empty_i, empty_i, empty_b, empty_b,
+                          None, empty_1)
 
     wd = walk_gen.walks_for_nodes(
         np.ascontiguousarray(seeds_t.cpu().numpy(), dtype=np.int32),
@@ -81,6 +84,12 @@ def build_query_walk_tokens(
         real = (node_mask & (ages != 0)).unsqueeze(-1)
         edge_features = (ef * real).reshape(q, k * length, d_ef)                        # [Q, T, d_ef]
 
+    seeds_np = np.ascontiguousarray(seeds_t.cpu().numpy(), dtype=np.int32)
+    cutoffs_np = np.ascontiguousarray(cutoffs_t.cpu().numpy(), dtype=np.int64)
+    recency = torch.from_numpy(
+        np.ascontiguousarray(walk_gen.get_candidate_recency(seeds_np, cutoffs_np))
+    ).to(device=device, dtype=torch.int64)
+
     return WalkTokens(
         seeds_t,
         cutoffs_t,
@@ -90,4 +99,5 @@ def build_query_walk_tokens(
         node_mask.reshape(q, -1),
         seed_mask.reshape(q, -1),
         edge_features,
+        recency,
     )
