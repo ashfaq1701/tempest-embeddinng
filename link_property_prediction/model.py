@@ -25,8 +25,6 @@ class BagWeights(nn.Module):
                                  nn.Linear(self.hidden, 1))
 
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
-        # A seed whose walk found no history gets itself in slot 0, so every row has at
-        # least one valid token and the midpoint never sees an empty bag.
         nodes = tokens.nodes.clamp_min(0).clone()
         valid = tokens.mask.clone()
         cold = ~valid.any(dim=-1)
@@ -55,9 +53,6 @@ class LinkPredHead(nn.Module):
         self.geom = LorentzManifold()
         torch.manual_seed(seed)
 
-        # Intrinsic coordinates: a point IS x' in R^d. The time coordinate is
-        # derived in float64 inside the manifold and never stored, so the
-        # embedding table is d wide, not d+1.
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
             init = self.geom.random(self.num_nodes, self.d_emb, irange=self.INIT_IRANGE)
