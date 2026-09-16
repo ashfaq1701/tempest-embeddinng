@@ -8,11 +8,19 @@ from .walk_tokens import WalkTokens
 
 
 class BagWeights(nn.Module):
-    """One query's walk bag -> one point on the manifold.
+    """One query's walk bag -> one point on the manifold, CONDITIONED ON THE OTHER SIDE.
 
-    softmax over the bag from [log1p(age), hop, radius], then the Lorentzian midpoint.
-    `rad` is detached: geometric features describe the bag, they are not a second
-    gradient path into E.
+    softmax over the bag from [log1p(age), hop, radius, d(token, other)], then the
+    Lorentzian midpoint. Identical to the unconditioned version except for the fourth
+    feature, which makes the weights -- and so the pooled point -- differ per counterpart.
+
+    That is cross-attention in the manifold: -d(., .) is the score kernel, the softmax is
+    the attention distribution, and midpoint() is the manifold's weighted sum, since a
+    convex combination of hyperboloid points is not itself a hyperboloid point.
+
+    `rad` is detached: geometric features describe the bag, they are not a second gradient
+    path into E. `cross` is NOT detached -- it is the query-dependent term and the only
+    route by which the other side reaches the weights.
     """
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32):
@@ -20,11 +28,12 @@ class BagWeights(nn.Module):
         self.geom = geom
         self.E = E
         self.hidden = int(hidden_dim)
-        self.n_feat = 3
+        self.n_feat = 4
         self.net = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU(),
                                  nn.Linear(self.hidden, 1))
 
-    def forward(self, tokens: WalkTokens) -> torch.Tensor:
+    def forward(self, tokens: WalkTokens, other_ids: torch.Tensor) -> torch.Tensor:
+        """`tokens` has Q rows, `other_ids` is [Q, M] counterpart nodes -> [Q, M, d]."""
         nodes = tokens.nodes.clamp_min(0).clone()
         valid = tokens.mask.clone()
         cold = ~valid.any(dim=-1)
@@ -33,13 +42,21 @@ class BagWeights(nn.Module):
             valid[cold, 0] = True
 
         x = F.embedding(nodes, self.E.weight)
-        age = torch.log1p(tokens.ages.clamp_min(0).to(x.dtype)).unsqueeze(-1)
-        pos = tokens.positions.unsqueeze(-1).to(x.dtype)
-        rad = self.geom.dist0(x.detach()).unsqueeze(-1)
-        feat = torch.cat([age, pos, rad], dim=-1).to(x.dtype)
+        e = F.embedding(other_ids, self.E.weight)
+        cross = self.geom.dist(x.unsqueeze(-3), e.unsqueeze(-2))
+
+        age = torch.log1p(tokens.ages.clamp_min(0).to(x.dtype)).unsqueeze(-2).expand(cross.shape)
+        pos = tokens.positions.to(x.dtype).unsqueeze(-2).expand(cross.shape)
+        rad = self.geom.dist0(x.detach()).unsqueeze(-2).expand(cross.shape)
+        feat = torch.stack([age, pos, rad, cross], dim=-1).to(x.dtype)
+
         logits = self.net(feat).squeeze(-1)
-        w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
-        return self.geom.midpoint(x, w)
+        keep = valid.unsqueeze(-2).expand(cross.shape)
+        w = torch.softmax(logits.masked_fill(~keep, float("-inf")), dim=-1)
+
+        m = cross.shape[-2]
+        xe = x.unsqueeze(-3).expand(x.shape[:-2] + (m,) + x.shape[-2:])
+        return self.geom.midpoint(xe, w)
 
 
 class LinkPredHead(nn.Module):
@@ -63,10 +80,12 @@ class LinkPredHead(nn.Module):
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        p_u = self.bag_weights(src_tokens)
-        p_v = self.bag_weights(cand_tokens)
-        b, d = p_u.shape
-        c = p_v.shape[0] // b
-        p_v = p_v.view(b, c, d)
-        geo = self.geom.dist(p_u.unsqueeze(1), p_v)
+        b = src_tokens.nodes.shape[0]
+        c = cand_tokens.nodes.shape[0] // b
+
+        p_uv = self.bag_weights(src_tokens, cand_tokens.seeds.view(b, c))
+        src_ids = src_tokens.seeds.repeat_interleave(c).unsqueeze(-1)
+        p_vu = self.bag_weights(cand_tokens, src_ids).view(b, c, -1)
+
+        geo = self.geom.dist(p_uv, p_vu)
         return self.geo_temp * (-geo)
