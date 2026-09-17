@@ -84,13 +84,6 @@ class LinkPredHead(nn.Module):
 
         self.bag_weights = BagWeights(self.geom, self.E, hidden_dim)
 
-        # Learned per-node popularity scalar, zero-init: the channel contributes exactly 0
-        # at step 0, so adding it cannot perturb the starting point. Rides at FIXED unit
-        # weight -- the model sharpens the geometry via geo_temp while popularity sits
-        # alongside at a constant scale. Recovered from fd1cfa9.
-        self.pop_bias = nn.Embedding(self.num_nodes, 1)
-        nn.init.zeros_(self.pop_bias.weight)
-
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
@@ -105,5 +98,4 @@ class LinkPredHead(nn.Module):
         p_vu = self.bag_weights(cand_tokens, src_ids).view(b, c, -1)         # [b, c, d]
 
         duv = self.geom.dist(p_uv, p_vu)
-        v_nodes = cand_tokens.seeds.view(b, c)                               # [b, c]
-        return self.geo_temp * (-duv) + self.pop_bias(v_nodes).squeeze(-1)
+        return self.geo_temp * (-duv)
