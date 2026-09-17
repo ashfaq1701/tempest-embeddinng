@@ -1,140 +1,26 @@
-# Runtime dependencies.
-#
-# ┌─ IMPORTANT: torch is PINNED to 2.7.1. This is the first PyPI default
-# │  that ships with `nvidia-cuda-runtime-cu12>=12.6`, which is what
-# │  `tempest-rw>=1.0.1` requires. torch 2.6.0 looks like the
-# │  natural "cu126" pairing but its PyPI metadata actually pins to
-# │  `nvidia-cuda-runtime-cu12==12.4.127`, which collides with the
-# │  tempest-rw constraint at pip-resolve time:
-# │      ERROR: Cannot install ... because these package versions have
-# │      conflicting dependencies.
-# │          torch 2.6.0 depends on nvidia-cuda-runtime-cu12==12.4.127
-# │          tempest-rw 1.0.0 depends on nvidia-cuda-runtime-cu12>=12.6
-# │  torch 2.7.x bundles a >=12.6 runtime and resolves cleanly. Install
-# │  the cu128 BUILD of that pinned version (see Step 2) -- the version
-# │  pin and the CUDA build are two separate choices.
-# │
-# │  The CUDA build is pinned too, as the local version `+cu128`, and the
-# │  index that serves it is declared at the foot of this file. So a plain
-# │  `pip install -r requirements.txt` gets the right wheel and there is no
-# │  separate torch step. Do NOT relax the pin to a bare `torch==2.7.1`:
-# │  that resolves to the CPU build on PyPI, training silently falls back
-# │  to CPU, and you get this at startup --
-# │      UserWarning: CUDA initialization: The NVIDIA driver on your
-# │      system is too old (found version XXXXX). ...
-# │      device: cpu
-# │  which is the most common installation pitfall on shared servers.
-# └──
-#
-# Step 1 — check your driver's supported CUDA runtime:
-#
-#     nvidia-smi      # top-right of the header shows e.g. "CUDA Version: 12.6"
-#
-# Step 2 — install everything, in one command, in your venv:
-#
-#     pip install -r requirements.txt
-#
-# There is no separate torch step. The `--extra-index-url` line at the
-# bottom of this file points pip at the cu128 wheel index, and the pin is
-# the exact build `torch==2.7.1+cu128`, so the right wheel is selected
-# automatically. PyPI stays the primary index and serves everything else.
-#
-# OVERRIDING THE BUILD (not needed on this cluster). The `+cu128` local
-# version is what selects the CUDA build, so changing it means editing two
-# lines together -- the pin and the index URL:
-#
-#     # A40 only -- will NOT run on the RTX nodes, see the sm_120 note below:
-#     torch==2.7.1+cu126     --extra-index-url .../whl/cu126
-#
-#     # CUDA 11.8 (legacy):
-#     torch==2.7.1+cu118     --extra-index-url .../whl/cu118
-#
-#     # no GPU / CPU-only -- note the cpu index uses a BARE version, no local
-#     # suffix, so drop the `+...` part entirely:
-#     torch==2.7.1           --extra-index-url .../whl/cpu
-#
-# Step 3 — verify (one-liner; must print True + your GPU name before
-# launching scripts/train_link_property_prediction.py with --use-gpu):
-#
-#     python -c "import torch; print(torch.__version__, torch.cuda.is_available(), \
-#                torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
-#
-# Expected output on an A40 node:
-#     2.7.1+cu128 True NVIDIA A40
-# and on an RTX node:
-#     2.7.1+cu128 True NVIDIA RTX PRO 6000 Blackwell Server Edition
-#
-# If the suffix is anything other than `+cu128` — a bare `2.7.1`, or a
-# cu126/cu13x build — then this file was not what installed torch: either
-# something overwrote it afterwards, or the pin was edited. Reinstall with
-# `pip install --force-reinstall -r requirements.txt`. The exact `+cu128`
-# pin is what makes that recoverable.
-#
-# ───────────────────────────────────────────────────────────────────
-# Why cu128 and not cu126 (measured 2026-09-17 on artemis-rtx-03).
-#
-# The RTX nodes are `NVIDIA RTX PRO 6000 Blackwell Server Edition`,
-# compute capability sm_120, 96 GB, driver 610.57.04. A cu126 torch dies
-# on the first kernel launch there:
-#
-#     NVIDIA RTX PRO 6000 Blackwell Server Edition with CUDA capability
-#     sm_120 is not compatible with the current PyTorch installation.
-#     The current PyTorch install supports CUDA capabilities
-#     sm_50 sm_60 sm_70 sm_75 sm_80 sm_86 sm_90
-#     ...
-#     RuntimeError: CUDA error: no kernel image is available for
-#     execution on the device
-#
-# There is no runtime workaround: `libtorch_cuda.so` in the cu126 wheel
-# carries cubins for sm_50..sm_90 and ZERO PTX (`cuobjdump -lptx` is
-# empty), so the driver has nothing to JIT from. The cu128 wheel carries
-# cubins for sm_75, sm_80, sm_86, sm_89, sm_90, sm_100, sm_120 plus
-# compute_120 PTX -- it covers the A40s and the Blackwell nodes with one
-# install. It drops sm_50/sm_60/sm_70, none of which exist here.
-#
-# tempest-rw does NOT need rebuilding for sm_120. Its extension ships
-# sm_52 cubins plus 12 PTX files, and PTX is forward-compatible: that JIT
-# path is already how it runs on the A40s, since it has no sm_86 cubin
-# either. Verified by import on the Blackwell node.
-#
-# CROSS-GPU RESULTS ARE NOT LIKE-FOR-LIKE. Every baseline in CLAUDE.md,
-# and the ~0.0002 reproducibility band, were measured on A40s. A
-# different architecture and a different CUDA build both sit upstream of
-# the numerics. Re-validate one known config (GoogleLocal seed 5, d64 k5
-# lr1e-3 -> 0.6535) on an RTX node before trusting an A/B run there.
-#
-# ───────────────────────────────────────────────────────────────────
-# Note on py-tgb vs tgb. The Temporal Graph Benchmark library
-# publishes on PyPI as `py-tgb` but imports as `tgb`. There is a
-# separate, unrelated PyPI package literally named `tgb` (currently
-# 1.2.0) — do NOT install that one. Pinned to >=2.2.0: that's the
-# version the eval protocol was verified against (tgbl-wiki v2: 999
-# sampled negatives per positive = exhaustive over the destination
-# space).
+# Runtime dependencies.  Install:  pip install -r requirements.txt
 
 numpy>=1.24,<3
-# Selected by the --extra-index-url at the foot of this file. The `+cu128`
-# local version IS the build selector -- see Step 2 to override it.
+
+# torch: the version AND the build are pinned. 2.7.1 is the first release
+# bundling nvidia-cuda-runtime-cu12>=12.6, which tempest-rw requires. The
+# +cu128 build is the only one that runs on both the A40s (sm_86) and the
+# RTX PRO 6000 Blackwell nodes (sm_120); cu126 has no sm_120 kernels and no
+# PTX to JIT from. A bare `torch==2.7.1` resolves to the CPU build on PyPI.
 torch==2.7.1+cu128
+
+# py-tgb imports as `tgb`. The PyPI package named `tgb` is unrelated -- do
+# not install it.
 py-tgb>=2.2.0
-# pandas is PINNED to <3. TGB's first-time preprocessing
-# (tgb.utils.pre_process.load_edgelist_*) mutates `df.iloc[:, k].values`
-# IN PLACE (e.g. `dst += int(src.max()) + 1`). pandas 3.0 makes
-# Copy-on-Write MANDATORY — it cannot be turned off (set_option /
-# option_context for `mode.copy_on_write` are accepted but are no-ops),
-# so `.values` is always read-only and the in-place op raises
-# "ValueError: output array is read-only" during LinkPropPredDataset
-# construction (seen on a py3.11 / pandas 3.0.3 / numpy 2.4.6 box). pandas
-# 2.x defaults CoW off and loads fine. Keep pandas <3 until TGB is
-# pandas-3.0-ready (do NOT install pandas 3.x in the env).
+
+# pandas 3 makes Copy-on-Write mandatory; TGB's preprocessing mutates
+# `df.iloc[:, k].values` in place and raises "output array is read-only".
 pandas>=2,<3
+
 tempest-rw>=1.0.6
 prodigyopt>=1.1
 geoopt>=0.5.0
 tgb-seq
 
-# PyPI stays primary; this index is consulted as well, and is where the
-# `+cu128` local version of torch lives. It is scoped in practice by the
-# exact pin above: no other requirement in this file has a matching
-# artefact on the pytorch index, so nothing else can be pulled from it.
+# Serves the +cu128 build of torch; PyPI stays primary for everything else.
 --extra-index-url https://download.pytorch.org/whl/cu128
