@@ -38,25 +38,32 @@ class BagWeights(nn.Module):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
 
-        # Live for the midpoint, detached for the features.
+        # Three lookups. Live for the midpoint, detached for the features.
         x_tokens = F.embedding(nodes, self.E.weight)                         # [Q, T, d]
-        xt = x_tokens.detach()
+        xt = x_tokens.detach()                                               # [Q, T, d]
+        x_seed = F.embedding(tokens.seeds, self.E.weight).detach()           # [Q, d]
         x_other = F.embedding(other_ids, self.E.weight).detach()             # [Q, M, d]
 
-        d_tok_oth = self.geom.dist(xt.unsqueeze(-3), x_other.unsqueeze(-2))  # [Q, M, T]
-        shape = d_tok_oth.shape
-
-        age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype)).unsqueeze(-2).expand(shape)
-        pos = tokens.positions.to(xt.dtype).unsqueeze(-2).expand(shape)
-        d0_tok = self.geom.dist0(xt).unsqueeze(-2).expand(shape)             # [Q, 1, T]
-        x_seed = F.embedding(tokens.seeds, self.E.weight).detach()           # [Q, d]
-        d0_seed = self.geom.dist0(x_seed)[..., None, None].expand(shape)     # [Q, 1, 1]
-        d0_oth = self.geom.dist0(x_other).unsqueeze(-1).expand(shape)        # [Q, M, 1]
+        # All the geometry, each in its natural shape: three radii, two pair distances.
+        d0_tok = self.geom.dist0(xt)                                         # [Q, T]
+        d0_seed = self.geom.dist0(x_seed)                                    # [Q]
+        d0_oth = self.geom.dist0(x_other)                                    # [Q, M]
         d_tok_seed = self.geom.dist(xt, x_seed.unsqueeze(-2))                # [Q, T]
-        d_tok_seed = d_tok_seed.unsqueeze(-2).expand(shape)                  # [Q, 1, T]
+        d_tok_oth = self.geom.dist(xt.unsqueeze(-3), x_other.unsqueeze(-2))  # [Q, M, T]
 
-        feat = torch.stack([age, pos, d0_tok, d0_seed, d0_oth, d_tok_seed, d_tok_oth],
-                           dim=-1).to(xt.dtype)
+        # Broadcast every feature to [Q, M, T] and stack.
+        shape = d_tok_oth.shape
+        age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, T]
+        pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
+        feat = torch.stack([
+            age.unsqueeze(-2).expand(shape),
+            pos.unsqueeze(-2).expand(shape),
+            d0_tok.unsqueeze(-2).expand(shape),
+            d0_seed[..., None, None].expand(shape),
+            d0_oth.unsqueeze(-1).expand(shape),
+            d_tok_seed.unsqueeze(-2).expand(shape),
+            d_tok_oth,
+        ], dim=-1).to(xt.dtype)
         logits = self.net(feat).squeeze(-1)                                  # [Q, M, T]
         keep = valid.unsqueeze(-2).expand(shape)
         w = torch.softmax(logits.masked_fill(~keep, float("-inf")), dim=-1)
