@@ -12,7 +12,7 @@ class BagWeights(nn.Module):
 
     The pooling weights depend on WHO is being scored: token t gets a different weight
     against counterpart m than against counterpart m'. Features per (m, t) pair are
-    [log1p(age), hop, d0(token), d0(other), d(token, other)], softmax over the bag, then
+    [log1p(age), hop, d0(token), d(token, seed), d(token, other)], softmax over the bag, then
     the Lorentzian midpoint -- so the bag collapses to [Q, M, d], not [Q, d].
 
     Geometric features are detached; the midpoint is NOT. That split is load-bearing:
@@ -48,9 +48,11 @@ class BagWeights(nn.Module):
         age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype)).unsqueeze(-2).expand(shape)
         pos = tokens.positions.to(xt.dtype).unsqueeze(-2).expand(shape)
         d0_tok = self.geom.dist0(xt).unsqueeze(-2).expand(shape)             # [Q, 1, T]
-        d0_oth = self.geom.dist0(x_other).unsqueeze(-1).expand(shape)        # [Q, M, 1]
+        x_seed = F.embedding(tokens.seeds, self.E.weight).detach()           # [Q, d]
+        d_tok_seed = self.geom.dist(xt, x_seed.unsqueeze(-2))                # [Q, T]
+        d_tok_seed = d_tok_seed.unsqueeze(-2).expand(shape)                  # [Q, 1, T]
 
-        feat = torch.stack([age, pos, d0_tok, d0_oth, d_tok_oth], dim=-1).to(xt.dtype)
+        feat = torch.stack([age, pos, d0_tok, d_tok_seed, d_tok_oth], dim=-1).to(xt.dtype)
         logits = self.net(feat).squeeze(-1)                                  # [Q, M, T]
         keep = valid.unsqueeze(-2).expand(shape)
         w = torch.softmax(logits.masked_fill(~keep, float("-inf")), dim=-1)
