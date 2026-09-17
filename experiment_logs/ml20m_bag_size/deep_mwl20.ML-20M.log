@@ -1,0 +1,98 @@
+# ML-20M BAG SIZE -- DEEP: 5 walks of length 20.
+# num_walks_per_node=5 max_walk_len=20  (control: 5 / 5, bag_n ~20, test 0.2429)
+# d_emb=64 k_train=5 lr=1e-3 seed=5 patience 8 --is-bipartite
+# branch=exp/escape-instrumentation commit=44413a26 (DETACHED WORKTREE, pinned, clean)
+#
+# THIS COMMIT IS MASTER. With TEMPEST_POOL_{FEAT,LAYERS,F4} unset the model is
+#   bit-identical to master: forward hash f62e1260cdbfb833, grad_E 4fbd9a1e0ec7a291,
+#   pooler init 6673dae38ebc39d1 on both refs.  The extra code is a no_grad stats
+#   stash and an opt-in checkpoint path, so the run is master plus free telemetry
+#   (pool_eff, bag_n, dE, r50/r90/r99).
+#
+# WHY.  ML-20M is the only dataset of the eight that cannot fit its own training
+# objective: link falls 1.6564->0.0776 on YouTube (95%), 1.7321->0.0086 on
+# GoogleLocal (100%), but only 0.8493->0.4320 on ML-20M (49%), still dropping
+# 1.2%/epoch when patience kills it at ep12.  Its link at the val peak is 0.4660,
+# five times any other dataset's.  Under-fitting, not over-fitting.
+#
+# THE HYPOTHESIS.  The bag is too small a sample of the neighbourhood.  ML-20M has
+# 127 edges/node (Taobao 8.6, Yelp 9.8) and a mean reachable walk length of 47.4,
+# but we sample wpn=5 walks of len=5 -> bag_n ~20.  98.6% of its walks are cut by
+# the mwl=5 cap.  If the bag under-samples, enlarging it lowers the link floor.
+#
+# TWO AXES, MATCHED BAG SIZE.  bag ~= wpn * mwl, so these two arms quadruple the
+# bag by orthogonal routes and cost the same number of walk steps:
+#   deep_mwl20  wpn 5  mwl 20   <- more history per walk
+#   wide_wpn20  wpn 20 mwl 5    <- more independent samples of recent history
+# Control is the shipped run (wpn 5, mwl 5, test 0.2429), not re-run.
+# If depth wins it is history; if breadth wins it is sampling noise; if they tie
+# it is bag size alone and neither axis matters.
+#
+# READ link AT ep3-4, NOT THE MRR.  Control link: ep1 0.8493, ep2 0.5644,
+# ep3 0.5238, ep4 0.5034.  The hypothesis predicts a visibly lower floor within
+# four epochs.  If neither arm beats the control's link by ep4 the bag is not the
+# constraint and this is dead -- kill it and move to the d_emb axis.
+set -u
+cd /its/home/ms2420/wt-ml20m-bag
+# started=2026-09-17 04:23:42
+# cmd: ./venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq --dataset ML-20M --d-emb 64 --k-train 5 --num-walks-per-node 5 --max-walk-len 20 --lr 1e-3 --seed 5 --early-stop-patience 8 --is-bipartite --use-gpu --use-gpu-tempest
+=== tempest-embedding training ===
+dataset: ML-20M
+device:  cuda
+seed:    5
+loaded (tgb-seq) in 2.7s
+  num_nodes:     110,432
+  neg_pool:      9,646 unique destinations (bipartite)
+  train edges:   14,000,091
+  val edges:     364,943
+  test edges:    129,291
+
+=== Config ===
+  num_nodes: 110432
+  dst_pool: <ndarray shape=(9646,) dtype=int32>
+  d_emb: 64
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 20
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 100
+  early_stop_patience: 8
+  seed: 5
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:            7,067,648
+  head params:              162
+  TOTAL trainable:    7,067,810
+
+=== Training ===
+  Ingested full graph into Tempest: 14,494,325 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=0.8545  lr=1e-03  train 2074.7s  r_mean=0.217  r_max=3.187  r50=0.043  r90=0.265  r99=2.647  dE=0.00000  geo_temp=4.747  pool_eff=6.9348  pool_ent=0.4205  pool_max=0.1815  logit_sd=18.9333  bag_n=96.5586  val 0.2297  test 0.2105 (new best)  eval 181.3s
+epoch 2/100  link=0.6394  lr=1e-03  train 2741.2s  r_mean=0.257  r_max=4.321  r50=0.077  r90=0.351  r99=2.681  dE=0.12949  geo_temp=8.840  pool_eff=10.0828  pool_ent=0.5044  pool_max=0.1236  logit_sd=17.7235  bag_n=97.1758  val 0.2612  test 0.2329 (new best)  eval 180.2s
+
+# KILLED at ep2 by the operator, 2026-09-17 05:52:51.
+#
+# I had said I would judge this arm at ep3.  I am killing it one epoch early and
+# saying so rather than quietly moving the line.  The reasons:
+#   1. Two epochs of EXACT val parity with the control -- 0.2297 vs 0.2303, then
+#      0.2612 vs 0.2612.  Not a slow start; a dead flat match.
+#   2. link is WORSE than the control at both epochs (0.8545 vs 0.8493, 0.6394 vs
+#      0.5644).  The ep3 falsifier was link <= 0.5238; from 0.6394 that needs an 18%
+#      drop in one epoch where the control managed 7%.
+#   3. The contrast this arm existed to provide is ALREADY MEASURED and stable:
+#      at matched bag size (96.6 vs 99.7 tokens) the pooler keeps ~40 effective
+#      tokens from 20 short walks but only 6.9-10.1 from 5 long walks.  Depth is
+#      discarded by the pooler at the point of pooling.
+#   4. 2741 s/epoch, 11.3x the control and 2.3x the wide arm.  Each further epoch
+#      costs 46 min that the wide arm and the YouTube rad arm can use.
+#
+# CAVEAT, recorded honestly: pool_eff DID rise 6.93 -> 10.08, so the pooler is
+# slowly learning to use more of the deep bag.  A much longer run might eventually
+# exploit depth.  This arm does not rule that out -- it rules out depth being
+# competitive with breadth at equal bag size and equal wall-clock.
