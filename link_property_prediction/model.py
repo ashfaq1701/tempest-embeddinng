@@ -12,8 +12,7 @@ class BagWeights(nn.Module):
 
     The pooling weights depend on WHO is being scored: token t gets a different weight
     against counterpart m than against counterpart m'. Features per (m, t) pair are
-    [log1p(age), hop, d0(token), d0(seed), d0(other), d(token, seed), d(token, other)],
-    softmax over the bag, then
+    [log1p(age), hop, d(token, seed), d(token, other)], softmax over the bag, then
     the Lorentzian midpoint -- so the bag collapses to [Q, M, d], not [Q, d].
 
     Geometric features are detached; the midpoint is NOT. That split is load-bearing:
@@ -25,7 +24,7 @@ class BagWeights(nn.Module):
         self.geom = geom
         self.E = E
         self.hidden = int(hidden_dim)
-        self.n_feat = 7
+        self.n_feat = 4
         self.net = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU(),
                                  nn.Linear(self.hidden, 1))
 
@@ -44,10 +43,7 @@ class BagWeights(nn.Module):
         x_seed = F.embedding(tokens.seeds, self.E.weight).detach()           # [Q, d]
         x_other = F.embedding(other_ids, self.E.weight).detach()             # [Q, M, d]
 
-        # All the geometry, each in its natural shape: three radii, two pair distances.
-        d0_tok = self.geom.dist0(xt)                                         # [Q, T]
-        d0_seed = self.geom.dist0(x_seed)                                    # [Q]
-        d0_oth = self.geom.dist0(x_other)                                    # [Q, M]
+        # All the geometry, each in its natural shape: two pair distances, no radii.
         d_tok_seed = self.geom.dist(xt, x_seed.unsqueeze(-2))                # [Q, T]
         d_tok_oth = self.geom.dist(xt.unsqueeze(-3), x_other.unsqueeze(-2))  # [Q, M, T]
 
@@ -58,9 +54,6 @@ class BagWeights(nn.Module):
         feat = torch.stack([
             age.unsqueeze(-2).expand(shape),
             pos.unsqueeze(-2).expand(shape),
-            d0_tok.unsqueeze(-2).expand(shape),
-            d0_seed[..., None, None].expand(shape),
-            d0_oth.unsqueeze(-1).expand(shape),
             d_tok_seed.unsqueeze(-2).expand(shape),
             d_tok_oth,
         ], dim=-1).to(xt.dtype)
