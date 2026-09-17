@@ -10,7 +10,9 @@
 # │      conflicting dependencies.
 # │          torch 2.6.0 depends on nvidia-cuda-runtime-cu12==12.4.127
 # │          tempest-rw 1.0.0 depends on nvidia-cuda-runtime-cu12>=12.6
-# │  torch 2.7.x bundles the cu126 runtime and resolves cleanly.
+# │  torch 2.7.x bundles a >=12.6 runtime and resolves cleanly. Install
+# │  the cu128 BUILD of that pinned version (see Step 2) -- the version
+# │  pin and the CUDA build are two separate choices.
 # │
 # │  If you run `pip install -r requirements.txt` without first selecting
 # │  a wheel index, pip will pull the CPU build of 2.7.1 from PyPI. To
@@ -28,19 +30,27 @@
 #
 #     nvidia-smi      # top-right of the header shows e.g. "CUDA Version: 12.6"
 #
-# Step 2 — install torch==2.7.1 with the matching CUDA wheel (in your venv):
+# Step 2 — install torch==2.7.1 with the matching CUDA wheel (in your venv).
 #
-#     # driver supports CUDA 12.6 (e.g. A40 + driver >= 560):
-#     pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu126
+#     ON THIS CLUSTER, USE cu128. It is the only build that runs on BOTH the
+#     A40 nodes (sm_86) and the RTX PRO 6000 Blackwell nodes (sm_120):
 #
-#     # driver supports CUDA 12.8 (e.g. driver >= 570):
 #     pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+#
+#     # A40 only -- will NOT run on the RTX nodes, see the sm_120 note below:
+#     pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu126
 #
 #     # driver supports CUDA 11.8 (legacy):
 #     pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu118
 #
 #     # no GPU / CPU-only:
 #     pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+#
+# The pin stays at the plain `torch==2.7.1` below rather than `2.7.1+cu128`.
+# A local version like `+cu128` does not exist on PyPI, so pinning it would
+# make `pip install -r requirements.txt` fail for anyone who has not selected
+# the pytorch index first, and would remove the cpu/cu118 paths entirely. The
+# CUDA build is chosen by the INDEX in this step, not by the pin.
 #
 # Step 3 — install the rest:
 #
@@ -52,12 +62,47 @@
 #     python -c "import torch; print(torch.__version__, torch.cuda.is_available(), \
 #                torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
 #
-# Expected output on a cu126 host:
-#     2.7.1+cu126 True NVIDIA A40
+# Expected output on an A40 node:
+#     2.7.1+cu128 True NVIDIA A40
+# and on an RTX node:
+#     2.7.1+cu128 True NVIDIA RTX PRO 6000 Blackwell Server Edition
 #
 # If you see `2.X.Y+cu130` or any cu13x suffix, pip pulled an unpinned
-# torch from a non-matching index — re-run Step 2 with the cu126 (or
+# torch from a non-matching index — re-run Step 2 with the cu128 (or
 # matching) index. The `==2.7.1` pin here is what makes that recoverable.
+#
+# ───────────────────────────────────────────────────────────────────
+# Why cu128 and not cu126 (measured 2026-09-17 on artemis-rtx-03).
+#
+# The RTX nodes are `NVIDIA RTX PRO 6000 Blackwell Server Edition`,
+# compute capability sm_120, 96 GB, driver 610.57.04. A cu126 torch dies
+# on the first kernel launch there:
+#
+#     NVIDIA RTX PRO 6000 Blackwell Server Edition with CUDA capability
+#     sm_120 is not compatible with the current PyTorch installation.
+#     The current PyTorch install supports CUDA capabilities
+#     sm_50 sm_60 sm_70 sm_75 sm_80 sm_86 sm_90
+#     ...
+#     RuntimeError: CUDA error: no kernel image is available for
+#     execution on the device
+#
+# There is no runtime workaround: `libtorch_cuda.so` in the cu126 wheel
+# carries cubins for sm_50..sm_90 and ZERO PTX (`cuobjdump -lptx` is
+# empty), so the driver has nothing to JIT from. The cu128 wheel carries
+# cubins for sm_75, sm_80, sm_86, sm_89, sm_90, sm_100, sm_120 plus
+# compute_120 PTX -- it covers the A40s and the Blackwell nodes with one
+# install. It drops sm_50/sm_60/sm_70, none of which exist here.
+#
+# tempest-rw does NOT need rebuilding for sm_120. Its extension ships
+# sm_52 cubins plus 12 PTX files, and PTX is forward-compatible: that JIT
+# path is already how it runs on the A40s, since it has no sm_86 cubin
+# either. Verified by import on the Blackwell node.
+#
+# CROSS-GPU RESULTS ARE NOT LIKE-FOR-LIKE. Every baseline in CLAUDE.md,
+# and the ~0.0002 reproducibility band, were measured on A40s. A
+# different architecture and a different CUDA build both sit upstream of
+# the numerics. Re-validate one known config (GoogleLocal seed 5, d64 k5
+# lr1e-3 -> 0.6535) on an RTX node before trusting an A/B run there.
 #
 # ───────────────────────────────────────────────────────────────────
 # Note on py-tgb vs tgb. The Temporal Graph Benchmark library
