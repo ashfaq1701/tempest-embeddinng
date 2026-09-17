@@ -8,19 +8,15 @@ from .walk_tokens import WalkTokens
 
 
 class BagWeights(nn.Module):
-    """One query's walk bag -> one point on the manifold, CONDITIONED ON THE OTHER SIDE.
+    """One query's walk bag -> one point per counterpart, conditioned on that counterpart.
 
-    softmax over the bag from [log1p(age), hop, radius, d(token, other)], then the
-    Lorentzian midpoint. Identical to the unconditioned version except for the fourth
-    feature, which makes the weights -- and so the pooled point -- differ per counterpart.
+    The pooling weights depend on WHO is being scored: token t gets a different weight
+    against counterpart m than against counterpart m'. Features per (m, t) pair are
+    [log1p(age), hop, d0(token), d0(other), d(token, other)], softmax over the bag, then
+    the Lorentzian midpoint -- so the bag collapses to [Q, M, d], not [Q, d].
 
-    That is cross-attention in the manifold: -d(., .) is the score kernel, the softmax is
-    the attention distribution, and midpoint() is the manifold's weighted sum, since a
-    convex combination of hyperboloid points is not itself a hyperboloid point.
-
-    `rad` is detached: geometric features describe the bag, they are not a second gradient
-    path into E. `cross` is NOT detached -- it is the query-dependent term and the only
-    route by which the other side reaches the weights.
+    Geometric features are detached; the midpoint is NOT. That split is load-bearing:
+    detaching the points would leave E with no gradient path at all.
     """
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32):
@@ -28,7 +24,7 @@ class BagWeights(nn.Module):
         self.geom = geom
         self.E = E
         self.hidden = int(hidden_dim)
-        self.n_feat = 4
+        self.n_feat = 5
         self.net = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU(),
                                  nn.Linear(self.hidden, 1))
 
@@ -41,22 +37,27 @@ class BagWeights(nn.Module):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
 
-        x = F.embedding(nodes, self.E.weight)
-        e = F.embedding(other_ids, self.E.weight)
-        cross = self.geom.dist(x.unsqueeze(-3), e.unsqueeze(-2))
+        # Live for the midpoint, detached for the features.
+        x_tokens = F.embedding(nodes, self.E.weight)                         # [Q, T, d]
+        xt = x_tokens.detach()
+        x_other = F.embedding(other_ids, self.E.weight).detach()             # [Q, M, d]
 
-        age = torch.log1p(tokens.ages.clamp_min(0).to(x.dtype)).unsqueeze(-2).expand(cross.shape)
-        pos = tokens.positions.to(x.dtype).unsqueeze(-2).expand(cross.shape)
-        rad = self.geom.dist0(x.detach()).unsqueeze(-2).expand(cross.shape)
-        feat = torch.stack([age, pos, rad, cross], dim=-1).to(x.dtype)
+        d_tok_oth = self.geom.dist(xt.unsqueeze(-3), x_other.unsqueeze(-2))  # [Q, M, T]
+        shape = d_tok_oth.shape
 
-        logits = self.net(feat).squeeze(-1)
-        keep = valid.unsqueeze(-2).expand(cross.shape)
+        age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype)).unsqueeze(-2).expand(shape)
+        pos = tokens.positions.to(xt.dtype).unsqueeze(-2).expand(shape)
+        d0_tok = self.geom.dist0(xt).unsqueeze(-2).expand(shape)             # [Q, 1, T]
+        d0_oth = self.geom.dist0(x_other).unsqueeze(-1).expand(shape)        # [Q, M, 1]
+
+        feat = torch.stack([age, pos, d0_tok, d0_oth, d_tok_oth], dim=-1).to(xt.dtype)
+        logits = self.net(feat).squeeze(-1)                                  # [Q, M, T]
+        keep = valid.unsqueeze(-2).expand(shape)
         w = torch.softmax(logits.masked_fill(~keep, float("-inf")), dim=-1)
 
-        m = cross.shape[-2]
-        xe = x.unsqueeze(-3).expand(x.shape[:-2] + (m,) + x.shape[-2:])
-        return self.geom.midpoint(xe, w)
+        m = shape[-2]
+        xe = x_tokens.unsqueeze(-3).expand(x_tokens.shape[:-2] + (m,) + x_tokens.shape[-2:])
+        return self.geom.midpoint(xe, w)                                     # [Q, M, d]
 
 
 class LinkPredHead(nn.Module):
@@ -83,9 +84,12 @@ class LinkPredHead(nn.Module):
         b = src_tokens.nodes.shape[0]
         c = cand_tokens.nodes.shape[0] // b
 
-        p_uv = self.bag_weights(src_tokens, cand_tokens.seeds.view(b, c))
-        src_ids = src_tokens.seeds.repeat_interleave(c).unsqueeze(-1)
-        p_vu = self.bag_weights(cand_tokens, src_ids).view(b, c, -1)
+        # Source side: Q = b, M = c. Candidate side: Q = b*c, M = 1 -- each candidate has
+        # exactly one counterpart, its own query's source. The factor c is absorbed by the
+        # COLUMNS on one side and by the ROWS on the other, so one code path serves both.
+        p_uv = self.bag_weights(src_tokens, cand_tokens.seeds.view(b, c))    # [b, c, d]
+        src_ids = src_tokens.seeds.repeat_interleave(c).unsqueeze(-1)        # [b*c, 1]
+        p_vu = self.bag_weights(cand_tokens, src_ids).view(b, c, -1)         # [b, c, d]
 
         geo = self.geom.dist(p_uv, p_vu)
         return self.geo_temp * (-geo)
