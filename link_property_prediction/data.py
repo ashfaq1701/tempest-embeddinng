@@ -27,6 +27,13 @@ class Loaded(NamedTuple):
     dataset: object             # live suite dataset handle (negatives + eval)
     name: str                   # dataset name (for the Evaluator)
     max_node_count: int
+    # Train-split time span, max(t) - min(t), in the SAME units the loader emits
+    # (already dense-ranked to int64 when the raw stamps are non-integral). It is the
+    # scale the pooler divides ages by: ages are cutoff - t_edge on that same axis, so
+    # age / T_train is unitless and comparable across datasets, whose raw stamp units
+    # differ by orders of magnitude. REQUIRED and no default: it is a divisor, so a
+    # silent 0 would put NaNs straight into the pooling weights.
+    T_train: int
 
 
 def concat_splits(*splits: SplitData) -> SplitData:

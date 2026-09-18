@@ -32,13 +32,16 @@ class TrainerConfig:
     # Dataset-derived.
     num_nodes: int
     dst_pool: np.ndarray
+    # Train-split time span from Loaded.T_train; the pooler divides ages by it.
+    # No default: it is a divisor and a silent 0 would produce NaN weights.
+    T_train: int
 
     # Embedding dimension.
     d_emb: int = 64
 
-    # Pooler MLP width. The feature count is fixed by max_walk_len: 1 normalised age +
-    # max_walk_len one-hot position slots + 1 radius.
-    # Pooler MLP width. Feature count is fixed by max_walk_len (1 age + L one-hot + 1 rad).
+    # Pooler MLP width, PINNED. It does NOT move with the feature count: under the
+    # old 8*n_feat rule every feature ablation silently changed pooler capacity too
+    # and the two effects could not be separated.
     hidden_dim: int = 32
 
     # Per-query training negatives ([B, 1+K_train]).
@@ -78,6 +81,8 @@ class Trainer:
             d_emb=int(config.d_emb),
             hidden_dim=int(config.hidden_dim),
             seed=int(config.seed),
+            T_train=int(config.T_train),
+            max_walk_len=int(config.max_walk_len),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(

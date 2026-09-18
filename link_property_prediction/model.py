@@ -12,18 +12,24 @@ class BagWeights(nn.Module):
 
     The pooling weights depend on WHO is being scored: token t gets a different weight
     against counterpart m than against counterpart m'. Features per (m, t) pair are
-    [log1p(age), hop, d(token, seed), d(token, other)], softmax over the bag, then
+    [age/T_train, hop/max_walk_len, d(token, seed), d(token, other)], softmax over the
+    bag, then
     the Lorentzian midpoint -- so the bag collapses to [Q, M, d], not [Q, d].
 
     Geometric features are detached; the midpoint is NOT. That split is load-bearing:
     detaching the points would leave E with no gradient path at all.
     """
 
-    def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32):
+    def __init__(self, geom: "LorentzManifold", E: nn.Embedding, T_train: int,
+                 max_walk_len: int, hidden_dim: int = 32):
         super().__init__()
         self.geom = geom
         self.E = E
         self.hidden = int(hidden_dim)
+        # Divisors that put age and hop on [0, 1]-ish scales: the train-split time span
+        # and the walk-length cap. Required, because a 0 here is a NaN in the weights.
+        self.T_train = int(T_train)
+        self.max_walk_len = int(max_walk_len)
         self.n_feat = 4
         self.net = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU(),
                                  nn.Linear(self.hidden, 1))
@@ -49,8 +55,8 @@ class BagWeights(nn.Module):
 
         # Broadcast every feature to [Q, M, T] and stack.
         shape = d_tok_oth.shape
-        age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, T]
-        pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
+        age = tokens.ages.clamp_min(0).to(xt.dtype) / self.T_train           # [Q, T]
+        pos = tokens.positions.to(xt.dtype) / self.max_walk_len              # [Q, T]
         feat = torch.stack([
             age.unsqueeze(-2).expand(shape),
             pos.unsqueeze(-2).expand(shape),
@@ -70,7 +76,8 @@ class LinkPredHead(nn.Module):
 
     INIT_IRANGE = 1e-3
 
-    def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32, seed: int = 42):
+    def __init__(self, num_nodes: int, d_emb: int, T_train: int, max_walk_len: int,
+                 hidden_dim: int = 32, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
@@ -82,7 +89,11 @@ class LinkPredHead(nn.Module):
             init = self.geom.random(self.num_nodes, self.d_emb, irange=self.INIT_IRANGE)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
-        self.bag_weights = BagWeights(self.geom, self.E, hidden_dim)
+        self.T_train = int(T_train)
+        self.max_walk_len = int(max_walk_len)
+
+        self.bag_weights = BagWeights(self.geom, self.E, T_train=self.T_train,
+                                      max_walk_len=self.max_walk_len, hidden_dim=hidden_dim)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
