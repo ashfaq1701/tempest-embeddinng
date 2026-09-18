@@ -1,3 +1,5 @@
+import math
+
 import geoopt
 import torch
 import torch.nn as nn
@@ -12,9 +14,9 @@ class BagWeights(nn.Module):
 
     The pooling weights depend on WHO is being scored: token t gets a different weight
     against counterpart m than against counterpart m'. Features per (m, t) pair are
-    [age/T_train, hop/max_walk_len, d(token, seed), d(token, other)], softmax over the
-    bag, then
-    the Lorentzian midpoint -- so the bag collapses to [Q, M, d], not [Q, d].
+    [log1p(age)/log1p(T_train), hop/max_walk_len, d(token, seed), d(token, other)],
+    softmax over the bag, then the Lorentzian midpoint -- so the bag collapses to
+    [Q, M, d], not [Q, d].
 
     Geometric features are detached; the midpoint is NOT. That split is load-bearing:
     detaching the points would leave E with no gradient path at all.
@@ -55,7 +57,7 @@ class BagWeights(nn.Module):
 
         # Broadcast every feature to [Q, M, T] and stack.
         shape = d_tok_oth.shape
-        age = tokens.ages.clamp_min(0).to(xt.dtype) / self.T_train           # [Q, T]
+        age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype)) / math.log1p(self.T_train)
         pos = tokens.positions.to(xt.dtype) / self.max_walk_len              # [Q, T]
         feat = torch.stack([
             age.unsqueeze(-2).expand(shape),
