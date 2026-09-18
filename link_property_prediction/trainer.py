@@ -36,8 +36,6 @@ class TrainerConfig:
     # Embedding dimension.
     d_emb: int = 64
 
-    # Score a learned per-node popularity scalar (zero-init) alongside the distance, mixed by w.
-
     # Pooler MLP width. The feature count is fixed by max_walk_len: 1 normalised age +
     # max_walk_len one-hot position slots + 1 radius.
     # Pooler MLP width. Feature count is fixed by max_walk_len (1 age + L one-hot + 1 rad).
@@ -192,9 +190,7 @@ class Trainer:
     @torch.no_grad()
     def _head_probe(self) -> str:
         """The head's scalar parameters, for the epoch line. Read via hasattr so a head with a different
-        set of knobs degrades to a shorter line rather than raising. geo_temp scales the distance term;
-        the popularity channel (when on) rides at fixed unit weight and its per-node bias mean is a
-        nuisance quantity (gauge + K-dependent negative-sampling offset), so it is not logged."""
+        set of knobs degrades to a shorter line rather than raising. geo_temp scales the distance term."""
         parts = []
         if hasattr(self.model, "temperature"):
             parts.append(f"temp={float(self.model.temperature):.3f}")

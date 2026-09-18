@@ -8,11 +8,15 @@ from .walk_tokens import WalkTokens
 
 
 class BagWeights(nn.Module):
-    """One query's walk bag -> one point on the manifold.
+    """One query's walk bag -> one point per counterpart, conditioned on that counterpart.
 
-    softmax over the bag from [log1p(age), hop, radius], then the Lorentzian midpoint.
-    `rad` is detached: geometric features describe the bag, they are not a second
-    gradient path into E.
+    The pooling weights depend on WHO is being scored: token t gets a different weight
+    against counterpart m than against counterpart m'. Features per (m, t) pair are
+    [log1p(age), hop, d(token, seed), d(token, other)], softmax over the bag, then
+    the Lorentzian midpoint -- so the bag collapses to [Q, M, d], not [Q, d].
+
+    Geometric features are detached; the midpoint is NOT. That split is load-bearing:
+    detaching the points would leave E with no gradient path at all.
     """
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32):
@@ -20,11 +24,12 @@ class BagWeights(nn.Module):
         self.geom = geom
         self.E = E
         self.hidden = int(hidden_dim)
-        self.n_feat = 3
+        self.n_feat = 4
         self.net = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU(),
                                  nn.Linear(self.hidden, 1))
 
-    def forward(self, tokens: WalkTokens) -> torch.Tensor:
+    def forward(self, tokens: WalkTokens, other_ids: torch.Tensor) -> torch.Tensor:
+        """`tokens` has Q rows, `other_ids` is [Q, M] counterpart nodes -> [Q, M, d]."""
         nodes = tokens.nodes.clamp_min(0).clone()
         valid = tokens.mask.clone()
         cold = ~valid.any(dim=-1)
@@ -32,14 +37,33 @@ class BagWeights(nn.Module):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
 
-        x = F.embedding(nodes, self.E.weight)
-        age = torch.log1p(tokens.ages.clamp_min(0).to(x.dtype)).unsqueeze(-1)
-        pos = tokens.positions.unsqueeze(-1).to(x.dtype)
-        rad = self.geom.dist0(x.detach()).unsqueeze(-1)
-        feat = torch.cat([age, pos, rad], dim=-1).to(x.dtype)
-        logits = self.net(feat).squeeze(-1)
-        w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
-        return self.geom.midpoint(x, w)
+        # Three lookups. Live for the midpoint, detached for the features.
+        x_tokens = F.embedding(nodes, self.E.weight)                         # [Q, T, d]
+        xt = x_tokens.detach()                                               # [Q, T, d]
+        x_seed = F.embedding(tokens.seeds, self.E.weight).detach()           # [Q, d]
+        x_other = F.embedding(other_ids, self.E.weight).detach()             # [Q, M, d]
+
+        # All the geometry, each in its natural shape: two pair distances, no radii.
+        d_tok_seed = self.geom.dist(xt, x_seed.unsqueeze(-2))                # [Q, T]
+        d_tok_oth = self.geom.dist(xt.unsqueeze(-3), x_other.unsqueeze(-2))  # [Q, M, T]
+
+        # Broadcast every feature to [Q, M, T] and stack.
+        shape = d_tok_oth.shape
+        age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, T]
+        pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
+        feat = torch.stack([
+            age.unsqueeze(-2).expand(shape),
+            pos.unsqueeze(-2).expand(shape),
+            d_tok_seed.unsqueeze(-2).expand(shape),
+            d_tok_oth,
+        ], dim=-1).to(xt.dtype)
+        logits = self.net(feat).squeeze(-1)                                  # [Q, M, T]
+        keep = valid.unsqueeze(-2).expand(shape)
+        w = torch.softmax(logits.masked_fill(~keep, float("-inf")), dim=-1)
+
+        m = shape[-2]
+        xe = x_tokens.unsqueeze(-3).expand(x_tokens.shape[:-2] + (m,) + x_tokens.shape[-2:])
+        return self.geom.midpoint(xe, w)                                     # [Q, M, d]
 
 
 class LinkPredHead(nn.Module):
@@ -63,10 +87,15 @@ class LinkPredHead(nn.Module):
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        p_u = self.bag_weights(src_tokens)
-        p_v = self.bag_weights(cand_tokens)
-        b, d = p_u.shape
-        c = p_v.shape[0] // b
-        p_v = p_v.view(b, c, d)
-        geo = self.geom.dist(p_u.unsqueeze(1), p_v)
-        return self.geo_temp * (-geo)
+        b = src_tokens.nodes.shape[0]
+        c = cand_tokens.nodes.shape[0] // b
+
+        # Source side: Q = b, M = c. Candidate side: Q = b*c, M = 1 -- each candidate has
+        # exactly one counterpart, its own query's source. The factor c is absorbed by the
+        # COLUMNS on one side and by the ROWS on the other, so one code path serves both.
+        p_uv = self.bag_weights(src_tokens, cand_tokens.seeds.view(b, c))    # [b, c, d]
+        src_ids = src_tokens.seeds.repeat_interleave(c).unsqueeze(-1)        # [b*c, 1]
+        p_vu = self.bag_weights(cand_tokens, src_ids).view(b, c, -1)         # [b, c, d]
+
+        duv = self.geom.dist(p_uv, p_vu)
+        return self.geo_temp * (-duv)
