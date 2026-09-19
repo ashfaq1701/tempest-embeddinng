@@ -14,9 +14,13 @@ class BagWeights(nn.Module):
 
     The pooling weights depend on WHO is being scored: token t gets a different weight
     against counterpart m than against counterpart m'. Features per (m, t) pair are
-    [log1p(age)/log1p(T_train), hop/max_walk_len, d(token, seed), d(token, other)],
+    [log1p(age)/log1p(T_train), hop/max_walk_len, d(token, mid), d(token, other)],
     softmax over the bag, then the Lorentzian midpoint -- so the bag collapses to
     [Q, M, d], not [Q, d].
+
+    `mid` is the bag's own UNWEIGHTED midpoint -- the Lorentzian centroid under uniform
+    weights over the valid tokens -- so the third feature is a per-token spread signal:
+    how far this token sits from the middle of its own bag. It replaces d(token, seed).
 
     Geometric features are detached; the midpoint is NOT. That split is load-bearing:
     detaching the points would leave E with no gradient path at all.
@@ -45,14 +49,20 @@ class BagWeights(nn.Module):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
 
-        # Three lookups. Live for the midpoint, detached for the features.
+        # Two lookups. Live for the midpoint, detached for the features. The seed's own
+        # embedding is no longer referenced, so it is not looked up.
         x_tokens = F.embedding(nodes, self.E.weight)                         # [Q, T, d]
         xt = x_tokens.detach()                                               # [Q, T, d]
-        x_seed = F.embedding(tokens.seeds, self.E.weight).detach()           # [Q, d]
         x_other = F.embedding(other_ids, self.E.weight).detach()             # [Q, M, d]
 
+        # The bag's unweighted midpoint: uniform weights over the valid tokens. The
+        # cold-start fix above guarantees at least one valid token per row, so the
+        # denominator is never zero.
+        u = valid.to(xt.dtype)
+        mid = self.geom.midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
+
         # All the geometry, each in its natural shape: two pair distances, no radii.
-        d_tok_seed = self.geom.dist(xt, x_seed.unsqueeze(-2))                # [Q, T]
+        d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
         d_tok_oth = self.geom.dist(xt.unsqueeze(-3), x_other.unsqueeze(-2))  # [Q, M, T]
 
         # Broadcast every feature to [Q, M, T] and stack.
@@ -62,7 +72,7 @@ class BagWeights(nn.Module):
         feat = torch.stack([
             age.unsqueeze(-2).expand(shape),
             pos.unsqueeze(-2).expand(shape),
-            d_tok_seed.unsqueeze(-2).expand(shape),
+            d_tok_mid.unsqueeze(-2).expand(shape),
             d_tok_oth,
         ], dim=-1).to(xt.dtype)
         logits = self.net(feat).squeeze(-1)                                  # [Q, M, T]
