@@ -12,8 +12,12 @@ from .walk_tokens import WalkTokens
 class BagWeights(nn.Module):
     """One query's walk bag -> one point on the manifold.
 
-    Features per token are [log1p(age)/log1p(T_train), hop/max_walk_len, d(token, seed)],
+    Features per token are [log1p(age)/log1p(T_train), hop/max_walk_len, d(token, mid)],
     softmax over the bag, then the Lorentzian midpoint: [Q, T, d] -> [Q, d].
+
+    `mid` is the bag's own UNWEIGHTED midpoint -- the Lorentzian centroid under uniform
+    weights over the valid tokens -- so the third feature is a per-token spread signal:
+    how far this token sits from the middle of its own bag.
 
     The pooling does NOT depend on who is being scored -- each query is summarised once,
     independently of its candidates.
@@ -45,17 +49,22 @@ class BagWeights(nn.Module):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
 
-        # Two lookups. Live for the midpoint, detached for the features.
+        # One lookup. Live for the pooled midpoint, detached for the features.
         x_tokens = F.embedding(nodes, self.E.weight)                         # [Q, T, d]
         xt = x_tokens.detach()                                               # [Q, T, d]
-        x_seed = F.embedding(tokens.seeds, self.E.weight).detach()           # [Q, d]
+
+        # The bag's unweighted midpoint: uniform weights over the valid tokens. The
+        # cold-start fix above guarantees at least one valid token per row, so the
+        # denominator is never zero.
+        u = valid.to(xt.dtype)
+        mid = self.geom.midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
 
         # Every feature is [Q, T]: two from the walk, one pair distance, no radii.
         age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype)) / math.log1p(self.T_train)
         pos = tokens.positions.to(xt.dtype) / self.max_walk_len
-        d_tok_seed = self.geom.dist(xt, x_seed.unsqueeze(-2))
+        d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))
 
-        feat = torch.stack([age, pos, d_tok_seed], dim=-1).to(xt.dtype)      # [Q, T, 3]
+        feat = torch.stack([age, pos, d_tok_mid], dim=-1).to(xt.dtype)       # [Q, T, 3]
         logits = self.net(feat).squeeze(-1)                                  # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
         return self.geom.midpoint(x_tokens, w)                               # [Q, d]
