@@ -1,0 +1,99 @@
+# ML-20M BAG SIZE -- WIDE: 20 walks of length 5.
+# num_walks_per_node=20 max_walk_len=5  (control: 5 / 5, bag_n ~20, test 0.2429)
+# d_emb=64 k_train=5 lr=1e-3 seed=5 patience 8 --is-bipartite
+# branch=exp/escape-instrumentation commit=44413a26 (DETACHED WORKTREE, pinned, clean)
+#
+# THIS COMMIT IS MASTER. With TEMPEST_POOL_{FEAT,LAYERS,F4} unset the model is
+#   bit-identical to master: forward hash f62e1260cdbfb833, grad_E 4fbd9a1e0ec7a291,
+#   pooler init 6673dae38ebc39d1 on both refs.  The extra code is a no_grad stats
+#   stash and an opt-in checkpoint path, so the run is master plus free telemetry
+#   (pool_eff, bag_n, dE, r50/r90/r99).
+#
+# WHY.  ML-20M is the only dataset of the eight that cannot fit its own training
+# objective: link falls 1.6564->0.0776 on YouTube (95%), 1.7321->0.0086 on
+# GoogleLocal (100%), but only 0.8493->0.4320 on ML-20M (49%), still dropping
+# 1.2%/epoch when patience kills it at ep12.  Its link at the val peak is 0.4660,
+# five times any other dataset's.  Under-fitting, not over-fitting.
+#
+# THE HYPOTHESIS.  The bag is too small a sample of the neighbourhood.  ML-20M has
+# 127 edges/node (Taobao 8.6, Yelp 9.8) and a mean reachable walk length of 47.4,
+# but we sample wpn=5 walks of len=5 -> bag_n ~20.  98.6% of its walks are cut by
+# the mwl=5 cap.  If the bag under-samples, enlarging it lowers the link floor.
+#
+# TWO AXES, MATCHED BAG SIZE.  bag ~= wpn * mwl, so these two arms quadruple the
+# bag by orthogonal routes and cost the same number of walk steps:
+#   deep_mwl20  wpn 5  mwl 20   <- more history per walk
+#   wide_wpn20  wpn 20 mwl 5    <- more independent samples of recent history
+# Control is the shipped run (wpn 5, mwl 5, test 0.2429), not re-run.
+# If depth wins it is history; if breadth wins it is sampling noise; if they tie
+# it is bag size alone and neither axis matters.
+#
+# READ link AT ep3-4, NOT THE MRR.  Control link: ep1 0.8493, ep2 0.5644,
+# ep3 0.5238, ep4 0.5034.  The hypothesis predicts a visibly lower floor within
+# four epochs.  If neither arm beats the control's link by ep4 the bag is not the
+# constraint and this is dead -- kill it and move to the d_emb axis.
+set -u
+cd /its/home/ms2420/wt-ml20m-bag
+# started=2026-09-17 04:25:42
+# cmd: ./venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq --dataset ML-20M --d-emb 64 --k-train 5 --num-walks-per-node 20 --max-walk-len 5 --lr 1e-3 --seed 5 --early-stop-patience 8 --is-bipartite --use-gpu --use-gpu-tempest
+=== tempest-embedding training ===
+dataset: ML-20M
+device:  cuda
+seed:    5
+loaded (tgb-seq) in 2.6s
+  num_nodes:     110,432
+  neg_pool:      9,646 unique destinations (bipartite)
+  train edges:   14,000,091
+  val edges:     364,943
+  test edges:    129,291
+
+=== Config ===
+  num_nodes: 110432
+  dst_pool: <ndarray shape=(9646,) dtype=int32>
+  d_emb: 64
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 20
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 100
+  early_stop_patience: 8
+  seed: 5
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:            7,067,648
+  head params:              162
+  TOTAL trainable:    7,067,810
+
+=== Training ===
+  Ingested full graph into Tempest: 14,494,325 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=0.8602  lr=1e-03  train 1066.8s  r_mean=0.242  r_max=2.837  r50=0.083  r90=0.512  r99=2.104  dE=0.00000  geo_temp=8.433  pool_eff=41.6883  pool_ent=0.8098  pool_max=0.0353  logit_sd=3.4748  bag_n=99.7198  val 0.2501  test 0.2243 (new best)  eval 123.0s
+epoch 2/100  link=0.5386  lr=1e-03  train 1191.0s  r_mean=0.271  r_max=2.992  r50=0.108  r90=0.547  r99=2.214  dE=0.08351  geo_temp=9.650  pool_eff=40.2063  pool_ent=0.8024  pool_max=0.0345  logit_sd=4.3929  bag_n=99.7363  val 0.2818  test 0.2467 (new best)  eval 127.6s
+epoch 3/100  link=0.4905  lr=1e-03  train 1166.7s  r_mean=0.298  r_max=3.226  r50=0.134  r90=0.562  r99=2.267  dE=0.06732  geo_temp=10.491  pool_eff=40.5248  pool_ent=0.8039  pool_max=0.0322  logit_sd=4.8808  bag_n=99.8205  val 0.2963  test 0.2571 (new best)  eval 113.6s
+epoch 4/100  link=0.4667  lr=1e-03  train 1174.3s  r_mean=0.323  r_max=3.376  r50=0.160  r90=0.579  r99=2.307  dE=0.06093  geo_temp=11.249  pool_eff=40.7301  pool_ent=0.8051  pool_max=0.0308  logit_sd=5.2037  bag_n=99.8114  val 0.3035  test 0.2612 (new best)  eval 125.4s
+epoch 5/100  link=0.4516  lr=1e-03  train 827.4s  r_mean=0.347  r_max=3.492  r50=0.185  r90=0.596  r99=2.337  dE=0.05648  geo_temp=12.024  pool_eff=41.0840  pool_ent=0.8070  pool_max=0.0293  logit_sd=5.3056  bag_n=99.8022  val 0.3069  test 0.2637 (new best)  eval 115.1s
+epoch 6/100  link=0.4401  lr=1e-03  train 876.2s  r_mean=0.369  r_max=3.540  r50=0.208  r90=0.617  r99=2.361  dE=0.05360  geo_temp=12.807  pool_eff=41.2535  pool_ent=0.8082  pool_max=0.0280  logit_sd=5.4233  bag_n=99.6978  val 0.3085  test 0.2627 (new best)  eval 101.2s
+epoch 7/100  link=0.4308  lr=1e-03  train 864.2s  r_mean=0.389  r_max=3.571  r50=0.231  r90=0.638  r99=2.380  dE=0.05158  geo_temp=13.553  pool_eff=41.5531  pool_ent=0.8096  pool_max=0.0276  logit_sd=5.2962  bag_n=99.8114  val 0.3080  patience 1/8  eval 120.6s
+epoch 8/100  link=0.4231  lr=1e-03  train 862.2s  r_mean=0.407  r_max=3.610  r50=0.251  r90=0.661  r99=2.397  dE=0.05025  geo_temp=14.247  pool_eff=41.4906  pool_ent=0.8093  pool_max=0.0278  logit_sd=5.3165  bag_n=99.7949  val 0.3087  test 0.2601 (new best)  eval 111.7s
+epoch 9/100  link=0.4165  lr=1e-03  train 875.3s  r_mean=0.425  r_max=3.650  r50=0.270  r90=0.684  r99=2.415  dE=0.04923  geo_temp=14.854  pool_eff=41.2896  pool_ent=0.8083  pool_max=0.0279  logit_sd=5.4040  bag_n=99.7857  val 0.3080  patience 1/8  eval 104.5s
+epoch 10/100  link=0.4107  lr=1e-03  train 791.8s  r_mean=0.441  r_max=3.796  r50=0.289  r90=0.704  r99=2.429  dE=0.04851  geo_temp=15.390  pool_eff=41.1864  pool_ent=0.8077  pool_max=0.0279  logit_sd=5.4762  bag_n=99.8095  val 0.3076  patience 2/8  eval 118.7s
+epoch 11/100  link=0.4055  lr=1e-03  train 987.7s  r_mean=0.456  r_max=4.082  r50=0.305  r90=0.728  r99=2.443  dE=0.04786  geo_temp=15.828  pool_eff=41.1489  pool_ent=0.8076  pool_max=0.0280  logit_sd=5.5270  bag_n=99.7637  val 0.3061  patience 3/8  eval 111.9s
+epoch 12/100  link=0.4010  lr=1e-03  train 1055.7s  r_mean=0.471  r_max=4.739  r50=0.322  r90=0.748  r99=2.453  dE=0.04794  geo_temp=16.267  pool_eff=41.0434  pool_ent=0.8070  pool_max=0.0282  logit_sd=5.6067  bag_n=99.7729  val 0.3046  patience 4/8  eval 111.5s
+epoch 13/100  link=0.3971  lr=1e-03  train 987.1s  r_mean=0.485  r_max=6.588  r50=0.337  r90=0.767  r99=2.464  dE=0.04986  geo_temp=16.627  pool_eff=41.0174  pool_ent=0.8067  pool_max=0.0281  logit_sd=5.6545  bag_n=99.8333  val 0.3042  patience 5/8  eval 110.5s
+epoch 14/100  link=0.3932  lr=1e-03  train 934.2s  r_mean=0.498  r_max=7.536  r50=0.352  r90=0.787  r99=2.473  dE=0.05447  geo_temp=16.973  pool_eff=40.8354  pool_ent=0.8062  pool_max=0.0285  logit_sd=5.6954  bag_n=99.6886  val 0.2996  patience 6/8  eval 114.3s
+epoch 15/100  link=0.3898  lr=1e-03  train 937.7s  r_mean=0.510  r_max=7.538  r50=0.367  r90=0.806  r99=2.489  dE=0.04702  geo_temp=17.285  pool_eff=40.9351  pool_ent=0.8063  pool_max=0.0283  logit_sd=5.6984  bag_n=99.8077  val 0.3000  patience 7/8  eval 116.8s
+epoch 16/100  link=0.3866  lr=1e-03  train 952.2s  r_mean=0.523  r_max=8.378  r50=0.381  r90=0.827  r99=2.501  dE=0.07224  geo_temp=17.583  pool_eff=40.8726  pool_ent=0.8062  pool_max=0.0285  logit_sd=5.7681  bag_n=99.7179  val 0.2987  patience 8/8  eval 116.3s
+  restored best weights from epoch 8 (val 0.3087, test 0.2601)
+
+=== Final results ===
+  dataset:           ML-20M
+  seed:              5
+  stopped_at_epoch:  8
+  best_val_mrr:      0.3087
+  best_test_mrr:     0.2601

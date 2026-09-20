@@ -1,0 +1,103 @@
+# PHASE 1 of the escape investigation.  TEMPEST_POOL_FEAT=sdist
+# dataset=YouTube d_emb=64 k_train=5 lr=1e-3 seed=5 patience 8 cap 100
+# branch=exp/escape-instrumentation commit=7e97fda6 (DETACHED WORKTREE, pinned)
+#
+# QUESTION. The control escapes at ep14 (val 0.4299 -> 0.4945 -> 0.6000); the
+#   sdist arm never does (0.4088 -> 0.4137 -> 0.4193) and finishes 0.4002 against
+#   0.5626. Every conclusion so far was inferred from the final val number. These
+#   two runs instrument the transition itself.
+#
+# THE ARMS DIFFER IN ONE LINE. Third pooler channel only:
+#     rad   = dist0(token)        <- master, escapes
+#     sdist = dist(seed, token)   <- does not
+#   Both detached, both n_feat=3, so Linear(3,32) either way and the pooler init
+#   hash is IDENTICAL (bcf56421f97deb3a, verified). No init-luck confound.
+#
+# NEW FIELDS. pool_eff = exp(entropy) = effective tokens the bag actually uses
+#   (8.93 of ~22 at init); pool_ent normalised entropy, 1.0 = uniform; pool_max
+#   mean largest weight; logit_sd pre-softmax spread; r50/r90/r99 radius
+#   percentiles; dE mean per-row movement of E since the last epoch.
+#
+# WHAT THE EXISTING LOGS ALREADY SHOW, and what these must explain. At ep14-17 the
+#   control's link COLLAPSES -- 0.3357 -> 0.2482 -> 0.1869 -> 0.1536, i.e. -26%,
+#   -25%, -18% per epoch -- and geo_temp ACCELERATES (+1.8, +2.0, +2.0). The sdist
+#   arm at the same epochs falls a steady -4%/epoch and geo_temp DECELERATES
+#   (+0.6, +0.5, +0.5). Both sit at nearly the same r_mean (0.465 vs 0.456), so
+#   radius alone does not separate them. Something goes critical in the control
+#   and not in sdist; these fields should say what.
+#
+# patience raised to 8 (from 5) so the sdist arm is given every chance to escape
+#   late rather than being cut off; that also costs little.
+# started=2026-09-17 01:24:08
+# cmd: TEMPEST_POOL_FEAT=sdist /its/home/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb-seq --dataset YouTube --d-emb 64 --k-train 5 --num-walks-per-node 5 --lr 1e-3 --seed 5 --early-stop-patience 8 --use-gpu --use-gpu-tempest
+
+=== tempest-embedding training ===
+dataset: YouTube
+device:  cuda
+seed:    5
+loaded (tgb-seq) in 0.9s
+  num_nodes:     402,423
+  neg_pool:      402,422 unique nodes (non-bipartite)
+  train edges:   2,730,407
+  val edges:     324,756
+  test edges:    232,865
+
+=== Config ===
+  num_nodes: 402423
+  dst_pool: <ndarray shape=(402422,) dtype=int32>
+  d_emb: 64
+  hidden_dim: 32
+  K_train: 5
+  num_walks_per_node: 5
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  num_epochs: 100
+  early_stop_patience: 8
+  seed: 5
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:           25,755,072
+  head params:              162
+  TOTAL trainable:   25,755,234
+
+=== Training ===
+  Ingested full graph into Tempest: 3,288,028 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=1.6476  lr=1e-03  train 96.1s  r_mean=0.111  r_max=0.856  r50=0.098  r90=0.208  r99=0.296  dE=0.00000  geo_temp=4.327  pool_eff=8.6171  pool_ent=0.6292  pool_max=0.2508  logit_sd=1.9738  bag_n=20.0254  val 0.2234  test 0.2008 (new best)  eval 30.8s
+epoch 2/100  link=1.3094  lr=1e-03  train 95.7s  r_mean=0.187  r_max=0.866  r50=0.174  r90=0.318  r99=0.436  dE=0.08729  geo_temp=6.832  pool_eff=7.9913  pool_ent=0.6068  pool_max=0.2507  logit_sd=2.1867  bag_n=20.1568  val 0.2648  test 0.2346 (new best)  eval 30.7s
+epoch 3/100  link=1.0577  lr=1e-03  train 91.5s  r_mean=0.240  r_max=0.860  r50=0.230  r90=0.385  r99=0.505  dE=0.06641  geo_temp=9.048  pool_eff=7.4311  pool_ent=0.5908  pool_max=0.2532  logit_sd=2.3837  bag_n=20.2019  val 0.2966  test 0.2601 (new best)  eval 30.9s
+epoch 4/100  link=0.8895  lr=1e-03  train 91.5s  r_mean=0.280  r_max=0.965  r50=0.274  r90=0.428  r99=0.548  dE=0.05509  geo_temp=11.148  pool_eff=6.9465  pool_ent=0.5762  pool_max=0.2551  logit_sd=2.6063  bag_n=20.2621  val 0.3217  test 0.2813 (new best)  eval 30.8s
+epoch 5/100  link=0.7712  lr=1e-03  train 91.5s  r_mean=0.312  r_max=1.037  r50=0.308  r90=0.458  r99=0.581  dE=0.04886  geo_temp=13.194  pool_eff=6.5130  pool_ent=0.5673  pool_max=0.2604  logit_sd=2.8885  bag_n=20.0233  val 0.3425  test 0.2988 (new best)  eval 31.1s
+epoch 6/100  link=0.6829  lr=1e-03  train 91.1s  r_mean=0.337  r_max=1.113  r50=0.336  r90=0.479  r99=0.611  dE=0.04518  geo_temp=15.175  pool_eff=6.1535  pool_ent=0.5529  pool_max=0.2667  logit_sd=3.2467  bag_n=20.2711  val 0.3568  test 0.3110 (new best)  eval 31.0s
+epoch 7/100  link=0.6136  lr=1e-03  train 95.8s  r_mean=0.359  r_max=1.189  r50=0.358  r90=0.497  r99=0.639  dE=0.04273  geo_temp=17.032  pool_eff=5.8327  pool_ent=0.5406  pool_max=0.2778  logit_sd=3.8407  bag_n=20.1826  val 0.3682  test 0.3208 (new best)  eval 31.1s
+epoch 8/100  link=0.5584  lr=1e-03  train 95.8s  r_mean=0.377  r_max=1.246  r50=0.376  r90=0.513  r99=0.667  dE=0.04107  geo_temp=18.705  pool_eff=5.6984  pool_ent=0.5333  pool_max=0.2836  logit_sd=4.7378  bag_n=20.1863  val 0.3778  test 0.3303 (new best)  eval 31.1s
+epoch 9/100  link=0.5148  lr=1e-03  train 95.8s  r_mean=0.393  r_max=1.303  r50=0.392  r90=0.527  r99=0.691  dE=0.03989  geo_temp=20.139  pool_eff=5.4691  pool_ent=0.5212  pool_max=0.2898  logit_sd=5.6294  bag_n=20.2744  val 0.3924  test 0.3442 (new best)  eval 31.0s
+epoch 10/100  link=0.4777  lr=1e-03  train 95.4s  r_mean=0.408  r_max=1.414  r50=0.405  r90=0.541  r99=0.714  dE=0.03906  geo_temp=21.372  pool_eff=5.3869  pool_ent=0.5157  pool_max=0.2995  logit_sd=6.5934  bag_n=20.1458  val 0.3961  test 0.3479 (new best)  eval 30.5s
+epoch 11/100  link=0.4460  lr=1e-03  train 91.6s  r_mean=0.421  r_max=1.492  r50=0.418  r90=0.554  r99=0.735  dE=0.03844  geo_temp=22.436  pool_eff=5.2779  pool_ent=0.5070  pool_max=0.3056  logit_sd=7.5168  bag_n=20.2420  val 0.4035  test 0.3550 (new best)  eval 30.4s
+epoch 12/100  link=0.4208  lr=1e-03  train 91.6s  r_mean=0.434  r_max=1.530  r50=0.429  r90=0.567  r99=0.755  dE=0.03794  geo_temp=23.323  pool_eff=5.1889  pool_ent=0.5030  pool_max=0.3103  logit_sd=8.4213  bag_n=20.1560  val 0.4099  test 0.3632 (new best)  eval 30.2s
+epoch 13/100  link=0.3969  lr=1e-03  train 91.6s  r_mean=0.446  r_max=1.568  r50=0.439  r90=0.579  r99=0.773  dE=0.03760  geo_temp=24.120  pool_eff=5.2012  pool_ent=0.4997  pool_max=0.3145  logit_sd=9.2926  bag_n=20.2453  val 0.4144  test 0.3671 (new best)  eval 30.6s
+epoch 14/100  link=0.3773  lr=1e-03  train 91.6s  r_mean=0.457  r_max=1.671  r50=0.449  r90=0.591  r99=0.790  dE=0.03733  geo_temp=24.804  pool_eff=5.1606  pool_ent=0.4966  pool_max=0.3201  logit_sd=10.0808  bag_n=20.1912  val 0.4198  test 0.3732 (new best)  eval 30.4s
+epoch 15/100  link=0.3597  lr=1e-03  train 91.6s  r_mean=0.468  r_max=1.736  r50=0.458  r90=0.603  r99=0.807  dE=0.03707  geo_temp=25.392  pool_eff=5.0873  pool_ent=0.4940  pool_max=0.3198  logit_sd=10.8566  bag_n=20.0819  val 0.4278  test 0.3809 (new best)  eval 30.5s
+epoch 16/100  link=0.3439  lr=1e-03  train 91.6s  r_mean=0.478  r_max=1.813  r50=0.467  r90=0.614  r99=0.823  dE=0.03687  geo_temp=25.926  pool_eff=5.2005  pool_ent=0.4960  pool_max=0.3186  logit_sd=11.3226  bag_n=20.2641  val 0.4293  test 0.3828 (new best)  eval 30.2s
+epoch 17/100  link=0.3303  lr=1e-03  train 91.6s  r_mean=0.488  r_max=1.854  r50=0.476  r90=0.625  r99=0.836  dE=0.03669  geo_temp=26.385  pool_eff=5.2069  pool_ent=0.4966  pool_max=0.3202  logit_sd=11.9368  bag_n=20.2281  val 0.4318  test 0.3861 (new best)  eval 30.4s
+epoch 18/100  link=0.3178  lr=1e-03  train 91.6s  r_mean=0.497  r_max=1.941  r50=0.485  r90=0.635  r99=0.849  dE=0.03655  geo_temp=26.793  pool_eff=5.2108  pool_ent=0.4931  pool_max=0.3223  logit_sd=12.4177  bag_n=20.3698  val 0.4312  patience 1/8  eval 30.5s
+epoch 19/100  link=0.3065  lr=1e-03  train 91.6s  r_mean=0.507  r_max=1.992  r50=0.493  r90=0.644  r99=0.861  dE=0.03640  geo_temp=27.160  pool_eff=5.2415  pool_ent=0.4948  pool_max=0.3254  logit_sd=12.7133  bag_n=20.2379  val 0.4291  patience 2/8  eval 30.5s
+epoch 20/100  link=0.2962  lr=1e-03  train 91.6s  r_mean=0.515  r_max=2.134  r50=0.501  r90=0.654  r99=0.873  dE=0.03625  geo_temp=27.475  pool_eff=5.2362  pool_ent=0.4954  pool_max=0.3251  logit_sd=12.8401  bag_n=20.1962  val 0.4332  test 0.3865 (new best)  eval 30.5s
+epoch 21/100  link=0.2868  lr=1e-03  train 91.5s  r_mean=0.524  r_max=2.236  r50=0.509  r90=0.663  r99=0.886  dE=0.03621  geo_temp=27.761  pool_eff=5.2346  pool_ent=0.4899  pool_max=0.3279  logit_sd=13.1774  bag_n=20.4357  val 0.4373  test 0.3916 (new best)  eval 30.2s
+epoch 22/100  link=0.2783  lr=1e-03  train 91.5s  r_mean=0.532  r_max=2.274  r50=0.517  r90=0.672  r99=0.897  dE=0.03613  geo_temp=28.019  pool_eff=5.1978  pool_ent=0.4917  pool_max=0.3277  logit_sd=13.5246  bag_n=20.2461  val 0.4407  test 0.3945 (new best)  eval 30.4s
+epoch 23/100  link=0.2709  lr=1e-03  train 91.6s  r_mean=0.541  r_max=2.281  r50=0.525  r90=0.681  r99=0.909  dE=0.03611  geo_temp=28.247  pool_eff=5.1752  pool_ent=0.4891  pool_max=0.3334  logit_sd=13.6727  bag_n=20.1458  val 0.4424  test 0.3965 (new best)  eval 30.5s
+epoch 24/100  link=0.2625  lr=1e-03  train 93.7s  r_mean=0.549  r_max=2.284  r50=0.532  r90=0.689  r99=0.920  dE=0.03597  geo_temp=28.478  pool_eff=5.2736  pool_ent=0.4944  pool_max=0.3274  logit_sd=13.7800  bag_n=20.2928  val 0.4526  test 0.4067 (new best)  eval 30.3s
+epoch 25/100  link=0.2569  lr=1e-03  train 91.5s  r_mean=0.556  r_max=2.299  r50=0.540  r90=0.698  r99=0.931  dE=0.03607  geo_temp=28.679  pool_eff=5.3842  pool_ent=0.5018  pool_max=0.3213  logit_sd=14.1513  bag_n=20.0971  val 0.4424  patience 1/8  eval 30.7s
+epoch 26/100  link=0.2491  lr=1e-03  train 91.6s  r_mean=0.564  r_max=2.356  r50=0.547  r90=0.706  r99=0.939  dE=0.03596  geo_temp=28.893  pool_eff=5.5285  pool_ent=0.5129  pool_max=0.3148  logit_sd=13.7400  bag_n=20.2735  val 0.4406  patience 2/8  eval 30.6s
+epoch 27/100  link=0.2422  lr=1e-03  train 91.5s  r_mean=0.571  r_max=2.531  r50=0.554  r90=0.713  r99=0.948  dE=0.03594  geo_temp=29.097  pool_eff=5.4898  pool_ent=0.5096  pool_max=0.3186  logit_sd=13.8615  bag_n=20.2699  val 0.4452  patience 3/8  eval 30.7s
+epoch 28/100  link=0.2370  lr=1e-03  train 91.5s  r_mean=0.579  r_max=2.610  r50=0.562  r90=0.721  r99=0.955  dE=0.03585  geo_temp=29.244  pool_eff=5.6709  pool_ent=0.5209  pool_max=0.3115  logit_sd=13.9736  bag_n=20.1032  val 0.4455  patience 4/8  eval 30.7s
+
+# STOPPED at 2026-09-17 02:30:04 after 28 epochs -- 13 past the control's escape point, the
+# question already answered. pool_eff stayed pinned 5.20-5.67 with no transient, against
+# the control's 6.20 -> 7.53 rise over ep12-15. Peak test 0.4067 vs 0.5590.
+# Killed to release the GPU for the phase-3 property sweep.
