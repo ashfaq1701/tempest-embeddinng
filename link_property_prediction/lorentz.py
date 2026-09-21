@@ -285,24 +285,58 @@ class LorentzManifold(geoopt.Manifold):
         makes the next error larger. That loop is how a 6.7e-3 step became
         149.8 and overflowed cosh in expmap.
 
-        Split v and d into radial and tangential parts about n = x'/||x'||.
-        With P = d.(x+y) = 2||x'|| d_r + ||d||^2 (difference first), d0 = y0 - x0
-        = P/(y0 + x0), and the identity k + x0 y0 - ||x'||^2 = 2k + x0 d0,
+        Split v and d into radial and tangential parts about n = x'/||x'||, then
+        rationalise the one remaining difference. With b = ||x'||, a = n.y =
+        b + d_r and d_perp = d - d_r n,
 
-            <Y-X,V>_L = v_r [d_r (2k + x0 d0) - ||x'|| ||d||^2] / (x0 (x0 + y0))
+            <Y-X,V>_L = v_r (x0 a - y0 b)/x0 + d_perp . v_perp
+
+        and clearing x0 a - y0 b with its conjugate, using x0^2 = k + b^2 and
+        y0^2 = k + a^2 + ||d_perp||^2,
+
+            <Y-X,V>_L = v_r [k d_r (2b + d_r) - b^2 ||d_perp||^2]
+                            / (x0 (x0 a + y0 b))
                         + d_perp . v_perp
 
-        The bracket is exact to ~eps ||x'|| delta / (2k) relative (0.8% at
-        r = 11.4, delta = 3), which enters the transported momentum scaled by
-        the step and is immaterial. d_perp.v_perp is used rather than d.v_perp
-        because v_perp computed as v - v_r n carries an n-component of size
-        eps v_r, and d_r times that is again the noise term. Measured over 300
-        radial transports at r = 11.4 in float32 the Riemannian norm of the
-        momentum is preserved to 0.3%, against 0 or +12% for the previous form.
-        Agrees with the previous form to 1e-9 in float64 at r <= 5.
+        THE FORM MATTERS, and the previous one was the problem. Written as
+        [d_r (2k + x0 d0) - ||x'|| ||d||^2] / (x0 (x0 + y0)), both numerator
+        terms are ~ ||x'|| d_r^2 for a radial-dominant step while the answer is
+        2k d_r. The answer is then smaller than its own operands by a factor
+        2k/(||x'|| ||d||), and float32 loses it entirely once
 
-        At the origin n = 0, so v_r = d_r = 0, the bracket term vanishes and
-        yv = d.v, which is the correct limit.
+            ||x'|| ||d||  >  2k / eps          (1.7e7 for float32, k = 1)
+
+        Rationalised, the two numerator terms are a radial and a perpendicular
+        quantity instead of two copies of ||x'|| d_r^2: for a radial step
+        d_perp = 0 and the expression is exact, for a perpendicular step d_r = 0
+        and it is exact, and neither term is a near-copy of the other in
+        between. No constant is introduced.
+
+        Measured against a float64 evaluation of the definition, radial momentum
+        carried along a radial step at the training step length t = 1e-3, worst
+        relative error of the transported vector over 200 draws:
+
+            r          9         11         13         15
+            was    2.6e-06    1.4e-04    1.1e-02    4.8e-01
+            now    5.7e-08    8.2e-07    6.1e-05    2.7e-03
+
+        45x to 180x, and at r = 15 the old form is 48% wrong on a SINGLE
+        transport. It compounds: geoopt's RiemannianAdam carries exp_avg through
+        retr_transp every step, and exp_avg was observed climbing 5.1e9 -> 2.0e21
+        in 17 steps while the gradient feeding it stayed flat at 5.1e10. As an
+        isometry check, ||PT(v)||_y/||v||_x at r = 11 and a step of 0.1 goes from
+        1.895 to 1.000239; at r = 15 and a step of 0.1, from 3582 to 1.0096.
+
+        ||d_perp||^2 is taken from the vector d_perp, NOT as ||d||^2 - d_r^2:
+        that difference is again two near-equal numbers for a radial step and
+        would reintroduce the same 2k/eps threshold. d_perp.v_perp is used
+        rather than d.v_perp because v_perp computed as v - v_r n carries an
+        n-component of size eps v_r, and d_r times that is the same noise term.
+
+        At the origin n = 0, so v_r = d_r = 0 and a = b = 0, making both the
+        numerator and x0 a + y0 b exactly 0. v_r = 0 already kills the term; the
+        denominator floor exists only so that 0/0 does not become NaN and is
+        unreachable for ||x'|| > 0.
         """
         x0, y0 = self._x0(x), self._x0(y)
         d = y - x
@@ -320,8 +354,21 @@ class LorentzManifold(geoopt.Manifold):
         vperp = v - vr * n
         dr = (n * d).sum(-1, keepdim=True)
         dperp = d - dr * n
-        bracket = (dr * (2.0 * self.k + x0 * d0) - nx * dd) / (x0 * (x0 + y0))
-        yv = vr * bracket + (dperp * vperp).sum(-1, keepdim=True)
+        dp2 = (dperp * dperp).sum(-1, keepdim=True)
+        a = nx + dr
+        conj = x0 * a + y0 * nx
+        direct = x0 * a - y0 * nx
+        num = self.k * dr * (2.0 * nx + dr) - nx * nx * dp2
+        # nx >= 0, so y0 nx >= 0 and the two products cancel only where a >= 0.
+        # Where a < 0 they share a sign and `direct` is already exact, so the
+        # conjugate -- which is what vanishes there -- is not needed. Substitute
+        # in the INPUT of the division, not the output: torch.where evaluates
+        # both arms and a division by 0 in the untaken arm returns a NaN
+        # gradient that survives the mask.
+        pos = conj > 0
+        rational = num / torch.where(pos, conj, torch.ones_like(conj))
+        yv = vr * (torch.where(pos, rational, direct) / x0) \
+             + (dperp * vperp).sum(-1, keepdim=True)
         coef = yv / (self.k * (2.0 + w))
         return torch.addcmul(v, coef, x + y)
 
