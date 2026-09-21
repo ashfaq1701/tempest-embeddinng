@@ -27,18 +27,28 @@ class BagWeights(nn.Module):
     """
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, T_train: int,
-                 max_walk_len: int, hidden_dim: int = 32):
+                 max_walk_len: int, hidden_dim: int = 32, n_layers: int = 1):
         super().__init__()
         self.geom = geom
         self.E = E
         self.hidden = int(hidden_dim)
+        # Number of hidden Linear->GELU stages. 1 is the shape this project has always
+        # used: Linear(n_feat, hidden) -> GELU -> Linear(hidden, 1). Each extra layer
+        # inserts a Linear(hidden, hidden) -> GELU before the output, so n_layers=1 is
+        # bit-identical to the previous construction.
+        self.n_layers = int(n_layers)
+        if self.n_layers < 1:
+            raise ValueError(f"n_layers must be >= 1, got {n_layers}")
         # Divisors that put age and hop on [0, 1]-ish scales: the train-split time span
         # and the walk-length cap. Required, because a 0 here is a NaN in the weights.
         self.T_train = int(T_train)
         self.max_walk_len = int(max_walk_len)
         self.n_feat = 3
-        self.net = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU(),
-                                 nn.Linear(self.hidden, 1))
+        layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
+        for _ in range(self.n_layers - 1):
+            layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
+        layers.append(nn.Linear(self.hidden, 1))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
         """`tokens` has Q rows of T walk tokens -> [Q, d]."""
@@ -75,7 +85,7 @@ class LinkPredHead(nn.Module):
     INIT_IRANGE = 1e-3
 
     def __init__(self, num_nodes: int, d_emb: int, T_train: int, max_walk_len: int,
-                 hidden_dim: int = 32, seed: int = 42):
+                 hidden_dim: int = 32, n_layers_pooler: int = 1, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
@@ -91,7 +101,8 @@ class LinkPredHead(nn.Module):
         self.max_walk_len = int(max_walk_len)
 
         self.bag_weights = BagWeights(self.geom, self.E, T_train=self.T_train,
-                                      max_walk_len=self.max_walk_len, hidden_dim=hidden_dim)
+                                      max_walk_len=self.max_walk_len, hidden_dim=hidden_dim,
+                                      n_layers=n_layers_pooler)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
