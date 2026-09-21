@@ -6,8 +6,6 @@ import torch.nn.functional as F
 from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
-_VAR_FLOOR = 1e-12
-
 
 class BagWeights(nn.Module):
     """One query's walk bag -> one point on the manifold."""
@@ -34,7 +32,7 @@ class BagWeights(nn.Module):
         n = m.sum(dim=(0, 1)).clamp_min(1.0)                                 # [F]
         mu = (feat * m).sum(dim=(0, 1)) / n                                  # [F]
         var = (((feat - mu) ** 2) * m).sum(dim=(0, 1)) / n                   # [F]
-        return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt()                # [Q, T, F]
+        return (feat - mu) / var.clamp_min(torch.finfo(feat.dtype).tiny).sqrt()  # [Q, T, F]
 
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
         nodes = tokens.nodes.clamp_min(0).clone()                            # [Q, T]
