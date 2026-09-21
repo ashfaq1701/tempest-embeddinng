@@ -44,10 +44,10 @@ class TrainerConfig:
     # and the two effects could not be separated.
     hidden_dim: int = 32
 
-    # Hidden Linear->GELU stages in the pooler MLP. 1 reproduces the shape this project
-    # has always used; each extra inserts a Linear(hidden, hidden) -> GELU. Depth and
-    # width are separate knobs so a capacity change can be attributed to one of them.
-    n_layers_pooler: int = 1
+    # Hidden Linear->GELU stages in the pooler MLP. Each past the first inserts a
+    # Linear(hidden, hidden) -> GELU. Depth and width are separate knobs so a capacity
+    # change can be attributed to one of them. 1 reproduces the pre-c2a7c95 shape.
+    n_layers_pooler: int = 2
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5

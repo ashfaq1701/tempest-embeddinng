@@ -27,15 +27,15 @@ class BagWeights(nn.Module):
     """
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, T_train: int,
-                 max_walk_len: int, hidden_dim: int = 32, n_layers: int = 1):
+                 max_walk_len: int, hidden_dim: int = 32, n_layers: int = 2):
         super().__init__()
         self.geom = geom
         self.E = E
         self.hidden = int(hidden_dim)
-        # Number of hidden Linear->GELU stages. 1 is the shape this project has always
-        # used: Linear(n_feat, hidden) -> GELU -> Linear(hidden, 1). Each extra layer
-        # inserts a Linear(hidden, hidden) -> GELU before the output, so n_layers=1 is
-        # bit-identical to the previous construction.
+        # Number of hidden Linear->GELU stages. Each layer past the first inserts a
+        # Linear(hidden, hidden) -> GELU before the output. n_layers=1 is the single-
+        # hidden-layer shape this project used until c2a7c95 and is bit-identical to it;
+        # 2 is the default because it measured +0.0039 on YouTube (see the commit).
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
@@ -85,7 +85,7 @@ class LinkPredHead(nn.Module):
     INIT_IRANGE = 1e-3
 
     def __init__(self, num_nodes: int, d_emb: int, T_train: int, max_walk_len: int,
-                 hidden_dim: int = 32, n_layers_pooler: int = 1, seed: int = 42):
+                 hidden_dim: int = 32, n_layers_pooler: int = 2, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
