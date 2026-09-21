@@ -276,15 +276,6 @@ class LorentzManifold(geoopt.Manifold):
 
         with k - <X,Y>_L = k(2 + w) and <Y,V>_L = <Y-X,V>_L since <X,V>_L = 0.
 
-        <Y-X,V>_L is NOT formed as (d.v) - d0 (x.v)/x0. For momentum with a
-        radial component v_r and a radial step delta both terms are delta*v_r
-        and the true difference is delta*v_r*k/x0^2; at r = 11.4 that is 250x
-        below float32 rounding, so the computed value is noise. That noise
-        multiplies (x + y) ~ 2||x'|| and lands in the radial momentum, ~3% per
-        transport at r = 11.4, systematically, and the resulting longer step
-        makes the next error larger. That loop is how a 6.7e-3 step became
-        149.8 and overflowed cosh in expmap.
-
         Split v and d into radial and tangential parts about n = x'/||x'||, then
         rationalise the one remaining difference. With b = ||x'||, a = n.y =
         b + d_r and d_perp = d - d_r n,
@@ -298,34 +289,28 @@ class LorentzManifold(geoopt.Manifold):
                             / (x0 (x0 a + y0 b))
                         + d_perp . v_perp
 
-        THE FORM MATTERS, and the previous one was the problem. Written as
-        [d_r (2k + x0 d0) - ||x'|| ||d||^2] / (x0 (x0 + y0)), both numerator
-        terms are ~ ||x'|| d_r^2 for a radial-dominant step while the answer is
-        2k d_r. The answer is then smaller than its own operands by a factor
-        2k/(||x'|| ||d||), and float32 loses it entirely once
+        THE GROUPING IS LOAD-BEARING; do not simplify it. Written either as
+        (d.v) - d0 (x.v)/x0 or as
+        [d_r (2k + x0 d0) - ||x'|| ||d||^2] / (x0 (x0 + y0)), the two terms being
+        differenced are both ~ ||x'|| d_r^2 for a radial-dominant step while the
+        answer is 2k d_r. The answer is then smaller than its own operands by a
+        factor 2k/(||x'|| ||d||), and the dtype loses it entirely once
 
-            ||x'|| ||d||  >  2k / eps          (1.7e7 for float32, k = 1)
+            ||x'|| ||d||  >  2k / eps      (1.7e7 in float32, 9.0e15 in float64)
 
         Rationalised, the two numerator terms are a radial and a perpendicular
         quantity instead of two copies of ||x'|| d_r^2: for a radial step
         d_perp = 0 and the expression is exact, for a perpendicular step d_r = 0
         and it is exact, and neither term is a near-copy of the other in
-        between. No constant is introduced.
+        between. No constant is introduced and nothing is clamped.
 
-        Measured against a float64 evaluation of the definition, radial momentum
-        carried along a radial step at the training step length t = 1e-3, worst
-        relative error of the transported vector over 200 draws:
-
-            r          9         11         13         15
-            was    2.6e-06    1.4e-04    1.1e-02    4.8e-01
-            now    5.7e-08    8.2e-07    6.1e-05    2.7e-03
-
-        45x to 180x, and at r = 15 the old form is 48% wrong on a SINGLE
-        transport. It compounds: geoopt's RiemannianAdam carries exp_avg through
-        retr_transp every step, and exp_avg was observed climbing 5.1e9 -> 2.0e21
-        in 17 steps while the gradient feeding it stayed flat at 5.1e10. As an
-        isometry check, ||PT(v)||_y/||v||_x at r = 11 and a step of 0.1 goes from
-        1.895 to 1.000239; at r = 15 and a step of 0.1, from 3582 to 1.0096.
+        Precision here compounds rather than averaging out: geoopt's
+        RiemannianAdam carries exp_avg through retr_transp on every step while
+        exp_avg_sq is recomputed from the fresh gradient and never transported,
+        so an error in the transported momentum feeds only the numerator of
+        direction = exp_avg/sqrt(exp_avg_sq). egrad2rgrad returns g + x (x.g)/k,
+        which is nearly radial by construction, so Adam's momentum sits squarely
+        in the radial case this grouping exists to protect.
 
         ||d_perp||^2 is taken from the vector d_perp, NOT as ||d||^2 - d_r^2:
         that difference is again two near-equal numbers for a radial step and
