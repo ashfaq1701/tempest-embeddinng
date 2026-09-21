@@ -1,5 +1,3 @@
-import math
-
 import geoopt
 import torch
 import torch.nn as nn
@@ -8,26 +6,14 @@ import torch.nn.functional as F
 from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
+_VAR_FLOOR = 1e-12
+
 
 class BagWeights(nn.Module):
-    """One query's walk bag -> one point on the manifold.
+    """One query's walk bag -> one point on the manifold."""
 
-    Features per token are [log1p(age)/log1p(T_train), hop/max_walk_len, d(token, mid)],
-    softmax over the bag, then the Lorentzian midpoint: [Q, T, d] -> [Q, d].
-
-    `mid` is the bag's own UNWEIGHTED midpoint -- the Lorentzian centroid under uniform
-    weights over the valid tokens -- so the third feature is a per-token spread signal:
-    how far this token sits from the middle of its own bag.
-
-    The pooling does NOT depend on who is being scored -- each query is summarised once,
-    independently of its candidates.
-
-    Geometric features are detached; the midpoint is NOT. That split is load-bearing:
-    detaching the points would leave E with no gradient path at all.
-    """
-
-    def __init__(self, geom: "LorentzManifold", E: nn.Embedding, T_train: int,
-                 max_walk_len: int, hidden_dim: int = 32, n_layers: int = 2):
+    def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
+                 n_layers: int = 2):
         super().__init__()
         self.geom = geom
         self.E = E
@@ -35,10 +21,6 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        # Divisors that put age and hop on [0, 1]-ish scales: the train-split time span
-        # and the walk-length cap. Required, because a 0 here is a NaN in the weights.
-        self.T_train = int(T_train)
-        self.max_walk_len = int(max_walk_len)
         self.n_feat = 3
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
@@ -46,33 +28,35 @@ class BagWeights(nn.Module):
         layers.append(nn.Linear(self.hidden, 1))
         self.net = nn.Sequential(*layers)
 
+    @staticmethod
+    def _standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        m = valid.unsqueeze(-1).to(feat.dtype)                               # [Q, T, 1]
+        n = m.sum(dim=(0, 1)).clamp_min(1.0)                                 # [F]
+        mu = (feat * m).sum(dim=(0, 1)) / n                                  # [F]
+        var = (((feat - mu) ** 2) * m).sum(dim=(0, 1)) / n                   # [F]
+        return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt()                # [Q, T, F]
+
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
-        """`tokens` has Q rows of T walk tokens -> [Q, d]."""
-        nodes = tokens.nodes.clamp_min(0).clone()
-        valid = tokens.mask.clone()
-        cold = ~valid.any(dim=-1)
+        nodes = tokens.nodes.clamp_min(0).clone()                            # [Q, T]
+        valid = tokens.mask.clone()                                          # [Q, T]
+        cold = ~valid.any(dim=-1)                                            # [Q]
         if bool(cold.any()):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
 
-        # One lookup. Live for the pooled midpoint, detached for the features.
         x_tokens = F.embedding(nodes, self.E.weight)                         # [Q, T, d]
         xt = x_tokens.detach()                                               # [Q, T, d]
 
-        # The bag's unweighted midpoint: uniform weights over the valid tokens. The
-        # cold-start fix above guarantees at least one valid token per row, so the
-        # denominator is never zero.
-        u = valid.to(xt.dtype)
+        u = valid.to(xt.dtype)                                               # [Q, T]
         mid = self.geom.midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
 
-        # Every feature is [Q, T]: two from the walk, one pair distance, no radii.
-        age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype)) / math.log1p(self.T_train)
-        pos = tokens.positions.to(xt.dtype) / self.max_walk_len
-        d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))
+        age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, T]
+        pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
+        d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
 
         feat = torch.stack([age, pos, d_tok_mid], dim=-1).to(xt.dtype)       # [Q, T, 3]
-        logits = self.net(feat).squeeze(-1)                                  # [Q, T]
-        w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)
+        logits = self.net(self._standardise(feat, valid)).squeeze(-1)        # [Q, T]
+        w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.midpoint(x_tokens, w)                               # [Q, d]
 
 
@@ -80,8 +64,8 @@ class LinkPredHead(nn.Module):
 
     INIT_IRANGE = 1e-3
 
-    def __init__(self, num_nodes: int, d_emb: int, T_train: int, max_walk_len: int,
-                 hidden_dim: int = 32, n_layers_pooler: int = 2, seed: int = 42):
+    def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32,
+                 n_layers_pooler: int = 2, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
@@ -93,11 +77,7 @@ class LinkPredHead(nn.Module):
             init = self.geom.random(self.num_nodes, self.d_emb, irange=self.INIT_IRANGE)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
-        self.T_train = int(T_train)
-        self.max_walk_len = int(max_walk_len)
-
-        self.bag_weights = BagWeights(self.geom, self.E, T_train=self.T_train,
-                                      max_walk_len=self.max_walk_len, hidden_dim=hidden_dim,
+        self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,
                                       n_layers=n_layers_pooler)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))

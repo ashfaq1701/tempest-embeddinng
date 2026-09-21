@@ -58,7 +58,6 @@ def load_tgb_seq(name: str, root: str = "datasets") -> Loaded:
         dataset=ds,
         name=name,
         max_node_count=int(max(src.max(), dst.max())) + 1,
-        T_train=int(t_train.max() - t_train.min()) if t_train.size else 0,
     )
 
 
