@@ -32,10 +32,6 @@ class BagWeights(nn.Module):
         self.geom = geom
         self.E = E
         self.hidden = int(hidden_dim)
-        # Number of hidden Linear->GELU stages. Each layer past the first inserts a
-        # Linear(hidden, hidden) -> GELU before the output. n_layers=1 is the single-
-        # hidden-layer shape this project used until c2a7c95 and is bit-identical to it;
-        # 2 is the default because it measured +0.0039 on YouTube (see the commit).
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
