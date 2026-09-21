@@ -125,45 +125,11 @@ class LorentzManifold(geoopt.Manifold):
     # ------------------------------------------------------------------
     # geoopt.Manifold API (the abstract set)
     # ------------------------------------------------------------------
-    _dtype_radius_cap = None
-
-    def dtype_radius_cap(self, dtype: torch.dtype) -> float:
-        """Radius past which this dtype cannot resolve distances at all.
-
-        A point at radius r has x0 ~ sqrt(k) sinh(r/sqrt(k)), so the Minkowski
-        inner product x'.y' - x0 y0 cancels two quantities of size ~sinh^2(r)
-        and inherits an absolute error of ~eps sinh^2(r). The cap is where that
-        error reaches the O(1) gap needed to resolve a unit distance:
-        eps sinh^2(r/sqrt(k)) = 2, i.e. r = sqrt(k) asinh(sqrt(2/eps)).
-        9.011 in float32, 19.062 in float64.
-
-        A function of the dtype rather than a property because the dtype is not
-        known until a tensor arrives; cached after the first call.
-        """
-        if self._dtype_radius_cap is None:
-            self._dtype_radius_cap = self._sqrt_k * math.asinh(
-                math.sqrt(2.0 / torch.finfo(dtype).eps))
-        return self._dtype_radius_cap
-
     def projx(self, x: Tensor) -> Tensor:
-        """By Eq. 6 every x' in R^n is a valid point, so there is no feasibility
-        projection to make. What this does instead is pull rows back inside
-        `dtype_radius_cap`, along their own ray, so direction is preserved and
-        only the radius changes.
-
-        geoopt calls this at `stabilize` intervals (10 in the trainer), which is
-        frequent enough: the runaway creeps at ~1e-4 radius per step for
-        thousands of steps before the single step that overflows, so holding the
-        table inside the cap keeps it out of that regime entirely.
-
-        This is a guard, not a fix. The loss is blind to uniform radial
-        inflation -- d(u,v) ~ r_u + r_v + angular far from the origin, and
-        softmax cancels per-query constants -- so nothing in the objective pins
-        the scale. Removing the null direction is the real repair.
-        """
-        nmax = self._sqrt_k * math.sinh(self.dtype_radius_cap(x.dtype) * self._inv_sqrt_k)
-        n = x.norm(dim=-1, keepdim=True)
-        return x * (nmax / n.clamp_min(_tiny(x))).clamp_max(1.0)
+        """Identity. By Eq. 6 every x' in R^n is a valid point, so unlike the
+        Poincare ball there is no feasibility projection, and no drift for
+        geoopt's `stabilize` to repair."""
+        return x
 
     def proju(self, x: Tensor, u: Tensor) -> Tensor:
         """Identity. T_x is all of R^n here: the constraint <x,v>_L = 0 is
