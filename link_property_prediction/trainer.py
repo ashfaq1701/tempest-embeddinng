@@ -44,6 +44,11 @@ class TrainerConfig:
     # and the two effects could not be separated.
     hidden_dim: int = 32
 
+    # Hidden Linear->GELU stages in the pooler MLP. Each past the first inserts a
+    # Linear(hidden, hidden) -> GELU. Depth and width are separate knobs so a capacity
+    # change can be attributed to one of them. 1 reproduces the pre-c2a7c95 shape.
+    n_layers_pooler: int = 2
+
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
 
@@ -80,6 +85,7 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             hidden_dim=int(config.hidden_dim),
+            n_layers_pooler=int(config.n_layers_pooler),
             seed=int(config.seed),
             T_train=int(config.T_train),
             max_walk_len=int(config.max_walk_len),
