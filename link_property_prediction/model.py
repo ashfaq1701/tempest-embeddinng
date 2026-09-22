@@ -25,14 +25,15 @@ class BagWeights(nn.Module):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
         layers.append(nn.Linear(self.hidden, 1))
         self.net = nn.Sequential(*layers)
+        self.feat_norm = nn.BatchNorm1d(self.n_feat, affine=False)
 
-    @staticmethod
-    def _standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        m = valid.unsqueeze(-1).to(feat.dtype)                               # [Q, T, 1]
-        n = m.sum(dim=(0, 1)).clamp_min(1.0)                                 # [F]
-        mu = (feat * m).sum(dim=(0, 1)) / n                                  # [F]
-        var = (((feat - mu) ** 2) * m).sum(dim=(0, 1)) / n                   # [F]
-        return (feat - mu) / var.clamp_min(torch.finfo(feat.dtype).tiny).sqrt()  # [Q, T, F]
+    def _standardise(self, feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros_like(feat)                                         # [Q, T, F]
+        sel = feat[valid]                                                    # [N_valid, F]
+        if self.training and sel.shape[0] < 2:
+            return out
+        out[valid] = self.feat_norm(sel)
+        return out
 
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
         nodes = tokens.nodes.clamp_min(0).clone()                            # [Q, T]
