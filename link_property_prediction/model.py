@@ -27,12 +27,15 @@ class BagWeights(nn.Module):
         self.net = nn.Sequential(*layers)
 
     @staticmethod
-    def _standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:  # [Q, T, F]
-        m = valid.unsqueeze(-1).to(feat.dtype)
-        n = m.sum(1, keepdim=True).clamp_min(1.0)                            # [Q, 1, 1]
-        mu = (feat * m).sum(1, keepdim=True) / n
-        var = (((feat - mu) ** 2) * m).sum(1, keepdim=True) / n
-        return (feat - mu) / (var + 1e-6).sqrt() * m
+    def _standardise(feat: torch.Tensor, valid: torch.Tensor,
+                     eps: float = 1e-5) -> torch.Tensor:
+        """Per-feature standardisation over the valid tokens of the whole batch.
+        Invalid positions come out as 0; they are masked before the softmax anyway."""
+        m = valid.unsqueeze(-1).to(feat.dtype)                               # [Q, T, 1]
+        n = m.sum(dim=(0, 1)).clamp_min(1.0)                                 # [F]
+        mu = (feat * m).sum(dim=(0, 1)) / n                                  # [F]
+        var = (((feat - mu) ** 2) * m).sum(dim=(0, 1)) / n                   # [F]
+        return (feat - mu) / (var + eps).sqrt() * m                          # [Q, T, F]
 
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
         nodes = tokens.nodes.clamp_min(0).clone()                            # [Q, T]
