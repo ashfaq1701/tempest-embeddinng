@@ -29,8 +29,7 @@ class BagWeights(nn.Module):
     @staticmethod
     def _standardise(feat: torch.Tensor, valid: torch.Tensor,
                      eps: float = 1e-5) -> torch.Tensor:
-        """Per-feature standardisation over the valid tokens of the whole batch.
-        Invalid positions come out as 0; they are masked before the softmax anyway."""
+        """Per-feature standardisation over the valid tokens of the whole batch."""
         m = valid.unsqueeze(-1).to(feat.dtype)                               # [Q, T, 1]
         n = m.sum(dim=(0, 1)).clamp_min(1.0)                                 # [F]
         mu = (feat * m).sum(dim=(0, 1)) / n                                  # [F]
