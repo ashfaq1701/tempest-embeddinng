@@ -27,14 +27,14 @@ class BagWeights(nn.Module):
         self.net = nn.Sequential(*layers)
 
     @staticmethod
-    def _standardise(feat: torch.Tensor, valid: torch.Tensor,
-                     eps: float = 1e-5) -> torch.Tensor:
+    def _standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """Per-feature standardisation over the valid tokens of the whole batch."""
         m = valid.unsqueeze(-1).to(feat.dtype)                               # [Q, T, 1]
         n = m.sum(dim=(0, 1)).clamp_min(1.0)                                 # [F]
         mu = (feat * m).sum(dim=(0, 1)) / n                                  # [F]
         var = (((feat - mu) ** 2) * m).sum(dim=(0, 1)) / n                   # [F]
-        return (feat - mu) / (var + eps).sqrt() * m                          # [Q, T, F]
+        floor = torch.finfo(feat.dtype).tiny
+        return (feat - mu) / var.clamp_min(floor).sqrt() * m                 # [Q, T, F]
 
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
         nodes = tokens.nodes.clamp_min(0).clone()                            # [Q, T]
