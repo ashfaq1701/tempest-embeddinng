@@ -32,6 +32,9 @@ class TrainerConfig:
     # Dataset-derived.
     num_nodes: int
     dst_pool: np.ndarray
+    # Train-split time span from Loaded.T_train; the pooler divides ages by it.
+    # No default: it is a divisor and a silent 0 would produce NaN weights.
+    T_train: int
 
     # Embedding dimension.
     d_emb: int = 64
@@ -84,6 +87,8 @@ class Trainer:
             hidden_dim=int(config.hidden_dim),
             n_layers_pooler=int(config.n_layers_pooler),
             seed=int(config.seed),
+            T_train=int(config.T_train),
+            max_walk_len=int(config.max_walk_len),
         ).to(self.device)
 
         self.walk_gen = WalkGenerator(
