@@ -51,11 +51,11 @@ class BagWeights(nn.Module):
         u = valid.to(xt.dtype)                                               # [Q, T]
         mid = self.geom.midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
 
-        age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, T]
-        pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
         d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
+        d0_tok = self.geom.dist0(xt)                                         # [Q, T]
+        d0_mid = self.geom.dist0(mid).unsqueeze(-1).expand_as(d0_tok)        # [Q, T]
 
-        feat = torch.stack([age, pos, d_tok_mid], dim=-1).to(xt.dtype)       # [Q, T, 3]
+        feat = torch.stack([d_tok_mid, d0_tok, d0_mid], dim=-1).to(xt.dtype) # [Q, T, 3]
         logits = self.net(self._standardise(feat, valid)).squeeze(-1)        # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.midpoint(x_tokens, w)                               # [Q, d]
