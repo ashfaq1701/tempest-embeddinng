@@ -7,6 +7,7 @@ from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
 _VAR_FLOOR = 1e-12
+_DENOM_FLOOR = 1e-12
 
 
 class BagWeights(nn.Module):
@@ -21,7 +22,7 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 3
+        self.n_feat = 4
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -51,12 +52,24 @@ class BagWeights(nn.Module):
         u = valid.to(xt.dtype)                                               # [Q, T]
         mid = self.geom.midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
 
+        x_seed = F.embedding(tokens.seeds.clamp_min(0), self.E.weight).detach()   # [Q, d]
+
         age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, T]
         pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
-        d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
 
-        feat = torch.stack([age, pos, d_tok_mid], dim=-1).to(xt.dtype)       # [Q, T, 3]
-        logits = self.net(self._standardise(feat, valid)).squeeze(-1)        # [Q, T]
+        d0_tok = self.geom.dist0(xt)                                         # [Q, T]
+        d0_mid = self.geom.dist0(mid).unsqueeze(-1)                          # [Q, 1]
+        d0_seed = self.geom.dist0(x_seed).unsqueeze(-1)                      # [Q, 1]
+        m = valid.to(xt.dtype)                                               # [Q, T]
+        r_mid = self.geom.dist(xt, mid.unsqueeze(-2)) \
+            / (d0_tok + d0_mid).clamp_min(_DENOM_FLOOR) * m                  # [Q, T]
+        r_seed = self.geom.dist(xt, x_seed.unsqueeze(-2)) \
+            / (d0_tok + d0_seed).clamp_min(_DENOM_FLOOR) * m                 # [Q, T]
+
+        non_geom = torch.stack([age, pos], dim=-1).to(xt.dtype)              # [Q, T, 2]
+        ratios = torch.stack([r_mid, r_seed], dim=-1).to(xt.dtype)           # [Q, T, 2]
+        feat = torch.cat([self._standardise(non_geom, valid), ratios], dim=-1)
+        logits = self.net(feat).squeeze(-1)                                  # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.midpoint(x_tokens, w)                               # [Q, d]
 
