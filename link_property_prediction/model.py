@@ -30,12 +30,17 @@ class BagWeights(nn.Module):
         self.net = nn.Sequential(*layers)
 
     @staticmethod
-    def _standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        """Per-feature standardisation over the valid tokens of the whole batch."""
+    def _standardise(feat: torch.Tensor, valid: torch.Tensor,
+                     dims: tuple = (0, 1)) -> torch.Tensor:
+        """Standardisation over the valid tokens of the whole batch.
+
+        dims=(0, 1) is per-feature, master's rule. dims=(0, 1, 2) pools the feature axis
+        too, so every column shares one mean and std and their relative spreads survive.
+        """
         m = valid.unsqueeze(-1).to(feat.dtype)                               # [Q, T, 1]
-        n = m.sum(dim=(0, 1)).clamp_min(1.0)                                 # [F]
-        mu = (feat * m).sum(dim=(0, 1)) / n                                  # [F]
-        var = (((feat - mu) ** 2) * m).sum(dim=(0, 1)) / n                   # [F]
+        n = m.expand_as(feat).sum(dim=dims).clamp_min(1.0)                   # [F] or scalar
+        mu = (feat * m).sum(dim=dims) / n                                    # [F] or scalar
+        var = (((feat - mu) ** 2) * m).sum(dim=dims) / n                     # [F] or scalar
         return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m            # [Q, T, F]
 
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
@@ -68,7 +73,8 @@ class BagWeights(nn.Module):
 
         non_geom = torch.stack([age, pos], dim=-1).to(xt.dtype)              # [Q, T, 2]
         ratios = torch.stack([r_mid, r_seed], dim=-1).to(xt.dtype)           # [Q, T, 2]
-        feat = torch.cat([self._standardise(non_geom, valid), ratios], dim=-1)
+        feat = torch.cat([self._standardise(non_geom, valid),
+                          self._standardise(ratios, valid, dims=(0, 1, 2))], dim=-1)
         logits = self.net(feat).squeeze(-1)                                  # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.midpoint(x_tokens, w)                               # [Q, d]
