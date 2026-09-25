@@ -21,7 +21,7 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 5
+        self.n_feat = 7
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -59,15 +59,20 @@ class BagWeights(nn.Module):
 
         age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, T]
         pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
+        x_seed = F.embedding(tokens.seeds.clamp_min(0), self.E.weight).detach()   # [Q, d]
+
         d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
         d0_tok = self.geom.dist0(xt)                                         # [Q, T]
         d0_mid = self.geom.dist0(mid).unsqueeze(-1).expand_as(d0_tok)        # [Q, T]
+        d_tok_seed = self.geom.dist(xt, x_seed.unsqueeze(-2))                # [Q, T]
+        d0_seed = self.geom.dist0(x_seed).unsqueeze(-1).expand_as(d0_tok)    # [Q, T]
 
         non_geom = torch.stack([age, pos], dim=-1).to(xt.dtype)              # [Q, T, 2]
-        geom = torch.stack([d_tok_mid, d0_tok, d0_mid], dim=-1).to(xt.dtype) # [Q, T, 3]
+        geom = torch.stack([d_tok_mid, d0_mid, d_tok_seed, d0_seed, d0_tok],
+                           dim=-1).to(xt.dtype)                              # [Q, T, 5]
         feat = torch.cat([self._standardise(non_geom, valid),
                           self._standardise(geom, valid, dims=(0, 1, 2))],
-                         dim=-1)                                             # [Q, T, 5]
+                         dim=-1)                                             # [Q, T, 7]
         logits = self.net(feat).squeeze(-1)                                  # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.midpoint(x_tokens, w)                               # [Q, d]
