@@ -66,11 +66,9 @@ class BagWeights(nn.Module):
         r_seed = d_seed / ((d_seed * m).sum(-1, keepdim=True) / n) \
             .clamp_min(_DENOM_FLOOR) * m                                     # [Q, T]
 
-        non_geom = torch.stack([age, pos], dim=-1).to(xt.dtype)              # [Q, T, 2]
-        ratios = torch.stack([r_mid, r_seed], dim=-1).to(xt.dtype)           # [Q, T, 2]
-        feat = torch.cat([self._standardise(non_geom, valid),
-                          self._standardise(ratios, valid)], dim=-1)
-        logits = self.net(feat).squeeze(-1)                                  # [Q, T]
+        feats = self._standardise(torch.stack([age, pos, r_mid, r_seed], dim=-1),
+                                  valid).to(xt.dtype)                        # [Q, T, 4]
+        logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.midpoint(x_tokens, w)                               # [Q, d]
 
