@@ -57,14 +57,14 @@ class BagWeights(nn.Module):
         age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, T]
         pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
 
-        d0_tok = self.geom.dist0(xt)                                         # [Q, T]
-        d0_mid = self.geom.dist0(mid).unsqueeze(-1)                          # [Q, 1]
-        d0_seed = self.geom.dist0(x_seed).unsqueeze(-1)                      # [Q, 1]
         m = valid.to(xt.dtype)                                               # [Q, T]
-        r_mid = self.geom.dist(xt, mid.unsqueeze(-2)) \
-            / (d0_tok + d0_mid).clamp_min(_DENOM_FLOOR) * m                  # [Q, T]
-        r_seed = self.geom.dist(xt, x_seed.unsqueeze(-2)) \
-            / (d0_tok + d0_seed).clamp_min(_DENOM_FLOOR) * m                 # [Q, T]
+        n = m.sum(-1, keepdim=True).clamp_min(1.0)                           # [Q, 1]
+        d_mid = self.geom.dist(xt, mid.unsqueeze(-2))                        # [Q, T]
+        d_seed = self.geom.dist(xt, x_seed.unsqueeze(-2))                    # [Q, T]
+        r_mid = d_mid / ((d_mid * m).sum(-1, keepdim=True) / n) \
+            .clamp_min(_DENOM_FLOOR) * m                                     # [Q, T]
+        r_seed = d_seed / ((d_seed * m).sum(-1, keepdim=True) / n) \
+            .clamp_min(_DENOM_FLOOR) * m                                     # [Q, T]
 
         non_geom = torch.stack([age, pos], dim=-1).to(xt.dtype)              # [Q, T, 2]
         ratios = torch.stack([r_mid, r_seed], dim=-1).to(xt.dtype)           # [Q, T, 2]
