@@ -180,18 +180,26 @@ class Trainer:
 
     @torch.no_grad()
     def _geometry_probe(self) -> Dict[str, float]:
-        """Boundary watch: mean and max HYPERBOLIC RADIUS of E.
+        """Boundary watch: mean and max PER-ROW EUCLIDEAN NORM of E.
 
-        Was the Euclidean norm of the ambient (d+1)-vector. Under intrinsic
-        coordinates that vector no longer exists and ||x'|| = sqrt(k) sinh(r)
-        is not comparable to it, so this reports r = dist0(x) directly. r is
-        the quantity that matters anyway: float32 storage of an ambient point
-        loses the manifold constraint near r = 9, and float64 near r = 19.
-        Logged as r_mean/r_max, NOT |E|mean/|E|max -- old logs are on the other
-        scale and must not be compared line-for-line.
+        The Poincare ball IS the open unit ball {x : sqrt(c)*||x|| < 1}, so the
+        per-node coordinate norm ||x_i|| is the quantity that reaches the
+        boundary, and at c = 1 the boundary is exactly 1.0. Reported as
+        Emean/Emax. This is a PER-ROW norm, one value per node, each in [0, 1)
+        -- not the Frobenius norm of the table, which grows like sqrt(N) and
+        says nothing about the boundary.
+
+        Landmarks: geoopt clamps ||x|| to (1 - eps)/sqrt(c), eps = 4e-3 in
+        float32 and 1e-5 in float64, so Emax cannot exceed 0.996 here. Emax
+        pinned at 0.996 means the embedding is against that wall.
+
+        Replaces r_mean/r_max = dist0(x). The two are monotonically related,
+        ||x|| = tanh(dist0 / 2), but they are NOT the same scale: dist0 3/5/6
+        is ||x|| 0.905/0.987/0.995. Do not compare these lines against a
+        Lorentz log's r_mean/r_max line-for-line.
         """
-        r = self.model.geom.dist0(self.model.E.weight.detach())
-        return {"max_norm": float(r.max()), "mean_norm": float(r.mean())}
+        n = self.model.E.weight.detach().norm(dim=-1)
+        return {"max_norm": float(n.max()), "mean_norm": float(n.mean())}
 
     @torch.no_grad()
     def _head_probe(self) -> str:
@@ -301,7 +309,7 @@ class Trainer:
 
             # Geometry watch: boundary radius (|E|mean vs |E|max).
             g = self._geometry_probe()
-            line += f"  r_mean={g['mean_norm']:.3f}  r_max={g['max_norm']:.3f}"
+            line += f"  Emean={g['mean_norm']:.5f}  Emax={g['max_norm']:.5f}"
             line += self._head_probe()
 
             if val_evaluator is not None and val_batches_factory is not None:
