@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
 _VAR_FLOOR = 1e-12
@@ -13,7 +12,7 @@ _DENOM_FLOOR = 1e-12
 class BagWeights(nn.Module):
     """One query's walk bag -> one point on the manifold."""
 
-    def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
+    def __init__(self, geom: "geoopt.PoincareBall", E: nn.Embedding, hidden_dim: int = 32,
                  n_layers: int = 2):
         super().__init__()
         self.geom = geom
@@ -50,7 +49,8 @@ class BagWeights(nn.Module):
         xt = x_tokens.detach()                                               # [Q, T, d]
 
         u = valid.to(xt.dtype)                                               # [Q, T]
-        mid = self.geom.midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
+        mid = self.geom.weighted_midpoint(
+            xt, weights=u / u.sum(-1, keepdim=True), reducedim=[-2])          # [Q, d]
 
         x_seed = F.embedding(tokens.seeds.clamp_min(0), self.E.weight).detach()   # [Q, d]
 
@@ -70,7 +70,8 @@ class BagWeights(nn.Module):
                                   valid).to(xt.dtype)                        # [Q, T, 4]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
-        return self.geom.midpoint(x_tokens, w)                               # [Q, d]
+        return self.geom.weighted_midpoint(x_tokens, weights=w,
+                                          reducedim=[-2])                    # [Q, d]
 
 
 class LinkPredHead(nn.Module):
@@ -82,12 +83,12 @@ class LinkPredHead(nn.Module):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
-        self.geom = LorentzManifold()
+        self.geom = geoopt.PoincareBall(c=1.0)
         torch.manual_seed(seed)
 
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            init = self.geom.random(self.num_nodes, self.d_emb, irange=self.INIT_IRANGE)
+            init = self.geom.random(self.num_nodes, self.d_emb, std=self.INIT_IRANGE)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
         self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,
