@@ -7,7 +7,6 @@ from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
 _VAR_FLOOR = 1e-12
-_DENOM_FLOOR = 1e-12
 
 
 class BagWeights(nn.Module):
@@ -55,13 +54,9 @@ class BagWeights(nn.Module):
         age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, T]
         pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
 
-        m = valid.to(xt.dtype)                                               # [Q, T]
-        n = m.sum(-1, keepdim=True).clamp_min(1.0)                           # [Q, 1]
         d_mid = self.geom.dist(xt, mid.unsqueeze(-2))                        # [Q, T]
-        r_mid = d_mid / ((d_mid * m).sum(-1, keepdim=True) / n) \
-            .clamp_min(_DENOM_FLOOR) * m                                     # [Q, T]
 
-        feats = self._standardise(torch.stack([age, pos, r_mid], dim=-1),
+        feats = self._standardise(torch.stack([age, pos, d_mid], dim=-1),
                                   valid).to(xt.dtype)                        # [Q, T, 3]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
