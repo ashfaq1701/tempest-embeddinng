@@ -99,7 +99,7 @@ class LinkPredHead(nn.Module):
     INIT_IRANGE = 1e-3
 
     def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32,
-                 n_layers_pooler: int = 2, seed: int = 42):
+                 seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
