@@ -13,20 +13,30 @@ class BagWeights(nn.Module):
     """One query's walk bag -> one point on the manifold."""
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
-                 n_layers: int = 2):
+                 n_layers: int = 1, n_heads: int = 4, dropout: float = 0.1):
         super().__init__()
         self.geom = geom
         self.E = E
         self.hidden = int(hidden_dim)
         self.n_layers = int(n_layers)
+        self.n_heads = int(n_heads)
+        self.dropout = float(dropout)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
+        if self.hidden % self.n_heads != 0:
+            raise ValueError(f"hidden_dim {self.hidden} must divide by n_heads {self.n_heads}")
         self.n_feat = 3
-        layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
-        for _ in range(self.n_layers - 1):
-            layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
-        layers.append(nn.Linear(self.hidden, 1))
-        self.net = nn.Sequential(*layers)
+        # A SET ENCODER over the walk-token features: every token's hidden vector is updated by
+        # attending over the other VALID tokens of its own bag, then scored. Padded tokens are
+        # invisible via src_key_padding_mask. Pre-norm, because with attention in the stack the
+        # LayerNorms are load-bearing rather than decoration.
+        self.stem = nn.Linear(self.n_feat, self.hidden)
+        layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden, nhead=self.n_heads, dim_feedforward=4 * self.hidden,
+            dropout=self.dropout, activation="gelu", batch_first=True, norm_first=True)
+        self.encoder = nn.TransformerEncoder(layer, num_layers=self.n_layers)
+        self.norm = nn.LayerNorm(self.hidden)
+        self.head = nn.Linear(self.hidden, 1)
 
     @staticmethod
     def _standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
@@ -58,7 +68,10 @@ class BagWeights(nn.Module):
 
         feats = self._standardise(torch.stack([age, pos, d_mid], dim=-1),
                                   valid).to(xt.dtype)                        # [Q, T, 3]
-        logits = self.net(feats).squeeze(-1)                                 # [Q, T]
+
+        h = self.stem(feats)                                                 # [Q, T, H]
+        h = self.encoder(h, src_key_padding_mask=~valid)                     # [Q, T, H]
+        logits = self.head(self.norm(h)).squeeze(-1)                         # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.midpoint(x_tokens, w)                               # [Q, d]
 
@@ -68,7 +81,8 @@ class LinkPredHead(nn.Module):
     INIT_IRANGE = 1e-3
 
     def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32,
-                 n_layers_pooler: int = 2, seed: int = 42):
+                 n_layers: int = 1, n_heads: int = 4, dropout: float = 0.1,
+                 seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
@@ -81,7 +95,7 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
         self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,
-                                      n_layers=n_layers_pooler)
+                                      n_layers=n_layers, n_heads=n_heads, dropout=dropout)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
