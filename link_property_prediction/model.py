@@ -31,6 +31,14 @@ class BagWeights(nn.Module):
         # invisible via src_key_padding_mask. Pre-norm, because with attention in the stack the
         # LayerNorms are load-bearing rather than decoration.
         self.stem = nn.Linear(self.n_feat, self.hidden)
+        # CONTENT branch: each token's embedding, mapped to the tangent space at the origin,
+        # projected to the hidden width and LayerNormed so it arrives on the same scale as the
+        # scalar branch it is added to. Normalise AFTER the projection: normalising the raw
+        # tangent vector instead would let the projection rescale it and the two branches could
+        # drift apart again. Learnable affine kept -- the next op is an addition, not a linear
+        # layer that could absorb it.
+        self.proj_e = nn.Linear(self.E.embedding_dim, self.hidden)
+        self.norm_e = nn.LayerNorm(self.hidden)
         layer = nn.TransformerEncoderLayer(
             d_model=self.hidden, nhead=self.n_heads, dim_feedforward=4 * self.hidden,
             dropout=self.dropout, activation="gelu", batch_first=True, norm_first=True)
@@ -69,7 +77,11 @@ class BagWeights(nn.Module):
         feats = self._standardise(torch.stack([age, pos, d_mid], dim=-1),
                                   valid).to(xt.dtype)                        # [Q, T, 3]
 
-        h = self.stem(feats)                                                 # [Q, T, H]
+        # xt is DETACHED, so the pooler sees the embeddings' CONTENT without being able to
+        # reshape them. Intrinsic coordinates: logmap from the origin is already the d-dim
+        # tangent vector, so there is no ambient time component to slice off.
+        v = self.geom.logmap(torch.zeros_like(xt), xt)                        # [Q, T, d]
+        h = self.norm_e(self.proj_e(v)) + self.stem(feats)                    # [Q, T, H]
         h = self.encoder(h, src_key_padding_mask=~valid)                     # [Q, T, H]
         logits = self.head(self.norm(h)).squeeze(-1)                         # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
