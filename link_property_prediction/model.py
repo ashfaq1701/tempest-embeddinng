@@ -11,23 +11,22 @@ _DENOM_FLOOR = 1e-12
 
 
 class BagWeights(nn.Module):
-    """One query's walk bag -> one point on the manifold, walk by walk.
+    """One query's walk bag -> one point on the manifold, walk by walk."""
 
-    Stage 1 within each walk: a bidirectional GRU reads the walk's token features, a per-token
-    head gives logits, softmax over that walk's L tokens, Lorentz midpoint -> one point per walk.
-    Stage 2 across walks: the GRU's final state summarises each walk, a per-walk head gives
-    logits, softmax over the K walks, Lorentz midpoint of those points -> the bag's point.
-    """
-
-    def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32):
+    def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
+                 kernel_size: int = 3):
         super().__init__()
         self.geom = geom
         self.E = E
         self.hidden = int(hidden_dim)
         self.n_feat = 3
-        self.gru = nn.GRU(self.n_feat, self.hidden, batch_first=True, bidirectional=True)
-        self.head_tok = nn.Linear(2 * self.hidden, 1)       # per-token logit within its walk
-        self.head_walk = nn.Linear(2 * self.hidden, 1)      # per-walk logit within its bag
+        pad = kernel_size // 2
+        self.enc = nn.Sequential(
+            nn.Conv1d(self.n_feat + 1, self.hidden, kernel_size, padding=pad), nn.GELU(),
+            nn.Conv1d(self.hidden, self.hidden, kernel_size, padding=pad), nn.GELU(),
+        )
+        self.head_tok = nn.Linear(self.hidden, 1)
+        self.head_walk = nn.Linear(self.hidden, 1)
 
     @staticmethod
     def _standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
@@ -57,7 +56,7 @@ class BagWeights(nn.Module):
         m = valid.to(xt.dtype)                                               # [Q, K, L]
         n_bag = m.reshape(q, -1).sum(-1, keepdim=True).clamp_min(1.0)        # [Q, 1]
         mid = self.geom.midpoint(xt.reshape(q, k * l, d),
-                                 (m.reshape(q, k * l) / n_bag))              # [Q, d]
+                                 m.reshape(q, k * l) / n_bag)                # [Q, d]
 
         age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, K, L]
         pos = tokens.positions.to(xt.dtype)                                  # [Q, K, L]
@@ -69,27 +68,25 @@ class BagWeights(nn.Module):
         feats = self._standardise(torch.stack([age, pos, r_mid], dim=-1),
                                   valid).to(xt.dtype)                        # [Q, K, L, 3]
 
-        seq = feats.reshape(q * k, l, self.n_feat)                           # [Q*K, L, 3]
-        lens = valid.reshape(q * k, l).sum(-1)                               # [Q*K]  padding is at the end
-        lens_c = lens.clamp_min(1).cpu()                                     # empty walks fed length 1, masked below
-        packed = nn.utils.rnn.pack_padded_sequence(seq, lens_c, batch_first=True,
-                                                   enforce_sorted=False)
-        out, h_n = self.gru(packed)                                          # h_n [2, Q*K, H]
-        out, _ = nn.utils.rnn.pad_packed_sequence(out, batch_first=True, total_length=l)
-        out = out.reshape(q, k, l, 2 * self.hidden)                          # [Q, K, L, 2H]
-        h_walk = torch.cat([h_n[0], h_n[1]], dim=-1).reshape(q, k, 2 * self.hidden)  # [Q, K, 2H]
+        seq = torch.cat([feats, m.unsqueeze(-1)], dim=-1)                    # [Q, K, L, 4]
+        seq = seq.reshape(q * k, l, self.n_feat + 1).transpose(1, 2)         # [Q*K, 4, L]
+        out = self.enc(seq).transpose(1, 2).reshape(q, k, l, self.hidden)    # [Q, K, L, H]
 
         tok_logits = self.head_tok(out).squeeze(-1)                          # [Q, K, L]
         tok_logits = tok_logits.masked_fill(~valid, float("-inf"))
-        w_tok = torch.softmax(tok_logits, dim=-1)                            # [Q, K, L]  sums to 1 per walk
-        w_tok = torch.where(walk_valid.unsqueeze(-1), w_tok, torch.zeros_like(w_tok))
+        w_tok = torch.softmax(tok_logits, dim=-1)                            # [Q, K, L]
+        w_tok = torch.where(walk_valid.unsqueeze(-1), w_tok,
+                            torch.zeros_like(w_tok))                         # empty walk -> weights 0
 
         m_k = self.geom.midpoint(x_tokens.reshape(q * k, l, d),
                                  w_tok.reshape(q * k, l)).reshape(q, k, d)   # [Q, K, d]
 
+        wm = m.unsqueeze(-1)                                                 # [Q, K, L, 1]
+        h_walk = (out * wm).sum(dim=2) / wm.sum(dim=2).clamp_min(1.0)        # [Q, K, H]
+
         walk_logits = self.head_walk(h_walk).squeeze(-1)                     # [Q, K]
         walk_logits = walk_logits.masked_fill(~walk_valid, float("-inf"))
-        w_walk = torch.softmax(walk_logits, dim=-1)                          # [Q, K]  sums to 1 per bag
+        w_walk = torch.softmax(walk_logits, dim=-1)                          # [Q, K]
 
         return self.geom.midpoint(m_k, w_walk)                               # [Q, d]
 
