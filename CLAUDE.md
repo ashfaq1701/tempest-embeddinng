@@ -264,3 +264,84 @@ run, against Taobao's 1381 s and Yelp's 1780 s), and the extreme point on trunca
 mechanism there, then **confirm on Taobao before believing it generalises** — ML-20M is an
 outlier in density too (127 edges/node against Taobao ~8.6 and Yelp ~9.8), so a fix that
 exploits deep dense history need not transfer.
+
+## Four poolers, one null result (measured, 2026-09-28/29)
+
+Four architectures were built off master, run on 3-5 datasets each and rejected in one session.
+All seed 5, d=64, K=5, wpn 5, mwl 5, lr 1e-3, patience 10, hidden 32, against **arm B = current
+master `9f24967`** with a depth-matched `n_layers_pooler 2` pooler (1,217 params).
+
+| arm | commit | pooler params | YouTube | Flickr | ML-20M | Yelp | WikiLink |
+|---|---|---|---|---|---|---|---|
+| **master (arm B)** | `9f24967` | 1,217 | **0.6149** | **0.6366** | **0.2469** | 0.6481 † | 0.6500 † |
+| hierarchical GRU | `be74a7a` | 7,234 | 0.4722 ‡ | 0.5165 ‡ | 0.2413 ‡ | — | — |
+| hierarchical conv | `cb3405e` | 3,586 | 0.5842 | 0.6242 | **0.2556** | 0.6589 ‡ | 0.6632 ‡ |
+| conv + pointwise stem | `6005d39` | 6,434 | 0.6129 | **0.6369** | — | **0.6592** | 0.5530 ✗ |
+| tangent displacement | `46e195a` | 1,217 | 0.4968 ‡ | 0.6053 ‡ | 0.2478 | — | — |
+
+† lower bound, run killed before convergence (ep14 / ep11). ‡ killed mid-run, not converged.
+✗ diverged. Bold = best converged number per dataset.
+
+**The three converged head-to-heads are −0.002, +0.0003 and +0.009.** Measured seed-to-seed
+spread on YouTube for one arm is **0.033**, so every one of these is inside noise. Nothing in
+this family beat master, and the conv arms cost **1.3-1.6x master per epoch** (YouTube 61.6s vs
+43.5s train, Flickr 93.6s vs 60.0s, ML-20M 193s vs 115.8s) at 3-5x the parameters. The GRU cost
+**3-4x** (YouTube 181s, ML-20M 958s) for the same null.
+
+### The shape they all share: front-load, then flatten
+
+Three of the four led master by **+0.05 to +0.18 val in the ep8-25 window and all lost**, because
+master has a late second escape none of them reproduce — YouTube val 0.583 -> 0.685 over ep25-50,
++0.068 in three epochs. The conv arm led by +0.143 val at ep15 and crossed under at ep30; the
+tangent arm led by +0.073 at ep18 and was -0.092 by ep35.
+
+**Capacity is not the constraint, and this is measured, not inferred.** The conv arm reached
+*identical training loss* to master on YouTube (ep50 link 0.0387 vs 0.0388) while scoring 0.031
+worse on test. The hierarchy arms' **val->test gap was 0.008-0.015 WIDER** than master's
+(YouTube 0.086 vs 0.071). They fit the objective as well and generalised less.
+
+**Do not re-run these.** A hierarchy over `[Q, K, L]` cannot enlarge the hypothesis class: any
+non-negative weight matrix `W[k,l]` factors as `w_walk[k] * w_tok[k,l]` with
+`w_walk[k] = sum_l W[k,l]`, so GRU and conv were *reparameterisations* of master's flat softmax,
+not extensions. Deeper convs, bigger kernels, GRU+conv hybrids and transformer set encoders
+(1 win / 4 losses, -0.126 on WikiLink) are all the same move.
+
+### What the pointwise stem fixed, and what it did not
+
+`6005d39` put a `Conv1d(C, H, kernel_size=1)` — a per-token Linear — in front of the two `k=3`
+convs. Master is two per-token Linear->GELU stages; the 2-conv arm had **zero** purely per-token
+stages, its first layer projecting 4->32 *and* mixing three positions in the same weights. The
+stem makes the conv arm a superset of master and recovered **+0.029 on YouTube and +0.013 on
+Flickr**, taking both from a real deficit to a tie. Receptive field is unchanged at 5, which at
+mwl 5 already spans the whole walk, so a third `k=3` stage buys capacity and no new context.
+
+### Two instabilities the conv arms have and master does not
+
+**WikiLink diverged** on the stem arm: stopped on val at ep8, then from ep9 the *training loss
+rose* (0.1925 -> 0.1988) while `r_mean` climbed a constant +0.20/epoch to 3.92 and val thrashed
+between 0.335 and 0.640. **Yelp** stopped at ep18 with `r_max` running 5.67 -> **8.14**. Both are
+radius blow-up, and both are plausibly fixable with a lower lr or a pooler-specific lr — so they
+are *not* evidence about hierarchy, and WikiLink's -0.097 should not be quoted as a capacity loss.
+
+### Reading these numbers later
+
+**Master has never been run to convergence on Yelp or WikiLink.** Its references above (0.6481 at
+ep14, 0.6500 at ep10) come from runs killed by hand. On WikiLink the val increments had decayed to
++0.0002/epoch and test had already turned over (0.6500 at ep10 -> 0.6477 at ep11), so that one is
+close to its plateau; Yelp's was still gaining +0.003/epoch. **Also: the arm-B WikiLink reference
+is `n_layers_pooler 1` (162 params) while every arm above ran `nl 2`** — so every WikiLink delta
+in this table mixes in a pooler-depth change. A clean WikiLink baseline does not exist.
+
+**Drift decides ties.** The stem arm's YouTube *val* (0.6906) and *max test* (0.6157 at ep64) both
+beat master's (0.6854 / 0.6149), yet its val-selected checkpoint reports 0.6129 because val
+flickered up at ep68 and ep73 while test fell. Record both numbers or the ranking is not
+like-for-like.
+
+### Where this leaves the attack
+
+Four unrelated mechanisms — recurrence, convolution, per-token depth, leaving the convex hull —
+each landed inside noise of master. **The pooler is not where the headroom is.** The open question
+is what the flat softmax does between ep25 and ep50 on YouTube that none of these reproduce, and
+the untested axes remain walk depth (`--max-walk-len`, 70-99% of reachable history is discarded at
+5), breadth (`--num-walks-per-node`; wpn 10 measured at only **1.11x** the train cost of wpn 5,
+one epoch, then killed) and the scorer.
