@@ -59,7 +59,7 @@ class BagWeights(nn.Module):
         feats = self._standardise(torch.stack([age, pos, d_mid], dim=-1),
                                   valid).to(xt.dtype)                        # [Q, T, 3]
 
-        a = self.net(feats).squeeze(-1) * m                                  # [Q, T]  signed, 0 on padding
+        a = torch.tanh(self.net(feats).squeeze(-1)) * m                      # [Q, T]  in [-1, 1], 0 on padding
         t = self.geom.logmap(b.unsqueeze(-2), x_tokens)                      # [Q, T, d]
         v = (a.unsqueeze(-1) * t).sum(-2) / n                                # [Q, d]
         return self.geom.expmap(b, v)                                        # [Q, d]
