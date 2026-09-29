@@ -21,7 +21,8 @@ class BagWeights(nn.Module):
         self.n_feat = 3
         pad = kernel_size // 2
         self.enc = nn.Sequential(
-            nn.Conv1d(self.n_feat + 1, self.hidden, kernel_size, padding=pad), nn.GELU(),
+            nn.Conv1d(self.n_feat + 1, self.hidden, 1), nn.GELU(),
+            nn.Conv1d(self.hidden, self.hidden, kernel_size, padding=pad), nn.GELU(),
             nn.Conv1d(self.hidden, self.hidden, kernel_size, padding=pad), nn.GELU(),
         )
         self.head_tok = nn.Linear(self.hidden, 1)
