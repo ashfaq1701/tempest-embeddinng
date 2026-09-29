@@ -10,7 +10,7 @@ _VAR_FLOOR = 1e-12
 
 
 class BagWeights(nn.Module):
-    """One query's walk bag -> one point on the manifold."""
+    """One query's walk bag -> one point on the manifold, by a tangent step from the midpoint."""
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
                  n_layers: int = 2):
@@ -48,19 +48,21 @@ class BagWeights(nn.Module):
         x_tokens = F.embedding(nodes, self.E.weight)                         # [Q, T, d]
         xt = x_tokens.detach()                                               # [Q, T, d]
 
-        u = valid.to(xt.dtype)                                               # [Q, T]
-        mid = self.geom.midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
+        m = valid.to(xt.dtype)                                               # [Q, T]
+        n = m.sum(-1, keepdim=True).clamp_min(1.0)                           # [Q, 1]
+
+        b = self.geom.midpoint(x_tokens, m / n)                              # [Q, d]  base, with gradient
 
         age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, T]
         pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
-
-        d_mid = self.geom.dist(xt, mid.unsqueeze(-2))                        # [Q, T]
-
+        d_mid = self.geom.dist(xt, b.detach().unsqueeze(-2))                 # [Q, T]
         feats = self._standardise(torch.stack([age, pos, d_mid], dim=-1),
                                   valid).to(xt.dtype)                        # [Q, T, 3]
-        logits = self.net(feats).squeeze(-1)                                 # [Q, T]
-        w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
-        return self.geom.midpoint(x_tokens, w)                               # [Q, d]
+
+        a = self.net(feats).squeeze(-1) * m                                  # [Q, T]  signed, 0 on padding
+        t = self.geom.logmap(b.unsqueeze(-2), x_tokens)                      # [Q, T, d]
+        v = (a.unsqueeze(-1) * t).sum(-2) / n                                # [Q, d]
+        return self.geom.expmap(b, v)                                        # [Q, d]
 
 
 class LinkPredHead(nn.Module):
