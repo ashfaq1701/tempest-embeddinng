@@ -52,10 +52,9 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. TWO RiemannianAdam param groups: `lr` drives the embedding
-    # table and the distance temperature, `lr_pooler` drives every pooler parameter.
+    # Constant lr, no weight decay. One RiemannianAdam param group at a single `lr`: the
+    # embedding tables, the distance temperature and the NN pooler all step at the same rate.
     lr: float = 1e-3
-    lr_pooler: float = 1e-4
 
     # Run control.
     num_epochs: int = 100
@@ -95,21 +94,9 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # Two param groups. The pooler is a Euclidean MLP that converges in an epoch or two,
-        # while E is a manifold parameter starting at radius 1e-3 under Riemannian steps: at a
-        # shared lr the pooler wins the race and fits a geometry that has not formed yet. Group
-        # 0 is E + geo_temp, group 1 is the pooler. BagWeights holds a REFERENCE to E, so its
-        # named_parameters() includes E.weight -- membership is decided by identity against the
-        # table, not by name, or E would land in both groups and be stepped twice.
-        table = self.model.E.weight
-        pooler = [q for q in self.model.bag_weights.parameters() if q is not table]
-        pooler_ids = {id(q) for q in pooler}
-        rest = [q for q in self.model.parameters() if id(q) not in pooler_ids]
-        assert len(pooler) + len(rest) == len(list(self.model.parameters()))
+        # One param group at a single lr: Riemannian update for E, standard Adam for the rest.
         self.opt = geoopt.optim.RiemannianAdam(
-            [{"params": rest, "lr": float(config.lr)},
-             {"params": pooler, "lr": float(config.lr_pooler)}],
-            lr=float(config.lr), stabilize=10,
+            self.model.parameters(), lr=float(config.lr), stabilize=10,
         )
 
     # Full-graph ingestion (once, up front)
@@ -181,7 +168,6 @@ class Trainer:
         return {
             "link": float(link_loss.detach()),
             "lr": float(self.opt.param_groups[0]["lr"]),
-            "lr_pooler": float(self.opt.param_groups[-1]["lr"]),
         }
 
     # Geometry probe
@@ -304,7 +290,6 @@ class Trainer:
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
                 f"lr={self.opt.param_groups[0]['lr']:.0e}  "
-                f"lr_p={self.opt.param_groups[-1]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
 

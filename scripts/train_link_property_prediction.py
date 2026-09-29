@@ -66,13 +66,8 @@ def parse_args() -> argparse.Namespace:
 
     # ── Optimisation / training ─────────────────────────────────────
     p.add_argument("--lr", default=1e-3, type=float,
-                   help="Learning rate for the embedding table and the distance temperature.")
-    p.add_argument("--lr-pooler", default=1e-4, type=float,
-                   help="Learning rate for every pooler parameter, as its own param group. The "
-                        "pooler is a Euclidean MLP that converges in an epoch or two while E is a "
-                        "manifold parameter starting at radius 1e-3; at a shared rate the pooler "
-                        "fits a geometry that has not formed yet. Pass --lr-pooler equal to --lr "
-                        "to recover the old single-rate behaviour.")
+                   help="Learning rate. One param group: the embedding tables, the distance "
+                        "temperature and the NN pooler all step at this rate.")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
@@ -186,7 +181,6 @@ def main() -> Dict[str, Any]:
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
         lr=args.lr,
-        lr_pooler=args.lr_pooler,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 
