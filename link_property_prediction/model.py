@@ -13,7 +13,7 @@ class BagWeights(nn.Module):
     """One query's walk bag -> one point on the manifold. Memory: seed -> oldest."""
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
-                 n_layers: int = 2, alpha_init: float = 0.5, floor: float = 0.0):
+                 n_layers: int = 2, alpha_init: float = 0.5):
         super().__init__()
         self.geom = geom
         self.E = E
@@ -22,7 +22,6 @@ class BagWeights(nn.Module):
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
         self.n_feat = 3
-        self.floor = float(floor)                       # lam in w = (1-lam) w + lam * uniform; 0 = off
         a0 = torch.full((self.n_feat,), float(alpha_init))
         self.log_alpha = nn.Parameter(torch.logit(a0))  # alpha = sigmoid(log_alpha), one per column
         layers = [nn.Linear(2 * self.n_feat, self.hidden), nn.GELU()]
@@ -83,8 +82,6 @@ class BagWeights(nn.Module):
         logits = self.net(z).squeeze(-1)                                     # [Q, T]
         valid_flat = valid.reshape(q, k * l)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid_flat, float("-inf")), dim=-1)
-        if self.floor > 0.0:
-            w = (1.0 - self.floor) * w + self.floor * (m_flat / n_bag)      # every real token keeps >= floor/n
         return self.geom.midpoint(x_tokens.reshape(q, k * l, d), w)         # [Q, d]
 
 
