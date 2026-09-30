@@ -10,22 +10,26 @@ _VAR_FLOOR = 1e-12
 
 
 class BagWeights(nn.Module):
-    """One query's walk bag -> one point on the manifold, walk by walk."""
+    """One query's walk bag -> one point on the manifold. Memory: oldest -> seed."""
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
-                 kernel_size: int = 3):
+                 n_layers: int = 2, alpha_init: float = 0.5, floor: float = 0.0):
         super().__init__()
         self.geom = geom
         self.E = E
         self.hidden = int(hidden_dim)
+        self.n_layers = int(n_layers)
+        if self.n_layers < 1:
+            raise ValueError(f"n_layers must be >= 1, got {n_layers}")
         self.n_feat = 3
-        pad = kernel_size // 2
-        self.enc = nn.Sequential(
-            nn.Conv1d(self.n_feat + 1, self.hidden, kernel_size, padding=pad), nn.GELU(),
-            nn.Conv1d(self.hidden, self.hidden, kernel_size, padding=pad), nn.GELU(),
-        )
-        self.head_tok = nn.Linear(self.hidden, 1)
-        self.head_walk = nn.Linear(self.hidden, 1)
+        self.floor = float(floor)                       # lam in w = (1-lam) w + lam * uniform; 0 = off
+        a0 = torch.full((self.n_feat,), float(alpha_init))
+        self.log_alpha = nn.Parameter(torch.logit(a0))  # alpha = sigmoid(log_alpha), one per column
+        layers = [nn.Linear(2 * self.n_feat, self.hidden), nn.GELU()]
+        for _ in range(self.n_layers - 1):
+            layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
+        layers.append(nn.Linear(self.hidden, 1))
+        self.net = nn.Sequential(*layers)
 
     @staticmethod
     def _standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
@@ -37,6 +41,17 @@ class BagWeights(nn.Module):
         var = (((feat - mu) ** 2) * m).sum(dim=dims) / n                     # [F]
         return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m            # [..., F]
 
+    def _walk_memory(self, feats: torch.Tensor, pos: torch.Tensor,
+                     valid: torch.Tensor) -> torch.Tensor:
+        """h_l = (1-alpha) * sum_{j: hop_j >= hop_l} alpha^(hop_j - hop_l) f_j, same walk only.
+        feats [Q, K, L, F] (0 on padding), pos [Q, K, L] hops, valid [Q, K, L] -> h [Q, K, L, F]."""
+        alpha = torch.sigmoid(self.log_alpha)                                # [F]
+        lag = (pos.unsqueeze(-2) - pos.unsqueeze(-1)).to(feats.dtype)        # [Q, K, L, L]  hop_j - hop_l
+        keep = (lag >= 0) & valid.unsqueeze(-1) & valid.unsqueeze(-2)        # j on the far side of l
+        decay = alpha ** lag.clamp_min(0).unsqueeze(-1)                      # [Q, K, L, L, F]
+        W = torch.where(keep.unsqueeze(-1), decay, torch.zeros_like(decay))
+        return (1.0 - alpha) * torch.einsum("qkljc,qkjc->qklc", W, feats)    # [Q, K, L, F]
+
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
         nodes = tokens.nodes.clamp_min(0).clone()                            # [Q, K, L]
         valid = tokens.mask.clone()                                          # [Q, K, L]
@@ -46,45 +61,31 @@ class BagWeights(nn.Module):
         if bool(cold.any()):
             nodes[cold, 0, 0] = tokens.seeds[cold]
             valid[cold, 0, 0] = True
-        walk_valid = valid.any(dim=-1)                                       # [Q, K]
 
         x_tokens = F.embedding(nodes, self.E.weight)                         # [Q, K, L, d]
         xt = x_tokens.detach()                                               # [Q, K, L, d]
         d = xt.shape[-1]
 
         m = valid.to(xt.dtype)                                               # [Q, K, L]
-        n_bag = m.reshape(q, -1).sum(-1, keepdim=True).clamp_min(1.0)        # [Q, 1]
-        mid = self.geom.midpoint(xt.reshape(q, k * l, d),
-                                 m.reshape(q, k * l) / n_bag)                # [Q, d]
+        m_flat = m.reshape(q, k * l)                                         # [Q, T]
+        n_bag = m_flat.sum(-1, keepdim=True).clamp_min(1.0)                  # [Q, 1]
+        mid = self.geom.midpoint(xt.reshape(q, k * l, d), m_flat / n_bag)    # [Q, d]
 
         age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, K, L]
         pos = tokens.positions.to(xt.dtype)                                  # [Q, K, L]
         d_mid = self.geom.dist(xt, mid.view(q, 1, 1, d))                     # [Q, K, L]
-
         feats = self._standardise(torch.stack([age, pos, d_mid], dim=-1),
                                   valid).to(xt.dtype)                        # [Q, K, L, 3]
 
-        seq = torch.cat([feats, m.unsqueeze(-1)], dim=-1)                    # [Q, K, L, 4]
-        seq = seq.reshape(q * k, l, self.n_feat + 1).transpose(1, 2)         # [Q*K, 4, L]
-        out = self.enc(seq).transpose(1, 2).reshape(q, k, l, self.hidden)    # [Q, K, L, H]
+        h = self._walk_memory(feats, pos, valid)                             # [Q, K, L, 3]
+        z = torch.cat([feats, h], dim=-1).reshape(q, k * l, 2 * self.n_feat)  # [Q, T, 6]
 
-        tok_logits = self.head_tok(out).squeeze(-1)                          # [Q, K, L]
-        tok_logits = tok_logits.masked_fill(~valid, float("-inf"))
-        w_tok = torch.softmax(tok_logits, dim=-1)                            # [Q, K, L]
-        w_tok = torch.where(walk_valid.unsqueeze(-1), w_tok,
-                            torch.zeros_like(w_tok))                         # empty walk -> weights 0
-
-        m_k = self.geom.midpoint(x_tokens.reshape(q * k, l, d),
-                                 w_tok.reshape(q * k, l)).reshape(q, k, d)   # [Q, K, d]
-
-        wm = m.unsqueeze(-1)                                                 # [Q, K, L, 1]
-        h_walk = (out * wm).sum(dim=2) / wm.sum(dim=2).clamp_min(1.0)        # [Q, K, H]
-
-        walk_logits = self.head_walk(h_walk).squeeze(-1)                     # [Q, K]
-        walk_logits = walk_logits.masked_fill(~walk_valid, float("-inf"))
-        w_walk = torch.softmax(walk_logits, dim=-1)                          # [Q, K]
-
-        return self.geom.midpoint(m_k, w_walk)                               # [Q, d]
+        logits = self.net(z).squeeze(-1)                                     # [Q, T]
+        valid_flat = valid.reshape(q, k * l)                                 # [Q, T]
+        w = torch.softmax(logits.masked_fill(~valid_flat, float("-inf")), dim=-1)
+        if self.floor > 0.0:
+            w = (1.0 - self.floor) * w + self.floor * (m_flat / n_bag)      # every real token keeps >= floor/n
+        return self.geom.midpoint(x_tokens.reshape(q, k * l, d), w)         # [Q, d]
 
 
 class LinkPredHead(nn.Module):
