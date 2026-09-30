@@ -10,10 +10,10 @@ _VAR_FLOOR = 1e-12
 
 
 class BagWeights(nn.Module):
-    """One query's walk bag -> one point on the manifold. Memory: seed -> oldest."""
+    """One query's walk bag -> one point on the manifold. Memory: seed -> oldest, with content."""
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
-                 n_layers: int = 2, alpha_init: float = 0.5):
+                 n_layers: int = 2, alpha_init: float = 0.5, n_content: int = 8):
         super().__init__()
         self.geom = geom
         self.E = E
@@ -21,7 +21,10 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 3
+        self.n_scal = 3
+        self.n_content = int(n_content)
+        self.n_feat = self.n_scal + self.n_content
+        self.proj = nn.Linear(int(E.weight.shape[1]), self.n_content)
         a0 = torch.full((self.n_feat,), float(alpha_init))
         self.log_alpha = nn.Parameter(torch.logit(a0))  # alpha = sigmoid(log_alpha), one per column
         layers = [nn.Linear(2 * self.n_feat, self.hidden), nn.GELU()]
@@ -73,11 +76,19 @@ class BagWeights(nn.Module):
         age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, K, L]
         pos = tokens.positions.to(xt.dtype)                                  # [Q, K, L]
         d_mid = self.geom.dist(xt, mid.view(q, 1, 1, d))                     # [Q, K, L]
-        feats = self._standardise(torch.stack([age, pos, d_mid], dim=-1),
-                                  valid).to(xt.dtype)                        # [Q, K, L, 3]
 
-        h = self._walk_memory(feats, pos, valid)                             # [Q, K, L, 3]
-        z = torch.cat([feats, h], dim=-1).reshape(q, k * l, 2 * self.n_feat)  # [Q, T, 6]
+        # Content: the DIRECTION of each token from the bag midpoint. ||logmap|| is d_mid, so the
+        # unit vector is the part that is not already a column. xt and mid are detached, so the
+        # projection is trained but E takes no gradient through it.
+        u = self.geom.logmap(mid.view(q, 1, 1, d).expand_as(xt), xt)          # [Q, K, L, d]
+        u = u / u.norm(dim=-1, keepdim=True).clamp_min(1e-12)                # [Q, K, L, d]
+        c = self.proj(u) * m.unsqueeze(-1)                                    # [Q, K, L, n_content]
+
+        feats = self._standardise(torch.cat([torch.stack([age, pos, d_mid], dim=-1), c], dim=-1),
+                                  valid).to(xt.dtype)                        # [Q, K, L, 3 + n_content]
+
+        h = self._walk_memory(feats, pos, valid)                             # [Q, K, L, F]
+        z = torch.cat([feats, h], dim=-1).reshape(q, k * l, 2 * self.n_feat)  # [Q, T, 2F]
 
         logits = self.net(z).squeeze(-1)                                     # [Q, T]
         valid_flat = valid.reshape(q, k * l)                                 # [Q, T]
