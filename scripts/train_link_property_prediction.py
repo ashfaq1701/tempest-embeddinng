@@ -87,6 +87,10 @@ def parse_args() -> argparse.Namespace:
 
     # ── Pooler widths ───────────────────────────────────────────────
     # Low-priority knobs: the defaults are the measured design and these are not swept.
+    p.add_argument("--n-layers-pooler", default=2, type=int,
+                   help="Hidden Linear->GELU stages in the pooler, COUNTING THE STEM (>= 1). 1 "
+                        "leaves the stem as the only hidden stage and reads [u, h] straight to a "
+                        "logit; 2 adds one Linear(2H, H)->GELU before the output.")
     p.add_argument("--hidden-dim", default=32, type=int,
                    help="Hidden width of the pooler MLP. Pinned independently of the feature "
                         "count so a feature change does not also move pooler capacity.")
@@ -171,6 +175,7 @@ def main() -> Dict[str, Any]:
 
         d_emb=args.d_emb,
         hidden_dim=args.hidden_dim,
+        n_layers_pooler=args.n_layers_pooler,
 
         K_train=args.k_train,
 

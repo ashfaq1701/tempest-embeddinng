@@ -24,10 +24,14 @@ class BagWeights(nn.Module):
         self.n_feat = 3
         self.log_alpha = nn.Parameter(torch.logit(torch.tensor(float(alpha_init))))  # scalar
         self.stem = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU())
-        layers = [nn.Linear(2 * self.hidden, self.hidden), nn.GELU()]      # reads [u, h]
-        for _ in range(self.n_layers - 2):
-            layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
-        layers.append(nn.Linear(self.hidden, 1))
+        # n_layers counts hidden Linear->GELU stages INCLUDING the stem, as master's flag does. So
+        # n_layers 1 leaves the stem as the only hidden stage and reads [u, h] straight to a logit.
+        layers = []                                                        # reads [u, h]
+        c = 2 * self.hidden
+        for _ in range(self.n_layers - 1):
+            layers += [nn.Linear(c, self.hidden), nn.GELU()]
+            c = self.hidden
+        layers.append(nn.Linear(c, 1))
         self.net = nn.Sequential(*layers)
 
     @staticmethod
@@ -90,7 +94,7 @@ class LinkPredHead(nn.Module):
     INIT_IRANGE = 1e-3
 
     def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32,
-                 seed: int = 42):
+                 n_layers_pooler: int = 2, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
@@ -102,7 +106,8 @@ class LinkPredHead(nn.Module):
             init = self.geom.random(self.num_nodes, self.d_emb, irange=self.INIT_IRANGE)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
-        self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim)
+        self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,
+                                      n_layers=n_layers_pooler)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 

@@ -40,6 +40,7 @@ class TrainerConfig:
     # old 8*n_feat rule every feature ablation silently changed pooler capacity too
     # and the two effects could not be separated.
     hidden_dim: int = 32
+    n_layers_pooler: int = 2
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
@@ -77,6 +78,7 @@ class Trainer:
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
             hidden_dim=int(config.hidden_dim),
+            n_layers_pooler=int(config.n_layers_pooler),
             seed=int(config.seed),
         ).to(self.device)
 
