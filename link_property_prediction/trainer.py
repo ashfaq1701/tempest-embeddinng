@@ -201,7 +201,9 @@ class Trainer:
         # during a run, so it has to reach the epoch line or it is lost when the job exits.
         bw = getattr(self.model, "bag_weights", None)
         if hasattr(bw, "log_alpha"):
-            a = torch.sigmoid(bw.log_alpha.detach())
+            # reshape(-1) because log_alpha is a SCALAR on the hidden-state arm and a vector on the
+            # per-column arms; slicing a 0-dim tensor raises.
+            a = torch.sigmoid(bw.log_alpha.detach()).reshape(-1)
             n_scal = int(getattr(bw, "n_scal", a.numel()))
             parts.append("a_scal=" + ",".join(f"{float(v):.3f}" for v in a[:n_scal]))
             if a.numel() > n_scal:

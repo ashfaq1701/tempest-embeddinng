@@ -10,7 +10,7 @@ _VAR_FLOOR = 1e-12
 
 
 class BagWeights(nn.Module):
-    """One query's walk bag -> one point on the manifold. Memory: seed -> oldest."""
+    """One query's walk bag -> one point on the manifold. Memory: seed -> oldest, hidden state."""
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
                  n_layers: int = 2, alpha_init: float = 0.5):
@@ -22,10 +22,10 @@ class BagWeights(nn.Module):
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
         self.n_feat = 3
-        a0 = torch.full((self.n_feat,), float(alpha_init))
-        self.log_alpha = nn.Parameter(torch.logit(a0))  # alpha = sigmoid(log_alpha), one per column
-        layers = [nn.Linear(2 * self.n_feat, self.hidden), nn.GELU()]
-        for _ in range(self.n_layers - 1):
+        self.log_alpha = nn.Parameter(torch.logit(torch.tensor(float(alpha_init))))  # scalar
+        self.stem = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU())
+        layers = [nn.Linear(2 * self.hidden, self.hidden), nn.GELU()]      # reads [u, h]
+        for _ in range(self.n_layers - 2):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
         layers.append(nn.Linear(self.hidden, 1))
         self.net = nn.Sequential(*layers)
@@ -40,16 +40,15 @@ class BagWeights(nn.Module):
         var = (((feat - mu) ** 2) * m).sum(dim=dims) / n                     # [F]
         return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m            # [..., F]
 
-    def _walk_memory(self, feats: torch.Tensor, pos: torch.Tensor,
+    def _walk_memory(self, u: torch.Tensor, pos: torch.Tensor,
                      valid: torch.Tensor) -> torch.Tensor:
-        """h_l = (1-alpha) * sum_{j: hop_j <= hop_l} alpha^(hop_l - hop_j) f_j, same walk only.
-        feats [Q, K, L, F] (0 on padding), pos [Q, K, L] hops, valid [Q, K, L] -> h [Q, K, L, F]."""
-        alpha = torch.sigmoid(self.log_alpha)                                # [F]
-        lag = (pos.unsqueeze(-1) - pos.unsqueeze(-2)).to(feats.dtype)        # [Q, K, L, L]  hop_l - hop_j
+        """h_l = (1-alpha) * sum_{j: hop_j <= hop_l} alpha^(hop_l - hop_j) u_j, same walk only.
+        u [Q, K, L, H], pos [Q, K, L] hops, valid [Q, K, L] -> h [Q, K, L, H]."""
+        alpha = torch.sigmoid(self.log_alpha)                                # scalar
+        lag = (pos.unsqueeze(-1) - pos.unsqueeze(-2)).to(u.dtype)            # [Q, K, L, L]  hop_l - hop_j
         keep = (lag >= 0) & valid.unsqueeze(-1) & valid.unsqueeze(-2)        # j on the seed side of l
-        decay = alpha ** lag.clamp_min(0).unsqueeze(-1)                      # [Q, K, L, L, F]
-        W = torch.where(keep.unsqueeze(-1), decay, torch.zeros_like(decay))
-        return (1.0 - alpha) * torch.einsum("qkljc,qkjc->qklc", W, feats)    # [Q, K, L, F]
+        W = torch.where(keep, alpha ** lag.clamp_min(0), torch.zeros_like(lag))  # [Q, K, L, L]
+        return (1.0 - alpha) * torch.einsum("qklj,qkjh->qklh", W, u)         # [Q, K, L, H]
 
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
         nodes = tokens.nodes.clamp_min(0).clone()                            # [Q, K, L]
@@ -76,8 +75,9 @@ class BagWeights(nn.Module):
         feats = self._standardise(torch.stack([age, pos, d_mid], dim=-1),
                                   valid).to(xt.dtype)                        # [Q, K, L, 3]
 
-        h = self._walk_memory(feats, pos, valid)                             # [Q, K, L, 3]
-        z = torch.cat([feats, h], dim=-1).reshape(q, k * l, 2 * self.n_feat)  # [Q, T, 6]
+        u = self.stem(feats) * m.unsqueeze(-1)                               # [Q, K, L, H]  0 on padding
+        h = self._walk_memory(u, pos, valid)                                 # [Q, K, L, H]
+        z = torch.cat([u, h], dim=-1).reshape(q, k * l, 2 * self.hidden)     # [Q, T, 2H]
 
         logits = self.net(z).squeeze(-1)                                     # [Q, T]
         valid_flat = valid.reshape(q, k * l)                                 # [Q, T]
