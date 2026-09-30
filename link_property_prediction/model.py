@@ -13,7 +13,7 @@ class BagWeights(nn.Module):
     """One query's walk bag -> one point on the manifold, tokens scored after reading the bag."""
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
-                 n_layers: int = 2, n_heads: int = 4, floor: float = 0.0):
+                 n_layers: int = 2, n_heads: int = 4):
         super().__init__()
         self.geom = geom
         self.E = E
@@ -22,7 +22,6 @@ class BagWeights(nn.Module):
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
         self.n_feat = 3
-        self.floor = float(floor)                                            # lam; 0 = off
 
         self.stem = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU())  # master's first layer
         self.attn = nn.MultiheadAttention(self.hidden, num_heads=int(n_heads), batch_first=True)
@@ -71,8 +70,6 @@ class BagWeights(nn.Module):
 
         logits = self.head(h).squeeze(-1)                                    # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
-        if self.floor > 0.0:
-            w = (1.0 - self.floor) * w + self.floor * (m / n)                # every real token keeps >= lam/n
         return self.geom.midpoint(x_tokens, w)                               # [Q, d]
 
 
@@ -81,8 +78,7 @@ class LinkPredHead(nn.Module):
     INIT_IRANGE = 1e-3
 
     def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32,
-                 n_layers_pooler: int = 2, n_heads: int = 4, floor: float = 0.0,
-                 seed: int = 42):
+                 n_layers_pooler: int = 2, n_heads: int = 4, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
@@ -95,7 +91,7 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
         self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,
-                                      n_layers=n_layers_pooler, n_heads=n_heads, floor=floor)
+                                      n_layers=n_layers_pooler, n_heads=n_heads)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
