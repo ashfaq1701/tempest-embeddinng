@@ -10,10 +10,10 @@ _VAR_FLOOR = 1e-12
 
 
 class BagWeights(nn.Module):
-    """One query's walk bag -> one point on the manifold."""
+    """One query's walk bag -> one point on the manifold, tokens scored after reading the bag."""
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
-                 n_layers: int = 2):
+                 n_layers: int = 2, n_heads: int = 4, floor: float = 0.0):
         super().__init__()
         self.geom = geom
         self.E = E
@@ -22,11 +22,18 @@ class BagWeights(nn.Module):
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
         self.n_feat = 3
-        layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
+        self.floor = float(floor)                                            # lam; 0 = off
+
+        self.stem = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU())  # master's first layer
+        self.attn = nn.MultiheadAttention(self.hidden, num_heads=int(n_heads), batch_first=True)
+        nn.init.zeros_(self.attn.out_proj.weight)                            # attention adds nothing at step 0
+        nn.init.zeros_(self.attn.out_proj.bias)
+        self.norm = nn.LayerNorm(self.hidden)
+        layers = []                                                          # master's remaining layers
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
         layers.append(nn.Linear(self.hidden, 1))
-        self.net = nn.Sequential(*layers)
+        self.head = nn.Sequential(*layers)
 
     @staticmethod
     def _standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
@@ -48,18 +55,24 @@ class BagWeights(nn.Module):
         x_tokens = F.embedding(nodes, self.E.weight)                         # [Q, T, d]
         xt = x_tokens.detach()                                               # [Q, T, d]
 
-        u = valid.to(xt.dtype)                                               # [Q, T]
-        mid = self.geom.midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
+        m = valid.to(xt.dtype)                                               # [Q, T]
+        n = m.sum(-1, keepdim=True).clamp_min(1.0)                           # [Q, 1]
+        mid = self.geom.midpoint(xt, m / n)                                  # [Q, d]
 
         age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, T]
         pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
-
         d_mid = self.geom.dist(xt, mid.unsqueeze(-2))                        # [Q, T]
-
         feats = self._standardise(torch.stack([age, pos, d_mid], dim=-1),
                                   valid).to(xt.dtype)                        # [Q, T, 3]
-        logits = self.net(feats).squeeze(-1)                                 # [Q, T]
+
+        h = self.stem(feats)                                                 # [Q, T, H]  one vector per token
+        a, _ = self.attn(h, h, h, key_padding_mask=~valid, need_weights=False)  # [Q, T, H]  reads the bag
+        h = self.norm(h + a)                                                 # [Q, T, H]  residual + LayerNorm
+
+        logits = self.head(h).squeeze(-1)                                    # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
+        if self.floor > 0.0:
+            w = (1.0 - self.floor) * w + self.floor * (m / n)                # every real token keeps >= lam/n
         return self.geom.midpoint(x_tokens, w)                               # [Q, d]
 
 
@@ -68,7 +81,8 @@ class LinkPredHead(nn.Module):
     INIT_IRANGE = 1e-3
 
     def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32,
-                 n_layers_pooler: int = 2, seed: int = 42):
+                 n_layers_pooler: int = 2, n_heads: int = 4, floor: float = 0.0,
+                 seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
@@ -81,7 +95,7 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
         self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,
-                                      n_layers=n_layers_pooler)
+                                      n_layers=n_layers_pooler, n_heads=n_heads, floor=floor)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 

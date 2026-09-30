@@ -87,6 +87,11 @@ def parse_args() -> argparse.Namespace:
 
     # ── Pooler widths ───────────────────────────────────────────────
     # Low-priority knobs: the defaults are the measured design and these are not swept.
+    p.add_argument("--n-heads", default=4, type=int,
+                   help="Heads in the bag self-attention layer (hidden_dim must divide by it).")
+    p.add_argument("--pooler-floor", default=0.0, type=float,
+                   help="lam in w = (1-lam) w + lam/n: every valid token keeps at least lam/n of the "
+                        "pooling weight, so every token keeps receiving gradient. 0 = off.")
     p.add_argument("--hidden-dim", default=32, type=int,
                    help="Hidden width of the pooler MLP. Pinned independently of the feature "
                         "count so a feature change does not also move pooler capacity.")
@@ -176,6 +181,8 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
         hidden_dim=args.hidden_dim,
         n_layers_pooler=args.n_layers_pooler,
+        n_heads=args.n_heads,
+        pooler_floor=args.pooler_floor,
 
         K_train=args.k_train,
 
