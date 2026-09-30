@@ -41,6 +41,7 @@ class TrainerConfig:
     # and the two effects could not be separated.
     hidden_dim: int = 32
     n_layers_pooler: int = 2
+    pooler_floor: float = 0.2
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
@@ -79,6 +80,7 @@ class Trainer:
             d_emb=int(config.d_emb),
             hidden_dim=int(config.hidden_dim),
             n_layers_pooler=int(config.n_layers_pooler),
+            floor=float(config.pooler_floor),
             seed=int(config.seed),
         ).to(self.device)
 
@@ -211,6 +213,8 @@ class Trainer:
             if a.numel() > n_scal:
                 ac = a[n_scal:]
                 parts.append(f"a_cont={float(ac.mean()):.3f}[{float(ac.min()):.3f},{float(ac.max()):.3f}]")
+        if getattr(bw, "floor", 0.0):
+            parts.append(f"floor={float(bw.floor):.2f}")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad

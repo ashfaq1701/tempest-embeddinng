@@ -91,6 +91,9 @@ def parse_args() -> argparse.Namespace:
                    help="Hidden Linear->GELU stages in the pooler, COUNTING THE STEM (>= 1). 1 "
                         "leaves the stem as the only hidden stage and reads [u, h] straight to a "
                         "logit; 2 adds one Linear(2H, H)->GELU before the output.")
+    p.add_argument("--pooler-floor", default=0.2, type=float,
+                   help="lam in w = (1-lam) w + lam/n: every valid token keeps at least lam/n of the "
+                        "pooling weight, so every token in every bag keeps receiving gradient. 0 = off.")
     p.add_argument("--hidden-dim", default=32, type=int,
                    help="Hidden width of the pooler MLP. Pinned independently of the feature "
                         "count so a feature change does not also move pooler capacity.")
@@ -176,6 +179,7 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
         hidden_dim=args.hidden_dim,
         n_layers_pooler=args.n_layers_pooler,
+        pooler_floor=args.pooler_floor,
 
         K_train=args.k_train,
 
