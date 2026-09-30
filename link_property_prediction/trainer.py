@@ -196,6 +196,17 @@ class Trainer:
             parts.append(f"temp={float(self.model.temperature):.3f}")
         if hasattr(self.model, "geo_temp"):
             parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
+        # Walk-memory fade rates. alpha -> 0 means the arm is asking for no memory at all, which is
+        # the one number that settles whether the recurrence is wanted; it is held only in memory
+        # during a run, so it has to reach the epoch line or it is lost when the job exits.
+        bw = getattr(self.model, "bag_weights", None)
+        if hasattr(bw, "log_alpha"):
+            a = torch.sigmoid(bw.log_alpha.detach())
+            n_scal = int(getattr(bw, "n_scal", a.numel()))
+            parts.append("a_scal=" + ",".join(f"{float(v):.3f}" for v in a[:n_scal]))
+            if a.numel() > n_scal:
+                ac = a[n_scal:]
+                parts.append(f"a_cont={float(ac.mean()):.3f}[{float(ac.min()):.3f},{float(ac.max()):.3f}]")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad
