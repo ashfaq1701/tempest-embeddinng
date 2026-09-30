@@ -7,10 +7,11 @@ from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
 _VAR_FLOOR = 1e-12
+_TAP_FLOOR = 1e-12
 
 
 class BagWeights(nn.Module):
-    """One query's walk bag -> one point on the manifold. Memory: seed -> oldest, hidden state."""
+    """One query's walk bag -> one point on the manifold. Memory: oldest -> seed, one shared rate."""
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
                  n_layers: int = 2, alpha_init: float = 0.5):
@@ -22,16 +23,12 @@ class BagWeights(nn.Module):
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
         self.n_feat = 3
-        self.log_alpha = nn.Parameter(torch.logit(torch.tensor(float(alpha_init))))  # scalar
-        self.stem = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU())
-        # n_layers counts hidden Linear->GELU stages INCLUDING the stem, as master's flag does. So
-        # n_layers 1 leaves the stem as the only hidden stage and reads [u, h] straight to a logit.
-        layers = []                                                        # reads [u, h]
-        c = 2 * self.hidden
+        self.stem = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU())  # master's stem
+        self.log_alpha = nn.Parameter(torch.logit(torch.tensor(float(alpha_init))))  # one shared alpha
+        layers = []                                                          # master's layers after the stem
         for _ in range(self.n_layers - 1):
-            layers += [nn.Linear(c, self.hidden), nn.GELU()]
-            c = self.hidden
-        layers.append(nn.Linear(c, 1))
+            layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
+        layers.append(nn.Linear(self.hidden, 1))
         self.net = nn.Sequential(*layers)
 
     @staticmethod
@@ -46,13 +43,15 @@ class BagWeights(nn.Module):
 
     def _walk_memory(self, u: torch.Tensor, pos: torch.Tensor,
                      valid: torch.Tensor) -> torch.Tensor:
-        """h_l = (1-alpha) * sum_{j: hop_j <= hop_l} alpha^(hop_l - hop_j) u_j, same walk only.
-        u [Q, K, L, H], pos [Q, K, L] hops, valid [Q, K, L] -> h [Q, K, L, H]."""
+        """h[l] = sum_{j older-or-equal} alpha^(hop_j - hop_l) u[j] / sum of those taps.
+        u [Q, K, L, H] (0 on padding), pos [Q, K, L] hops, valid [Q, K, L] -> h [Q, K, L, H]."""
         alpha = torch.sigmoid(self.log_alpha)                                # scalar
-        lag = (pos.unsqueeze(-1) - pos.unsqueeze(-2)).to(u.dtype)            # [Q, K, L, L]  hop_l - hop_j
-        keep = (lag >= 0) & valid.unsqueeze(-1) & valid.unsqueeze(-2)        # j on the seed side of l
+        lag = (pos.unsqueeze(-2) - pos.unsqueeze(-1)).to(u.dtype)            # [Q, K, L, L]  hop_j - hop_l
+        keep = (lag >= 0) & valid.unsqueeze(-1) & valid.unsqueeze(-2)        # j at or beyond l, both real
         W = torch.where(keep, alpha ** lag.clamp_min(0), torch.zeros_like(lag))  # [Q, K, L, L]
-        return (1.0 - alpha) * torch.einsum("qklj,qkjh->qklh", W, u)         # [Q, K, L, H]
+        num = torch.einsum("qklj,qkjh->qklh", W, u)                          # [Q, K, L, H]
+        den = W.sum(dim=-1, keepdim=True).clamp_min(_TAP_FLOOR)              # [Q, K, L, 1]
+        return num / den
 
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
         nodes = tokens.nodes.clamp_min(0).clone()                            # [Q, K, L]
@@ -81,9 +80,8 @@ class BagWeights(nn.Module):
 
         u = self.stem(feats) * m.unsqueeze(-1)                               # [Q, K, L, H]  0 on padding
         h = self._walk_memory(u, pos, valid)                                 # [Q, K, L, H]
-        z = torch.cat([u, h], dim=-1).reshape(q, k * l, 2 * self.hidden)     # [Q, T, 2H]
 
-        logits = self.net(z).squeeze(-1)                                     # [Q, T]
+        logits = self.net(h).squeeze(-1).reshape(q, k * l)                   # [Q, T]
         valid_flat = valid.reshape(q, k * l)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid_flat, float("-inf")), dim=-1)
         return self.geom.midpoint(x_tokens.reshape(q, k * l, d), w)         # [Q, d]
