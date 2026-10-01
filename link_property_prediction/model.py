@@ -21,7 +21,7 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 3
+        self.n_feat = 4
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -55,9 +55,10 @@ class BagWeights(nn.Module):
         pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
 
         d_mid = self.geom.dist(xt, mid.unsqueeze(-2))                        # [Q, T]
+        d0_tok = self.geom.dist0(xt)                                         # [Q, T]  token's own radius
 
-        feats = self._standardise(torch.stack([age, pos, d_mid], dim=-1),
-                                  valid).to(xt.dtype)                        # [Q, T, 3]
+        feats = self._standardise(torch.stack([age, pos, d_mid, d0_tok], dim=-1),
+                                  valid).to(xt.dtype)                        # [Q, T, 4]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.midpoint(x_tokens, w)                               # [Q, d]
