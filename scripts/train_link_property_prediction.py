@@ -90,6 +90,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hidden-dim", default=32, type=int,
                    help="Hidden width of the pooler MLP. Pinned independently of the feature "
                         "count so a feature change does not also move pooler capacity.")
+    p.add_argument("--n-queries", default=4, type=int,
+                   help="Learned query points per bag (>= 1). Each is the bag's Lorentz midpoint "
+                        "shifted by its own learned tangent offset, and contributes one distance "
+                        "column d(token, query) to the pooler features. At the zero init every "
+                        "query IS the midpoint, so the arm starts as master with d_mid repeated.")
     p.add_argument("--n-layers-pooler", default=2, type=int,
                    help="Hidden Linear->GELU stages in the pooler MLP (>= 1). Each past the "
                         "first inserts a Linear(hidden, hidden) -> GELU before the output "
@@ -176,6 +181,7 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
         hidden_dim=args.hidden_dim,
         n_layers_pooler=args.n_layers_pooler,
+        n_queries=args.n_queries,
 
         K_train=args.k_train,
 

@@ -45,6 +45,7 @@ class TrainerConfig:
     # Linear(hidden, hidden) -> GELU. Depth and width are separate knobs so a capacity
     # change can be attributed to one of them. 1 reproduces the pre-c2a7c95 shape.
     n_layers_pooler: int = 2
+    n_queries: int = 4
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
@@ -83,6 +84,7 @@ class Trainer:
             d_emb=int(config.d_emb),
             hidden_dim=int(config.hidden_dim),
             n_layers_pooler=int(config.n_layers_pooler),
+            n_queries=int(config.n_queries),
             seed=int(config.seed),
         ).to(self.device)
 
