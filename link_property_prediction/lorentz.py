@@ -269,6 +269,17 @@ class LorentzManifold(geoopt.Manifold):
         coef = torch.where(safe, num / den, 1.0 - w * _THIRD)
         return coef * (y - a * x)
 
+    def logmap0(self, x: Tensor) -> Tensor:
+        """log_0(x), the tangent vector at the origin pointing at x.
+
+        In these intrinsic coordinates the origin IS the zero vector, so this is
+        logmap(0, x) and nothing more; delegating keeps the one audited w/coef path
+        rather than a second expansion of it. With x_base = 0 the formula collapses
+        to coef * x, a purely radial rescale: the direction of x is preserved exactly
+        and the length becomes dist0(x), since g_0 is the identity.
+        """
+        return self.logmap(torch.zeros_like(x), x)
+
     def transp(self, x: Tensor, y: Tensor, v: Tensor) -> Tensor:
         """Parallel transport T_x -> T_y:
 
