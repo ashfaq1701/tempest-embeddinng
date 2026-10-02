@@ -1,3 +1,12 @@
+"""Master plus one column: cos_o, the angle at the origin between the bag centre and the token.
+
+Origin O, bag centre M, token X form a hyperbolic triangle with sides a = d(M, X) = d_mid,
+b = d(O, X) = r_tok, c = d(O, M) = r_mid. The angle at O, by the hyperbolic law of cosines,
+    cos_o = (cosh b cosh c - cosh a) / (sinh b sinh c),
+is +1 when the token and the centre lie on the same ray from the origin (same branch of the
+hierarchy), 0 when in unrelated directions, -1 on opposite sides. Computed from distances
+only, so the chart never enters. Features: [log1p(age), pos, d_mid, cos_o].
+"""
 import geoopt
 import torch
 import torch.nn as nn
@@ -7,6 +16,7 @@ from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
 _VAR_FLOOR = 1e-12
+_SIN_FLOOR = 1e-6
 
 
 class BagWeights(nn.Module):
@@ -21,7 +31,7 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 3
+        self.n_feat = 4
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -54,10 +64,15 @@ class BagWeights(nn.Module):
         age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, T]
         pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
 
-        d_mid = self.geom.dist(xt, mid.unsqueeze(-2))                        # [Q, T]
+        a = self.geom.dist(xt, mid.unsqueeze(-2))                            # [Q, T]  d_mid
+        b = self.geom.dist0(xt)                                              # [Q, T]  r_tok
+        c = self.geom.dist0(mid).unsqueeze(-1)                               # [Q, 1]  r_mid
+        cos_o = (torch.cosh(b) * torch.cosh(c) - torch.cosh(a)) \
+            / (torch.sinh(b) * torch.sinh(c)).clamp_min(_SIN_FLOOR)          # [Q, T]  angle at O
+        cos_o = cos_o.clamp(-1.0, 1.0) * u                                   # degenerate -> ~0
 
-        feats = self._standardise(torch.stack([age, pos, d_mid], dim=-1),
-                                  valid).to(xt.dtype)                        # [Q, T, 3]
+        feats = self._standardise(torch.stack([age, pos, a, cos_o], dim=-1),
+                                  valid).to(xt.dtype)                        # [Q, T, 4]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.midpoint(x_tokens, w)                               # [Q, d]
