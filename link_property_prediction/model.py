@@ -7,6 +7,7 @@ from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
 _VAR_FLOOR = 1e-12
+_DENOM_FLOOR = 1e-12
 
 
 class BagWeights(nn.Module):
@@ -54,9 +55,16 @@ class BagWeights(nn.Module):
         age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, T]
         pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
 
-        d_mid = self.geom.dist(xt, mid.unsqueeze(-2))                        # [Q, T]
+        d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]  token -> bag centre
+        r_tok = self.geom.dist0(xt)                                          # [Q, T]  token radius
+        r_mid = self.geom.dist0(mid).unsqueeze(-1)                           # [Q, 1]  bag-centre radius
+        # Triangle inequality bounds d_tok_mid by |r_tok - r_mid| below and r_tok + r_mid above,
+        # so this ratio sits in [|r_tok - r_mid|/(r_tok + r_mid), 1]: the floor is radial imbalance
+        # (0 for equal radii, ->1 with one point at the centre) and the rise above it is the angle.
+        rad_sum = (r_tok + r_mid).clamp_min(_DENOM_FLOOR)                    # [Q, T]
+        d_norm = d_tok_mid / rad_sum * u                                     # [Q, T]  in [floor, 1]
 
-        feats = self._standardise(torch.stack([age, pos, d_mid], dim=-1),
+        feats = self._standardise(torch.stack([age, pos, d_norm], dim=-1),
                                   valid).to(xt.dtype)                        # [Q, T, 3]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
