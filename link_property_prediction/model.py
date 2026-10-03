@@ -1,3 +1,14 @@
+"""Master plus one column: theta_o, the angle at the origin between the bag centre and the token.
+
+In the intrinsic Lorentz chart a point on a ray at radius r has coordinates x' = sinh(r) * n,
+with n the ray's unit direction, so the angle at the origin between two points is the Euclidean
+angle between their coordinate vectors. It is computed with atan2(sin, cos), which is accurate
+at every angle, including the small sectors most tokens occupy where arccos loses precision.
+No distances or cosh terms are involved. Range [0, pi]: 0 = same ray as the centre (same branch
+of the hierarchy), pi/2 = orthogonal directions, pi = opposite sides of the root. A token or a
+centre at the origin has no direction and returns 0.
+Features: [log1p(age), pos, d_mid, theta_o].
+"""
 import geoopt
 import torch
 import torch.nn as nn
@@ -7,6 +18,22 @@ from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
 _VAR_FLOOR = 1e-12
+_DIR_FLOOR = 1e-12
+
+
+def angle_at_origin(x: torch.Tensor, y: torch.Tensor, floor: float = _DIR_FLOOR) -> torch.Tensor:
+    """Angle at the origin between the rays through x and y, in the intrinsic Lorentz chart.
+    x [..., d], y broadcastable to x -> [...], in [0, pi]. Degenerate (a point at the origin)
+    returns 0."""
+    nx = x.norm(dim=-1, keepdim=True)
+    ny = y.norm(dim=-1, keepdim=True)
+    ux = x / nx.clamp_min(floor)                                             # unit directions
+    uy = y / ny.clamp_min(floor)
+    cos = (ux * uy).sum(-1)                                                  # cos of the angle
+    sin = (ux - cos.unsqueeze(-1) * uy).norm(dim=-1)                         # |perpendicular part|
+    theta = torch.atan2(sin, cos)
+    ok = (nx.squeeze(-1) > floor) & (ny.squeeze(-1) > floor)
+    return torch.where(ok, theta, torch.zeros_like(theta))
 
 
 class BagWeights(nn.Module):
@@ -21,7 +48,7 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 3
+        self.n_feat = 4
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -55,9 +82,10 @@ class BagWeights(nn.Module):
         pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
 
         d_mid = self.geom.dist(xt, mid.unsqueeze(-2))                        # [Q, T]
+        theta_o = angle_at_origin(xt, mid.unsqueeze(-2)) * u                 # [Q, T]  angle at O, [0, pi]
 
-        feats = self._standardise(torch.stack([age, pos, d_mid], dim=-1),
-                                  valid).to(xt.dtype)                        # [Q, T, 3]
+        feats = self._standardise(torch.stack([age, pos, d_mid, theta_o], dim=-1),
+                                  valid).to(xt.dtype)                        # [Q, T, 4]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.midpoint(x_tokens, w)                               # [Q, d]
