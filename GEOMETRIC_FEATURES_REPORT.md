@@ -61,9 +61,11 @@ still gaining -- so every Yelp delta understates the loss.
 | cos_up (angle at M) | 1,249 | 0.5157 | 0.6347 | 0.2499 | 0.6161 | 0.6674 |
 | 2r (`+d0_tok`) | 1,249 | 0.5753 | 0.6366 | 0.2518 | 0.6348 | 0.6659 |
 | 3r (`+d0_tok,+d0_mid`) | 1,281 | 0.5836 | 0.6342 | **0.2539** | 0.6288 | **0.6739** |
-| depth (`+r_tok-r_mid`) | 1,249 | 0.5657 | 0.6352 | 0.2506 | ep20 | ep24 |
+| depth (`+r_tok-r_mid`) | 1,249 | 0.5657 | 0.6352 | 0.2506 | 0.6302 | 0.6609 ‡ |
 | radsum (`d/(r_tok+r_mid)`) | 1,217 | 0.5684 | 0.6311 | 0.2390 | killed | killed |
 | multi-query (4 learned pts) | 1,569 | 0.6009 | **0.6420** | 0.2511 | **0.6514** | 0.5743 |
+
+† hand-killed, a floor. ‡ stopped inside a radius blow-up, a floor -- see section 7.
 
 **No arm beats master on YouTube.** Twelve arms have now tried (including the attention family)
 and master holds it outright.
@@ -140,6 +142,57 @@ spread. So the trained pooler runs on hop position, and the cosine's lasting eff
 `r_head` (radius of the top training-degree decile) at ep1: master **0.148**, cos_o **0.080**.
 By ep60 they converge (0.623 vs 0.598). `gtail`, the share of the embedding gradient landing on
 bottom-decile nodes, is 0.155 vs 0.123 at ep1.
+
+---
+
+## 3a. --lr-pooler 1e-4: the knob worked and the MRR did not follow
+
+The temperature result above says cos_o's pooler is over-sharp, so the obvious next move is to
+train it that way rather than patch it at eval. `--lr-pooler` gives the pooler MLP
+(`bag_weights.net.*`, 6 tensors, 1,249 params) its own RiemannianAdam param group while `E` and
+`geo_temp` stay at `--lr`; unset, it keeps exactly one group. Verified before launch by a step
+with all grads = 1.0: MLP tensors move rms 1.000e-04, `geo_temp` 1.000e-03, `E.weight` 1.250e-04
+unchanged. Branch `diag/coso-lr-pooler` `b8b38b8`, YouTube seed 5, otherwise the cos_o config.
+
+**Killed by hand at ep61 on a decided result. It lost to both references.**
+
+| arm | logit_sd | val | test |
+|---|---|---|---|
+| **lrP 1e-4** | **5.6 - 6.2** | 0.6633 | **0.5786 max / 0.5783 val-sel** |
+| cos_o (lrP = lr) | 9.5 - 13.6 | 0.6692 | 0.5834 |
+| master | 3.3 - 3.8 | 0.6854 | 0.6149 |
+
+**The intervention did exactly what it was aimed at.** `logit_sd` held 5.6-6.2 for sixty epochs
+against cos_o's 9.5-13.6 -- a sustained ~2x reduction, landing close to where the tau=2 patch
+effectively put cos_o. The early trajectory is unambiguous: ep1 logit_sd 2.40 against cos_o's
+7.51, and the arm skipped cos_o's early run-up to 13.6 entirely.
+
+**It bought nothing.** 0.5786 max test against cos_o's 0.5834, and 0.0363 behind master. So
+**over-sharpening is a correlate of cos_o's deficit, not its cause.** An eval-time `logits/2` is
+worth +0.0184; reaching the same sharpness by training the pooler ten times slower is worth
+-0.0048. The two facts are only consistent if what matters is not the sharpness itself.
+
+**Best current explanation, and it is untested.** tau=2 reshapes the pooling of an embedding that
+was *trained under sharp pooling*; a low pooler lr co-adapts `E` to soft pooling from epoch 1 and
+lands in a different, worse basin. The same weights are reachable either way -- a fixed tau is
+exactly a 1/tau rescale of the output layer -- so this is about which trajectory finds them, not
+about the hypothesis class. If that is right, the lever is `E`'s trajectory or the scorer, and
+the pooler's logit scale is downstream of both.
+
+**No escape, and the familiar front-loaded shape.** It led cos_o by +0.052 val at ep7 and master
+by +0.122, led cos_o on test through ep18, then flattened: ep40 0.5742 -> ep61 0.5786, **+0.0044
+over 21 epochs**, with val inside a 0.004 band from ep50. cos_o escaped in that same window
+(ep40 0.6552 val -> ep61 0.6692). This is the same lead-then-flatten curve as the four rejected
+pooler arms, now with a sixth mechanism.
+
+**The tau sweep was forfeited.** It fires after training on restored best weights, so killing the
+run lost it. That is the one readout worth recovering if this arm is revisited: it would say
+whether a soft-trained pooler is *also* mis-calibrated, in the other direction.
+
+This also makes the five-failed-interventions list six, and the two weight-decay arms read
+differently now. wd was dismissed as a near no-op under coupled L2 that pulled toward a bad
+target. A lower lr has no shrinkage target at all, reached the intended sharpness, and still
+lost -- so the wd arms were probably not failing for the reason given.
 
 ---
 
@@ -243,17 +296,22 @@ even after 3r's +0.0226). YouTube is already above the bar by +0.0185 without an
 
 Still running: `depth` on Yelp (ep20) and WikiLink (ep24), jobs 11422721 and 11422720.
 
-**The WikiLink depth run is in radius blow-up and should not be quoted when it stops.** From
-ep20 the *training loss is rising* -- 0.1578, 0.1587, 0.1596, 0.1605, 0.1615 -- while `r_mean`
-climbs a near-constant **+0.186/epoch** to 4.757 and val sits dead flat at 0.6695-0.6700. It is
-at patience 7/10, so it will stop at ep27 on a val plateau, not on convergence. This is the same
-signature CLAUDE.md records for the conv-stem arm on WikiLink (training loss up, `r_mean`
-+0.20/epoch) and is plausibly a lr problem rather than anything about the `r_tok - r_mid`
-feature. Its 0.6609 is a floor and the arm needs a lower lr before WikiLink says anything about
-it.
+Nothing is running. All three in-flight runs finished or were stopped on 2026-10-03.
 
-Yelp depth is healthy by contrast: loss falling monotonically (0.0671 -> 0.0570 over ep16-20),
-`r_mean` rising smoothly 0.911 -> 1.073, best test 0.6302 at ep18, patience 2/10. Still gaining.
+**depth / WikiLink stopped at ep27 inside a radius blow-up, as predicted, and 0.6609 is a
+floor.** From ep20 the *training loss rose* -- 0.1578, 0.1587, 0.1596, 0.1605, 0.1615, 0.1632,
+0.1640 -- while `r_mean` climbed a near-constant +0.19/epoch to 5.32 and val sat dead flat at
+0.6691-0.6700 for eight epochs. It stopped on the val plateau, not on convergence. Same
+signature CLAUDE.md records for the conv-stem arm on WikiLink, and plausibly a lr problem rather
+than anything about `r_tok - r_mid`. Its nominal +0.0096 over master nl1 should not be read as a
+win; the arm needs a lower lr before WikiLink says anything about it.
+
+**depth / Yelp converged cleanly and lost**: 28 epochs, healthy throughout (loss monotone to
+0.0474, `r_mean` smooth to 1.371), best test **0.6302** at ep18 with zero drift. Against master's
+0.6481 *floor* that is a loss of at least 0.018 -- one of the few clean depth numbers here, and
+it is negative.
+
+**coso_lrp / YouTube killed at ep61**, section 3a.
 
 Branches, all local, none pushed:
 
