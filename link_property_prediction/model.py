@@ -16,7 +16,25 @@ from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
 _VAR_FLOOR = 1e-12
-_SIN_FLOOR = 1e-6
+
+
+def triangle_cos(p: torch.Tensor, q: torch.Tensor, r: torch.Tensor,
+                 small: float = 1e-2, floor: float = 1e-12) -> torch.Tensor:
+    """Cosine of the angle between the two sides p and q of a hyperbolic triangle
+    (curvature -1) whose third side is r. Broadcasts; returns values in [-1, 1].
+
+    Uses the hyperbolic law of cosines, and the Euclidean law of cosines when both
+    adjacent sides are below `small`, where the hyperbolic form loses precision to
+    cancellation (cosh terms near 1). Degenerate triangles (p or q zero) return 0.
+    """
+    cos_h = (torch.cosh(p) * torch.cosh(q) - torch.cosh(r)) \
+        / (torch.sinh(p) * torch.sinh(q)).clamp_min(floor)
+    cos_e = (p * p + q * q - r * r) / (2.0 * p * q).clamp_min(floor)
+    use_e = (p < small) & (q < small)
+    out = torch.where(use_e, cos_e, cos_h)
+    out = torch.where((p <= 0) | (q <= 0), torch.zeros_like(out), out)   # no angle at a degenerate vertex
+    return out.clamp(-1.0, 1.0)
+
 
 
 class BagWeights(nn.Module):
@@ -67,9 +85,7 @@ class BagWeights(nn.Module):
         a = self.geom.dist(xt, mid.unsqueeze(-2))                            # [Q, T]  d_mid
         b = self.geom.dist0(xt)                                              # [Q, T]  r_tok
         c = self.geom.dist0(mid).unsqueeze(-1)                               # [Q, 1]  r_mid
-        cos_up = (torch.cosh(a) * torch.cosh(c) - torch.cosh(b)) \
-            / (torch.sinh(a) * torch.sinh(c)).clamp_min(_SIN_FLOOR)          # [Q, T]  angle at M
-        cos_up = cos_up.clamp(-1.0, 1.0) * u                                 # degenerate -> ~0
+        cos_up = triangle_cos(a, c, b) * u                                    # [Q, T]  angle at M
 
         feats = self._standardise(torch.stack([age, pos, a, cos_up], dim=-1),
                                   valid).to(xt.dtype)                        # [Q, T, 4]
