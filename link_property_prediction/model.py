@@ -1,3 +1,12 @@
+"""Master plus one column: cos_o, the angle at the origin between the bag centre and the token.
+
+Origin O, bag centre M, token X form a hyperbolic triangle with sides a = d(M, X) = d_mid,
+b = d(O, X) = r_tok, c = d(O, M) = r_mid. The angle at O, by the hyperbolic law of cosines,
+    cos_o = (cosh b cosh c - cosh a) / (sinh b sinh c),
+is +1 when the token and the centre lie on the same ray from the origin (same branch of the
+hierarchy), 0 when in unrelated directions, -1 on opposite sides. Computed from distances
+only, so the chart never enters. Features: [log1p(age), pos, d_mid, cos_o].
+"""
 import geoopt
 import torch
 import torch.nn as nn
@@ -7,6 +16,24 @@ from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
 _VAR_FLOOR = 1e-12
+
+
+def triangle_cos(p: torch.Tensor, q: torch.Tensor, r: torch.Tensor,
+                 small: float = 1e-2, floor: float = 1e-12) -> torch.Tensor:
+    """Cosine of the angle between the two sides p and q of a hyperbolic triangle
+    (curvature -1) whose third side is r. Broadcasts; returns values in [-1, 1].
+
+    Uses the hyperbolic law of cosines, and the Euclidean law of cosines when both
+    adjacent sides are below `small`, where the hyperbolic form loses precision to
+    cancellation (cosh terms near 1). Degenerate triangles (p or q zero) return 0.
+    """
+    cos_h = (torch.cosh(p) * torch.cosh(q) - torch.cosh(r)) \
+        / (torch.sinh(p) * torch.sinh(q)).clamp_min(floor)
+    cos_e = (p * p + q * q - r * r) / (2.0 * p * q).clamp_min(floor)
+    use_e = (p < small) & (q < small)
+    out = torch.where(use_e, cos_e, cos_h)
+    out = torch.where((p <= 0) | (q <= 0), torch.zeros_like(out), out)   # no angle at a degenerate vertex
+    return out.clamp(-1.0, 1.0)
 
 
 class BagWeights(nn.Module):
@@ -21,7 +48,7 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 3
+        self.n_feat = 4
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -54,10 +81,13 @@ class BagWeights(nn.Module):
         age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, T]
         pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
 
-        d_mid = self.geom.dist(xt, mid.unsqueeze(-2))                        # [Q, T]
+        a = self.geom.dist(xt, mid.unsqueeze(-2))                            # [Q, T]  d_mid
+        b = self.geom.dist0(xt)                                              # [Q, T]  r_tok
+        c = self.geom.dist0(mid).unsqueeze(-1)                               # [Q, 1]  r_mid
+        cos_o = triangle_cos(b, c, a) * u                                     # [Q, T]  angle at O
 
-        feats = self._standardise(torch.stack([age, pos, d_mid], dim=-1),
-                                  valid).to(xt.dtype)                        # [Q, T, 3]
+        feats = self._standardise(torch.stack([age, pos, a, cos_o], dim=-1),
+                                  valid).to(xt.dtype)                        # [Q, T, 4]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.midpoint(x_tokens, w)                               # [Q, d]
