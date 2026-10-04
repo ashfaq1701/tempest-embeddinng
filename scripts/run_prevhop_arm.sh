@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cos_o pooler, KERNEL-2 CAUSAL: each token sees itself + the one hop NEARER THE SEED (index l+1).
+# cos_o pooler, KERNEL-2 CAUSAL IN TIME: each token sees itself + the one OLDER hop (index l-1).
 #   usage: run_prevhop_arm.sh <CODE> <EXP> <DS> <yes/no bip> <TAG> <PAT> <SEED> <EPOCHS> <WPN> <MWL>
 set -u
 CODE="${1:?}"; EXPERIMENT="${2:?}"; DS="${3:?}"; BIP="${4:?}"; TAG="${5:?}"; PAT="${6:?}"
