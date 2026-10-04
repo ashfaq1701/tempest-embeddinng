@@ -20,7 +20,7 @@ grep -q 'Seed sits at row position ``lens-1``' link_property_prediction/walks.py
 # --- the two-linear causal mix, and the DIRECTION ---
 grep -q 'self.w_self = nn.Linear(self.hidden, self.hidden)' $M || { echo "ABORT: w_self missing" >&2; exit 3; }
 grep -q 'self.w_prev = nn.Linear(self.hidden, self.hidden, bias=False)' $M || { echo "ABORT: w_prev missing, or it has a bias (which breaks the w_prev=0 reduction to master)" >&2; exit 3; }
-grep -q 'h_prev = F.pad(h\[:, :, 1:\], (0, 0, 0, 1))' $M || { echo "ABORT: h_prev is not the l+1 shift -- this arm is the NEARER-THE-SEED direction" >&2; exit 3; }
+grep -q 'h_prev = F.pad(h\[:, :, :-1\], (0, 0, 1, 0))' $M || { echo "ABORT: h_prev is not the l-1 shift. Index 0 is the OLDEST hop and lens-1 is the seed (measured: ages 50,40,30,20,10,0 along increasing index), so l-1 is the OLDER hop and l+1 would read the token's own FUTURE" >&2; exit 3; }
 grep -q 'self.act(self.w_self(h) + self.w_prev(h_prev))' $M || { echo "ABORT: mix is not act(w_self(h) + w_prev(h_prev))" >&2; exit 3; }
 grep -q 'self.stem = nn.Sequential(nn.Linear(self.n_feat, self.hidden), nn.GELU())' $M || { echo "ABORT: per-token stem missing" >&2; exit 3; }
 grep -q 'self.head = nn.Linear(self.hidden, 1)' $M || { echo "ABORT: head missing" >&2; exit 3; }
@@ -65,11 +65,15 @@ CMD="$PY -u scripts/train_link_property_prediction.py --data-suite tgb-seq --dat
   echo "#   h_prev = F.pad(h[:, :, 1:], (0, 0, 0, 1))   index l+1"
   echo "#   h = GELU(w_self(h) + w_prev(h_prev))"
   echo "#   logits = head(h), ONE softmax over all K*L tokens -> Lorentz midpoint."
-  echo "# DIRECTION: walks are stored oldest-first with the seed at index lens-1 and padding"
-  echo "#   after it, so index l+1 is the hop NEARER THE SEED -- the one the token was reached"
-  echo "#   from, the previous step in the walk's own generation order. The seed is the only"
-  echo "#   token with no prior and sees a zero vector. The other reading (l-1, 'the event"
-  echo "#   older than me') is F.pad(h[:, :, :-1], (0, 0, 1, 0)) and is NOT what ran here."
+  echo "# DIRECTION, MEASURED: walks are stored in TIME ORDER. A real walk (chain 0->1->..->5"
+  echo "#   at t=10..60, backward from node 5 at cutoff 60) gives ages 50,40,30,20,10,0 along"
+  echo "#   increasing index, so index 0 is the OLDEST hop and lens-1 is the seed, and rising"
+  echo "#   index is FORWARD IN TIME. This arm reads l-1, the OLDER hop: each token is"
+  echo "#   conditioned on what preceded it, the oldest hop has no prior, and the seed -- the"
+  echo "#   token closest to the prediction -- sees the hop just before it."
+  echo "#   DO NOT call l+1 'the hop it was reached from'. That is walk-GENERATION order (the"
+  echo "#   sampler starts at the seed and steps backward), the REVERSE of time, and that exact"
+  echo "#   phrasing made the first version of this arm read every token's own FUTURE."
   echo "# STRICT SUPERSET OF MASTER, AND THAT IS THE POINT. w_prev has no bias, so w_prev = 0"
   echo "#   collapses the pooler to stem -> w_self -> GELU -> head, which IS master's 2-layer"
   echo "#   shape. Measured bitwise equal to a hand-built master reference, max|diff| 0.000e+00."
