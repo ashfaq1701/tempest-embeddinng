@@ -65,8 +65,16 @@ class BagWeights(nn.Module):
         return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m            # [Q, T, F]
 
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
-        nodes = tokens.nodes.clamp_min(0).clone()                            # [Q, T]
-        valid = tokens.mask.clone()                                          # [Q, T]
+        # WalkTokens keeps the walk axis explicit as [Q, K, L] so a sequence-model pooler can
+        # read it without changing the token builder. THIS pooler is a flat softmax over the
+        # whole bag and ignores walk structure, so it folds K and L into one token axis here.
+        # reshape(q, -1) reproduces the old [Q, T] layout exactly: the builder already computed
+        # every field in [Q, K, L] and only flattened on the way out, so this is a no-op move
+        # of that reshape from the builder into the consumer. flatten(1), not reshape(q, -1):
+        # the latter is AMBIGUOUS for an empty batch, where [0, K, L] has 0 elements and -1
+        # cannot be inferred.
+        nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
+        valid = tokens.mask.flatten(1).clone()                               # [Q, T]
         cold = ~valid.any(dim=-1)                                            # [Q]
         if bool(cold.any()):
             nodes[cold, 0] = tokens.seeds[cold]
@@ -78,8 +86,8 @@ class BagWeights(nn.Module):
         u = valid.to(xt.dtype)                                               # [Q, T]
         mid = self.geom.midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
 
-        age = torch.log1p(tokens.ages.clamp_min(0).to(xt.dtype))             # [Q, T]
-        pos = tokens.positions.to(xt.dtype)                                  # [Q, T]
+        age = torch.log1p(tokens.ages.flatten(1).clamp_min(0).to(xt.dtype))  # [Q, T]
+        pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
 
         a = self.geom.dist(xt, mid.unsqueeze(-2))                            # [Q, T]  d_mid
         b = self.geom.dist0(xt)                                              # [Q, T]  r_tok
