@@ -12,13 +12,9 @@ cd "$CODE"
 
 M=link_property_prediction/model.py; W=link_property_prediction/walk_tokens.py
 grep -q 'torch.stack(\[age, pos, a, cos_o\], dim=-1)' $M || { echo "ABORT: features are not [age, pos, d_mid, cos_o]" >&2; exit 3; }
-grep -q 'cos_o = triangle_cos(b, c, a) \* u' $M || { echo "ABORT: cos_o not from triangle_cos(r_tok, r_mid, d_mid)" >&2; exit 3; }
-grep -q 'def triangle_cos' $M             || { echo "ABORT: triangle_cos helper missing" >&2; exit 3; }
-grep -q 'return out.clamp(-1.0, 1.0)' $M  || { echo "ABORT: triangle_cos does not clamp to [-1,1]" >&2; exit 3; }
-grep -q 'use_e = (p < small) & (q < small)' $M || { echo "ABORT: no Euclidean small-side branch" >&2; exit 3; }
-grep -q 'torch.where((p <= 0) | (q <= 0)' $M || { echo "ABORT: degenerate vertex not zeroed" >&2; exit 3; }
-grep -q 'b = self.geom.dist0(xt)' $M      || { echo "ABORT: r_tok missing" >&2; exit 3; }
-grep -q 'c = self.geom.dist0(mid).unsqueeze(-1)' $M || { echo "ABORT: r_mid missing" >&2; exit 3; }
+grep -q 'cos_o = F.cosine_similarity(xt, mid.unsqueeze(-2), dim=-1, eps=_COS_EPS) \* u' $M || { echo "ABORT: cos_o is not the coordinate cosine" >&2; exit 3; }
+grep -q 'triangle_cos' $M                 && { echo "ABORT: triangle_cos is back -- the intrinsic chart needs no law of cosines" >&2; exit 3; }
+grep -q '_COS_EPS = 1e-12' $M             || { echo "ABORT: _COS_EPS missing" >&2; exit 3; }
 grep -q 'self.n_feat = 4' $M              || { echo "ABORT: n_feat is not 4" >&2; exit 3; }
 grep -q 'feats = standardise(torch.stack' $M || { echo "ABORT: features not standardised via the module-level standardise()" >&2; exit 3; }
 grep -q 'def standardise' $M              || { echo "ABORT: module-level standardise() missing" >&2; exit 3; }
