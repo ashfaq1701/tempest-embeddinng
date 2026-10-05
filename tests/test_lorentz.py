@@ -319,12 +319,12 @@ def test_midpoint_on_manifold_and_scale_invariant(k):
     w = torch.rand(8, 5, dtype=torch.float64)
     w_norm = w / w.sum(-1, keepdim=True)
 
-    mu = m.midpoint(x, w_norm)
+    mu = m.weighted_midpoint(x, w_norm)
     MU = m._lift(mu)
     assert torch.allclose(lip(MU, MU), torch.full((8,), -k, dtype=torch.float64),
                           rtol=1e-11, atol=1e-11)
-    assert torch.allclose(m.midpoint(x, w), mu, rtol=1e-10, atol=1e-11)
-    assert torch.allclose(m.midpoint(x, 0.01 * w), mu, rtol=1e-10, atol=1e-11)
+    assert torch.allclose(m.weighted_midpoint(x, w), mu, rtol=1e-10, atol=1e-11)
+    assert torch.allclose(m.weighted_midpoint(x, 0.01 * w), mu, rtol=1e-10, atol=1e-11)
 
 
 def test_midpoint_of_one_point_is_that_point():
@@ -332,7 +332,7 @@ def test_midpoint_of_one_point_is_that_point():
         m = LorentzManifold(k=k)
         x = rand_points(4, scale=3.0).reshape(4, 1, DIM)
         w = torch.ones(4, 1, dtype=torch.float64)
-        assert torch.allclose(m.midpoint(x, w), x.squeeze(1), rtol=1e-11, atol=1e-11)
+        assert torch.allclose(m.weighted_midpoint(x, w), x.squeeze(1), rtol=1e-11, atol=1e-11)
 
 
 @pytest.mark.parametrize("k", KS)
@@ -686,7 +686,7 @@ def test_every_op_is_dtype_passthrough(dt, k):
         ("expmap", m.expmap(x, u)), ("transp", m.transp(x, y, u)),
         ("egrad2rgrad", m.egrad2rgrad(x, u)), ("inner", m.inner(x, u)),
         ("to_poincare", m.to_poincare(x)), ("projx", m.projx(x)),
-        ("midpoint", m.midpoint(bag, wts)),
+        ("midpoint", m.weighted_midpoint(bag, wts)),
     ]:
         assert out.dtype == dt, f"{name} returned {out.dtype} for {dt} input"
         assert torch.isfinite(out).all(), f"{name} non-finite in {dt}"
@@ -719,7 +719,7 @@ def test_no_hardcoded_epsilon_breaks_in_float16():
     bag = torch.zeros(2, 4, DIM, dtype=torch.float16)
     for w in (torch.zeros(2, 4, dtype=torch.float16),
               torch.rand(2, 4, dtype=torch.float16)):
-        assert torch.isfinite(m.midpoint(bag, w)).all()
+        assert torch.isfinite(m.weighted_midpoint(bag, w)).all()
 
     # from_poincare at and beyond the boundary: 1 - ||u||^2 -> 0
     for val in (0.0, 0.999, 1.0, 1.5):
@@ -770,8 +770,8 @@ def test_midpoint_float32_loss_is_small_and_stays_on_manifold():
             x = (rand_points(64 * T, scale=scale).reshape(64, T, DIM)).float()
             w = torch.rand(64, T)
             w = w / w.sum(-1, keepdim=True)
-            a = m.midpoint(x, w)
-            b = m.midpoint(x.double(), w.double())
+            a = m.weighted_midpoint(x, w)
+            b = m.weighted_midpoint(x.double(), w.double())
             assert float(((a.double() - b).abs() / b.abs().clamp_min(1e-12)).max()) < 5e-3
             P = m._lift(a.double())
             assert ((lip(P, P) + 1.0).abs() / (P[..., 0] ** 2)).max() < 1e-6
@@ -823,7 +823,7 @@ def _deg_cases(k=1.0):
 
     bag = (torch.randn(4, 5, D, dtype=torch.float64)).requires_grad_(True)
     zw = torch.zeros(4, 5, dtype=torch.float64, requires_grad=True)
-    out.append(("midpoint(bag, zeros)", lambda: m.midpoint(bag, zw), (bag, zw)))
+    out.append(("midpoint(bag, zeros)", lambda: m.weighted_midpoint(bag, zw), (bag, zw)))
 
     o1 = torch.zeros(6, D, dtype=torch.float64, requires_grad=True)
     out.append(("to_poincare(origin)", lambda: m.to_poincare(o1), (o1,)))

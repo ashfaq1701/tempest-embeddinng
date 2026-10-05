@@ -18,6 +18,15 @@ from .walk_tokens import WalkTokens
 _VAR_FLOOR = 1e-12
 
 
+def standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Per-feature standardisation over the valid tokens of the whole batch."""
+    m = valid.unsqueeze(-1).to(feat.dtype)                                   # [Q, T, 1]
+    n = m.sum(dim=(0, 1)).clamp_min(1.0)                                     # [F]
+    mu = (feat * m).sum(dim=(0, 1)) / n                                      # [F]
+    var = (((feat - mu) ** 2) * m).sum(dim=(0, 1)) / n                       # [F]
+    return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m                # [Q, T, F]
+
+
 def triangle_cos(p: torch.Tensor, q: torch.Tensor, r: torch.Tensor,
                  small: float = 1e-2, floor: float = 1e-12) -> torch.Tensor:
     """Cosine of the angle between the two sides p and q of a hyperbolic triangle
@@ -55,15 +64,6 @@ class BagWeights(nn.Module):
         layers.append(nn.Linear(self.hidden, 1))
         self.net = nn.Sequential(*layers)
 
-    @staticmethod
-    def _standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        """Per-feature standardisation over the valid tokens of the whole batch."""
-        m = valid.unsqueeze(-1).to(feat.dtype)                               # [Q, T, 1]
-        n = m.sum(dim=(0, 1)).clamp_min(1.0)                                 # [F]
-        mu = (feat * m).sum(dim=(0, 1)) / n                                  # [F]
-        var = (((feat - mu) ** 2) * m).sum(dim=(0, 1)) / n                   # [F]
-        return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m            # [Q, T, F]
-
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
         valid = tokens.mask.flatten(1).clone()                               # [Q, T]
@@ -76,7 +76,7 @@ class BagWeights(nn.Module):
         xt = x_tokens.detach()                                               # [Q, T, d]
 
         u = valid.to(xt.dtype)                                               # [Q, T]
-        mid = self.geom.midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
+        mid = self.geom.weighted_midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
 
         age = torch.log1p(tokens.ages.flatten(1).clamp_min(0).to(xt.dtype))  # [Q, T]
         pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
@@ -86,11 +86,11 @@ class BagWeights(nn.Module):
         c = self.geom.dist0(mid).unsqueeze(-1)                               # [Q, 1]  r_mid
         cos_o = triangle_cos(b, c, a) * u                                     # [Q, T]  angle at O
 
-        feats = self._standardise(torch.stack([age, pos, a, cos_o], dim=-1),
-                                  valid).to(xt.dtype)                        # [Q, T, 4]
+        feats = standardise(torch.stack([age, pos, a, cos_o], dim=-1),
+                            valid).to(xt.dtype)                        # [Q, T, 4]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
-        return self.geom.midpoint(x_tokens, w)                               # [Q, d]
+        return self.geom.weighted_midpoint(x_tokens, w)                               # [Q, d]
 
 
 class LinkPredHead(nn.Module):

@@ -360,7 +360,7 @@ class LorentzManifold(geoopt.Manifold):
     # ------------------------------------------------------------------
     # extensions used by this project (NOT in the paper)
     # ------------------------------------------------------------------
-    def midpoint(self, x: Tensor, w: Tensor) -> Tensor:
+    def weighted_midpoint(self, x: Tensor, w: Tensor) -> Tensor:
         """Weighted Lorentzian centroid (Law et al., ICML 2019):
 
             mu = s / sqrt(-<s,s>_L / k),   s = sum_t w_t x_t

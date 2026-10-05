@@ -20,7 +20,11 @@ grep -q 'torch.where((p <= 0) | (q <= 0)' $M || { echo "ABORT: degenerate vertex
 grep -q 'b = self.geom.dist0(xt)' $M      || { echo "ABORT: r_tok missing" >&2; exit 3; }
 grep -q 'c = self.geom.dist0(mid).unsqueeze(-1)' $M || { echo "ABORT: r_mid missing" >&2; exit 3; }
 grep -q 'self.n_feat = 4' $M              || { echo "ABORT: n_feat is not 4" >&2; exit 3; }
-grep -q 'self._standardise(torch.stack' $M || { echo "ABORT: features not standardised" >&2; exit 3; }
+grep -q 'feats = standardise(torch.stack' $M || { echo "ABORT: features not standardised via the module-level standardise()" >&2; exit 3; }
+grep -q 'def standardise' $M              || { echo "ABORT: module-level standardise() missing" >&2; exit 3; }
+grep -q '_standardise' $M                 && { echo "ABORT: the old BagWeights._standardise staticmethod is still present" >&2; exit 3; }
+grep -q 'self.geom.weighted_midpoint(' $M || { echo "ABORT: pooler does not call weighted_midpoint (renamed from midpoint)" >&2; exit 3; }
+grep -q 'self.geom.midpoint(' $M          && { echo "ABORT: the old geom.midpoint name is still in use" >&2; exit 3; }
 grep -q 'q_off\|n_queries\|logmap0\|log_alpha\|d0_mid' $M && { echo "ABORT: another arm's machinery present" >&2; exit 3; }
 grep -q 'nn.MultiheadAttention\|nn.Conv1d\|nn.GRU\|nn.LayerNorm' $M && { echo "ABORT: attention/conv/GRU/LayerNorm present" >&2; exit 3; }
 grep -q '\[Q, K, L\] fields (walk axis explicit)' $W || { echo "ABORT: walk_tokens is not the [Q,K,L] builder (master moved to it in 4b1a919)" >&2; exit 3; }
