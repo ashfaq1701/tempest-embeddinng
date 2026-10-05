@@ -1,45 +1,37 @@
-"""Master plus one column: cos_o, the angle at the origin between the bag centre and the token.
+"""Poincare-ball branch of master: same pooler, same features, geoopt's ball as the manifold.
 
-Origin O, bag centre M, token X form a hyperbolic triangle with sides a = d(M, X) = d_mid,
-b = d(O, X) = r_tok, c = d(O, M) = r_mid. The angle at O, by the hyperbolic law of cosines,
-    cos_o = (cosh b cosh c - cosh a) / (sinh b sinh c),
-is +1 when the token and the centre lie on the same ray from the origin (same branch of the
-hierarchy), 0 when in unrelated directions, -1 on opposite sides. Computed from distances
-only, so the chart never enters. Features: [log1p(age), pos, d_mid, cos_o].
+Features per token: [log1p(age), pos, d_mid, cos_o], with d_mid the geodesic distance to the
+bag's weighted midpoint and cos_o the angle at the origin between token and midpoint. In the
+ball a point at radius r in direction n has coordinates tanh(r/2) n, so cos_o is the Euclidean
+cosine of the two coordinate vectors; no triangle needed. Scorer: geo_temp * (-d(P_u, P_v)).
+
+The ball is open, so points near the boundary (large radius) lose precision in dist; this
+branch will show that before the Lorentz one does on datasets that spread far.
 """
 import geoopt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
 _VAR_FLOOR = 1e-12
+_COS_EPS = 1e-12
 
 
-def triangle_cos(p: torch.Tensor, q: torch.Tensor, r: torch.Tensor,
-                 small: float = 1e-2, floor: float = 1e-12) -> torch.Tensor:
-    """Cosine of the angle between the two sides p and q of a hyperbolic triangle
-    (curvature -1) whose third side is r. Broadcasts; returns values in [-1, 1].
-
-    Uses the hyperbolic law of cosines, and the Euclidean law of cosines when both
-    adjacent sides are below `small`, where the hyperbolic form loses precision to
-    cancellation (cosh terms near 1). Degenerate triangles (p or q zero) return 0.
-    """
-    cos_h = (torch.cosh(p) * torch.cosh(q) - torch.cosh(r)) \
-        / (torch.sinh(p) * torch.sinh(q)).clamp_min(floor)
-    cos_e = (p * p + q * q - r * r) / (2.0 * p * q).clamp_min(floor)
-    use_e = (p < small) & (q < small)
-    out = torch.where(use_e, cos_e, cos_h)
-    out = torch.where((p <= 0) | (q <= 0), torch.zeros_like(out), out)   # no angle at a degenerate vertex
-    return out.clamp(-1.0, 1.0)
+def standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Per-feature standardisation over the valid tokens of the whole batch."""
+    m = valid.unsqueeze(-1).to(feat.dtype)                                   # [Q, T, 1]
+    n = m.sum(dim=(0, 1)).clamp_min(1.0)                                     # [F]
+    mu = (feat * m).sum(dim=(0, 1)) / n                                      # [F]
+    var = (((feat - mu) ** 2) * m).sum(dim=(0, 1)) / n                       # [F]
+    return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m                # [Q, T, F]
 
 
 class BagWeights(nn.Module):
     """One query's walk bag -> one point on the manifold."""
 
-    def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
+    def __init__(self, geom: geoopt.PoincareBall, E: nn.Embedding, hidden_dim: int = 32,
                  n_layers: int = 2):
         super().__init__()
         self.geom = geom
@@ -55,15 +47,6 @@ class BagWeights(nn.Module):
         layers.append(nn.Linear(self.hidden, 1))
         self.net = nn.Sequential(*layers)
 
-    @staticmethod
-    def _standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        """Per-feature standardisation over the valid tokens of the whole batch."""
-        m = valid.unsqueeze(-1).to(feat.dtype)                               # [Q, T, 1]
-        n = m.sum(dim=(0, 1)).clamp_min(1.0)                                 # [F]
-        mu = (feat * m).sum(dim=(0, 1)) / n                                  # [F]
-        var = (((feat - mu) ** 2) * m).sum(dim=(0, 1)) / n                   # [F]
-        return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m            # [Q, T, F]
-
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
         valid = tokens.mask.flatten(1).clone()                               # [Q, T]
@@ -76,21 +59,22 @@ class BagWeights(nn.Module):
         xt = x_tokens.detach()                                               # [Q, T, d]
 
         u = valid.to(xt.dtype)                                               # [Q, T]
-        mid = self.geom.midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
+        mid = self.geom.weighted_midpoint(
+            xt, weights=u / u.sum(-1, keepdim=True), reducedim=[-2])          # [Q, d]
 
         age = torch.log1p(tokens.ages.flatten(1).clamp_min(0).to(xt.dtype))  # [Q, T]
         pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
 
-        a = self.geom.dist(xt, mid.unsqueeze(-2))                            # [Q, T]  d_mid
-        b = self.geom.dist0(xt)                                              # [Q, T]  r_tok
-        c = self.geom.dist0(mid).unsqueeze(-1)                               # [Q, 1]  r_mid
-        cos_o = triangle_cos(b, c, a) * u                                     # [Q, T]  angle at O
+        d_mid = self.geom.dist(xt, mid.unsqueeze(-2))                        # [Q, T]
+        cos_o = F.cosine_similarity(xt, mid.unsqueeze(-2), dim=-1, eps=_COS_EPS) * u   # [Q, T]  angle at O
+        has_dir = (xt.norm(dim=-1) > _COS_EPS) & (mid.norm(dim=-1) > _COS_EPS).unsqueeze(-1)
+        cos_o = torch.where(has_dir, cos_o, torch.zeros_like(cos_o))         # no direction at the origin
 
-        feats = self._standardise(torch.stack([age, pos, a, cos_o], dim=-1),
-                                  valid).to(xt.dtype)                        # [Q, T, 4]
+        feats = standardise(torch.stack([age, pos, d_mid, cos_o], dim=-1),
+                            valid).to(xt.dtype)                              # [Q, T, 4]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
-        return self.geom.midpoint(x_tokens, w)                               # [Q, d]
+        return self.geom.weighted_midpoint(x_tokens, weights=w, reducedim=[-2])   # [Q, d]
 
 
 class LinkPredHead(nn.Module):
@@ -102,12 +86,12 @@ class LinkPredHead(nn.Module):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
-        self.geom = LorentzManifold()
+        self.geom = geoopt.PoincareBall(c=1.0)
         torch.manual_seed(seed)
 
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            init = self.geom.random(self.num_nodes, self.d_emb, irange=self.INIT_IRANGE)
+            init = self.geom.random(self.num_nodes, self.d_emb, std=self.INIT_IRANGE)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
         self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,
