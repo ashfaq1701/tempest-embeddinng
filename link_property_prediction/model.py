@@ -66,9 +66,10 @@ class BagWeights(nn.Module):
         pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
 
         d_mid = self.geom.dist(xt, mid.unsqueeze(-2))                        # [Q, T]
+        # No origin guard: cosine_similarity already returns exactly 0 for a zero vector
+        # (its denominator is clamped at eps), and the feature block is detached, so the only
+        # thing a guard did was suppress a ~1e12 gradient that cannot flow. See the commit.
         cos_o = F.cosine_similarity(xt, mid.unsqueeze(-2), dim=-1, eps=_COS_EPS) * u   # [Q, T]  angle at O
-        has_dir = (xt.norm(dim=-1) > _COS_EPS) & (mid.norm(dim=-1) > _COS_EPS).unsqueeze(-1)
-        cos_o = torch.where(has_dir, cos_o, torch.zeros_like(cos_o))         # no direction at the origin
 
         feats = standardise(torch.stack([age, pos, d_mid, cos_o], dim=-1),
                             valid).to(xt.dtype)                              # [Q, T, 4]
