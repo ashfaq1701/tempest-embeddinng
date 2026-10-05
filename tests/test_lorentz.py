@@ -23,9 +23,12 @@ TOL = 1e-11
 # helpers: the ambient formulas exactly as printed in the paper
 # ----------------------------------------------------------------------
 def amb_tangent(m, x, u):
-    """Ambient lift of a tangent vector: v0 = (x.u)/x0 fixes the time part."""
-    v0 = (x * u).sum(-1, keepdim=True) / m._x0(x)
-    return torch.cat([v0, u.expand(*v0.shape[:-1], u.shape[-1])], -1)
+    """Ambient lift of a tangent vector: v0 = (x'.u')/x0 fixes the time part.
+    AMBIENT CONVENTION: x and u are already (n+1)-vectors, so both are reduced to
+    their spatial parts first. In the intrinsic chart they were n-vectors."""
+    xs, us = m._sp(x), m._sp(u)
+    v0 = (xs * us).sum(-1, keepdim=True) / m._x0(xs)
+    return torch.cat([v0, us.expand(*v0.shape[:-1], us.shape[-1])], -1)
 
 
 def lip(a, b):
@@ -51,13 +54,22 @@ def paper_expmap(X, V, k):
     return torch.cosh(nrm / sk) * X + sk * torch.sinh(nrm / sk) * V / nrm
 
 
-def rand_points(n, dim=DIM, scale=1.0, dtype=torch.float64):
-    return torch.randn(n, dim, dtype=dtype) * scale
+def rand_points(m, n, dim=DIM, scale=1.0, dtype=torch.float64):
+    """AMBIENT points [n, dim]: a (dim-1) spatial part lifted by Eq. 6 at THIS manifold's k.
+    The manifold takes the (n+1)-vector convention, so it must be lifted with the matching k
+    or the stored x0 is stale and _check_point_on_manifold rejects it."""
+    xs = torch.randn(n, dim - 1, dtype=dtype) * scale
+    return m._point(xs)
 
 
 def rand_tangent(m, x, scale=1.0):
-    """Any vector in R^n is tangent in this chart."""
-    return torch.randn_like(x) * scale
+    """AMBIENT tangent at x: draw a spatial part and let the manifold fix u0 from
+    <x,u>_L = 0, i.e. u0 = (x'.u')/x0. In the intrinsic chart any R^n vector was already
+    tangent, so this helper was a no-op and its first argument was ignored; now it needs
+    the manifold, and every call site passes m."""
+    xs = m._sp(x)
+    us = torch.randn_like(xs) * scale
+    return m._tangent(xs, us)
 
 
 # ======================================================================
@@ -68,7 +80,7 @@ def test_lift_lands_on_manifold_at_every_radius(k):
     m = LorentzManifold(k=k)
     eps = torch.finfo(torch.float64).eps
     for scale in (1e-6, 1.0, 1e3, 1e6, 1e9):
-        X = m._lift(rand_points(64, scale=scale))
+        X = rand_points(m, 64, scale=scale)
         resid = (lip(X, X) + k).abs()
         assert (resid / (X[..., 0] ** 2)).max() < 8 * eps
 
@@ -76,25 +88,25 @@ def test_lift_lands_on_manifold_at_every_radius(k):
 @pytest.mark.parametrize("k", KS)
 def test_inner_is_pullback_of_ambient_form(k):
     m = LorentzManifold(k=k)
-    x = rand_points(32, scale=3.0)
-    u = rand_tangent(32, x)
-    V = amb_tangent(m, x, u)
+    x = rand_points(m, 32, scale=3.0)
+    u = rand_tangent(m, x)
+    V = u                      # rand_tangent already returns an ambient tangent
     assert torch.allclose(m.inner(x, u), lip(V, V), rtol=1e-12, atol=1e-12)
 
 
 @pytest.mark.parametrize("k", KS)
 def test_lift_tangent_is_tangent(k):
     m = LorentzManifold(k=k)
-    x = rand_points(32, scale=3.0)
-    X, V = m._lift(x), amb_tangent(m, x, rand_tangent(32, x))
+    x = rand_points(m, 32, scale=3.0)
+    X, V = x, rand_tangent(m, x)        # both already ambient
     assert lip(X, V).abs().max() < 1e-10
 
 
 @pytest.mark.parametrize("k", KS)
 def test_inner_positive_definite(k):
     m = LorentzManifold(k=k)
-    x = rand_points(64, scale=50.0)
-    assert m.inner(x, rand_tangent(64, x)).min() > 0
+    x = rand_points(m, 64, scale=50.0)
+    assert m.inner(x, rand_tangent(m, x)).min() > 0
 
 
 @pytest.mark.parametrize("k", KS)
@@ -102,19 +114,17 @@ def test_egrad2rgrad_matches_papers_ambient_recipe(k):
     """THE CORE CLAIM. Paper: h = g_l^-1 grad f, then proj_x(h).
     Chart: g^-1 grad, after the chain rule through Eq. 6. Must agree."""
     m = LorentzManifold(k=k)
-    x = rand_points(32, scale=4.0)
-    X = m._lift(x)
-    Ea = torch.randn(32, DIM + 1, dtype=torch.float64)
+    X = rand_points(m, 32, scale=4.0)          # already ambient
+    Ea = torch.randn(32, DIM, dtype=torch.float64)
 
     h = Ea.clone()
     h[..., 0] *= -1
     paper = h + lip(X, h).unsqueeze(-1) * X / k
 
-    x0 = X[..., :1]
-    Ec = Ea[..., 1:] + Ea[..., :1] * x / x0
-    chart = m.egrad2rgrad(x, Ec)
-
-    assert torch.allclose(paper[..., 1:], chart, rtol=1e-9, atol=1e-9)
+    # AMBIENT CONVENTION: egrad2rgrad takes the full (n+1) euclidean gradient and folds
+    # g0 through dx0/dx' itself, so it is handed Ea directly and returns an ambient tangent.
+    chart = m.egrad2rgrad(X, Ea)
+    assert torch.allclose(paper, chart, rtol=1e-9, atol=1e-9)
 
 
 # ======================================================================
@@ -123,10 +133,10 @@ def test_egrad2rgrad_matches_papers_ambient_recipe(k):
 @pytest.mark.parametrize("k", KS)
 def test_expmap_matches_equation_9(k):
     m = LorentzManifold(k=k)
-    x = rand_points(32, scale=3.0)
-    u = rand_tangent(32, x, scale=0.7)
-    mine = m._lift(m.expmap(x, u))
-    theirs = paper_expmap(m._lift(x), amb_tangent(m, x, u), k)
+    x = rand_points(m, 32, scale=3.0)
+    u = rand_tangent(m, x, scale=0.7)
+    mine = m.expmap(x, u)
+    theirs = paper_expmap(x, u, k)
     assert torch.allclose(mine, theirs, rtol=1e-10, atol=1e-10)
 
 
@@ -134,9 +144,9 @@ def test_expmap_matches_equation_9(k):
 def test_expmap_stays_on_manifold(k):
     m = LorentzManifold(k=k)
     for scale in (1.0, 1e3, 1e6):
-        x = rand_points(32, scale=scale)
-        y = m.expmap(x, rand_tangent(32, x, scale=2.0))
-        Y = m._lift(y)
+        x = rand_points(m, 32, scale=scale)
+        y = m.expmap(x, rand_tangent(m, x, scale=2.0))
+        Y = m._point(y)
         assert torch.isfinite(Y).all()
         assert ((lip(Y, Y) + k).abs() / (Y[..., 0] ** 2)).max() < 8 * torch.finfo(torch.float64).eps
 
@@ -144,8 +154,8 @@ def test_expmap_stays_on_manifold(k):
 @pytest.mark.parametrize("k", KS)
 def test_expmap_step_length_is_tangent_norm(k):
     m = LorentzManifold(k=k)
-    x = rand_points(32, scale=3.0)
-    u = rand_tangent(32, x, scale=1.3)
+    x = rand_points(m, 32, scale=3.0)
+    u = rand_tangent(m, x, scale=1.3)
     assert torch.allclose(m.dist(x, m.expmap(x, u)), m.inner(x, u).sqrt(),
                           rtol=1e-9, atol=1e-11)
 
@@ -153,7 +163,7 @@ def test_expmap_step_length_is_tangent_norm(k):
 @pytest.mark.parametrize("k", KS)
 def test_expmap_zero_is_identity(k):
     m = LorentzManifold(k=k)
-    x = rand_points(16, scale=3.0)
+    x = rand_points(m, 16, scale=3.0)
     z = torch.zeros_like(x)
     assert torch.allclose(m.expmap(x, z), x, rtol=0, atol=1e-12)
 
@@ -161,8 +171,8 @@ def test_expmap_zero_is_identity(k):
 @pytest.mark.parametrize("k", KS)
 def test_expmap_small_norm_is_euclidean(k):
     m = LorentzManifold(k=k)
-    x = rand_points(16, scale=1.0)
-    u = rand_tangent(16, x) * 1e-9
+    x = rand_points(m, 16, scale=1.0)
+    u = rand_tangent(m, x) * 1e-9
     assert torch.allclose(m.expmap(x, u), x + u, rtol=0, atol=1e-15)
 
 
@@ -172,8 +182,8 @@ def test_expmap_small_norm_is_euclidean(k):
 @pytest.mark.parametrize("k", KS)
 def test_logmap_inverts_expmap(k):
     m = LorentzManifold(k=k)
-    x = rand_points(32, scale=3.0)
-    u = rand_tangent(32, x, scale=1.1)
+    x = rand_points(m, 32, scale=3.0)
+    u = rand_tangent(m, x, scale=1.1)
     y = m.expmap(x, u)
     assert torch.allclose(m.logmap(x, y), u, rtol=1e-8, atol=1e-9)
 
@@ -181,14 +191,14 @@ def test_logmap_inverts_expmap(k):
 @pytest.mark.parametrize("k", KS)
 def test_expmap_inverts_logmap(k):
     m = LorentzManifold(k=k)
-    x, y = rand_points(32, scale=3.0), rand_points(32, scale=3.0)
+    x, y = rand_points(m, 32, scale=3.0), rand_points(m, 32, scale=3.0)
     assert torch.allclose(m.expmap(x, m.logmap(x, y)), y, rtol=1e-8, atol=1e-9)
 
 
 @pytest.mark.parametrize("k", KS)
 def test_logmap_norm_equals_distance(k):
     m = LorentzManifold(k=k)
-    x, y = rand_points(32, scale=3.0), rand_points(32, scale=3.0)
+    x, y = rand_points(m, 32, scale=3.0), rand_points(m, 32, scale=3.0)
     assert torch.allclose(m.inner(x, m.logmap(x, y)).sqrt(), m.dist(x, y),
                           rtol=1e-9, atol=1e-10)
 
@@ -196,7 +206,7 @@ def test_logmap_norm_equals_distance(k):
 @pytest.mark.parametrize("k", KS)
 def test_logmap_of_self_is_zero(k):
     m = LorentzManifold(k=k)
-    x = rand_points(16, scale=3.0)
+    x = rand_points(m, 16, scale=3.0)
     assert m.logmap(x, x).abs().max() < 1e-12
 
 
@@ -206,8 +216,8 @@ def test_logmap_of_self_is_zero(k):
 @pytest.mark.parametrize("k", KS)
 def test_dist_matches_equation_5_verbatim(k):
     m = LorentzManifold(k=k)
-    x, y = rand_points(64, scale=3.0), rand_points(64, scale=3.0)
-    assert torch.allclose(m.dist(x, y), paper_dist(m._lift(x), m._lift(y), k),
+    x, y = rand_points(m, 64, scale=3.0), rand_points(m, 64, scale=3.0)
+    assert torch.allclose(m.dist(x, y), paper_dist(x, y, k),
                           rtol=1e-10, atol=1e-11)
 
 
@@ -215,8 +225,8 @@ def test_dist_matches_geoopt_lorentz():
     for k in KS:
         m = LorentzManifold(k=k)
         g = geoopt.Lorentz(k=torch.tensor(k, dtype=torch.float64))
-        x, y = rand_points(64, scale=3.0), rand_points(64, scale=3.0)
-        assert torch.allclose(m.dist(x, y), g.dist(m._lift(x), m._lift(y)),
+        x, y = rand_points(m, 64, scale=3.0), rand_points(m, 64, scale=3.0)
+        assert torch.allclose(m.dist(x, y), g.dist(x, y),
                               rtol=1e-12, atol=1e-13)
 
 
@@ -228,20 +238,23 @@ def test_geoopt_downcasts_a_python_float_curvature_to_float32():
     m = LorentzManifold(k=2.7)
     g32 = geoopt.Lorentz(k=2.7)
     g64 = geoopt.Lorentz(k=torch.tensor(2.7, dtype=torch.float64))
-    x, y = rand_points(64, scale=3.0), rand_points(64, scale=3.0)
-    X, Y = m._lift(x), m._lift(y)
+    x, y = rand_points(m, 64, scale=3.0), rand_points(m, 64, scale=3.0)
+    X, Y = x, y
     gap32 = (m.dist(x, y) - g32.dist(X, Y)).abs().max()
     gap64 = (m.dist(x, y) - g64.dist(X, Y)).abs().max()
     assert gap32 > 1e-8, "geoopt may have fixed the float32 k downcast"
     assert gap64 < 1e-12
     m1, g1 = LorentzManifold(k=1.0), geoopt.Lorentz(k=1.0)
-    assert (m1.dist(x, y) - g1.dist(m1._lift(x), m1._lift(y))).abs().max() < 1e-13
+    # x, y above were lifted at k=2.7. Our manifold RE-DERIVES x0 from x' with ITS k while
+    # geoopt TRUSTS the stored x0, so they must be compared on a k=1 lift of the same x'.
+    x1, y1 = m1._point(m._sp(x)), m1._point(m._sp(y))
+    assert (m1.dist(x1, y1) - g1.dist(x1, y1)).abs().max() < 1e-13
 
 
 @pytest.mark.parametrize("k", KS)
 def test_dist_is_a_metric(k):
     m = LorentzManifold(k=k)
-    x, y, z = (rand_points(64, scale=2.0) for _ in range(3))
+    x, y, z = (rand_points(m, 64, scale=2.0) for _ in range(3))
     assert (m.dist(x, y) >= 0).all()
     assert torch.allclose(m.dist(x, y), m.dist(y, x), rtol=1e-12, atol=1e-12)
     assert (m.dist(x, z) <= m.dist(x, y) + m.dist(y, z) + 1e-9).all()
@@ -251,7 +264,7 @@ def test_dist_is_a_metric(k):
 @pytest.mark.parametrize("k", KS)
 def test_dist0_matches_dist_to_origin(k):
     m = LorentzManifold(k=k)
-    x = rand_points(64, scale=100.0)
+    x = rand_points(m, 64, scale=100.0)
     assert torch.allclose(m.dist0(x), m.dist(x, torch.zeros_like(x)),
                           rtol=1e-10, atol=1e-11)
 
@@ -260,7 +273,7 @@ def test_dist_stays_nonnegative_where_geoopt_float32_does_not():
     g = geoopt.Lorentz(k=1.0)
     m = LorentzManifold(k=1.0)
     for scale, expect_neg in ((1.0, True), (139.0, True), (1390.0, True)):
-        xp = rand_points(200, dim=3, scale=scale)
+        xp = rand_points(m, 200, dim=3, scale=scale)
         X32 = lift(xp, torch.tensor(1.0, dtype=torch.float64)).float()
         d_geo = g.dist(X32, X32)
         assert (d_geo < 0).any() == expect_neg, scale
@@ -275,10 +288,10 @@ def test_dist_stays_nonnegative_where_geoopt_float32_does_not():
 @pytest.mark.parametrize("k", KS)
 def test_transp_is_tangent_and_isometric(k):
     m = LorentzManifold(k=k)
-    x, y = rand_points(32, scale=3.0), rand_points(32, scale=3.0)
-    v = rand_tangent(32, x)
+    x, y = rand_points(m, 32, scale=3.0), rand_points(m, 32, scale=3.0)
+    v = rand_tangent(m, x)
     pv = m.transp(x, y, v)
-    Y, PV = m._lift(y), amb_tangent(m, y, pv)
+    Y, PV = y, pv              # both already ambient
     assert lip(Y, PV).abs().max() < 1e-9
     assert torch.allclose(m.inner(y, pv), m.inner(x, v), rtol=1e-9, atol=1e-10)
 
@@ -304,8 +317,8 @@ def test_broadcasting_shapes(k):
 @pytest.mark.parametrize("k", KS)
 def test_transp_to_self_is_identity(k):
     m = LorentzManifold(k=k)
-    x = rand_points(16, scale=3.0)
-    v = rand_tangent(16, x)
+    x = rand_points(m, 16, scale=3.0)
+    v = rand_tangent(m, x)
     assert torch.allclose(m.transp(x, x, v), v, rtol=1e-11, atol=1e-12)
 
 
@@ -315,12 +328,12 @@ def test_transp_to_self_is_identity(k):
 @pytest.mark.parametrize("k", KS)
 def test_midpoint_on_manifold_and_scale_invariant(k):
     m = LorentzManifold(k=k)
-    x = rand_points(5 * 8, scale=2.0).reshape(8, 5, DIM)
+    x = rand_points(m, 5 * 8, scale=2.0).reshape(8, 5, DIM)
     w = torch.rand(8, 5, dtype=torch.float64)
     w_norm = w / w.sum(-1, keepdim=True)
 
     mu = m.weighted_midpoint(x, w_norm)
-    MU = m._lift(mu)
+    MU = mu
     assert torch.allclose(lip(MU, MU), torch.full((8,), -k, dtype=torch.float64),
                           rtol=1e-11, atol=1e-11)
     assert torch.allclose(m.weighted_midpoint(x, w), mu, rtol=1e-10, atol=1e-11)
@@ -330,7 +343,7 @@ def test_midpoint_on_manifold_and_scale_invariant(k):
 def test_midpoint_of_one_point_is_that_point():
     for k in KS:
         m = LorentzManifold(k=k)
-        x = rand_points(4, scale=3.0).reshape(4, 1, DIM)
+        x = rand_points(m, 4, scale=3.0).reshape(4, 1, DIM)
         w = torch.ones(4, 1, dtype=torch.float64)
         assert torch.allclose(m.weighted_midpoint(x, w), x.squeeze(1), rtol=1e-11, atol=1e-11)
 
@@ -338,16 +351,20 @@ def test_midpoint_of_one_point_is_that_point():
 @pytest.mark.parametrize("k", KS)
 def test_poincare_round_trip(k):
     m = LorentzManifold(k=k)
-    x = rand_points(64, scale=3.0)
+    x = rand_points(m, 64, scale=3.0)
     u = m.to_poincare(x)
     assert (u.norm(dim=-1) < 1).all()
-    assert torch.allclose(m.from_poincare(u), x, rtol=1e-9, atol=1e-10)
+    # the ambient file drops from_poincare, so invert u = x'/(x0+sqrt k) here:
+    # |u| = p gives |x'| = 2 p sqrt(k) / (1 - p^2), hence x' = 2 sqrt(k) u / (1 - |u|^2)
+    p2 = (u * u).sum(-1, keepdim=True)
+    back = m._point(2.0 * math.sqrt(k) * u / (1.0 - p2))
+    assert torch.allclose(back, x, rtol=1e-9, atol=1e-10)
 
 
 @pytest.mark.parametrize("k", KS)
 def test_poincare_map_is_an_isometry(k):
     m = LorentzManifold(k=k)
-    x, y = rand_points(64, scale=2.0), rand_points(64, scale=2.0)
+    x, y = rand_points(m, 64, scale=2.0), rand_points(m, 64, scale=2.0)
     u, v = m.to_poincare(x), m.to_poincare(y)
     dp = torch.acosh(1 + 2 * (u - v).pow(2).sum(-1)
                      / ((1 - u.pow(2).sum(-1)) * (1 - v.pow(2).sum(-1))))
@@ -360,7 +377,7 @@ def test_poincare_map_is_an_isometry(k):
 @pytest.mark.parametrize("k", KS)
 def test_expmap_gradient_finite_at_zero_tangent(k):
     m = LorentzManifold(k=k)
-    x = rand_points(8, scale=2.0).requires_grad_(True)
+    x = rand_points(m, 8, scale=2.0).requires_grad_(True)
     u = torch.zeros(8, DIM, dtype=torch.float64, requires_grad=True)
     m.expmap(x, u).sum().backward()
     assert torch.isfinite(x.grad).all(), "NaN gradient through expmap at ||v||=0"
@@ -370,7 +387,7 @@ def test_expmap_gradient_finite_at_zero_tangent(k):
 @pytest.mark.parametrize("k", KS)
 def test_logmap_gradient_finite_at_coincident_points(k):
     m = LorentzManifold(k=k)
-    x = rand_points(8, scale=2.0).requires_grad_(True)
+    x = rand_points(m, 8, scale=2.0).requires_grad_(True)
     y = x.detach().clone().requires_grad_(True)
     m.logmap(x, y).sum().backward()
     assert torch.isfinite(x.grad).all(), "NaN gradient through logmap at x == y"
@@ -380,8 +397,8 @@ def test_logmap_gradient_finite_at_coincident_points(k):
 @pytest.mark.parametrize("k", KS)
 def test_logmap_gradient_finite_in_mixed_batch(k):
     m = LorentzManifold(k=k)
-    x = rand_points(8, scale=2.0)
-    y = rand_points(8, scale=2.0)
+    x = rand_points(m, 8, scale=2.0)
+    y = rand_points(m, 8, scale=2.0)
     y[3] = x[3]
     x = x.requires_grad_(True)
     y = y.requires_grad_(True)
@@ -421,19 +438,21 @@ def test_output_masking_would_nan_but_input_masking_does_not():
 @pytest.mark.parametrize("k", KS)
 def test_expmap_jacobian_at_zero_is_the_identity(k):
     m = LorentzManifold(k=k)
-    x = rand_points(1, scale=2.0)
+    x = rand_points(m, 1, scale=2.0)
+    # AMBIENT CONVENTION: the tangent space is n-dimensional inside R^{n+1}, so the identity
+    # claim is about the SPATIAL block -- d x'(exp_x(u)) / d u' = I_n at u = 0.
     J = torch.autograd.functional.jacobian(
-        lambda u: m.expmap(x, u).squeeze(0),
-        torch.zeros(1, DIM, dtype=torch.float64),
-    ).reshape(DIM, DIM)
-    assert torch.allclose(J, torch.eye(DIM, dtype=torch.float64), rtol=0, atol=1e-12)
+        lambda us: m._sp(m.expmap(x, m._tangent(m._sp(x), us))).squeeze(0),
+        torch.zeros(1, DIM - 1, dtype=torch.float64),
+    ).reshape(DIM - 1, DIM - 1)
+    assert torch.allclose(J, torch.eye(DIM - 1, dtype=torch.float64), rtol=0, atol=1e-12)
 
 
 @pytest.mark.parametrize("k", KS)
 def test_gradients_finite_on_ordinary_input(k):
     m = LorentzManifold(k=k)
-    x = rand_points(16, scale=3.0).requires_grad_(True)
-    y = rand_points(16, scale=3.0).requires_grad_(True)
+    x = rand_points(m, 16, scale=3.0).requires_grad_(True)
+    y = rand_points(m, 16, scale=3.0).requires_grad_(True)
     loss = (m.dist(x, y).sum() + m.logmap(x, y).sum()
             + m.expmap(x, m.egrad2rgrad(x, y)).sum() + m.dist0(x).sum())
     loss.backward()
@@ -469,7 +488,7 @@ def test_k_not_in_state_dict_is_documented_tradeoff():
 def test_manifold_is_instantiable_and_complete(k):
     m = LorentzManifold(k=k)
     assert not getattr(type(m), "__abstractmethods__", frozenset())
-    x, y = rand_points(4, scale=1.0), rand_points(4, scale=1.0)
+    x, y = rand_points(m, 4, scale=1.0), rand_points(m, 4, scale=1.0)
     for name in ("retr", "expmap", "logmap", "transp", "projx", "proju",
                  "egrad2rgrad", "inner", "dist"):
         assert hasattr(m, name)
@@ -479,9 +498,9 @@ def test_manifold_is_instantiable_and_complete(k):
 @pytest.mark.parametrize("k", KS)
 def test_base_class_composites_work(k):
     m = LorentzManifold(k=k)
-    x = rand_points(8, scale=2.0)
-    u = rand_tangent(8, x, scale=0.1)
-    v = rand_tangent(8, x)
+    x = rand_points(m, 8, scale=2.0)
+    u = rand_tangent(m, x, scale=0.1)
+    v = rand_tangent(m, x)
     y, pv = m.retr_transp(x, u, v)
     assert torch.allclose(y, m.expmap(x, u), rtol=1e-12, atol=1e-12)
     assert torch.allclose(pv, m.transp(x, y, v), rtol=1e-12, atol=1e-12)
@@ -513,7 +532,7 @@ def test_optimizer_reduces_a_hyperbolic_loss(opt_cls, k):
         last = float(loss)
 
     assert last < first * 0.02, f"{opt_cls.__name__}: {first:.4f} -> {last:.4f}"
-    P = m._lift(p.detach())
+    P = m._point(p.detach())
     assert ((lip(P, P) + k).abs() / (P[..., 0] ** 2)).max() < 8 * torch.finfo(torch.float64).eps
 
 
@@ -538,9 +557,9 @@ def test_momentum_path_uses_transport(k):
 def test_gradcheck_against_numerical_jacobians(k):
     from torch.autograd import gradcheck
     m = LorentzManifold(k=k)
-    x = (rand_points(3, dim=4, scale=1.5)).requires_grad_(True)
-    y = (rand_points(3, dim=4, scale=1.5)).requires_grad_(True)
-    u = (rand_points(3, dim=4, scale=0.4)).requires_grad_(True)
+    x = (rand_points(m, 3, dim=4, scale=1.5)).requires_grad_(True)
+    y = (rand_points(m, 3, dim=4, scale=1.5)).requires_grad_(True)
+    u = (rand_points(m, 3, dim=4, scale=0.4)).requires_grad_(True)
     for fn, args in [
         (lambda a, b: m.dist(a, b), (x, y)),
         (lambda a: m.dist0(a), (x,)),
@@ -584,7 +603,7 @@ def test_float32_end_to_end_training_stays_finite():
 @pytest.mark.parametrize("k", KS)
 def test_dist0_is_accurate_at_the_papers_init_radius(k):
     m = LorentzManifold(k=k)
-    x32 = (rand_points(4096, scale=1e-3)).float()
+    x32 = (rand_points(m, 4096, scale=1e-3)).float()
     exact = m.dist0(x32.double())
 
     def naive(xx):
@@ -600,8 +619,8 @@ def test_dist0_is_accurate_at_the_papers_init_radius(k):
 def test_inner_does_not_regress_on_random_tangents(k):
     m = LorentzManifold(k=k)
     for scale in (1.0, 1e4, 1e8):
-        x = (rand_points(1024, scale=scale)).float()
-        u = rand_points(1024, scale=1.0).float()
+        x = (rand_points(m, 1024, scale=scale)).float()
+        u = rand_points(m, 1024, scale=1.0).float()
         exact = m.inner(x.double(), u.double(), keepdim=True)
         rel = float(((m.inner(x, u, keepdim=True).double() - exact) / exact.abs()).abs().max())
         assert rel < 1e-5
@@ -612,8 +631,9 @@ def test_nearby_pairs_at_radius_survive_float32(k):
     m = LorentzManifold(k=k)
 
     def naive_gap(xx, yy):
-        d = xx - yy
-        d0 = m._x0(xx) - m._x0(yy)
+        xs, ys = m._sp(xx), m._sp(yy)
+        d = xs - ys
+        d0 = m._x0(xs) - m._x0(ys)          # the naive difference of two large x0
         return (((d * d).sum(-1, keepdim=True)) - d0 * d0) * m._half_inv_k
 
     def naive_dist(xx, yy):
@@ -621,8 +641,9 @@ def test_nearby_pairs_at_radius_survive_float32(k):
             torch.sqrt(naive_gap(xx, yy).clamp_min(0) * 0.5))).squeeze(-1)
 
     for scale, sep in ((1e2, 1e-4), (1e4, 1e-4), (1e2, 1e-6)):
-        x64 = rand_points(2000, scale=scale)
-        y64 = x64 + torch.randn_like(x64) * sep
+        x64 = rand_points(m, 2000, scale=scale)
+        # perturb the SPATIAL part and re-lift, so y stays on the sheet
+        y64 = m._point(m._sp(x64) + torch.randn_like(m._sp(x64)) * sep)
         x, y = x64.float(), y64.float()
         exact = m.dist(x.double(), y.double())
         den = exact.abs().clamp_min(1e-30)
@@ -630,7 +651,9 @@ def test_nearby_pairs_at_radius_survive_float32(k):
         e_mine = float(((m.dist(x, y).double() - exact) / den).abs().max())
         assert e_naive > 1e-2, (scale, sep, e_naive)
         assert e_mine < 1e-5, (scale, sep, e_mine)
-        distinct = (x != y).any(-1)
+        # dist is a function of x' alone, so distinctness is judged there: at scale 1e4
+        # some rows differ only in the stored x0 (21 of 1485 measured) and correctly give 0.
+        distinct = (m._sp(x) != m._sp(y)).any(-1)
         if distinct.any():
             assert (m.dist(x, y)[distinct] > 0).all(), (scale, sep)
 
@@ -639,9 +662,9 @@ def test_nearby_pairs_at_radius_survive_float32(k):
 def test_transp_stays_isometric_in_float32(k):
     m = LorentzManifold(k=k)
     for scale in (1.0, 1e2, 1e4):
-        x = rand_points(512, scale=scale).float()
-        y = rand_points(512, scale=scale).float()
-        v = rand_points(512, scale=1.0).float()
+        x = rand_points(m, 512, scale=scale).float()
+        y = rand_points(m, 512, scale=scale).float()
+        v = rand_points(m, 512, scale=1.0).float()
         pv = m.transp(x, y, v)
         ratio = m.inner(y.double(), pv.double()) / m.inner(x.double(), v.double())
         assert (ratio - 1).abs().max() < 1e-4
@@ -651,18 +674,20 @@ def test_random_matches_paper_init():
     m = LorentzManifold(k=1.0)
     x = m.random(4096, DIM, dtype=torch.float64)
     assert isinstance(x, geoopt.ManifoldTensor)
-    assert x.abs().max() <= 1e-3
+    assert x.shape == (4096, DIM), "random returns the AMBIENT shape"
+    assert m._sp(x).abs().max() <= 1e-3, "x' ~ U(-irange, irange)"
+    assert torch.allclose(x[..., 0], m._x0(m._sp(x)).squeeze(-1)), "x0 derived, not drawn"
     assert m.dist0(x).max() < 1e-2
 
 
 def test_origin_is_the_vertex():
     for k in KS:
         m = LorentzManifold(k=k)
-        o = m.origin(3, DIM, dtype=torch.float64)
-        assert (o == 0).all()
+        o = m._point(torch.zeros(3, DIM - 1, dtype=torch.float64))
+        assert (m._sp(o) == 0).all(), "the origin has zero spatial part"
         assert m.dist0(o).abs().max() == 0.0
-        assert torch.allclose(m._lift(o)[..., 0].squeeze(-1),
-                              torch.full((3,), math.sqrt(k), dtype=torch.float64))
+        assert torch.allclose(o[..., 0], torch.full((3,), math.sqrt(k), dtype=torch.float64)), \
+            "the vertex sits at x0 = sqrt(k)"
 
 
 # ======================================================================
@@ -676,10 +701,10 @@ DTYPES = [torch.float64, torch.float32, torch.float16, torch.bfloat16]
 def test_every_op_is_dtype_passthrough(dt, k):
     """No internal upcast, no dtype branch: what goes in comes out."""
     m = LorentzManifold(k=k)
-    x = rand_points(16, scale=2.0).to(dt)
-    y = rand_points(16, scale=2.0).to(dt)
-    u = rand_points(16, scale=0.3).to(dt)
-    bag = rand_points(4 * 5, scale=2.0).reshape(4, 5, DIM).to(dt)
+    x = rand_points(m, 16, scale=2.0).to(dt)
+    y = rand_points(m, 16, scale=2.0).to(dt)
+    u = rand_points(m, 16, scale=0.3).to(dt)
+    bag = rand_points(m, 4 * 5, scale=2.0).reshape(4, 5, DIM).to(dt)
     wts = torch.rand(4, 5).to(dt)
     for name, out in [
         ("dist", m.dist(x, y)), ("dist0", m.dist0(x)), ("logmap", m.logmap(x, y)),
@@ -695,8 +720,8 @@ def test_every_op_is_dtype_passthrough(dt, k):
 @pytest.mark.parametrize("dt", DTYPES)
 def test_accuracy_lands_at_the_dtypes_own_resolution(dt, k=1.0):
     m = LorentzManifold(k=k)
-    x = rand_points(500, scale=3.0)
-    y = rand_points(500, scale=3.0)
+    x = rand_points(m, 500, scale=3.0)
+    y = rand_points(m, 500, scale=3.0)
     exact = m.dist(x.to(dt).double(), y.to(dt).double())
     got = m.dist(x.to(dt), y.to(dt)).double()
     rel = ((got - exact).abs() / exact.abs().clamp_min(1e-6)).max()
@@ -707,10 +732,10 @@ def test_no_hardcoded_epsilon_breaks_in_float16():
     """A fixed 1e-30 floor underflows to exactly 0.0 in float16, and 1/0 is
     inf, so the floor must come from finfo(dtype).
 
-    Exercises the two sites that actually USE the floor -- midpoint's rsqrt and
-    from_poincare's division. An earlier version of this test called inner,
-    expmap, dist0 and logmap, none of which touch _tiny, so replacing it with a
-    hardcoded 1e-30 passed."""
+    Exercises the sites that actually USE the floor. In the AMBIENT file those are
+    weighted_midpoint's rsqrt and transp's radial normalisation (from_poincare is gone).
+    An earlier version called inner, expmap, dist0 and logmap, none of which touch _tiny,
+    so replacing it with a hardcoded 1e-30 passed."""
     assert float(torch.tensor(1e-30, dtype=torch.float16)) == 0.0
     assert torch.finfo(torch.float16).tiny > 0
     m = LorentzManifold(k=1.0)
@@ -721,21 +746,26 @@ def test_no_hardcoded_epsilon_breaks_in_float16():
               torch.rand(2, 4, dtype=torch.float16)):
         assert torch.isfinite(m.weighted_midpoint(bag, w)).all()
 
-    # from_poincare at and beyond the boundary: 1 - ||u||^2 -> 0
-    for val in (0.0, 0.999, 1.0, 1.5):
-        u = torch.full((4, DIM), val / DIM ** 0.5, dtype=torch.float16)
-        assert torch.isfinite(m.from_poincare(u)).all(), val
+    # transp AT THE ORIGIN: ||x'|| -> 0, so the radial unit vector divides by the floor
+    o = m._point(torch.zeros(4, DIM - 1, dtype=torch.float16))
+    for ys in (torch.zeros(4, DIM - 1, dtype=torch.float16),
+               torch.full((4, DIM - 1), 0.5, dtype=torch.float16)):
+        y = m._point(ys)
+        v = m._tangent(torch.zeros(4, DIM - 1, dtype=torch.float16),
+                       torch.full((4, DIM - 1), 0.25, dtype=torch.float16))
+        assert torch.isfinite(m.transp(o, y, v)).all()
 
 
 @pytest.mark.parametrize("k", KS)
 def test_inner_needs_no_division_floor(k):
     m = LorentzManifold(k=k)
-    at_origin = torch.zeros(4, DIM, dtype=torch.float64)
-    u = rand_points(4, scale=1.0)
-    assert torch.allclose(m.inner(at_origin, u), (u * u).sum(-1), rtol=0, atol=1e-14)
+    at_origin = m._point(torch.zeros(4, DIM - 1, dtype=torch.float64))
+    u = rand_tangent(m, at_origin, scale=1.0)
+    us = m._sp(u)
+    assert torch.allclose(m.inner(at_origin, u), (us * us).sum(-1), rtol=0, atol=1e-14)
 
-    x = (rand_points(500, scale=1e-3)).half()
-    uu = rand_points(500, scale=1.0).half()
+    x = (rand_points(m, 500, scale=1e-3)).half()
+    uu = rand_points(m, 500, scale=1.0).half()
     exact = m.inner(x.double(), uu.double(), keepdim=True)
     got = m.inner(x, uu, keepdim=True).double()
     rel = float(((got - exact) / exact.abs()).abs().max())
@@ -747,17 +777,20 @@ def test_inner_beats_the_printed_form_at_both_widths(k):
     m = LorentzManifold(k=k)
 
     def printed(x, u):
-        return ((u * u).sum(-1, keepdim=True)
-                - (x * u).sum(-1, keepdim=True) ** 2
-                / (m.k + (x * x).sum(-1, keepdim=True)))
+        xs, us = m._sp(x), m._sp(u)
+        return ((us * us).sum(-1, keepdim=True)
+                - (xs * us).sum(-1, keepdim=True) ** 2
+                / (m.k + (xs * xs).sum(-1, keepdim=True)))
 
     for dt, scale, bound in ((torch.float32, 1e2, 1e-5), (torch.float32, 1e4, 1e-3),
                              (torch.float64, 1e4, 1e-12), (torch.float64, 1e6, 1e-12)):
-        x = (rand_points(1000, scale=scale)).to(dt)
-        u = (x.double() / x.double().norm(dim=-1, keepdim=True)).to(dt)
-        x0sq = m.k + (x.double() * x.double()).sum(-1, keepdim=True)
-        q = (x.double() * u.double()).sum(-1, keepdim=True) / x0sq
-        exact = ((u.double() - q * x.double()) ** 2).sum(-1, keepdim=True) + q * q * m.k
+        x = (rand_points(m, 1000, scale=scale)).to(dt)
+        xs64 = m._sp(x).double()
+        us64 = xs64 / xs64.norm(dim=-1, keepdim=True)     # the near-radial worst case
+        u = m._tangent(m._sp(x), us64.to(dt))
+        x0sq = m.k + (xs64 * xs64).sum(-1, keepdim=True)
+        q = (xs64 * us64).sum(-1, keepdim=True) / x0sq
+        exact = ((us64 - q * xs64) ** 2).sum(-1, keepdim=True) + q * q * m.k
         rel = lambda a: float(((a.double() - exact) / exact.abs()).abs().max())
         assert rel(m.inner(x, u, keepdim=True)) < bound, (dt, scale)
         assert rel(printed(x, u)) > rel(m.inner(x, u, keepdim=True))
@@ -767,13 +800,13 @@ def test_midpoint_float32_loss_is_small_and_stays_on_manifold():
     m = LorentzManifold(k=1.0)
     for scale in (1.0, 1e2, 1e4, 1e6):
         for T in (8, 64):
-            x = (rand_points(64 * T, scale=scale).reshape(64, T, DIM)).float()
+            x = (rand_points(m, 64 * T, scale=scale).reshape(64, T, DIM)).float()
             w = torch.rand(64, T)
             w = w / w.sum(-1, keepdim=True)
             a = m.weighted_midpoint(x, w)
             b = m.weighted_midpoint(x.double(), w.double())
             assert float(((a.double() - b).abs() / b.abs().clamp_min(1e-12)).max()) < 5e-3
-            P = m._lift(a.double())
+            P = m._point(a.double())
             assert ((lip(P, P) + 1.0).abs() / (P[..., 0] ** 2)).max() < 1e-6
 
 
@@ -828,7 +861,6 @@ def _deg_cases(k=1.0):
     o1 = torch.zeros(6, D, dtype=torch.float64, requires_grad=True)
     out.append(("to_poincare(origin)", lambda: m.to_poincare(o1), (o1,)))
     o2 = torch.zeros(6, D, dtype=torch.float64, requires_grad=True)
-    out.append(("from_poincare(origin)", lambda: m.from_poincare(o2), (o2,)))
     return out
 
 
@@ -871,15 +903,20 @@ def test_gradient_is_bounded_approaching_coincidence(k):
         assert float(x.grad.abs().max()) < 10.0, (sep, float(x.grad.abs().max()))
 
 
-def test_projx_is_the_identity():
-    """Eq. 6 makes every x' in R^n a valid point, so projx has nothing to do --
-    at the origin, and at radii that used to be clipped."""
+def test_projx_recomputes_x0_and_is_idempotent():
+    """AMBIENT CONVENTION: projx is no longer the identity -- it rebuilds the stored time
+    coordinate from x'. It must be idempotent, must leave x' untouched, and must REPAIR a
+    deliberately stale x0, which is the whole reason geoopt's `stabilize` calls it."""
     m = LorentzManifold()
-    x = torch.zeros(3, 8)
-    x[1, 0] = 1.0
-    assert torch.equal(m.projx(x), x)
-    y = torch.randn(16, 8)
-    y = y / y.norm(dim=-1, keepdim=True)
-    for r in (1.0, 8.0, 20.0, 40.0):
-        z = y * math.sinh(r)
-        assert torch.equal(m.projx(z), z)
+    ys = torch.randn(16, 7, dtype=torch.float64)
+    ys = ys / ys.norm(dim=-1, keepdim=True)
+    for r in (0.0, 1.0, 8.0, 20.0, 40.0):
+        z = m._point(ys * math.sinh(r))
+        pz = m.projx(z)
+        assert torch.equal(pz, z), "projx must fix a point already on the sheet"
+        assert torch.equal(m.projx(pz), pz), "projx must be idempotent"
+        stale = z.clone()
+        stale[..., 0] *= 1.5                       # corrupt only the time coordinate
+        fixed = m.projx(stale)
+        assert torch.equal(m._sp(fixed), m._sp(z)), "x' must be untouched"
+        assert torch.allclose(fixed, z, rtol=0, atol=1e-12), "x0 must be repaired"
