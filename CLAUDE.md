@@ -345,3 +345,104 @@ is what the flat softmax does between ep25 and ep50 on YouTube that none of thes
 the untested axes remain walk depth (`--max-walk-len`, 70-99% of reachable history is discarded at
 5), breadth (`--num-walks-per-node`; wpn 10 measured at only **1.11x** the train cost of wpn 5,
 one epoch, then killed) and the scorer.
+
+## Walk-sequence poolers and step columns: master wins 4/5 (measured, 2026-10-05)
+
+Two independent families, run as two tables. All seed 5, d64, K5, wpn 5, mwl 5, lr 1e-3,
+patience 10, hidden 32. **The baseline is the POST-`triangle_cos` master** (`logs/cosomaster`,
+commit `7e68aa7`), which is not the same as the older `logs/coso` references — see "the baseline
+moved" below.
+
+### Table A: does the pooler need walk structure?
+
+Five arms. `ema` = single-rate normalised EMA over the older hops (one learned fade rate `alpha`);
+`ph` = the one older hop through a learned linear map. `nl1`/`nl2` is pooler depth, and each arm
+reduces to master **bitwise** at its degenerate setting (`alpha -> 0`, `w_prev = 0`).
+
+| arm | params | YouTube | Flickr | ML-20M | Yelp | WikiLink |
+|---|---|---|---|---|---|---|
+| **cos_o (master)** | 1,249 / 193 nl1 | **0.5867** | **0.6377** | 0.2515 | **0.6523** | 0.6607 ‡ |
+| ema-nl1 | 194 | 0.5668 | 0.6312 | 0.2513 | 0.6348 | 0.6596 |
+| ema-nl2 | 1,250 | 0.5708 | 0.6329 | 0.2539 | 0.6304 | 0.6652 ◊ |
+| ph-nl1 | 225 | 0.5584 † | 0.6302 | 0.2500 | 0.6307 | **0.6647** |
+| ph-nl2 | 2,273 | 0.5652 | 0.6381 | **0.2542** | (running) | (running) |
+
+† **FLOOR, not a result**: hit the `--num-epochs 100` cap with its best AT ep100, val still
+rising. ‡ at ep23/patience 5, past its ep18 peak, effectively final. ◊ **no depth-matched
+baseline exists** — 1,250 params against master's nl1 193 — so this is NOT a delta and must not
+be quoted as one. A clean cos_o **nl2** WikiLink run still does not exist.
+
+**Master wins 4 of 4 completed datasets.** Deltas vs master: YouTube −0.016 to −0.028 for all
+four arms, Yelp −0.018 to −0.022, Flickr −0.005 to −0.008 (ph-nl2 +0.0004, a tie), ML-20M −0.002
+to **+0.0027**. ML-20M is the only dataset where arms lead, and by ~0.0025.
+
+**The one legitimate win is ph-nl1 on WikiLink, +0.0040**, depth-matched (225 vs 193). It is also
+the only dataset where any arm beats master, now across fifteen attempts.
+
+**nl2 > nl1 within each mechanism** (ema +0.0040, ph +0.0068 on YouTube) but **"nl2 beats master"
+does not generalise** — it holds only on ML-20M. An earlier read of partial columns suggested
+depth mattered more than mechanism; the final numbers do not support it.
+
+**alpha is NOT logged per epoch, so both EMA nulls are uninterpretable at the mechanism level.**
+A null cannot distinguish "memory unused, `alpha -> 0`, i.e. master" from "memory used and
+unhelpful". Evidence points at collapse: on WikiLink ema-nl1 tracked cos_o nl1 to within 0.001
+train loss, 0.002 `r_mean` and 0.0003 val at matched epochs, which is what `alpha -> 0` looks
+like. **Add an `alpha=` field to the epoch line before running any further EMA arm.**
+
+### Table B: feed the previous hop as feature columns instead
+
+Three columns added to master's four, all **zero-initialised with master's exact RNG
+consumption**, so each arm starts BITWISE identical to master (verified: forward equal, max|diff|
+0.000e+00) and the columns enter only by gradient.
+
+`d_step = d(x_l, x_{l-1})`, `cos_step = triangle_cos(r_tok, r_prev, d_step)`,
+`age_step = log1p(age_{l-1} - age_l)`.
+
+| arm | params | YouTube | Flickr | ML-20M | min train loss (YT / FL / ML) |
+|---|---|---|---|---|---|
+| **cos_o (master)** | 1,249 | **0.5867** | **0.6377** | 0.2515 | 0.0290 / 0.0602 / 0.3967 |
+| step-geo (`d`,`cos`) | 1,313 | 0.5865 | 0.6348 | 0.2539 | 0.0282 / 0.0562 / 0.3874 |
+| step-geo-age (+`age`) | 1,345 | 0.5837 | 0.6349 | **0.2546** | **0.0255 / 0.0561 / 0.3792** |
+
+**Both arms undercut master's training loss on all three datasets and generalised no better.**
+That is the project's standing law holding again: driving train link loss below master's does not
+transfer. step-geo-age has the lowest loss everywhere and the worse MRR of the two on 2 of 3.
+
+**These columns are nearly free, unlike Table A.** Deltas are −0.0002/−0.003 on YouTube and
+−0.003 on Flickr against Table A's −0.016 to −0.028, and +0.002/+0.003 on ML-20M. So **the large
+YouTube damage in Table A tracks the ARCHITECTURAL change, not the sequence information** —
+feeding the previous hop as standardised columns costs almost nothing; restructuring the pooler
+to consume it costs 0.02+.
+
+`logit_sd` is **unavailable** for Table B: these drivers derive from `run_cosomaster_arm.sh`,
+which carries no probe. That diagnostic is missing, not null.
+
+### Two things that will mislead the next reader
+
+**The baseline moved, and in both directions.** Four of five old `logs/coso` references predate
+`triangle_cos` (commit `2d7b739`). Re-running master post-fix gave Flickr 0.6368 -> **0.6377**,
+ML-20M 0.2518 -> **0.2515** (down, via drift: max was 0.2521), Yelp 0.6610 -> **0.6523** (down
+0.0087, the largest revision), WikiLink 0.6554 -> **0.6607** (up 0.0053). That WikiLink revision
+alone flipped ema-nl1 from a +0.0042 win to a −0.0011 loss. **Always state which baseline a delta
+uses.** YouTube reproduced 0.5867 exactly, which also confirms the `[Q,K,L]` walk_tokens refactor
+(`4b1a919`) is inert end-to-end through a full 78-epoch run, not just in its unit test.
+
+**Four Table-A cells ran on A40, not RTX** — cos_o ML-20M, ema-nl2 Flickr, ph-nl2 YouTube and
+Flickr (headers show `gpu=NVIDIA A40`). Per-epoch timings are not comparable and bitwise
+reproduction is not guaranteed. Table B's ML-20M column therefore compares RTX arms against an
+A40 baseline.
+
+### The direction trap, which cost five runs
+
+Walks are stored in **time order**: index 0 is the OLDEST hop, `lens-1` is the seed. Measured on
+a real chain walk (`0->1->...->5` at t=10..50, backward from node 5 at cutoff 60) the ages come
+out 50, 40, 30, 20, 10, 0 along increasing index. So **increasing index is forward in time** and
+the previous hop is `l-1`.
+
+The first versions of all three sequence arms read `l+1` and so conditioned every token on its
+own FUTURE. The cause was a docstring: `l+1` is "the hop it was reached from" in walk-GENERATION
+order, because the sampler starts at the seed and steps backward — and generation order is the
+reverse of time. Five runs were launched and killed on it. The same trap bit `age_step`, where
+the natural-looking `age_l - age_{l-1}` is NEGATIVE here and `log1p` of it is NaN (verified).
+**Every driver for these arms now pins the direction with an abort guard.** Do not describe `l+1`
+as "the hop it was reached from".
