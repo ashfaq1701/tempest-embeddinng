@@ -361,16 +361,23 @@ reduces to master **bitwise** at its degenerate setting (`alpha -> 0`, `w_prev =
 
 | arm | params | YouTube | Flickr | ML-20M | Yelp | WikiLink |
 |---|---|---|---|---|---|---|
-| **cos_o (master)** | 1,249 / 193 nl1 | **0.5867** | **0.6377** | 0.2515 | **0.6523** | 0.6607 ‡ |
-| ema-nl1 | 194 | 0.5668 | 0.6312 | 0.2513 | 0.6348 | 0.6596 |
+| **cos_o (master)** | 1,249 / 193 nl1 | **0.5867** | **0.6377** | 0.2515 | **0.6523** | **0.6607** |
+| ema-nl1 | 194 ᴰ | 0.5668 | 0.6312 | 0.2513 | 0.6348 | 0.6596 |
 | ema-nl2 | 1,250 | 0.5708 | 0.6329 | 0.2539 | 0.6304 | 0.6652 ◊ |
-| ph-nl1 | 225 | 0.5584 † | 0.6302 | 0.2500 | 0.6307 | **0.6647** |
-| ph-nl2 | 2,273 | 0.5652 | 0.6381 | **0.2542** | (running) | (running) |
+| ph-nl1 | 225 ᴰ | 0.5584 † | 0.6302 | 0.2500 | 0.6307 | **0.6647** |
+| ph-nl2 | 2,273 | 0.5652 | 0.6381 | **0.2542** | (last run) | ✗ dropped |
 
 † **FLOOR, not a result**: hit the `--num-epochs 100` cap with its best AT ep100, val still
-rising. ‡ at ep23/patience 5, past its ep18 peak, effectively final. ◊ **no depth-matched
-baseline exists** — 1,250 params against master's nl1 193 — so this is NOT a delta and must not
-be quoted as one. A clean cos_o **nl2** WikiLink run still does not exist.
+rising. ᴰ **nl1 arm against an nl2 master** — on YouTube/Flickr/ML-20M/Yelp these two rows mix
+the mechanism with a 5-6x capacity cut, because a cos_o **nl1** run exists only for WikiLink.
+Only the nl2 rows are depth-matched there. ◊ **no depth-matched baseline exists** — 1,250 params
+against master's nl1 193 — NOT a delta, do not quote it as one. ✗ ph-nl2 WikiLink was killed at
+ep5 when the family was dropped; it was uninterpretable for the same reason (2,273 vs 193). A
+clean cos_o **nl2** WikiLink run has never been made.
+
+**VERDICT, called 2026-10-05: the recurrence family is a no-go and was dropped.** Master is
+complete at 5/5 and wins every dataset except WikiLink. Across four arms and two mechanisms the
+only win is ph-nl1's +0.0040 on WikiLink. Remaining runs were cancelled rather than finished.
 
 **Master wins 4 of 4 completed datasets.** Deltas vs master: YouTube −0.016 to −0.028 for all
 four arms, Yelp −0.018 to −0.022, Flickr −0.005 to −0.008 (ph-nl2 +0.0004, a tie), ML-20M −0.002
@@ -388,6 +395,27 @@ A null cannot distinguish "memory unused, `alpha -> 0`, i.e. master" from "memor
 unhelpful". Evidence points at collapse: on WikiLink ema-nl1 tracked cos_o nl1 to within 0.001
 train loss, 0.002 `r_mean` and 0.0003 val at matched epochs, which is what `alpha -> 0` looks
 like. **Add an `alpha=` field to the epoch line before running any further EMA arm.**
+
+### The one door left open, and it was not tested
+
+The family was dropped on the numbers above, which is defensible, but **the nl2 losses are
+confounded with INITIALISATION and that confound was never controlled.** Table A's arms do not
+start at master: `ema` initialises `alpha_init = 0.5`, i.e. the memory fully ON before any
+gradient step, and `ph` leaves `w_prev` at the default `nn.Linear` draw, i.e. the prior hop
+contributes RANDOMLY at init. Table B's step arms zero-initialise and so start BITWISE as master.
+The arms that start at master cost ~0.000-0.003; the arms that start far from it cost 0.016-0.022.
+
+The tell is ema-nl2: it is a strict superset of master with **one** extra parameter, and `alpha ->
+0` recovers master bitwise (verified) -- yet it lost 0.016 on YouTube and 0.022 on Yelp. A single
+scalar that can switch the mechanism off should not cost that much if the optimiser could get
+back. So these runs measure "can the optimiser switch recurrence off from a bad start", not "does
+recurrence help". Same shape as the `--lr-pooler` result, where an eval-time tau=2 gained +0.018
+but training at a low pooler lr gained nothing.
+
+**If this is ever reopened, the test is two runs:** ema-nl2 with `alpha_init ~ 1e-3` and ph-nl2
+with `w_prev` zero-initialised, making both exact supersets of master at init. Deltas collapsing
+toward 0 would mean the 0.02 was initialisation and recurrence is neutral; deltas staying at 0.02
+would confirm the verdict on its own terms. Neither run was made.
 
 ### Table B: feed the previous hop as feature columns instead
 
