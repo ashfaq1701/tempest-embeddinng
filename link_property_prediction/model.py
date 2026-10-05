@@ -16,6 +16,7 @@ from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
 _VAR_FLOOR = 1e-12
+_COS_EPS = 1e-12
 
 
 def standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
@@ -25,24 +26,6 @@ def standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     mu = (feat * m).sum(dim=(0, 1)) / n                                      # [F]
     var = (((feat - mu) ** 2) * m).sum(dim=(0, 1)) / n                       # [F]
     return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m                # [Q, T, F]
-
-
-def triangle_cos(p: torch.Tensor, q: torch.Tensor, r: torch.Tensor,
-                 small: float = 1e-2, floor: float = 1e-12) -> torch.Tensor:
-    """Cosine of the angle between the two sides p and q of a hyperbolic triangle
-    (curvature -1) whose third side is r. Broadcasts; returns values in [-1, 1].
-
-    Uses the hyperbolic law of cosines, and the Euclidean law of cosines when both
-    adjacent sides are below `small`, where the hyperbolic form loses precision to
-    cancellation (cosh terms near 1). Degenerate triangles (p or q zero) return 0.
-    """
-    cos_h = (torch.cosh(p) * torch.cosh(q) - torch.cosh(r)) \
-        / (torch.sinh(p) * torch.sinh(q)).clamp_min(floor)
-    cos_e = (p * p + q * q - r * r) / (2.0 * p * q).clamp_min(floor)
-    use_e = (p < small) & (q < small)
-    out = torch.where(use_e, cos_e, cos_h)
-    out = torch.where((p <= 0) | (q <= 0), torch.zeros_like(out), out)   # no angle at a degenerate vertex
-    return out.clamp(-1.0, 1.0)
 
 
 class BagWeights(nn.Module):
@@ -82,9 +65,16 @@ class BagWeights(nn.Module):
         pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
 
         a = self.geom.dist(xt, mid.unsqueeze(-2))                            # [Q, T]  d_mid
-        b = self.geom.dist0(xt)                                              # [Q, T]  r_tok
-        c = self.geom.dist0(mid).unsqueeze(-1)                               # [Q, 1]  r_mid
-        cos_o = triangle_cos(b, c, a) * u                                     # [Q, T]  angle at O
+        # AMBIENT COORDS: a point at radius r on ray n is (cosh r, sinh(r) n), so the angle at
+        # the origin is the Euclidean cosine of the SPATIAL parts. Taking it on the full
+        # (x0, x') vector is wrong -- x0*y0 contaminates it by up to 1.84 (measured). On the
+        # spatial parts it matches the hyperbolic law of cosines to ~1e-15 at every radius,
+        # so triangle_cos is not needed here at all.
+        xsp = self.geom._sp(xt)                                              # [Q, T, n]
+        msp = self.geom._sp(mid).unsqueeze(-2)                               # [Q, 1, n]
+        cos_o = F.cosine_similarity(xsp, msp, dim=-1, eps=_COS_EPS) * u      # [Q, T]  angle at O
+        has_dir = (xsp.norm(dim=-1) > _COS_EPS) & (msp.norm(dim=-1) > _COS_EPS)
+        cos_o = torch.where(has_dir, cos_o, torch.zeros_like(cos_o))         # no direction at O
 
         feats = standardise(torch.stack([age, pos, a, cos_o], dim=-1),
                             valid).to(xt.dtype)                        # [Q, T, 4]
@@ -105,9 +95,14 @@ class LinkPredHead(nn.Module):
         self.geom = LorentzManifold()
         torch.manual_seed(seed)
 
-        self.E = nn.Embedding(self.num_nodes, self.d_emb)
+        # d_emb is the HYPERBOLIC dimension, as in every other branch. The ambient Lorentz
+        # vector stores one derived coordinate on top of it: H^d lives in R^{d+1}, with x0
+        # fixed by the other d. So Euclidean R^64, Poincare B^64, the intrinsic chart and
+        # this branch all have 64 degrees of freedom per node; only the tensor is 65 wide.
+        # Allocating d_emb here instead would silently give H^{d_emb-1}.
+        self.E = nn.Embedding(self.num_nodes, self.d_emb + 1)
         with torch.no_grad():
-            init = self.geom.random(self.num_nodes, self.d_emb, irange=self.INIT_IRANGE)
+            init = self.geom.random(self.num_nodes, self.d_emb + 1, irange=self.INIT_IRANGE)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
         self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,
