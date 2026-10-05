@@ -37,7 +37,7 @@ grep -q 'self.n_feat = 4' $M               || { echo "ABORT: n_feat is not 4" >&
 grep -q 'dims = tuple(range(feat.dim() - 1))' $M || { echo "ABORT: standardiser is not rank-agnostic" >&2; exit 3; }
 grep -q 'logits.masked_fill(~valid_flat, float("-inf")), dim=-1' $M || { echo "ABORT: not a single softmax over all K*L tokens" >&2; exit 3; }
 # --- plumbing: n_layers gone, no stray knobs ---
-grep -rq 'n_layers' --include=*.py link_property_prediction $S && { echo "ABORT: n_layers plumbing still present in the package or train script" >&2; exit 3; }
+grep -rqE 'n_layers_pooler|self\.n_layers|n_layers: int' --include=*.py link_property_prediction $S && { echo "ABORT: n_layers PLUMBING still present. A prose mention in a docstring is fine -- this matches only the config field, the attribute and the annotation" >&2; exit 3; }
 grep -q 'kernel-size-pooler\|lr-pooler\|pooler-wd' $S && { echo "ABORT: a pooler knob from another arm is plumbed" >&2; exit 3; }
 # --- nothing from another arm ---
 grep -q 'nn.MultiheadAttention\|nn.GRU\|nn.LayerNorm' $M && { echo "ABORT: attention/GRU/LayerNorm present" >&2; exit 3; }
