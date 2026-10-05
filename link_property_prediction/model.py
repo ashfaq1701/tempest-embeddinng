@@ -72,9 +72,10 @@ class BagWeights(nn.Module):
         # so triangle_cos is not needed here at all.
         xsp = self.geom._sp(xt)                                              # [Q, T, n]
         msp = self.geom._sp(mid).unsqueeze(-2)                               # [Q, 1, n]
+        # No origin guard: cosine_similarity already returns exactly 0 for a zero vector
+        # (its denominator is clamped at eps), and the feature block is detached, so the only
+        # thing a guard did was suppress a ~1e12 gradient that cannot flow. See the commit.
         cos_o = F.cosine_similarity(xsp, msp, dim=-1, eps=_COS_EPS) * u      # [Q, T]  angle at O
-        has_dir = (xsp.norm(dim=-1) > _COS_EPS) & (msp.norm(dim=-1) > _COS_EPS)
-        cos_o = torch.where(has_dir, cos_o, torch.zeros_like(cos_o))         # no direction at O
 
         feats = standardise(torch.stack([age, pos, a, cos_o], dim=-1),
                             valid).to(xt.dtype)                        # [Q, T, 4]
