@@ -365,19 +365,26 @@ reduces to master **bitwise** at its degenerate setting (`alpha -> 0`, `w_prev =
 | ema-nl1 | 194 ᴰ | 0.5668 | 0.6312 | 0.2513 | 0.6348 | 0.6596 |
 | ema-nl2 | 1,250 | 0.5708 | 0.6329 | 0.2539 | 0.6304 | 0.6652 ◊ |
 | ph-nl1 | 225 ᴰ | 0.5584 † | 0.6302 | 0.2500 | 0.6307 | **0.6647** |
-| ph-nl2 | 2,273 | 0.5652 | 0.6381 | **0.2542** | (last run) | ✗ dropped |
+| ph-nl2 | 2,273 | 0.5652 | 0.6381 | **0.2542** | ✗ dropped | ✗ dropped |
 
 † **FLOOR, not a result**: hit the `--num-epochs 100` cap with its best AT ep100, val still
 rising. ᴰ **nl1 arm against an nl2 master** — on YouTube/Flickr/ML-20M/Yelp these two rows mix
 the mechanism with a 5-6x capacity cut, because a cos_o **nl1** run exists only for WikiLink.
 Only the nl2 rows are depth-matched there. ◊ **no depth-matched baseline exists** — 1,250 params
-against master's nl1 193 — NOT a delta, do not quote it as one. ✗ ph-nl2 WikiLink was killed at
-ep5 when the family was dropped; it was uninterpretable for the same reason (2,273 vs 193). A
-clean cos_o **nl2** WikiLink run has never been made.
+against master's nl1 193 — NOT a delta, do not quote it as one. ✗ both ph-nl2 heavy cells were killed
+when the family was dropped -- WikiLink at ep5 (max 0.6449) and Yelp at ep13 (max 0.6392, still
+gaining, against a cos_o reference that ran 34 epochs). Both are floors; neither is a result.
+WikiLink was uninterpretable anyway (2,273 params against master's nl1 193). A clean cos_o
+**nl2** WikiLink run has never been made.
+
+**So the Yelp column has no ph-nl2 entry**, and ema-nl2's 0.6304 (-0.0219) is the only
+depth-matched nl2 Yelp number.
 
 **VERDICT, called 2026-10-05: the recurrence family is a no-go and was dropped.** Master is
 complete at 5/5 and wins every dataset except WikiLink. Across four arms and two mechanisms the
-only win is ph-nl1's +0.0040 on WikiLink. Remaining runs were cancelled rather than finished.
+only win is ph-nl1's +0.0040 on WikiLink. The last two runs were cancelled mid-flight rather than
+finished, so **18 of 25 cells are converged results and 2 are floors that must not be quoted**;
+nothing from this family is queued and no GPU work remains.
 
 **Master wins 4 of 4 completed datasets.** Deltas vs master: YouTube −0.016 to −0.028 for all
 four arms, Yelp −0.018 to −0.022, Flickr −0.005 to −0.008 (ph-nl2 +0.0004, a tie), ML-20M −0.002
