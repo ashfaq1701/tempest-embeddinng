@@ -1,15 +1,23 @@
-"""Walk-bag pooler and the link-prediction head.
+"""Walk-bag pooler and head, WITH the `cos_o` column -- the arm the ablation removed.
 
-Pooling weights are `softmax(MLP(standardise(features)))` over the walk-token bag,
-features `[log1p(age), pos, d_mid]`, n_feat 3, pooler 1,217 params at nl2 (161 at nl1).
-The pooled point is a weighted Lorentz midpoint; the scorer is `geo_temp * (-d(p_u, p_v))`.
+Features `[log1p(age), pos, d_mid, cos_o]`, n_feat 4, pooler 1,249 params at nl2 (193 at
+nl1). `cos_o` is the angle at the origin between a walk token and the bag centre, taken as
+the Euclidean cosine of the coordinate vectors: in the intrinsic chart a point IS
+x' = sinh(r) n, so no triangle and no law of cosines is needed. It is +1 when token and
+centre lie on the same ray from the origin (same branch of the hierarchy), 0 in unrelated
+directions, -1 on opposite sides.
 
-`cos_o` -- the angle at the origin between token and bag centre -- was removed at
-791360a. It lowered the TRAINING loss and widened the val->test gap: on YouTube the loss
-ratio reached 2.15 at ep18, both runs reached the same best val (0.6823 vs 0.6819) and the
-gap to test was 0.0890 with it against 0.0714 without, worth +0.0159 on test to remove.
-Recover it from d36ce26^ if you want to re-run those arms; WikiLink is the one dataset
-that preferred it.
+THIS BRANCH EXISTS TO RE-RUN THE LOSING SIDE. The clean six-dataset ablation measured
+`cos_o` as a net negative -- YouTube -0.0159, GoogleLocal -0.0121 against Flickr +0.0070,
+ML-20M +0.0033, and provisionally Yelp +0.0015, WikiLink +0.0112 -- so it was dropped. The
+mechanism: `cos_o` lowers the training loss and widens the val->test gap (YouTube loss ratio
+2.15 at ep18, identical best val 0.6823 vs 0.6819, gap 0.0890 against 0.0714). WikiLink is
+the one dataset that prefers it, and the one where the gap ordering flips. It also makes the
+model intolerant of more training negatives: k_train 10 costs -0.0498 with `cos_o` and only
+-0.0124 without.
+
+Keep this branch for WikiLink work and for any arm whose published number was measured with
+`cos_o` present. See CLAUDE.md, "cos_o vs no cos_o".
 """
 import geoopt
 import torch
@@ -43,7 +51,7 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 3
+        self.n_feat = 4
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -68,9 +76,13 @@ class BagWeights(nn.Module):
         pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
 
         a = self.geom.dist(xt, mid.unsqueeze(-2))                            # [Q, T]  d_mid
+        # In the intrinsic chart a point IS x' = sinh(r) n, so the angle at the origin is the
+        # Euclidean cosine of the coordinate vectors -- no triangle, no law of cosines, and no
+        # slicing (unlike the ambient branch, where the cosine must be taken on x' alone).
+        cos_o = F.cosine_similarity(xt, mid.unsqueeze(-2), dim=-1) * u   # [Q, T]
 
-        feats = standardise(torch.stack([age, pos, a], dim=-1),
-                            valid).to(xt.dtype)                        # [Q, T, 3]
+        feats = standardise(torch.stack([age, pos, a, cos_o], dim=-1),
+                            valid).to(xt.dtype)                        # [Q, T, 4]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.weighted_midpoint(x_tokens, w)                               # [Q, d]
