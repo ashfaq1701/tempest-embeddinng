@@ -16,7 +16,6 @@ import torch.nn.functional as F
 from .walk_tokens import WalkTokens
 
 _VAR_FLOOR = 1e-12
-_COS_EPS = 1e-12
 
 
 def standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
@@ -66,10 +65,10 @@ class BagWeights(nn.Module):
         pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
 
         d_mid = self.geom.dist(xt, mid.unsqueeze(-2))                        # [Q, T]
-        # No origin guard: cosine_similarity already returns exactly 0 for a zero vector
-        # (its denominator is clamped at eps), and the feature block is detached, so the only
-        # thing a guard did was suppress a ~1e12 gradient that cannot flow. See the commit.
-        cos_o = F.cosine_similarity(xt, mid.unsqueeze(-2), dim=-1, eps=_COS_EPS) * u   # [Q, T]  angle at O
+        # No origin guard: cosine_similarity returns exactly 0 for a zero vector at any eps,
+        # and the feature block is detached, so the only thing a guard did was suppress a
+        # ~1e12 gradient that cannot flow.
+        cos_o = F.cosine_similarity(xt, mid.unsqueeze(-2), dim=-1) * u   # [Q, T]  angle at O
 
         feats = standardise(torch.stack([age, pos, d_mid, cos_o], dim=-1),
                             valid).to(xt.dtype)                              # [Q, T, 4]
