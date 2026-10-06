@@ -39,11 +39,23 @@ def _strip_version_suffix(name: str) -> str:
 
 def load_tgb(name: str, root: str = "datasets") -> Loaded:
     """Load a TGB link-property-prediction dataset. `-vN` suffixes are stripped
-    before the call — TGB's registry uses bare names."""
+    before the call — TGB's registry uses bare names.
+
+    `root` is translated because TGB does `root = PROJ_DIR + root` (literal string
+    concatenation, dataset.py:75), so its `root` is ALWAYS relative to the tgb
+    install dir and an absolute path yields e.g.
+    `.../site-packages/tgb//mnt/.../datasets/tgbl_review/` -- a real 2.1 GB download
+    inside the venv, which is how this was found. Passing the relative path from
+    PROJ_DIR makes `PROJ_DIR + root` resolve back to the directory the caller asked
+    for, so `--data-root` is honoured rather than silently ignored.
+    """
+    import os
     from tgb.linkproppred.dataset import LinkPropPredDataset
+    from tgb.utils.info import PROJ_DIR
 
     tgb_name = _strip_version_suffix(name)
-    dataset = LinkPropPredDataset(name=tgb_name, root=root, preprocess=True)
+    tgb_root = os.path.relpath(root, PROJ_DIR) if os.path.isabs(root) else root
+    dataset = LinkPropPredDataset(name=tgb_name, root=tgb_root, preprocess=True)
     full = dataset.full_data
     sources = np.asarray(full["sources"], dtype=np.int64)
     destinations = np.asarray(full["destinations"], dtype=np.int64)
@@ -65,12 +77,6 @@ def load_tgb(name: str, root: str = "datasets") -> Loaded:
             edge_feat=ef,
         )
 
-    node_feat = getattr(dataset, "node_feat", None)
-    if node_feat is None:
-        node_feat = full.get("node_feat", None)
-    if node_feat is not None:
-        node_feat = np.asarray(node_feat, dtype=np.float32)
-
     return Loaded(
         train=_apply(train_mask),
         val=_apply(val_mask),
@@ -78,9 +84,7 @@ def load_tgb(name: str, root: str = "datasets") -> Loaded:
         dataset=dataset,
         # TGB-canonical (suffix-stripped) name — the Evaluator passes it back to TGB.
         name=tgb_name,
-        eval_metric=str(dataset.eval_metric),
         max_node_count=int(max(sources.max(), destinations.max())) + 1,
-        node_feat=node_feat,
     )
 
 
@@ -146,5 +150,8 @@ class TGBSuite(DataSuite):
             dataset=loaded.dataset,
             split_mode=split_mode,
             tgb_dataset_name=loaded.name,
-            eval_metric=loaded.eval_metric,
+            # Off the live handle, not off Loaded: `eval_metric` is TGB-specific and
+            # Loaded is the vocabulary BOTH suites share. Keeping it out is what lets
+            # a suite carry its own metadata without widening the common type.
+            eval_metric=str(loaded.dataset.eval_metric),
         )
