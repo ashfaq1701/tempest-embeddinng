@@ -639,3 +639,29 @@ Five arms today inverted between ep14 and ep40 -- both LayerNorm arms, `nl3`, th
 K=10 arm, and the no-`cos_o` YouTube arm itself, which sat at **-0.1457 val at ep16** and
 finished **+0.0159 up**. The ep10-40 window carries no information about the ep50+ result on
 this suite.
+
+## TGB suite: `cos_o` vs no `cos_o` -- PLACEHOLDER, nothing closed yet
+
+The same ablation on the TGB suite (`--data-suite tgb`, restored 2026-10-06). Paired runs,
+one variable: seed 5, d64 K5 wpn5 mwl5 lr1e-3 h32 nl2, 100 epochs / patience 10,
+`bipartite=no`, RTX. `no cos_o` -> `logs/tgb_anchor`, `cos_o` -> `logs/tgb_coso`.
+
+| arm | tgbl-wiki | tgbl-review | tgbl-coin | tgbl-comment | tgbl-flight |
+|---|---|---|---|---|---|
+| `cos_o` | pending | pending | pending | pending | running |
+| no `cos_o` | 0.7481 ◊ | 0.1288 | 0.4045 ◊ | pending | pending |
+
+◊ max-test-so-far on a live run, not a val-selected final. tgbl-review is the only closed
+cell: **0.1288**, stopped at ep6 of 100 after val fell for ten straight epochs
+(0.1345 -> 0.1086, back to its ep1 level) -- it overfits within six epochs.
+
+**These five numbers are not comparable with each other, nor with any TGB-Seq number.** TGB
+ships a different per-positive negative count per dataset (tgbl-review serves K=100), and
+serves pre-generated negatives for BOTH val and test where TGB-Seq uses our sampler for val.
+The only valid comparison for a TGB cell is the same cell in the other arm, or the TGB
+leaderboard.
+
+Note the TGB arms show almost NO val->test gap -- tgbl-review ran val/test within 0.004 at
+every epoch, tgbl-coin's test (0.4045) is above its val (0.3971) -- because both splits use
+the same negative protocol. The val->test gap that drives every TGB-Seq conclusion is a
+property of TGB-Seq's eval design, not of the model.
