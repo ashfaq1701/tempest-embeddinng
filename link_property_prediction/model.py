@@ -1,12 +1,25 @@
-"""Poincare-ball branch of master: same pooler, same features, geoopt's ball as the manifold.
+"""Poincare ball pooler, WITHOUT the `cos_o` column -- the fourth cell of the 2x2.
 
-Features per token: [log1p(age), pos, d_mid, cos_o], with d_mid the geodesic distance to the
-bag's weighted midpoint and cos_o the angle at the origin between token and midpoint. In the
-ball a point at radius r in direction n has coordinates tanh(r/2) n, so cos_o is the Euclidean
-cosine of the two coordinate vectors; no triangle needed. Scorer: geo_temp * (-d(P_u, P_v)).
+`geoopt.PoincareBall(c=1.0)` in place of the Lorentz chart, features
+`[log1p(age), pos, d_mid]`, n_feat 3, pooler 1,217 params at nl2 (161 at nl1).
 
-The ball is open, so points near the boundary (large radius) lose precision in dist; this
-branch will show that before the Lorentz one does on datasets that spread far.
+THE 2x2 THIS COMPLETES, chart x feature:
+
+                     with cos_o                 without cos_o
+    Lorentz          feature/with-cos-o         (default)
+    Poincare ball    feature/poincare           THIS BRANCH
+
+Both axes were measured one at a time and both came out small. The chart was worth
+nothing on five of six TGB-Seq datasets (ball ahead only on YouTube, by 0.0142) and the
+pooler is provably the SAME operation in either chart -- geoopt's Einstein midpoint IS
+the Lorentzian centroid, agreeing to 1e-10 across the chart map. Removing `cos_o` was
+worth +0.0159 YouTube / +0.0121 GoogleLocal against -0.0070 Flickr / -0.0033 ML-20M.
+Neither axis has been tested in combination with the other.
+
+Note the ball clamps at `r_max = 2 artanh(0.99599993) = 6.2126` in float32, and removing
+`cos_o` LENGTHENS the radial tail (r_max 1.3-1.5x at matched epoch, r_mean unchanged), so
+this arm is the most likely of the four to hit that ceiling. Watch for `r_max = 6.213`
+pinned in the log -- it means clamped, not converged.
 """
 import geoopt
 import torch
@@ -39,7 +52,7 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 4
+        self.n_feat = 3
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -65,12 +78,8 @@ class BagWeights(nn.Module):
         pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
 
         d_mid = self.geom.dist(xt, mid.unsqueeze(-2))                        # [Q, T]
-        # No origin guard: cosine_similarity returns exactly 0 for a zero vector at any eps,
-        # and the feature block is detached, so the only thing a guard did was suppress a
-        # ~1e12 gradient that cannot flow.
-        cos_o = F.cosine_similarity(xt, mid.unsqueeze(-2), dim=-1) * u   # [Q, T]  angle at O
 
-        feats = standardise(torch.stack([age, pos, d_mid, cos_o], dim=-1),
+        feats = standardise(torch.stack([age, pos, d_mid], dim=-1),
                             valid).to(xt.dtype)                              # [Q, T, 4]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
