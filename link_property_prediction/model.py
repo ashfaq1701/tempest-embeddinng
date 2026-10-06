@@ -4,6 +4,11 @@ Pooling weights are `softmax(MLP(standardise(features)))` over the walk-token ba
 features `[log1p(age), pos, d_mid]`, n_feat 3, pooler 1,217 params at nl2 (161 at nl1).
 The pooled point is a weighted Lorentz midpoint; the scorer is `geo_temp * (-d(p_u, p_v))`.
 
+A fixed, unlearnable recency prior `-age - pos` is ADDED to the pooling logits, so the
+softmax starts from exponential recency decay and the MLP can only perturb it. A sign
+flip of the age/pos feature columns would NOT do this -- `standardise` is sign-
+equivariant and `net[0].weight[:, 0:2]` absorbs the flip exactly -- see `prior` below.
+
 `cos_o` -- the angle at the origin between token and bag centre -- was removed at
 791360a. It lowered the TRAINING loss and widened the val->test gap: on YouTube the loss
 ratio reached 2.15 at ep18, both runs reached the same best val (0.6823 vs 0.6819) and the
@@ -71,7 +76,16 @@ class BagWeights(nn.Module):
 
         feats = standardise(torch.stack([age, pos, a], dim=-1),
                             valid).to(xt.dtype)                        # [Q, T, 3]
-        logits = self.net(feats).squeeze(-1)                                 # [Q, T]
+        # Fixed recency prior on the pooling logits, added BEFORE the mask (pads carry
+        # age=pos=0, i.e. prior 0, the largest value -- masked_fill below removes them).
+        # Not a sign flip of the age/pos columns: that is absorbed exactly by negating
+        # net[0].weight[:, 0:2] (measured max|diff| 0.000e+00), so it leaves the
+        # hypothesis class and the init distribution unchanged. This term is unlearnable,
+        # so the softmax cannot invert it -- recency is imposed, not merely available.
+        # Raw, NOT standardised: the prior's scale is deliberate, it is what sets how
+        # sharply the bag collapses onto its newest tokens.
+        prior = (-age - pos)                                                 # [Q, T]
+        logits = prior + self.net(feats).squeeze(-1)                         # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.weighted_midpoint(x_tokens, w)                               # [Q, d]
 
