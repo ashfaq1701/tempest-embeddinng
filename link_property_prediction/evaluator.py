@@ -1,6 +1,16 @@
 """Benchmark-agnostic evaluation interfaces (Evaluator, DataSuite) and the
-`make_suite` factory. The only suite is TGB-Seq, implemented in
-`tgb_seq_eval.py`."""
+`make_suite` factory.
+
+Two suites: TGB-Seq in `tgb_seq_eval.py` and TGB in `tgb_eval.py`. Everything
+suite-specific lives behind these two ABCs -- `trainer.py`, `negatives.py` and
+`data.py` never branch on the suite, and `make_suite` is the single place a name
+maps to a class. A new suite is therefore additive: one module, one branch here,
+one `--data-suite` choice.
+
+The suites agree on the vocabulary (`Loaded`, `SplitData`, `Batch`) and on the
+`Evaluator` contract; they differ only inside, which is what makes them
+interchangeable. They do NOT agree on the negative-sampling protocol, so their
+MRRs are not comparable with each other -- see `tgb_eval.py`."""
 import abc
 from typing import List, Optional
 
@@ -64,11 +74,21 @@ class DataSuite(abc.ABC):
         return pool.astype(np.int32)
 
 
+#: Valid `--data-suite` values. The train script reads this for its `choices`, so the
+#: flag and the dispatch below cannot drift apart.
+SUITES = ("tgb-seq", "tgb")
+
+
 def make_suite(data_suite: str, **kwargs) -> DataSuite:
-    """Dispatch `--data-suite` to its native suite. The suite is imported lazily to
-    avoid an import cycle (it subclasses the ABCs defined here)."""
+    """Dispatch `--data-suite` to its native suite. The ONLY dispatch site: callers
+    pass `args.data_suite` through and never branch on it. Each suite is imported
+    lazily to avoid an import cycle (they subclass the ABCs defined here) and so that
+    a missing optional dependency only bites the suite that needs it."""
     if data_suite == "tgb-seq":
         from .tgb_seq_eval import TGBSeqSuite
         return TGBSeqSuite(**kwargs)
+    if data_suite == "tgb":
+        from .tgb_eval import TGBSuite
+        return TGBSuite(**kwargs)
     raise ValueError(
-        f"unknown --data-suite {data_suite!r} (expected 'tgb-seq')")
+        f"unknown --data-suite {data_suite!r} (expected one of {sorted(SUITES)})")
