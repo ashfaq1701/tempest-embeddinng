@@ -1,14 +1,15 @@
-"""Master MINUS cos_o: the ablation that master's lineage never got.
+"""Walk-bag pooler and the link-prediction head.
 
-Features are [log1p(age), pos, d_mid], n_feat 3, pooler 1,217 at nl2 against master's
-1,249. Everything else -- the [Q, K, L] builder, standardise, weighted_midpoint, the
-ball-matched init, the scorer -- is master at 7675d01, so cos_o is the only variable.
+Pooling weights are `softmax(MLP(standardise(features)))` over the walk-token bag,
+features `[log1p(age), pos, d_mid]`, n_feat 3, pooler 1,217 params at nl2 (161 at nl1).
+The pooled point is a weighted Lorentz midpoint; the scorer is `geo_temp * (-d(p_u, p_v))`.
 
-WHY: cos_o was added at 2d7b739 and its one-variable test against 9f24967 is contaminated
-by the triangle_cos numerics bug, fixed later at 7e68aa7 and worth +0.0398 on YouTube. So
-a bug-free cos_o ablation has never been run. The confounded lineage reads +0.005 Flickr,
-+0.004 ML-20M, +0.021 WikiLink, 0.000 Yelp, -0.022 YouTube -- and YouTube is the dataset
-every other decision is measured on.
+`cos_o` -- the angle at the origin between token and bag centre -- was removed at
+791360a. It lowered the TRAINING loss and widened the val->test gap: on YouTube the loss
+ratio reached 2.15 at ep18, both runs reached the same best val (0.6823 vs 0.6819) and the
+gap to test was 0.0890 with it against 0.0714 without, worth +0.0159 on test to remove.
+Recover it from d36ce26^ if you want to re-run those arms; WikiLink is the one dataset
+that preferred it.
 """
 import geoopt
 import torch
