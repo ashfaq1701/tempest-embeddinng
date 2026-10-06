@@ -57,6 +57,11 @@ def _safe_sqrt(t: Tensor) -> Tensor:
     return torch.where(torch.isnan(t), t, out)
 
 
+def _fmax(t: Tensor) -> float:
+    """Largest finite value of t's dtype, the upper clamp on ||v||_L^2."""
+    return torch.finfo(t.dtype).max
+
+
 def _tiny(t: Tensor) -> float:
     """Smallest positive normal of t's dtype, as a division floor. Read from
     the dtype because a fixed 1e-30 underflows to 0.0 in float16."""
@@ -178,9 +183,12 @@ class LorentzManifold(geoopt.Manifold):
 
         A step large enough to overflow cosh(t)*x0 gives inf rather than
         raising; `_check_point_on_manifold` reports non-finite values, and a
-        device-side guard would stall the pipeline on every call.
+        device-side guard would stall the pipeline on every call. The upper
+        clamp on qq is what makes that true: once inner() itself overflows,
+        nrm = sqrt(inf) = inf and coef = sinh(inf)/inf is NaN, which no guard
+        catches because every comparison against it is false.
         """
-        qq = self.inner(x, u, keepdim=True).clamp_min(0.0)   # ||v||_L^2
+        qq = self.inner(x, u, keepdim=True).clamp(0.0, _fmax(u))   # ||v||_L^2
         tsq = qq * self._inv_k                               # t^2
 
         # v/||v||_L is 0/0 at ||v||=0. Sanitise the INPUT of sqrt, not the
