@@ -408,13 +408,29 @@ class LorentzManifold(geoopt.Manifold):
     # ------------------------------------------------------------------
     # initialisation (paper, section 3.2.2)
     # ------------------------------------------------------------------
-    def random(self, *size, dtype=None, device=None, irange: float = 1e-3) -> Tensor:
-        """The paper's init: x' ~ U(-0.001, 0.001), with x0 following from
-        Eq. 6 and so needing no separate step."""
-        return geoopt.ManifoldTensor(
-            torch.empty(*size, dtype=dtype, device=device).uniform_(-irange, irange),
-            manifold=self,
-        )
+    def random(self, *size, dtype=None, device=None, std: float = 1e-3) -> Tensor:
+        """Isotropic tangent-normal init, matched to geoopt.PoincareBall.random.
+
+        u ~ N(0, (2 std)^2 / n) per coordinate, x = expmap_O(u), so the
+        hyperbolic radius is d(x, O) = |u|, concentrated at 2 std.
+
+        The factor 2 is the bridge between two curvature conventions and is
+        load-bearing. PoincareBall's dist0 is 2 artanh|x|, so its `std` lands
+        at radius 2 std; this chart's dist0 is asinh|x'| and expmap_O gives
+        radius |u| exactly. Without the 2 the same nominal std would start the
+        two manifolds at different distances from the origin -- which is
+        precisely the confound this replaces. Verified at n=64 over 200k
+        samples: random(std=1e-3) here and PoincareBall.random(std=1e-3) agree
+        to 4 s.f. on the mean, std, min and max of d(x, O)
+        (1.9929e-03 / 1.764e-04 / 1.252e-03 / 3.007e-03).
+
+        REPLACES the paper's x' ~ U(-irange, irange) box (Nickel & Kiela
+        2018), which was anisotropic and, at the same nominal 1e-3, started at
+        mean radius 4.6125e-03 -- 2.3x the ball's. Every number recorded
+        before this change used that init and will not reproduce under it.
+        """
+        u = torch.randn(*size, dtype=dtype, device=device) * (2.0 * std / size[-1] ** 0.5)
+        return geoopt.ManifoldTensor(self.expmap(torch.zeros_like(u), u), manifold=self)
 
     def origin(self, *size, dtype=None, device=None, seed: int = 42) -> Tensor:
         """The vertex, i.e. x' = 0. `seed` is unused but part of

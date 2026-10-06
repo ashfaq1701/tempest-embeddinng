@@ -647,12 +647,41 @@ def test_transp_stays_isometric_in_float32(k):
         assert (ratio - 1).abs().max() < 1e-4
 
 
-def test_random_matches_paper_init():
+def test_random_matches_poincare_ball():
+    """random() is pinned to geoopt.PoincareBall.random: same tangent draw, so the
+    same hyperbolic radius per node. The 2x in the implementation is what makes
+    these agree; dropping it halves every radius and the comparison between the
+    two charts stops being init-matched."""
     m = LorentzManifold(k=1.0)
-    x = m.random(4096, DIM, dtype=torch.float64)
-    assert isinstance(x, geoopt.ManifoldTensor)
-    assert x.abs().max() <= 1e-3
-    assert m.dist0(x).max() < 1e-2
+    # geoopt refuses a dtype that differs from its own k, so cast the ball itself
+    ball = geoopt.PoincareBall(c=1.0).to(torch.float64)
+    for std in (1e-3, 1e-2):
+        torch.manual_seed(5)
+        r_ball = ball.dist0(ball.random(4096, DIM, std=std))
+        torch.manual_seed(5)
+        x = m.random(4096, DIM, dtype=torch.float64, std=std)
+        r_lor = m.dist0(x)
+        assert isinstance(x, geoopt.ManifoldTensor)
+        assert x.manifold is m
+        assert (r_ball - r_lor).abs().max() < 1e-7
+        # mean radius is 2*std*E[chi_n]/sqrt(n); the factor is 0.955 at n=6,
+        # 0.996 at n=64, so it must be stated exactly rather than taken as 1
+        chi = math.sqrt(2.0) * math.gamma((DIM + 1) / 2) / math.gamma(DIM / 2)
+        assert abs(r_lor.mean().item() / (2 * std * chi / math.sqrt(DIM)) - 1) < 0.01
+    # isotropy: no coordinate is privileged, unlike the uniform box this replaced
+    torch.manual_seed(5)
+    x = m.random(65536, DIM, dtype=torch.float64)
+    assert x.mean(0).abs().max() < 1e-4
+
+
+def test_random_is_on_manifold_and_passes_dtypes():
+    for k in KS:
+        m = LorentzManifold(k=k)
+        for dt in (torch.float32, torch.float64):
+            x = m.random(256, DIM, dtype=dt)
+            assert x.dtype == dt
+            assert m.check_point_on_manifold(x)
+            assert (m.projx(x) - x).abs().max() == 0.0
 
 
 def test_origin_is_the_vertex():
