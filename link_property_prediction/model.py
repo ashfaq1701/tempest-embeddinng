@@ -16,7 +16,6 @@ from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
 _VAR_FLOOR = 1e-12
-_COS_EPS = 1e-12
 
 
 def standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
@@ -68,7 +67,7 @@ class BagWeights(nn.Module):
         # In the intrinsic chart a point IS x' = sinh(r) n, so the angle at the origin is the
         # Euclidean cosine of the coordinate vectors -- no triangle, no law of cosines, and no
         # slicing (unlike the ambient branch, where the cosine must be taken on x' alone).
-        cos_o = F.cosine_similarity(xt, mid.unsqueeze(-2), dim=-1, eps=_COS_EPS) * u   # [Q, T]
+        cos_o = F.cosine_similarity(xt, mid.unsqueeze(-2), dim=-1) * u   # [Q, T]
 
         feats = standardise(torch.stack([age, pos, a, cos_o], dim=-1),
                             valid).to(xt.dtype)                        # [Q, T, 4]
