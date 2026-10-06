@@ -32,36 +32,6 @@ half-downloaded dataset (CSV present, `test_ns` missing, from an interrupted fet
 self-healed by `load_tgb_seq`'s preflight: it checks both files and refetches the missing
 `test_ns` from `TGB-Seq/<name>` on HF.
 
-## Reproduction is stable to ~0.0002 MRR
-
-Same seed, same config, independent launches land on the same number to the third
-decimal. Walk sampling is the only nondeterminism, and it moves results far less than
-the ±0.01 band the older notes assumed. **Single-seed deltas are readable at the third
-decimal here** — a +0.005 difference between two configs is signal, not noise.
-
-Measured, all seed 42:
-
-| replicate pair | run A | run B | Δ |
-|---|---|---|---|
-| GoogleLocal d=32 | 0.6303 | 0.6301 | 0.0002 |
-| ML-20M d=32 | 0.2222 | 0.2224 | 0.0002 |
-
-Patent d=64 with `--use-cand-pop` was launched twice and tracked epoch for epoch:
-
-| epoch | run A test | run B test |
-|---|---|---|
-| 1 | 0.0990 | 0.0990 |
-| 2 | 0.0836 | 0.0837 |
-| 3 | 0.1107 | 0.1106 |
-| 4 | 0.1531 | 0.1531 |
-| 5 | 0.1939 | 0.1940 |
-| 6 | 0.2241 | 0.2242 |
-
-Two consequences. An A/B does not need multiple seeds to separate configs that differ by
-more than ~0.001 — the remaining reason to run several seeds is to report mean±std against
-a leaderboard, not to establish an ordering. And a run that fails to reproduce is a real
-signal: suspect a code or config change rather than variance.
-
 ## Where run logs live
 
 **Every run writes to `logs/`, never to `experiment_logs/`.** `logs/` is git-untracked
@@ -106,9 +76,8 @@ commit `e6b6079c`. Logs: `logs/pooler_feature_ablation/d64_k5/`.
 signal. It was **removed**; recover it from `e6b6079c` if you want to re-run these arms.
 
 **Both geometric features are individually real, and they do not compose.** Over the
-no-geometry baseline `rad` is worth +0.031 max test and `dev` +0.023 — both well clear of the
-~0.01 band where initialisation luck is a live explanation. But `rad+dev` lands *below* `rad`
-alone: `dev` is largely redundant with `rad` and pays for the overlap in delay.
+no-geometry baseline `rad` is worth +0.031 max test and `dev` +0.023. But `rad+dev` lands
+*below* `rad` alone: `dev` is largely redundant with `rad` and pays for the overlap in delay.
 
 **The mechanism is escape timing, not height.** Every arm shows the same explore-then-escape
 shape: a slow grind to ~0.36, then a three-epoch jump of ~+0.15, then a plateau. `rad` escapes
@@ -126,9 +95,9 @@ which is exactly the window that inverts. Pre-escape super-additivity misleads t
 the two 3-feature arms (`+rad` vs `+dev`) are `Linear(3,32)` either way and draw bit-identical
 initial weights — that comparison isolates the feature exactly. Arms with different input
 widths draw different RNG (the 2-feature arm's first-layer weights do not match the 4-feature
-arm's first two columns, and even the output layers differ), so a gap under ~0.01 there is not
-separable from init luck. `rad`'s +0.0058 over `rad+dev` is inside that band: the choice rests
-on parsimony plus the clean `rad`-beats-`dev` contrast, not on that number.
+arm's first two columns, and even the output layers differ), so those comparisons mix the
+feature with an initialisation change. `rad`'s +0.0058 over `rad+dev` is one of them: the choice
+rests on parsimony plus the clean `rad`-beats-`dev` contrast, not on that number.
 
 **Nothing here beats the parameter-free pooler on YouTube.** Best arm 0.5605 vs the fixed
 pooling rule's 0.5677 (K=5) and 0.5756 (K=10); LB #1 GraphMixer is 0.5887. The learned pooler
@@ -282,8 +251,7 @@ master `9f24967`** with a depth-matched `n_layers_pooler 2` pooler (1,217 params
 † lower bound, run killed before convergence (ep14 / ep11). ‡ killed mid-run, not converged.
 ✗ diverged. Bold = best converged number per dataset.
 
-**The three converged head-to-heads are −0.002, +0.0003 and +0.009.** Measured seed-to-seed
-spread on YouTube for one arm is **0.033**, so every one of these is inside noise. Nothing in
+**The three converged head-to-heads are −0.002, +0.0003 and +0.009.** Nothing in
 this family beat master, and the conv arms cost **1.3-1.6x master per epoch** (YouTube 61.6s vs
 43.5s train, Flickr 93.6s vs 60.0s, ML-20M 193s vs 115.8s) at 3-5x the parameters. The GRU cost
 **3-4x** (YouTube 181s, ML-20M 958s) for the same null.
@@ -340,7 +308,7 @@ like-for-like.
 ### Where this leaves the attack
 
 Four unrelated mechanisms — recurrence, convolution, per-token depth, leaving the convex hull —
-each landed inside noise of master. **The pooler is not where the headroom is.** The open question
+each landed within 0.009 of master and none of them ahead. **The pooler is not where the headroom is.** The open question
 is what the flat softmax does between ep25 and ep50 on YouTube that none of these reproduce, and
 the untested axes remain walk depth (`--max-walk-len`, 70-99% of reachable history is discarded at
 5), breadth (`--num-walks-per-node`; wpn 10 measured at only **1.11x** the train cost of wpn 5,
