@@ -449,3 +449,99 @@ reverse of time. Five runs were launched and killed on it. The same trap bit `ag
 the natural-looking `age_l - age_{l-1}` is NEGATIVE here and `log1p` of it is NaN (verified).
 **Every driver for these arms now pins the direction with an abort guard.** Do not describe `l+1`
 as "the hop it was reached from".
+
+## Poincare ball vs Lorentz hyperboloid: equivalent on 5 of 6 (measured, 2026-10-06)
+
+Six datasets, one seed (5), d64 K5 wpn5 mwl5 lr1e-3 h32, nl2 except WikiLink nl1. Lorentz is
+`4649142` (`logs/ballinit`), the ball is `6bb43ea` (`logs/poincare1`). **YouTube ran 200 epochs
+/ patience 20 on both sides; the other five ran 100 / 10 on both sides.** val is best-val, test
+is the val-selected `best_test_mrr`.
+
+| dataset | Lorentz val/test | stop | ball val/test | stop | d (L-P) | L r_max | P r_max |
+|---|---|---|---|---|---|---|---|
+| GoogleLocal | 0.6849 / 0.6574 | 44 | 0.6830 / **0.6577** | 44 | -0.0003 | 1.05 | 1.15 |
+| YouTube | 0.6823 / 0.5933 | 118 | 0.6855 / **0.6075** | 118 | **-0.0142** | 3.12 | 3.00 |
+| Flickr | 0.6706 / **0.6417** | 28 | 0.6680 / 0.6378 | 28 | **+0.0039** | 2.73 | 3.24 |
+| ML-20M | 0.2927 / **0.2510** | 9 | 0.2916 / 0.2500 | 9 | +0.0010 | 4.85 | 4.56 |
+| Yelp | 0.6701 / 0.6528 | 25 | 0.6691 / **0.6534** | 24 | -0.0006 | **7.75** | **6.21** |
+| WikiLink | 0.6812 / 0.6723 | 16 | 0.6815 / **0.6728** | 17 | -0.0005 | **7.28** | **6.21** |
+
+**Five of six land within 0.004 and four pairs stop at the IDENTICAL epoch** (44, 118, 28, 9).
+Summed across six the ball is ahead by 0.0107, all of it YouTube. Lorentz wins Flickr +0.0039
+and ML-20M +0.0010; the ball wins YouTube -0.0142 and three cells by <=0.0006.
+
+### This comparison is only meaningful because the init was matched first
+
+The original sweep was NOT a chart-only A/B, and the difference it showed was mostly an init
+artefact. Two things had to be established:
+
+**The pooler is the same operation in both charts.** geoopt's `PoincareBall.weighted_midpoint`
+is the Einstein/gyromidpoint; `lorentz.py::weighted_midpoint` is the Lorentzian centroid (Law et
+al. 2019). They are the same point in two charts -- both are the Klein-model affine average, with
+Klein coords `k_i = x'_i/x0_i` and `gamma_i = x0_i` making the Einstein form equal `s'/s0`.
+Measured agreement across the chart map: **1e-12 to 1e-10** on bags of 2 to 125 with uniform,
+one-hot and skewed weights. So the pooler is NOT a difference between the arms.
+
+**The inits differed by 2.3x on three stacked conventions**, fixed in `4649142`: `irange` was a
+per-coordinate scale while geoopt's `std` is a tangent-norm scale (factor sqrt(n)); the box is
+anisotropic; and PoincareBall's `dist0` is `2 artanh|x|` against this chart's `asinh|x'|`
+(factor 2). At the same nominal 1e-3 and n=64 the old master started at mean radius 4.6125e-03
+and the ball at 1.9929e-03. On YouTube at 200/20 that was worth **+0.0168** to Lorentz
+(0.5765 -> 0.5933) and it changed the stopping epoch from 104 to 118 -- the SAME epoch the ball
+stops at. The remaining 0.0142 is the chart.
+
+### The ball clamps at r_max 6.2126 and training goes past it
+
+geoopt's `project` caps the coordinate norm at 0.99599993, i.e. **r = 2 artanh(0.996) = 6.2126
+in float32** (12.2061 in float64). Both large datasets pinned there exactly: Yelp and WikiLink
+read `r_max=6.213` while Lorentz, whose `projx` is the identity, reached 7.75 and 7.28 on the
+same data. Earlier master runs reached r_max 12.09, and the worst across all logs is 15.89.
+
+**`r_max = 6.213` in a ball log means CLAMPED, not converged.** Nothing in the log says so. On
+WikiLink the ball spent its last six epochs pinned, every outward gradient discarded, still
+printing plausible val increments. Converting a Lorentz model at r=9 into the ball loses 2.79 of
+radius to the clamp; at r=12.09 it loses 5.88.
+
+So "just bound r below 5 and use the ball" is not free: **training does not stay under 5 on its
+own** (7.3-7.8 on two of six datasets), and capping it is an untested modelling change.
+
+### geoopt's ball `dist` is far less accurate than ours, including below r=5
+
+Against a 60-digit mpmath reference. `to_poincare` is exact (1e-16..1e-13), so every discrepancy
+is geoopt's `dist`, which uses `2 artanh(sqrt(c)|(-x)+y|)` -- Mobius addition plus `artanh` near
+1 -- where this file uses the `2 asinh(sqrt(w/2))` rearrangement.
+
+| r | ours f64 | geoopt f64 | ours f32 | geoopt f32 |
+|---|---|---|---|---|
+| 0.001 | 2.3e-16 | 8.7e-14 | 1.1e-07 | 5.6e-05 |
+| 0.5 | 2.2e-16 | 2.0e-09 | 1.4e-07 | 1.9e-07 |
+| 2.0 | 1.4e-16 | 2.7e-08 | 7.6e-08 | 4.7e-07 |
+| 5.0 | 1.2e-16 | 3.1e-07 | 6.4e-08 | **1.3e-04** |
+| 8.0 | 6.1e-17 | 3.9e-06 | 4.3e-08 | **2.3e-02** |
+| 10.0 | 8.8e-17 | **1.5e-01** | - | - |
+
+Nearby pairs at separation 1e-3 -- what the ranking loss compares -- f32: ours 1.2e-05 / 8.4e-05
+/ 2.1e-03 at r = 0.5 / 2 / 5 against the ball's 7.2e-05 / 2.5e-04 / **4.1e-01**. `transp`
+isometry error f32: ours 3.0e-05 / 3.9e-05 / 9.8e-05 against 7.8e-04 / 2.3e-03 / 1.1e-02 --
+**26x to 110x better inside r<5**. `expmap` is comparable below r=5. The f32 coordinate LATTICE
+is equivalent in the two charts (`sinh(r) eps` vs `2 cosh^2(r/2) eps`, ratio 0.46 at r=1 rising
+to 1.000 by r=5), so the precision gap is the algorithm, not the chart.
+
+### Standing read
+
+**The chart is worth nothing on five of six datasets and ~0.013 to the ball on YouTube** (0.0129
+on max test; patience 8-14 would have given Lorentz its own 0.5946, see below). Against that,
+Lorentz represents what training actually does rather than clamping it, and its `dist` -- the
+scorer's own function -- is 6x to 2000x more accurate. One seed, so the YouTube number is not
+replicated.
+
+**YouTube's reported number is set by where patience cuts a flat val surface.** The three 200/20
+runs have best-val 0.6741 / 0.6823 / 0.6855 -- 0.0114 apart -- selecting test numbers 0.031
+apart. On the Lorentz run, **patience 15 is the minimum** that reaches the ep118 checkpoint (the
+binding gap is a 14-epoch val drought, ep82 -> ep97), and patience 8-14 would have reported
+**0.5946**, better than patience 20's 0.5933: val gained +0.0062 after ep82 while test lost
+0.0013. Record both numbers.
+
+**Reproduction is exact at fixed seed.** The pat20 runs reproduced their pat10 twins bit-for-bit
+to four decimals on val and test -- 72/72 epochs on Lorentz, 63/63 on the ball -- so a differing
+number means a differing input, not variance.
