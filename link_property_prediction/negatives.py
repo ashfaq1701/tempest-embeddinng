@@ -4,7 +4,9 @@
   - UniformNegativeSampler  : random over a destination pool; used for training and
                               to build TGB-Seq's fixed eval negatives.
 
-The eval-time suite-native sampler lives in `tgb_seq_eval.py`.
+Eval-time negatives are suite-native and live behind `Evaluator.sample_negatives`
+(`tgb_seq_eval.py`, `tgb_eval.py`), not here: that interface allows a variable K
+per positive, which `sample() -> [B, K]` below cannot express.
 """
 
 import abc
