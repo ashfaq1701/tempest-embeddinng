@@ -1,11 +1,14 @@
-"""Master plus one column: cos_o, the angle at the origin between the bag centre and the token.
+"""Master MINUS cos_o: the ablation that master's lineage never got.
 
-Origin O, bag centre M, token X form a hyperbolic triangle with sides a = d(M, X) = d_mid,
-b = d(O, X) = r_tok, c = d(O, M) = r_mid. The angle at O, by the hyperbolic law of cosines,
-    cos_o = cos of the angle at O, as the Euclidean cosine of the coordinate vectors,
-is +1 when the token and the centre lie on the same ray from the origin (same branch of the
-hierarchy), 0 when in unrelated directions, -1 on opposite sides. Computed from distances
-only, so the chart never enters. Features: [log1p(age), pos, d_mid, cos_o].
+Features are [log1p(age), pos, d_mid], n_feat 3, pooler 1,217 at nl2 against master's
+1,249. Everything else -- the [Q, K, L] builder, standardise, weighted_midpoint, the
+ball-matched init, the scorer -- is master at 7675d01, so cos_o is the only variable.
+
+WHY: cos_o was added at 2d7b739 and its one-variable test against 9f24967 is contaminated
+by the triangle_cos numerics bug, fixed later at 7e68aa7 and worth +0.0398 on YouTube. So
+a bug-free cos_o ablation has never been run. The confounded lineage reads +0.005 Flickr,
++0.004 ML-20M, +0.021 WikiLink, 0.000 Yelp, -0.022 YouTube -- and YouTube is the dataset
+every other decision is measured on.
 """
 import geoopt
 import torch
@@ -39,7 +42,7 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 4
+        self.n_feat = 3
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -64,13 +67,9 @@ class BagWeights(nn.Module):
         pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
 
         a = self.geom.dist(xt, mid.unsqueeze(-2))                            # [Q, T]  d_mid
-        # In the intrinsic chart a point IS x' = sinh(r) n, so the angle at the origin is the
-        # Euclidean cosine of the coordinate vectors -- no triangle, no law of cosines, and no
-        # slicing (unlike the ambient branch, where the cosine must be taken on x' alone).
-        cos_o = F.cosine_similarity(xt, mid.unsqueeze(-2), dim=-1) * u   # [Q, T]
 
-        feats = standardise(torch.stack([age, pos, a, cos_o], dim=-1),
-                            valid).to(xt.dtype)                        # [Q, T, 4]
+        feats = standardise(torch.stack([age, pos, a], dim=-1),
+                            valid).to(xt.dtype)                        # [Q, T, 3]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.weighted_midpoint(x_tokens, w)                               # [Q, d]
