@@ -545,3 +545,97 @@ binding gap is a 14-epoch val drought, ep82 -> ep97), and patience 8-14 would ha
 **Reproduction is exact at fixed seed.** The pat20 runs reproduced their pat10 twins bit-for-bit
 to four decimals on val and test -- 72/72 epochs on Lorentz, 63/63 on the ball -- so a differing
 number means a differing input, not variance.
+
+## `cos_o` vs no `cos_o`: the ablation the lineage never got (measured, 2026-10-06)
+
+One variable. `cos_o` is the angle at the origin between a walk token and the bag centre,
+`F.cosine_similarity(xt, mid)`; the no-`cos_o` arm drops that column and nothing else.
+Features `[log1p(age), pos, d_mid, cos_o]` (n_feat 4, pooler 1,249 at nl2 / 193 at nl1)
+against `[log1p(age), pos, d_mid]` (n_feat 3, pooler 1,217 / 161).
+
+Seed 5, d64 K5 wpn5 mwl5 lr1e-3 h32, nl2 except WikiLink nl1, **100 epochs / patience 10
+on both arms including YouTube**, Lorentz chart, matched init, same GPU model per cell.
+
+| dataset | `cos_o` | no `cos_o` | d | stop ep (`cos_o` / no) |
+|---|---|---|---|---|
+| YouTube | 0.5946 | **0.6105** | **+0.0159** | 82 / 50 |
+| GoogleLocal | 0.6574 | **0.6695** | **+0.0121** | 44 / 46 |
+| Flickr | **0.6417** | 0.6347 | -0.0070 | 28 / 28 |
+| ML-20M | **0.2510** | 0.2477 | -0.0033 | 9 / 9 |
+| Yelp | **0.6528** | 0.6513 ◊ | -0.0015 ◊ | 25 / ep19, pat 1/10 |
+| WikiLink | **0.6723** | 0.6611 ◊ | -0.0112 ◊ | 16 / ep13, pat 1/10 |
+
+◊ **PROVISIONAL, still running.** Yelp and WikiLink are max-test-so-far, not val-selected
+finals. Yelp has swung +0.0173 (ep9) -> -0.0041 (ep16) -> -0.0015 (ep19) and its patience
+keeps resetting, so its sign is genuinely open. WikiLink has sat at -0.009 to -0.012 since
+ep5 and is the one cell that has never favoured removal.
+
+**YouTube's `cos_o` number is DERIVED, not run at 100/10.** The run was launched at 200/20;
+patience only decides when to stop, never the trajectory (verified: the 200/20 and 100/10
+twins were bit-identical for all 72 shared epochs). Replaying the stop rule on its log,
+patience 10 stops at ep92 and restores ep82 -> val 0.6761, test **0.5946**. The 0.5933
+quoted elsewhere is the 200/20 number, 0.0013 lower because running to ep118 let val tick
+up while test fell.
+
+### The mechanism is the val->test gap, not the fit
+
+`cos_o` LOWERS training loss and WIDENS the gap. On YouTube the loss ratio (with/without)
+climbs 1.00 at ep6 -> **2.15 at ep18**, the two arms reach the SAME best val (0.6823 vs
+0.6819, 0.0004 apart), and the gap to test is **0.0890 with against 0.0714 without** --
+which accounts for essentially all of the +0.0159. Not a checkpoint artefact: at matched
+epochs the gap is 0.083-0.089 with against 0.065-0.072 without. Same ordering on Yelp
+(gap 0.029-0.032 with, 0.019-0.021 without, `cos_o` loss lower at every epoch).
+
+**WikiLink is the one cell where the ordering FLIPS** -- there the no-`cos_o` arm has the
+*wider* gap (0.0089 vs 0.0079 at ep6) -- and it is also the one cell `cos_o` wins. That is
+consistent, not coincidental: where the angle is genuinely predictive it helps, where it is
+not it substitutes a cheap signal for radial structure and the model reaches the same
+validation with less usable geometry.
+
+### Spreading: the tail, not the bulk
+
+Removing `cos_o` leaves `r_mean` unchanged and lengthens the radial tail, on BOTH a winning
+and a losing dataset, so spread is NOT what separates them:
+
+| dataset | ep | r_mean (with / without) | r_max (with / without) | ratio |
+|---|---|---|---|---|
+| WikiLink | 9 | 1.936 / 1.980 | 3.302 / **4.857** | 1.47x |
+| YouTube | 30 | 0.553 / 0.574 | 1.656 / **2.272** | 1.37x |
+| YouTube | 60 | 0.678 / 0.699 | 2.112 / **2.750** | 1.30x |
+
+`geo_temp` moves inversely, the scorer compensating for the wider spread. Practical note:
+on Yelp and WikiLink the no-`cos_o` arm crosses `r_max` 5 (5.46 and 5.58 by ep17/ep13),
+into the band where float32 `expmap` steps lose accuracy -- an argument for bounding radius,
+not against the ablation.
+
+### Why no clean ablation existed before
+
+`cos_o` entered at `2d7b739`, whose parent `9f24967` differs by one CLAUDE.md commit -- so
+that WAS a one-variable test, but `2d7b739` carried the `triangle_cos` numerics bug, fixed
+later at `7e68aa7` and worth **+0.0398 on YouTube**. No bug-free ablation had ever been run.
+The confounded lineage read -0.0216 on YouTube, +0.0051 Flickr, +0.0041 ML-20M, +0.0210
+WikiLink, 0.0000 Yelp. The clean ablation reproduces the YouTube sign and size (-0.0159 for
+keeping it) but **not** the claimed +0.0210 on WikiLink, which comes out at -0.0112 the
+other way. Treat every lineage-based `cos_o` delta as contaminated.
+
+### k_train interacts with it
+
+`cos_o` also makes the model intolerant of more training negatives. YouTube, same config,
+k_train 5 vs 10:
+
+| | K=5 | K=10 | d from doubling K |
+|---|---|---|---|
+| with `cos_o` | 0.5946 | 0.5448 (stop ep24) | **-0.0498** |
+| without `cos_o` | **0.6105** | 0.5981 (stop ep56) | **-0.0124** |
+
+Removing `cos_o` makes the K=10 penalty **4x smaller** and the run survives to ep56 instead
+of dying at ep24 (best val 0.6837 vs 0.6637). The K=10 gap with `cos_o` blew out to 0.1189
+and never recovered; without it the gap peaked at 0.1223 around ep31 and came back to 0.0885.
+More negatives still cost something; the catastrophic version was `cos_o`-mediated.
+
+### Do not call these runs before ep50
+
+Five arms today inverted between ep14 and ep40 -- both LayerNorm arms, `nl3`, the no-`cos_o`
+K=10 arm, and the no-`cos_o` YouTube arm itself, which sat at **-0.1457 val at ep16** and
+finished **+0.0159 up**. The ep10-40 window carries no information about the ep50+ result on
+this suite.
