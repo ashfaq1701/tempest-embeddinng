@@ -1,7 +1,9 @@
 """Walk-bag pooler and the link-prediction head.
 
 Pooling weights are `softmax(MLP(standardise(features)))` over the walk-token bag,
-features `[log1p(age), pos, d_mid]`, n_feat 3, pooler 1,217 params at nl2 (161 at nl1).
+features `[log1p(age), pos, d_mid]`, n_feat 3, pooler 1,217 params at nl2 (161 at nl1)
+-- identical to master. The weights are INITIALISED so the step-0 logit is the linear
+prior `-z_age - z_pos` up to O(eps); see `_init_prior`.
 The pooled point is a weighted Lorentz midpoint; the scorer is `geo_temp * (-d(p_u, p_v))`.
 
 `cos_o` -- the angle at the origin between token and bag centre -- was removed at
@@ -32,7 +34,12 @@ def standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
 
 
 class BagWeights(nn.Module):
-    """One query's walk bag -> one point on the manifold."""
+    """One query's walk bag -> one point on the manifold.
+
+    Master's pooler with its weights arranged so that at step 0 the logit is the linear
+    prior `-z_age - z_pos` up to O(eps), for any n_layers. Same architecture and parameter
+    count as master; only the starting values differ.
+    """
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
                  n_layers: int = 2):
@@ -49,6 +56,32 @@ class BagWeights(nn.Module):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
         layers.append(nn.Linear(self.hidden, 1))
         self.net = nn.Sequential(*layers)
+        self._init_prior(prior=(-1.0, -1.0, 0.0), eps=0.05, jitter=0.01)
+
+    def _init_prior(self, prior, eps: float, jitter: float) -> None:
+        """Set the MLP so that MLP(z) ~= prior . z at step 0.
+
+        First Linear: every hidden unit reads eps*(prior . z), plus a small random
+        perturbation so the rows are not exact copies (equal rows would receive equal
+        gradients and never separate). Middle Linears: identity. Last Linear: one equal
+        gain per unit, 2^n_layers / (eps*H), which undoes the eps, one GELU halving per
+        layer (GELU(x) ~= x/2 for |x| << 1), and the H-fold sum. All biases zero.
+        """
+        linears = [m for m in self.net if isinstance(m, nn.Linear)]          # n_layers + 1
+        first, mids, last = linears[0], linears[1:-1], linears[-1]
+        H = self.hidden
+        pr = torch.tensor(prior, dtype=first.weight.dtype)
+        if pr.numel() != self.n_feat:
+            raise ValueError(f"prior has {pr.numel()} entries, n_feat is {self.n_feat}")
+        with torch.no_grad():
+            first.weight.copy_(eps * pr.expand(H, -1)
+                               + jitter * eps * torch.randn(H, self.n_feat))
+            first.bias.zero_()
+            for m in mids:
+                m.weight.copy_(torch.eye(H))
+                m.bias.zero_()
+            last.weight.fill_((2.0 ** self.n_layers) / (eps * H))
+            last.bias.zero_()
 
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
