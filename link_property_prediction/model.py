@@ -55,20 +55,7 @@ class BagWeights(nn.Module):
         layers.append(nn.Linear(self.hidden, 1))
         self.net = nn.Sequential(*layers)                 # correction (residual) branch
 
-        # Identity-class branch: a linear read of the standardised features onto the logit.
-        # Declared AFTER self.net so net's draws are untouched. The output is a scalar and the
-        # input is n_feat-dim, so the ResNet "identity" is a Linear(n_feat, 1), not the
-        # literal identity.
-        #
-        # Initialised at [-1, -1, 0] rather than zero, so at step 0 the skip contributes
-        # exactly -(z_age + z_pos): the sigma-unit recency prior of e509656, which scores
-        # 0.7572 on tgbl-wiki against master's 0.7282. The weights stay free, so the arm can
-        # keep that law, rescale it, or unlearn it -- unlike the fixed prior, the sign is not
-        # pinned. Zero init instead reproduces master at step 0 (see 471f3f1), where the skip
-        # plateaued near [-0.07, -0.03, +0.03] and was far too small to matter.
         self.skip = nn.Linear(self.n_feat, 1, bias=False)
-        if self.n_feat != 3:
-            raise ValueError(f"skip init [-1,-1,0] assumes n_feat 3, got {self.n_feat}")
         with torch.no_grad():
             self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0]]))
 
