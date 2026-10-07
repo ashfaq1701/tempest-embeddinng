@@ -1,6 +1,6 @@
 """Walk-bag pooler and the link-prediction head.
 
-Pooling weights are `softmax(MLP(standardise(features)))` over the walk-token bag,
+Pooling weights are `softmax(MLP(scale_norm(features)))` over the walk-token bag,
 features `[log1p(age), pos, d_mid]`, n_feat 3, pooler 1,217 params at nl2 (161 at nl1).
 The pooled point is a weighted Lorentz midpoint; the scorer is `geo_temp * (-d(p_u, p_v))`.
 
@@ -22,13 +22,27 @@ from .walk_tokens import WalkTokens
 _VAR_FLOOR = 1e-12
 
 
-def standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-    """Per-feature standardisation over the valid tokens of the whole batch."""
+def scale_norm(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Per-feature SCALE normalisation over the valid tokens of the whole batch:
+    `feat / std(feat)`, with no recentring. `mu` is still computed, but only to form
+    the variance -- it is not subtracted.
+
+    The difference from standardising is one data-dependent offset per column,
+    `mu / std`, which standardising removes and this keeps. Three consequences:
+    the natural zero survives, so a column that is intrinsically non-negative
+    (age, pos, d_mid all are) stays non-negative; the absolute LEVEL of a batch is
+    visible to the pooler in std units, where standardising made an all-old batch
+    and an all-recent one identical; and a Linear can only absorb that offset into
+    its bias insofar as the offset is constant, which it is not -- it is re-estimated
+    per batch. So this is not a reparameterisation of standardising: it coincides
+    with it for a linear readout (the offset is the same for every token, so it
+    cancels in each bag's softmax) and diverges through the GELU.
+    """
     m = valid.unsqueeze(-1).to(feat.dtype)                                   # [Q, T, 1]
     n = m.sum(dim=(0, 1)).clamp_min(1.0)                                     # [F]
     mu = (feat * m).sum(dim=(0, 1)) / n                                      # [F]
     var = (((feat - mu) ** 2) * m).sum(dim=(0, 1)) / n                       # [F]
-    return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m                # [Q, T, F]
+    return feat / var.clamp_min(_VAR_FLOOR).sqrt() * m                       # [Q, T, F]
 
 
 class BagWeights(nn.Module):
@@ -69,8 +83,8 @@ class BagWeights(nn.Module):
 
         a = self.geom.dist(xt, mid.unsqueeze(-2))                            # [Q, T]  d_mid
 
-        feats = standardise(torch.stack([age, pos, a], dim=-1),
-                            valid).to(xt.dtype)                        # [Q, T, 3]
+        feats = scale_norm(torch.stack([age, pos, a], dim=-1),
+                           valid).to(xt.dtype)                         # [Q, T, 3]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.weighted_midpoint(x_tokens, w)                               # [Q, d]
