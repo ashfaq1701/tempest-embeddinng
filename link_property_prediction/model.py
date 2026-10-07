@@ -2,11 +2,11 @@
 
 Pooling weights are `softmax(skip(f) + MLP(f))` over the walk-token bag with
 `f = standardise(features)`, features `[log1p(age), pos, d_mid]`, n_feat 3, pooler 1,220
-params at nl2 (164 at nl1). `skip` is a zero-initialised `Linear(3, 1, bias=False)`: the
-residual's identity branch, carrying whatever part of the weighting is linear in the
-standardised features, with the MLP left to carry the curved part. Zero init means the
-pooler is master exactly at step 0, and `skip.weight` after training reads out the
-pooler's linear law in standardised units.
+params at nl2 (164 at nl1). `skip` is a `Linear(3, 1, bias=False)` initialised at
+`[-1, -1, 0]`: the residual's identity branch, carrying whatever part of the weighting is
+linear in the standardised features, with the MLP left to carry the curved part. That init
+makes step 0 the sigma-unit recency prior rather than master, and the weights stay free, so
+`skip.weight` after training reads out the pooler's linear law in standardised units.
 The pooled point is a weighted Lorentz midpoint; the scorer is `geo_temp * (-d(p_u, p_v))`.
 
 `cos_o` -- the angle at the origin between token and bag centre -- was removed at
@@ -56,11 +56,21 @@ class BagWeights(nn.Module):
         self.net = nn.Sequential(*layers)                 # correction (residual) branch
 
         # Identity-class branch: a linear read of the standardised features onto the logit.
-        # Declared AFTER self.net so net's draws are untouched, and zero-initialised so the
-        # pooler IS master at step 0. The output is a scalar and the input is n_feat-dim, so
-        # the ResNet "identity" has to be Linear(n_feat, 1) rather than the literal identity.
+        # Declared AFTER self.net so net's draws are untouched. The output is a scalar and the
+        # input is n_feat-dim, so the ResNet "identity" is a Linear(n_feat, 1), not the
+        # literal identity.
+        #
+        # Initialised at [-1, -1, 0] rather than zero, so at step 0 the skip contributes
+        # exactly -(z_age + z_pos): the sigma-unit recency prior of e509656, which scores
+        # 0.7572 on tgbl-wiki against master's 0.7282. The weights stay free, so the arm can
+        # keep that law, rescale it, or unlearn it -- unlike the fixed prior, the sign is not
+        # pinned. Zero init instead reproduces master at step 0 (see 471f3f1), where the skip
+        # plateaued near [-0.07, -0.03, +0.03] and was far too small to matter.
         self.skip = nn.Linear(self.n_feat, 1, bias=False)
-        nn.init.zeros_(self.skip.weight)
+        if self.n_feat != 3:
+            raise ValueError(f"skip init [-1,-1,0] assumes n_feat 3, got {self.n_feat}")
+        with torch.no_grad():
+            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0]]))
 
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
