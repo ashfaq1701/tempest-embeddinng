@@ -66,8 +66,12 @@ def parse_args() -> argparse.Namespace:
 
     # ── Optimisation / training ─────────────────────────────────────
     p.add_argument("--lr", default=1e-3, type=float,
-                   help="Learning rate. One param group: the embedding tables, the distance "
-                        "temperature and the NN pooler all step at this rate.")
+                   help="Learning rate. Two param groups differing only in weight decay: the "
+                        "embedding table, the distance temperature and the NN pooler all step "
+                        "at this rate.")
+    p.add_argument("--wd-e", default=0.0, type=float,
+                   help="Weight decay on the embedding table only (0.0 = off, the default; the "
+                        "pooler and geo_temp are never decayed).")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
@@ -186,6 +190,7 @@ def main() -> Dict[str, Any]:
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
         lr=args.lr,
+        wd_e=args.wd_e,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 

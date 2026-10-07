@@ -57,9 +57,10 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. One RiemannianAdam param group at a single `lr`: the
-    # embedding tables, the distance temperature and the NN pooler all step at the same rate.
+    # Constant lr. Two RiemannianAdam param groups at a single `lr`, differing only in
+    # weight decay: `wd_e` decays the embedding table, the pooler and geo_temp never decay.
     lr: float = 1e-3
+    wd_e: float = 0.0      # weight decay on E.weight only; 0.0 reproduces one undecayed group
 
     # Run control.
     num_epochs: int = 100
@@ -100,9 +101,18 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
         )
 
-        # One param group at a single lr: Riemannian update for E, standard Adam for the rest.
+        # Two groups at one lr: `wd_e` on the embedding table, nothing on the 1.2k-param
+        # pooler or geo_temp. geoopt applies decay as `grad += wd * x` BEFORE egrad2rgrad
+        # (radam.py:89), and x'=0 is the origin in this chart, so decay pulls the embedding
+        # toward the origin -- a direct brake on the radius.
+        e_params = [p for n, p in self.model.named_parameters() if n == "E.weight"]
+        others = [p for n, p in self.model.named_parameters() if n != "E.weight"]
+        if len(e_params) != 1:
+            raise RuntimeError(f"expected exactly one E.weight, found {len(e_params)}")
         self.opt = geoopt.optim.RiemannianAdam(
-            self.model.parameters(), lr=float(config.lr), stabilize=10,
+            [{"params": e_params, "weight_decay": float(config.wd_e)},
+             {"params": others, "weight_decay": 0.0}],
+            lr=float(config.lr), stabilize=10,
         )
 
     # Full-graph ingestion (once, up front)
