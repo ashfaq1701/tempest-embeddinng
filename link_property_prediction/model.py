@@ -1,7 +1,7 @@
 """Walk-bag pooler and the link-prediction head.
 
 Pooling weights are `softmax(MLP(scale_norm(features)))` over the walk-token bag,
-features `[log1p(age), pos, d_mid]`, n_feat 3, pooler 1,217 params at nl2 (161 at nl1).
+features `[-log1p(age), -pos, d_mid]`, n_feat 3, pooler 1,217 params at nl2 (161 at nl1).
 The pooled point is a weighted Lorentz midpoint; the scorer is `geo_temp * (-d(p_u, p_v))`.
 
 `cos_o` -- the angle at the origin between token and bag centre -- was removed at
@@ -83,7 +83,15 @@ class BagWeights(nn.Module):
 
         a = self.geom.dist(xt, mid.unsqueeze(-2))                            # [Q, T]  d_mid
 
-        feats = scale_norm(torch.stack([age, pos, a], dim=-1),
+        # [-sn(age), -sn(hop), sn(d_mid)]. The sign goes inside because scale_norm is
+        # sign-equivariant -- sn(-f) == -sn(f) exactly, sd being even (measured max|diff|
+        # 0.000e+00) -- so negating before or after normalising is the same tensor.
+        # NOTE: provably absorbable. Negating net[0].weight[:, 0:2] reproduces this arm's
+        # forward pass bit-for-bit (max|diff| 0.000e+00), and nn.Linear's Kaiming-uniform
+        # init is symmetric about zero, so the hypothesis class AND the init distribution
+        # are unchanged. At fixed seed this differs from the unsigned arm only in which
+        # weight draw lands on which column.
+        feats = scale_norm(torch.stack([-age, -pos, a], dim=-1),
                            valid).to(xt.dtype)                         # [Q, T, 3]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
