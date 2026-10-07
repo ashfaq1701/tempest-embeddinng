@@ -4,9 +4,10 @@ Pooling weights are `softmax(MLP(standardise(features)))` over the walk-token ba
 features `[log1p(age), pos, d_mid]`, n_feat 3, pooler 1,217 params at nl2 (161 at nl1).
 The pooled point is a weighted Lorentz midpoint; the scorer is `geo_temp * (-d(p_u, p_v))`.
 
-A fixed, unlearnable recency prior `-age - pos` is ADDED to the pooling logits, so the
-softmax starts from exponential recency decay and the MLP can only perturb it. A sign
-flip of the age/pos feature columns would NOT do this -- `standardise` is sign-
+A fixed, unlearnable recency prior `-age/sd(age) - pos/sd(pos)` is ADDED to the pooling
+logits, so the softmax starts from exponential recency decay and the MLP can only perturb
+it. Equivalently it is a linear skip pinned at `w = (-1, -1, 0)` over the standardised
+columns. A sign flip of those columns would NOT do this -- `standardise` is sign-
 equivariant and `net[0].weight[:, 0:2]` absorbs the flip exactly -- see `prior` below.
 
 `cos_o` -- the angle at the origin between token and bag centre -- was removed at
@@ -76,15 +77,23 @@ class BagWeights(nn.Module):
 
         feats = standardise(torch.stack([age, pos, a], dim=-1),
                             valid).to(xt.dtype)                        # [Q, T, 3]
-        # Fixed recency prior on the pooling logits, added BEFORE the mask (pads carry
-        # age=pos=0, i.e. prior 0, the largest value -- masked_fill below removes them).
-        # Not a sign flip of the age/pos columns: that is absorbed exactly by negating
-        # net[0].weight[:, 0:2] (measured max|diff| 0.000e+00), so it leaves the
-        # hypothesis class and the init distribution unchanged. This term is unlearnable,
-        # so the softmax cannot invert it -- recency is imposed, not merely available.
-        # Raw, NOT standardised: the prior's scale is deliberate, it is what sets how
-        # sharply the bag collapses onto its newest tokens.
-        prior = (-age - pos)                                                 # [Q, T]
+        # Fixed recency prior on the pooling logits, in SIGMA units:
+        #     prior = -age/sd(age) - pos/sd(pos)
+        # which is what `-(feats[..., 0] + feats[..., 1])` computes. Subtracting the means
+        # is a no-op here -- a per-batch constant is constant within every bag and the
+        # softmax cancels any per-bag constant -- so dividing by sd is the whole content,
+        # and reading the columns out of `feats` reuses standardise()'s mask-weighted sd
+        # and its variance floor instead of duplicating them.
+        #
+        # So this arm is a LINEAR SKIP with its weights pinned at w = (-1, -1, 0) in the
+        # same units the MLP sees. Unlearnable, hence not absorbable: there is no weight
+        # to flip. A sign flip of the columns themselves would be absorbed exactly by
+        # negating net[0].weight[:, 0:2] (measured max|diff| 0.000e+00) and would change
+        # neither the hypothesis class nor the init distribution.
+        #
+        # Added BEFORE the mask: pads carry prior 0, the largest value in a bag, and are
+        # removed by the masked_fill below.
+        prior = -(feats[..., 0] + feats[..., 1])                             # [Q, T]
         logits = prior + self.net(feats).squeeze(-1)                         # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.weighted_midpoint(x_tokens, w)                               # [Q, d]
