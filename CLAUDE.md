@@ -546,7 +546,7 @@ binding gap is a 14-epoch val drought, ep82 -> ep97), and patience 8-14 would ha
 to four decimals on val and test -- 72/72 epochs on Lorentz, 63/63 on the ball -- so a differing
 number means a differing input, not variance.
 
-## `cos_o` vs no `cos_o`: the ablation the lineage never got (measured, 2026-10-06)
+## `cos_o` vs no `cos_o`: the ablation the lineage never got (measured, 2026-10-06/07)
 
 One variable. `cos_o` is the angle at the origin between a walk token and the bag centre,
 `F.cosine_similarity(xt, mid)`; the no-`cos_o` arm drops that column and nothing else.
@@ -562,13 +562,33 @@ on both arms including YouTube**, Lorentz chart, matched init, same GPU model pe
 | GoogleLocal | 0.6574 | **0.6695** | **+0.0121** | 44 / 46 |
 | Flickr | **0.6417** | 0.6347 | -0.0070 | 28 / 28 |
 | ML-20M | **0.2510** | 0.2477 | -0.0033 | 9 / 9 |
-| Yelp | **0.6528** | 0.6513 ◊ | -0.0015 ◊ | 25 / ep19, pat 1/10 |
-| WikiLink | **0.6723** | 0.6611 ◊ | -0.0112 ◊ | 16 / ep13, pat 1/10 |
+| Yelp | **0.6528** | 0.6513 | -0.0015 | 25 / 18 |
+| WikiLink | **0.6723** | 0.6608 | -0.0115 | 16 / 17 |
 
-◊ **PROVISIONAL, still running.** Yelp and WikiLink are max-test-so-far, not val-selected
-finals. Yelp has swung +0.0173 (ep9) -> -0.0041 (ep16) -> -0.0015 (ep19) and its patience
-keeps resetting, so its sign is genuinely open. WikiLink has sat at -0.009 to -0.012 since
-ep5 and is the one cell that has never favoured removal.
+**All six cells are now final** (2026-10-07, both closed `rc=0`): Yelp stopped at ep18 of 28
+with val 0.6711 -> test 0.6513, WikiLink at ep17 of 27 with val 0.6711 -> test 0.6608. Every
+number in the table is the val-selected `best_test_mrr`. Max test differs on one cell only:
+WikiLink peaked at **0.6611 at ep12**, so its val-selected 0.6608 carries 0.0003 of drift;
+everywhere else max test equals the reported number.
+
+The two cells that were provisional both landed where they had been sitting, and neither
+sign changed. Yelp's earlier swing (+0.0173 at ep9 -> -0.0041 at ep16) settled at -0.0015,
+so the "genuinely open" reading of its sign was resolved by running it out, not by variance.
+WikiLink closed at **-0.0115** and remains the one dataset that has never favoured removal,
+having held -0.009 to -0.012 from ep5 onward.
+
+**Standing: removing `cos_o` wins 2 of 6.** But read the shape, not the count: the two wins
+are +0.0159 and +0.0121 while three of the four losses are <=0.0070, so the summed effect
+favours removal. WikiLink at -0.0115 is the only loss comparable in size to a win, and it is
+the same cell that prefers `cos_o` in every other experiment on this suite.
+
+**Both closing runs ended in radius inflation, which is why the last ten epochs bought
+nothing.** WikiLink's train loss ROSE for its final twelve epochs (0.1464 at ep15 ->
+0.1524 at ep27) while `r_mean` climbed a near-constant +0.18/epoch to 5.26 and `r_max`
+reached **7.62**; Yelp's `r_max` ran to **8.18** by ep27. Both are past the float32 band
+where `expmap` loses accuracy, and in both cases val sat inside a 0.0008 band throughout.
++0.0003 val flickers kept resetting patience with no gain, so on this suite a run whose
+train loss has turned up and whose `r_mean` is growing linearly can be stopped early.
 
 **YouTube's `cos_o` number is DERIVED, not run at 100/10.** The run was launched at 200/20;
 patience only decides when to stop, never the trajectory (verified: the 200/20 and 100/10
@@ -604,9 +624,9 @@ and a losing dataset, so spread is NOT what separates them:
 | YouTube | 60 | 0.678 / 0.699 | 2.112 / **2.750** | 1.30x |
 
 `geo_temp` moves inversely, the scorer compensating for the wider spread. Practical note:
-on Yelp and WikiLink the no-`cos_o` arm crosses `r_max` 5 (5.46 and 5.58 by ep17/ep13),
-into the band where float32 `expmap` steps lose accuracy -- an argument for bounding radius,
-not against the ablation.
+on Yelp and WikiLink the no-`cos_o` arm crosses `r_max` 5 by ep17/ep13 and kept going to
+**8.18 and 7.62** by the time both runs closed, well into the band where float32 `expmap`
+steps lose accuracy -- an argument for bounding radius, not against the ablation.
 
 ### Why no clean ablation existed before
 
