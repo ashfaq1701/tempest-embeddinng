@@ -202,6 +202,10 @@ class Trainer:
             parts.append(f"temp={float(self.model.temperature):.3f}")
         if hasattr(self.model, "geo_temp"):
             parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
+        # Prior temperature, if the pooler has one -- a null is uninterpretable without it.
+        bw = getattr(self.model, "bag_weights", None)
+        if bw is not None and hasattr(bw, "log_tau"):
+            parts.append(f"tau={float(bw.log_tau.exp()):.4f}")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad
