@@ -27,3 +27,7 @@ runs/
 
 # Paper-tracked run logs: keep these versioned despite the *.log rule above.
 !experiment_logs/**
+
+# Experiment drivers and sbatch wrappers: written on demand, never version-controlled.
+scripts/*.sh
+scripts/*.sbatch
