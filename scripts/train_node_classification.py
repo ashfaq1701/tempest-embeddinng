@@ -1,8 +1,11 @@
 """Frozen-encoder dynamic node classification (DyGLib protocol).
 
 Loads a Run-1 link-prediction checkpoint (`train_link_property_prediction.py
---data-suite dyglib --save-checkpoint ...`), freezes it, and trains only a small
-classifier on [d0(p_u), sum_i w_i d(x_i, p_u)] and the mean walk edge feature, source side.
+--data-suite dyglib --save-checkpoint ...`), freezes it, and trains only a small classifier on
+22 scalars per interaction, source side: 12 geometric + 5 walk-time features from the frozen
+encoder's walks (node_classification/encoder.py) and 5 exact history features of the user
+(node_classification/history.py). Each split is encoded once: the walks replay identically on
+every pass, so that one pass is exactly what every epoch would see.
 """
 
 import argparse
@@ -13,6 +16,7 @@ _PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+import numpy as np
 import torch
 
 from link_property_prediction.data import concat_splits
@@ -20,6 +24,7 @@ from link_property_prediction.dyglib_eval import load_dyglib
 from link_property_prediction.utils import seed_all
 from node_classification.classifier import NodeClassifier
 from node_classification.encoder import FrozenEncoder
+from node_classification.history import history_features
 from node_classification.train import fit_classifier
 
 
@@ -33,7 +38,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", default=200, type=int)
     p.add_argument("--num-epochs", default=100, type=int)
     p.add_argument("--early-stop-patience", default=20, type=int)
-    p.add_argument("--lr", default=1e-4, type=float, help="DyGLib's node-classification lr.")
+    p.add_argument("--lr", default=1e-3, type=float,
+                   help="Classifier lr. DyGLib uses 1e-4; 1e-3 won on validation here.")
+    p.add_argument("--num-walks", default=20, type=int,
+                   help="Walks per node at classification time (the checkpoint trained with 5).")
     p.add_argument("--seed", default=42, type=int,
                    help="Classifier init and walk seed; pair seed k with the seed-k checkpoint.")
     p.add_argument("--use-gpu", action="store_true")
@@ -53,19 +61,27 @@ def main() -> None:
         n_pos = int(labels[name].sum())
         print(f"  {name:5s} interactions {len(split.sources):>8,}  positives {n_pos:>5,}")
 
+    stream = concat_splits(loaded.train, loaded.val, loaded.test)
     encoder = FrozenEncoder.from_checkpoint(
-        args.checkpoint, concat_splits(loaded.train, loaded.val, loaded.test),
-        device=device, use_gpu_tempest=args.use_gpu_tempest, seed=args.seed)
-    classifier = NodeClassifier(n_geo=encoder.n_geo, d_ef=encoder.d_ef).to(device)
+        args.checkpoint, stream, device=device, use_gpu_tempest=args.use_gpu_tempest,
+        seed=args.seed, num_walks_per_node=args.num_walks)
+    hash_before = encoder.state_hash()
+
+    features = {}
+    for name, split in splits.items():
+        walk = encoder.encode(split)
+        hist = torch.from_numpy(history_features(stream, split)).to(device)
+        features[name] = torch.cat([walk, hist], dim=1)
+    print(f"  checkpoint: {args.checkpoint}  (walks per node {encoder.walk_args['num_walks_per_node']})")
+
+    classifier = NodeClassifier(n_in=features["train"].shape[1]).to(device)
     n_params = sum(p.numel() for p in classifier.parameters())
-    print(f"  checkpoint: {args.checkpoint}")
     print(f"  classifier params: {n_params:,}  (encoder frozen)")
 
-    hash_before = encoder.state_hash()
     result = fit_classifier(
-        encoder, classifier, splits, labels,
+        classifier, features, {k: np.asarray(v) for k, v in labels.items()},
         batch_size=args.batch_size, lr=args.lr,
-        num_epochs=args.num_epochs, patience=args.early_stop_patience)
+        num_epochs=args.num_epochs, patience=args.early_stop_patience, seed=args.seed)
     if encoder.state_hash() != hash_before:
         raise RuntimeError("encoder weights changed during classifier training")
 

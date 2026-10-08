@@ -6,8 +6,8 @@
     weights bit-identical
   - replay: two encoding passes over the same split give bitwise-identical features
   - checkpoint round trip: the rebuilt encoder carries the trained weights exactly
-  - geo features are [d0(p_u), sum_i w_i d(x_i, p_u)], and pool()[0] is forward() exactly
-  - ef is the mean feature of u's real walk edges (seed slot and padding excluded)
+  - geometric features match direct recomputation, and pool()[0] is forward() exactly
+  - history features match a brute-force scan of u's strictly earlier edges
 """
 import numpy as np
 import pytest
@@ -17,7 +17,8 @@ from link_property_prediction.data import SplitData
 from link_property_prediction.model import LinkPredHead
 from link_property_prediction.walk_tokens import build_query_walk_tokens
 from node_classification.classifier import NodeClassifier
-from node_classification.encoder import FrozenEncoder
+from node_classification.encoder import N_FEATURES, FrozenEncoder
+from node_classification.history import history_features
 from node_classification.train import fit_classifier
 
 N_NODES, D_EMB, D_EF = 20, 8, 6
@@ -76,23 +77,23 @@ def test_optimiser_excludes_encoder_and_training_leaves_it_unchanged(encoder):
     labels = {name: (rng.random(len(s.sources)) < 0.3).astype(np.float32)
               for name, s in splits.items()}
 
-    classifier = NodeClassifier(n_geo=encoder.n_geo, d_ef=encoder.d_ef)
+    before = encoder.state_hash()
+    features = {name: encoder.encode(split) for name, split in splits.items()}
+    classifier = NodeClassifier(n_in=N_FEATURES)
     encoder_params = {id(p) for p in encoder.model.parameters()}
     assert not any(id(p) in encoder_params for p in classifier.parameters())
     assert not any(p.requires_grad for p in encoder.model.parameters())
 
-    before = encoder.state_hash()
-    fit_classifier(encoder, classifier, splits, labels,
-                   batch_size=50, lr=1e-3, num_epochs=2, patience=5)
+    fit_classifier(classifier, features, labels,
+                   batch_size=50, lr=1e-3, num_epochs=2, patience=5, seed=0)
     assert encoder.state_hash() == before
 
 
 def test_two_passes_replay_identical_features(encoder):
-    first = list(encoder.encode(encoder.graph, batch_size=64))
-    second = list(encoder.encode(encoder.graph, batch_size=64))
-    assert len(first) == len(second)
-    for (g1, e1), (g2, e2) in zip(first, second):
-        assert torch.equal(g1, g2) and torch.equal(e1, e2)
+    first = encoder.encode(encoder.graph, batch_size=64)
+    second = encoder.encode(encoder.graph, batch_size=64)
+    assert first.shape == (len(encoder.graph.sources), N_FEATURES)
+    assert torch.equal(first, second)
 
 
 def test_checkpoint_round_trip_restores_trained_weights(encoder):
@@ -101,39 +102,43 @@ def test_checkpoint_round_trip_restores_trained_weights(encoder):
         assert torch.equal(tensor, reference[name]), name
 
 
-def test_features_are_radius_and_weighted_spread(encoder):
+def test_geometric_features_match_direct_recomputation(encoder):
     walker = encoder._fresh_walker()
     graph = encoder.graph
+    src = torch.from_numpy(graph.sources[200:260])
     tokens = build_query_walk_tokens(
-        walker, torch.device("cpu"),
-        torch.from_numpy(graph.sources[200:260]), torch.from_numpy(graph.timestamps[200:260]),
+        walker, torch.device("cpu"), src, torch.from_numpy(graph.timestamps[200:260]),
         max_walk_len=5, num_walks_per_node=4,
         start_bias="ExponentialWeight", walk_bias="ExponentialWeight")
     geom = encoder.model.geom
     with torch.no_grad():
         p_u, w, x_tokens = encoder.model.bag_weights.pool(tokens)
-        feats = encoder._geo_features(tokens)
+        feats = encoder._features(tokens, src)
         assert torch.equal(p_u, encoder.model.bag_weights(tokens))      # pool()[0] is forward()
         valid = w > 0
         spread = torch.stack([(w[q, valid[q]] * geom.dist(x_tokens[q, valid[q]], p_u[q])).sum()
                               for q in range(len(p_u))])
-    assert feats.shape == (len(p_u), 2)
+        distinct = torch.tensor([float(len(set(tokens.nodes.flatten(1)[q][valid[q]].tolist())))
+                                 for q in range(len(p_u))])
+    assert feats.shape == (len(p_u), N_FEATURES)
     torch.testing.assert_close(feats[:, 0], geom.dist0(p_u))
     torch.testing.assert_close(feats[:, 1], spread)
+    torch.testing.assert_close(feats[:, 6], geom.dist0(encoder.model.E.weight[src]))
+    torch.testing.assert_close(feats[:, 16], distinct)
 
 
-def test_edge_features_are_the_mean_over_real_walk_edges(encoder):
-    walker = encoder._fresh_walker()
-    graph = encoder.graph
-    tokens = build_query_walk_tokens(
-        walker, torch.device("cpu"),
-        torch.from_numpy(graph.sources[200:260]), torch.from_numpy(graph.timestamps[200:260]),
-        max_walk_len=5, num_walks_per_node=4,
-        start_bias="ExponentialWeight", walk_bias="ExponentialWeight")
-    ef = encoder._edge_features(tokens)
-    real_edge = (tokens.mask & ~tokens.seed_mask).flatten(1)
-    flat = tokens.edge_features.flatten(1, 2)
-    for q in range(len(ef)):
-        expected = (flat[q, real_edge[q]].mean(dim=0) if real_edge[q].any()
-                    else torch.zeros(flat.shape[-1]))
-        torch.testing.assert_close(ef[q], expected)
+def test_history_features_match_brute_force():
+    stream = _graph()
+    queries = SplitData(*(arr[150:400] for arr in stream))
+    got = history_features(stream, queries)
+    for q in range(len(queries.sources)):
+        u, t = queries.sources[q], queries.timestamps[q]
+        times = np.sort(stream.timestamps[(stream.sources == u) & (stream.timestamps < t)])
+        expected = np.zeros(5, np.float32)
+        expected[0] = np.log1p(len(times))
+        expected[1] = np.log1p(t - times[-1]) if len(times) else np.log1p(1e7)
+        expected[2] = np.log1p(t - times[0]) if len(times) else 0.0
+        if len(times) >= 2:
+            expected[3] = np.log1p(np.diff(times).mean())
+            expected[4] = np.log1p(times[-1] - times[-2])
+        np.testing.assert_allclose(got[q], expected, rtol=1e-6)
