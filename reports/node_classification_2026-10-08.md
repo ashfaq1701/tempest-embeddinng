@@ -5,12 +5,17 @@ beats every published dynamic-node-classification result on both DyGLib datasets
 
 | test AUC-ROC, 5 runs (mean ± std, ddof=1) | Wikipedia | Reddit |
 |---|---|---|
-| **ours** | **89.91 ± 0.87** | **73.87 ± 0.95** |
+| **ours** | **90.28 ± 0.76** | **73.63 ± 0.77** |
 | best published | JODIE 88.99 ± 1.05 | TAWRMAC 71.45 ± 0.92 |
-| margin | **+0.92** | **+2.42** |
+| margin | **+1.29** | **+2.18** |
 
-Code: branch `feature/node-classification-geo-walk-hist` (recipe commit `83c6911`).
-Logs: `logs/node_cls_final*/k5/seed*/`, link-prediction checkpoints in `logs/node_cls_linskip/k5/`.
+Every feature comes from the frozen encoder's Tempest instance: walks over the trained
+hyperbolic embedding, plus Tempest's own per-node event index for the history columns.
+
+Code: branch `feature/node-classification-geo-walk-hist`, recipe commit `85662e1`.
+Logs: `logs/node_cls_tempest_hist/k5/seed*/` (recipe); `logs/node_cls_final*/k5/seed*/`
+(ablations, and the earlier numpy-history version). Link-prediction checkpoints are in
+`logs/node_cls_linskip/k5/`.
 
 ---
 
@@ -50,7 +55,7 @@ Per interaction, 22 scalars:
 |---|---|
 | **geometry (12)**, from the frozen walk bag | `d0(p_u)`; spread `Σ w_i d(x_i, p_u)`; unweighted spread; nearest / farthest token; mean token radius; `d0(E[u])`; `d(E[u], p_u)`; pooling entropy and peak weight; spread and entropy under `softmax(−d(x_i, p_u))` (attention keyed on `p_u`) |
 | **walk time (5)** | log #real edges; min / mean / pooler-weighted log-age; #distinct nodes in the bag |
-| **exact history (5)** | log #prior edges of `u`; log time since last / first; log mean / last gap |
+| **Tempest history (5)** | from Tempest's per-node event index: log #prior edges of `u` (`get_node_popularity`); log time since `u`'s last edge (`get_node_recency`); log gap between `u`'s last two edges (a second `get_latest_events` with cutoff = last edge time); log #prior edges and log recency of `u`'s **last partner** (the partner returned by `get_latest_events`) |
 
 Here `p_u` is the frozen pooler's point, `w` its weights, `x_i` the bag's token points and `d0`
 the hyperbolic radius.
@@ -63,14 +68,20 @@ AUC. **20 walks per node** at classification time; the checkpoints trained with 
 
 ### Per run, test AUC
 
-| seed | Wikipedia | Reddit |
-|---|---|---|
-| 42 | 0.8923 | 0.7458 |
-| 0 | 0.9050 | 0.7237 |
-| 1 | 0.8923 | 0.7348 |
-| 2 | 0.8943 | 0.7438 |
-| 3 | 0.9114 | 0.7453 |
-| **mean ± std** | **89.91 ± 0.87** | **73.87 ± 0.95** |
+| seed | Wikipedia | Reddit | Wikipedia, numpy history | Reddit, numpy history |
+|---|---|---|---|---|
+| 42 | 0.8945 | 0.7403 | 0.8923 | 0.7458 |
+| 0 | 0.9127 | 0.7227 | 0.9050 | 0.7237 |
+| 1 | 0.8974 | 0.7378 | 0.8923 | 0.7348 |
+| 2 | 0.9010 | 0.7395 | 0.8943 | 0.7438 |
+| 3 | 0.9083 | 0.7411 | 0.9114 | 0.7453 |
+| **mean ± std** | **90.28 ± 0.76** | **73.63 ± 0.77** | 89.91 ± 0.87 | 73.87 ± 0.95 |
+
+The right-hand columns are the first version, whose history columns came from a numpy scan of
+the event stream (count, time since last / first, mean / last gap). It was replaced so that
+every feature comes from Tempest. Tempest has no first-event lookup, so time-since-first and
+mean gap became last-partner popularity and recency. That gained +0.37 on Wikipedia and
+−0.24 on Reddit, within noise, with a tighter spread on both.
 
 The link-prediction checkpoints are consistent across seeds. Wikipedia best epochs are
 42/43/54/70/36 (val MRR 0.964–0.966, test 0.956–0.960). Reddit best epochs are 40/38/42/33/41
@@ -91,7 +102,7 @@ The link-prediction checkpoints are consistent across seeds. Wikipedia best epoc
 | DyG-Mamba | 88.58 ± 0.92 | 70.79 ± 1.97 | arXiv 2408.06966, Table 11 |
 | TIDFormer | 87.53 ± 1.12 | 69.59 ± 1.70 | arXiv 2506.00431, Table 2 |
 | TAWRMAC | 87.69 ± 0.78 | 71.45 ± 0.92 | arXiv 2510.09884, Table 7 |
-| **ours** | **89.91 ± 0.87** | **73.87 ± 0.95** | this report |
+| **ours** | **90.28 ± 0.76** | **73.63 ± 0.77** | this report |
 
 ### Ablations (5 runs each, same checkpoints)
 
@@ -99,16 +110,16 @@ The link-prediction checkpoints are consistent across seeds. Wikipedia best epoc
 |---|---|---|
 | geometry only (12), `--geometry-only` | 89.68 ± 0.97 | 64.84 ± 2.26 |
 | geometry + walk time (17), `--no-history` | 89.91 ± 0.67 | 68.63 ± 0.87 |
-| full recipe (22) | 89.91 ± 0.87 | 73.87 ± 0.95 |
+| full recipe (22, Tempest history) | 90.28 ± 0.76 | 73.63 ± 0.77 |
 
 **On Wikipedia the geometry is enough on its own.** Twelve numbers read off the frozen
 hyperbolic encoder beat every published method. The strongest single feature is `d0(E[u])`, the
 radius of the user's own point (univariate AUC 0.88 train / 0.84 val, inverted). Banned users
-sit near the origin, which in this geometry means low activity. The exact history lookups add
-nothing on test.
+sit near the origin, which in this geometry means low activity. The history columns add only
++0.37 on test.
 
 **On Reddit it is not.** Geometry alone (64.84) still beats JODIE, DyRep, TGN and GraphMixer,
-but the walk-time features (+3.8) and the exact history (+5.2) are what carry the margin over
+but the walk-time features (+3.8) and the history columns (+5.0) are what carry the margin over
 TAWRMAC. The Wikipedia ablation does not generalise; report both.
 
 ## 4. How the recipe was chosen
@@ -160,9 +171,12 @@ What moved the number:
    draws different walks; a fresh instance with the same seed replays exactly. The encoder
    builds a fresh walker per pass (re-ingest about 0.2 s on Wikipedia), so every pass is
    deterministic.
-3. **Reddit's zip is Deflate64.** Python's `zipfile` cannot read it; the loader falls back to
+3. **`get_node_degrees` has no cutoff.** With the full graph ingested it would count future
+   edges, so it is not used. Only `get_latest_events_for_nodes` and
+   `get_node_participation_counts`, which take per-node cutoffs, feed the history columns.
+4. **Reddit's zip is Deflate64.** Python's `zipfile` cannot read it; the loader falls back to
    Info-ZIP `unzip`.
-4. **Reddit's timestamps are in milliseconds.** The loader scales to integers by the smallest
+5. **Reddit's timestamps are in milliseconds.** The loader scales to integers by the smallest
    exact power of ten (×1000) instead of truncating. The split still cuts on DyGLib's float
    quantiles.
 
@@ -170,7 +184,10 @@ What moved the number:
 
 - **Selection and reporting share a checkpoint.** The seed-42 Wikipedia checkpoint was used for
   selection (train and validation only) and is also one of the 5 reported runs. Its test number
-  (0.8923) is the lowest of the five, so this did not inflate the mean.
+  (0.8945) is the lowest of the five, so this did not inflate the mean.
+- **The history columns were changed after the test numbers had been seen.** The change was
+  made for code reasons (every feature from Tempest, no separate numpy pass), not selected on
+  test. Both versions are reported, and both beat every baseline on both datasets.
 - **Our link-prediction backbone differs from DyGLib's.** It is trained on the full train split,
   where DyGLib's LP split also holds out 10% of nodes for inductive testing. It uses our
   negatives (uniform, `k=5`, MRR), not DyGLib's 1:1 AP/AUC. The node-classification protocol

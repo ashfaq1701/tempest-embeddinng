@@ -692,14 +692,17 @@ DyGLib protocol (Wikipedia/Reddit ban prediction, ROC-AUC over the whole split, 
 frozen, classifier on the source node only, 5 runs, std with ddof=1). Run 1 trains link
 prediction on `--data-suite dyglib --is-bipartite --k-train 5 --k-eval 5` (linear-skip
 pooler) and saves the best-val checkpoint; Run 2 freezes it and trains a ~2.4k-param MLP.
-Branch `feature/node-classification-geo-walk-hist`, recipe commit `83c6911`; drivers
-`scripts/lp_seeds_wiki.sh`, `scripts/nc_final.sh`; logs `logs/node_cls_final*/k5/seed*/`.
+Branch `feature/node-classification-geo-walk-hist`, recipe commit `85662e1`; drivers
+`scripts/lp_seeds_wiki.sh`, `scripts/nc_final.sh`; logs `logs/node_cls_tempest_hist/k5/seed*/`
+(recipe), `logs/node_cls_final*/k5/seed*/` (ablations, earlier numpy-history version).
+Full write-up: `reports/node_classification_2026-10-08.md`.
 
 ### 5 checkpoints per dataset (seeds 42, 0, 1, 2, 3), test AUC
 
 | classifier input | Wikipedia | Reddit |
 |---|---|---|
-| **12 geometric + 5 walk-time + 5 exact history** (the recipe) | **89.91 ± 0.87** | **73.87 ± 0.95** |
+| **12 geometric + 5 walk-time + 5 Tempest history** (the recipe) | **90.28 ± 0.76** | **73.63 ± 0.77** |
+| same, history from a numpy scan of the stream (first version) | 89.91 ± 0.87 | 73.87 ± 0.95 |
 | 12 geometric + 5 walk-time (`--no-history`) | 89.91 ± 0.67 | 68.63 ± 0.87 |
 | 12 geometric only (`--geometry-only`) | 89.68 ± 0.97 | 64.84 ± 2.26 |
 | best published | JODIE 88.99 ± 1.05 | TAWRMAC 71.45 ± 0.92 |
@@ -715,6 +718,12 @@ selection of any kind. Reddit LP checkpoints (seeds 42/0/1/2/3) restore epochs 4
 enough (89.68) and history adds nothing; on Reddit geometry alone is 64.84 (still above
 JODIE/DyRep/TGN/GraphMixer at 60-64) and the walk-time (+3.8) and exact history (+5.2)
 features are what lift it past TAWRMAC. Report both; do not generalise the Wikipedia ablation.
+
+**History comes from Tempest, not a side scan.** `get_node_popularity` (count),
+`get_node_recency` / `get_latest_events` (last edge time AND partner), a second latest-event
+lookup with cutoff = t_last (last gap), and the last partner's popularity and recency. Never
+use `get_node_degrees` here: it takes no cutoff, so with the full graph ingested it leaks
+future edges.
 
 **The geometry carries the ban signal on its own.** Twelve numbers from the frozen hyperbolic
 encoder -- radius of `E[u]` and of the pooled point, bag spread (pooler-weighted, unweighted,
