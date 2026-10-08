@@ -23,7 +23,7 @@ from link_property_prediction.data import concat_splits
 from link_property_prediction.dyglib_eval import load_dyglib
 from link_property_prediction.utils import seed_all
 from node_classification.classifier import NodeClassifier
-from node_classification.encoder import FrozenEncoder
+from node_classification.encoder import N_GEOMETRY, FrozenEncoder
 from node_classification.history import history_features
 from node_classification.train import fit_classifier
 
@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
                    help="Classifier lr. DyGLib uses 1e-4; 1e-3 won on validation here.")
     p.add_argument("--no-history", action="store_true",
                    help="Ablation: drop the 5 exact history features, keep the 17 walk features.")
+    p.add_argument("--geometry-only", action="store_true",
+                   help="Ablation: only the 12 geometric features (no walk-time, no history).")
     p.add_argument("--num-walks", default=20, type=int,
                    help="Walks per node at classification time (the checkpoint trained with 5).")
     p.add_argument("--seed", default=42, type=int,
@@ -72,7 +74,9 @@ def main() -> None:
     features = {}
     for name, split in splits.items():
         walk = encoder.encode(split)
-        if args.no_history:
+        if args.geometry_only:
+            features[name] = walk[:, :N_GEOMETRY]
+        elif args.no_history:
             features[name] = walk
         else:
             hist = torch.from_numpy(history_features(stream, split)).to(device)

@@ -36,6 +36,7 @@ from link_property_prediction.walk_tokens import WalkTokens, build_query_walk_to
 from link_property_prediction.walks import WalkGenerator
 
 N_FEATURES = 17
+N_GEOMETRY = 12                 # the first 12 columns; the last 5 are walk-time
 NO_EDGE_LOG_AGE = 16.0          # log1p(age) stand-in when u has no prior edge (> any real age)
 
 
