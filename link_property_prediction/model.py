@@ -8,10 +8,9 @@ linear in the standardised features, with the MLP left to carry the curved part.
 makes step 0 the sigma-unit recency prior rather than master, and the weights stay free, so
 `skip.weight` after training reads out the pooler's linear law in standardised units.
 The pooled point is a weighted Lorentz midpoint. The scorer is `w . [-d(p_u, p_v), spread_v]`
-with learned `w`, initialised at `[1, 1]`. `spread_v = sum a d(x_i, p_v)` under attention
-`a = softmax(-d(x_i, p_v))` over v's own walk tokens -- the attention spread the
-node-classification encoder reads off p_u, here taken on the candidate side, with the
-tokens x detached and the pooled point p_v not.
+with learned `w`, initialised at `[1, 1]`. `spread_v = sum w_v,i d(x_i, p_v)` is v's walk
+bag's distance to its own pooled point under the pooler's weights `w_v` -- how well p_v
+summarises the bag. The tokens x are detached; p_v and w_v are not.
 
 `cos_o` -- the angle at the origin between token and bag centre -- was removed at
 791360a. It lowered the TRAINING loss and widened the val->test gap: on YouTube the loss
@@ -118,14 +117,12 @@ class LinkPredHead(nn.Module):
         self.w = nn.Parameter(torch.tensor([1.0, 1.0]))
 
     def attention_spread(self, p: torch.Tensor, x: torch.Tensor, pool_w: torch.Tensor) -> torch.Tensor:
-        """spread = sum a d(x_i, p) under attention a = softmax(-d(x_i, p)) over a bag's valid
-        tokens (padding has pool_w = 0), [Q]. x is detached, as the pooler's own features are,
-        so the tokens are not moved to change the column; gradient still reaches p."""
-        x = x.detach()
-        valid = pool_w > 0                                                   # [Q, T]
-        d_tok = self.geom.dist(x, p.unsqueeze(-2))                           # [Q, T]
-        attention = torch.softmax((-d_tok).masked_fill(~valid, float("-inf")), dim=-1)
-        return (attention * d_tok).sum(-1)                                   # [Q]
+        """spread = sum pool_w d(x_i, p): the bag's distance to its own pooled point under the
+        pooler's weights (padding has pool_w = 0, so it drops out), [Q]. x is detached, as the
+        pooler's own features are, so the tokens are not moved to change the column; gradient
+        still reaches p and pool_w."""
+        d_tok = self.geom.dist(x.detach(), p.unsqueeze(-2))                  # [Q, T]
+        return (pool_w * d_tok).sum(-1)                                      # [Q]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         # Each side is pooled once, independently of the other. The candidate rows arrive
