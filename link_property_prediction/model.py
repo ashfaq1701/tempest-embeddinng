@@ -116,20 +116,15 @@ class LinkPredHead(nn.Module):
         # Scorer weights over [-geo, spread_v].
         self.w = nn.Parameter(torch.tensor([1.0, 1.0]))
 
-    def attention_spread(self, p: torch.Tensor, x: torch.Tensor, pool_w: torch.Tensor) -> torch.Tensor:
-        """spread = sum pool_w d(x_i, p): the bag's distance to its own pooled point under the
-        pooler's weights (padding has pool_w = 0, so it drops out), [Q]. x is detached, as the
-        pooler's own features are, so the tokens are not moved to change the column; gradient
-        still reaches p and pool_w."""
-        d_tok = self.geom.dist(x.detach(), p.unsqueeze(-2))                  # [Q, T]
-        return (pool_w * d_tok).sum(-1)                                      # [Q]
-
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         # Each side is pooled once, independently of the other. The candidate rows arrive
         # flattened as b*c, so the only reshaping left is folding c back out.
         p_u = self.bag_weights(src_tokens)                                   # [b, d]
         p_v, w_v, x_v = self.bag_weights.pool(cand_tokens)                   # [b*c, d], [b*c, T], [b*c, T, d]
-        spread_v = self.attention_spread(p_v, x_v, w_v)                      # [b*c]
+        # v's bag's distance to its own pooled point under the pooler's weights (padding has
+        # w_v = 0). x is detached, as the pooler's features are; p_v and w_v carry gradient.
+        d_tok = self.geom.dist(x_v.detach(), p_v.unsqueeze(-2))              # [b*c, T]
+        spread_v = (w_v * d_tok).sum(-1)                                     # [b*c]
 
         b, d = p_u.shape
         c = p_v.shape[0] // b
