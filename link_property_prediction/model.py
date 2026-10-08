@@ -7,7 +7,11 @@ params at nl2 (164 at nl1). `skip` is a `Linear(3, 1, bias=False)` initialised a
 linear in the standardised features, with the MLP left to carry the curved part. That init
 makes step 0 the sigma-unit recency prior rather than master, and the weights stay free, so
 `skip.weight` after training reads out the pooler's linear law in standardised units.
-The pooled point is a weighted Lorentz midpoint; the scorer is `geo_temp * (-d(p_u, p_v))`.
+The pooled point is a weighted Lorentz midpoint. The scorer is `w . [-d(p_u, p_v), spread_v,
+entropy_v]` with learned `w`, initialised at `[1, 1, 1]`. The two candidate columns come from
+attention `a = softmax(-d(x_i, p_v))` over v's own walk tokens: `spread_v = sum a d(x_i, p_v)`
+and `entropy_v = -sum a log a` -- the same attention features the node-classification encoder
+reads off p_u, here taken on the candidate side.
 
 `cos_o` -- the angle at the origin between token and bag centre -- was removed at
 791360a. It lowered the TRAINING loss and widened the val->test gap: on YouTube the loss
@@ -110,15 +114,30 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,
                                       n_layers=n_layers_pooler)
 
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+        # Scorer weights over [-geo, spread_v, entropy_v].
+        self.w = nn.Parameter(torch.tensor([1.0, 1.0, 1.0]))
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         # Each side is pooled once, independently of the other. The candidate rows arrive
         # flattened as b*c, so the only reshaping left is folding c back out.
         p_u = self.bag_weights(src_tokens)                                   # [b, d]
-        p_v = self.bag_weights(cand_tokens)                                  # [b*c, d]
+        p_v, w_v, x_v = self.bag_weights.pool(cand_tokens)                   # [b*c, d], [b*c, T], [b*c, T, d]
+        spread_v, entropy_v = self.attention_spread_entropy(p_v, x_v, w_v)   # [b*c], [b*c]
+
         b, d = p_u.shape
-        p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
+        c = p_v.shape[0] // b
+        p_v = p_v.view(b, c, d)                                              # [b, c, d]
 
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                          # [b, c]
-        return self.geo_temp * (-geo)
+        feats = torch.stack([-geo, spread_v.view(b, c), entropy_v.view(b, c)], dim=-1)  # [b, c, 3]
+        return (self.w * feats).sum(-1)                                      # [b, c]
+
+    def attention_spread_entropy(self, p: torch.Tensor, x: torch.Tensor, pool_w: torch.Tensor):
+        """Attention a = softmax(-d(x_i, p)) over a bag's valid tokens (padding has pool_w = 0)
+        -> (spread = sum a d(x_i, p), entropy = -sum a log a), each [Q]."""
+        valid = pool_w > 0                                                   # [Q, T]
+        d_tok = self.geom.dist(x, p.unsqueeze(-2))                           # [Q, T]
+        attention = torch.softmax((-d_tok).masked_fill(~valid, float("-inf")), dim=-1)
+        spread = (attention * d_tok).sum(-1)                                 # [Q]
+        entropy = -(attention.clamp_min(1e-12).log() * attention).sum(-1)    # [Q]
+        return spread, entropy
