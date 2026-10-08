@@ -1,4 +1,4 @@
-"""The node classifier: 7 standardised scalars in (5 geometric + 2 history), one logit out.
+"""The node classifier: 6 standardised scalars in (4 geometric + 2 history), one logit out.
 
     BatchNorm1d(n) -> Linear(n, m) -> GELU -> Linear(m, 32) -> GELU      input stem, m = max(16, n)
     -> Linear(32, 32) -> GELU -> Dropout(0.1) -> Linear(32, 1)            head
