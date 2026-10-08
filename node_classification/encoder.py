@@ -63,6 +63,9 @@ FEATURE_SETS = {
     # train ∪ val, Wikipedia 0.902 vs 0.893, Reddit 0.814 vs 0.813): the three radii and
     # u's prior edge count and time since its last edge.
     "minimal": [0, 5, 6, 17, 18],
+    # minimal + the attention pair (spread and entropy under softmax(-d(x_i, p_u))): the only
+    # small set that held Reddit's latest CV fold (0.773 vs 0.776 for all 22).
+    "minimal+attention": [0, 5, 6, 10, 11, 17, 18],
 }
 NO_EDGE_LOG_AGE = 16.0          # log1p(age) stand-in when u has no prior edge (> any real age)
 
