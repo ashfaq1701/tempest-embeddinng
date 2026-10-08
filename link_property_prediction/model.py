@@ -59,12 +59,12 @@ class BagWeights(nn.Module):
         with torch.no_grad():
             self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0]]))
 
-    def forward(self, tokens: WalkTokens) -> torch.Tensor:
-        return self.pool(tokens)[0]
+    def forward(self, tokens: WalkTokens):
+        return self.pool(tokens)
 
     def pool(self, tokens: WalkTokens):
-        """-> (pooled point p [Q, d], pooling weights w [Q, T], token points x [Q, T, d]).
-        w is exactly 0 on padding, so sums over T need no extra mask."""
+        """-> (pooled point p [Q, d], spread [Q]). spread is the unweighted mean distance of
+        the bag's valid tokens to p."""
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
         valid = tokens.mask.flatten(1).clone()                               # [Q, T]
         cold = ~valid.any(dim=-1)                                            # [Q]
@@ -87,7 +87,11 @@ class BagWeights(nn.Module):
                             valid).to(xt.dtype)                        # [Q, T, 3]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
-        return self.geom.weighted_midpoint(x_tokens, w), w, x_tokens         # [Q, d], [Q, T], [Q, T, d]
+        p = self.geom.weighted_midpoint(x_tokens, w)                         # [Q, d]
+
+        d_tok_p = self.geom.dist(xt, p.unsqueeze(-2))                        # [Q, T]
+        spread = (d_tok_p * u).sum(-1) / u.sum(-1)                           # [Q]
+        return p, spread
 
 
 class LinkPredHead(nn.Module):
@@ -115,8 +119,8 @@ class LinkPredHead(nn.Module):
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         # Each side is pooled once, independently of the other. The candidate rows arrive
         # flattened as b*c, so the only reshaping left is folding c back out.
-        p_u = self.bag_weights(src_tokens)                                   # [b, d]
-        p_v = self.bag_weights(cand_tokens)                                  # [b*c, d]
+        p_u, _ = self.bag_weights(src_tokens)                                # [b, d]
+        p_v, _ = self.bag_weights(cand_tokens)                               # [b*c, d]
         b, d = p_u.shape
         p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
 

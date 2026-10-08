@@ -2,7 +2,7 @@
 
 Loads a Run-1 link-prediction checkpoint (`train_link_property_prediction.py
 --data-suite dyglib --save-checkpoint ...`), freezes it, and trains only a small classifier on
-6 scalars per interaction, source side (node_classification/encoder.py): 4 geometric features
+5 scalars per interaction, source side (node_classification/encoder.py): 3 geometric features
 of u's walk bag and own point, and 2 history features from Tempest's per-node event index.
 Each split is encoded once: the walks replay identically on every pass, so that one pass is
 exactly what every epoch would see.
