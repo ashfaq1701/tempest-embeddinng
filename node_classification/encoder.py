@@ -45,6 +45,21 @@ from link_property_prediction.walks import WalkGenerator
 N_GEOMETRY = 12                 # columns [0, 12)
 N_WALK = 17                     # columns [0, 17): geometry + walk time
 N_FEATURES = 22                 # columns [17, 22): Tempest history
+
+# Named column subsets for ablations. Column 15 (w-weighted log-age) reads the frozen pooler's
+# weights, so the "strict" walk-time set drops it: walk sampling only, no learned parameter.
+_GEOMETRY = list(range(0, 12))
+_WALK_TIME = list(range(12, 17))
+_WALK_TIME_STRICT = [12, 13, 14, 16]
+_HISTORY = list(range(17, 22))
+FEATURE_SETS = {
+    "all": _GEOMETRY + _WALK_TIME + _HISTORY,
+    "geometry": _GEOMETRY,
+    "geometry+walk": _GEOMETRY + _WALK_TIME,
+    "history": _HISTORY,
+    "walk+history": _WALK_TIME + _HISTORY,
+    "walk-strict+history": _WALK_TIME_STRICT + _HISTORY,
+}
 NO_EDGE_LOG_AGE = 16.0          # log1p(age) stand-in when u has no prior edge (> any real age)
 
 

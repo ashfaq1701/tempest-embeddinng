@@ -23,7 +23,7 @@ from link_property_prediction.data import concat_splits
 from link_property_prediction.dyglib_eval import load_dyglib
 from link_property_prediction.utils import seed_all
 from node_classification.classifier import NodeClassifier
-from node_classification.encoder import N_GEOMETRY, N_WALK, FrozenEncoder
+from node_classification.encoder import FEATURE_SETS, FrozenEncoder
 from node_classification.train import fit_classifier
 
 
@@ -39,10 +39,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--early-stop-patience", default=20, type=int)
     p.add_argument("--lr", default=1e-3, type=float,
                    help="Classifier lr. DyGLib uses 1e-4; 1e-3 won on validation here.")
-    p.add_argument("--no-history", action="store_true",
-                   help="Ablation: drop the 5 Tempest history features, keep the 17 walk features.")
-    p.add_argument("--geometry-only", action="store_true",
-                   help="Ablation: only the 12 geometric features (no walk-time, no history).")
+    p.add_argument("--feature-set", default="all", choices=sorted(FEATURE_SETS),
+                   help="Columns fed to the classifier. 'all' is the recipe (22); 'geometry' (12) and "
+                        "'geometry+walk' (17) drop the history; 'history' (5), 'walk+history' (10) and "
+                        "'walk-strict+history' (9, no pooler weights) drop the geometry.")
     p.add_argument("--num-walks", default=20, type=int,
                    help="Walks per node at classification time (the checkpoint trained with 5).")
     p.add_argument("--seed", default=42, type=int,
@@ -72,14 +72,9 @@ def main() -> None:
 
     features = {}
     for name, split in splits.items():
-        encoded = encoder.encode(split)
-        if args.geometry_only:
-            features[name] = encoded[:, :N_GEOMETRY]
-        elif args.no_history:
-            features[name] = encoded[:, :N_WALK]
-        else:
-            features[name] = encoded
+        features[name] = encoder.encode(split)[:, FEATURE_SETS[args.feature_set]]
     print(f"  checkpoint: {args.checkpoint}  (walks per node {encoder.walk_args['num_walks_per_node']})")
+    print(f"  feature set: {args.feature_set} ({features['train'].shape[1]} columns)")
 
     classifier = NodeClassifier(n_in=features["train"].shape[1]).to(device)
     n_params = sum(p.numel() for p in classifier.parameters())
