@@ -1,10 +1,11 @@
 """The frozen Run-1 encoder: trained E + pooler from a link-prediction checkpoint.
 
-For an interaction (u, t) it returns two geometric features of u's walk bag, from u's
-backward walks with the EXCLUSIVE cutoff t, so only edges strictly before t are seen:
+For an interaction (u, t) it returns two inputs from u's backward walks with the EXCLUSIVE
+cutoff t, so only edges strictly before t are seen:
 
-    d0(p_u)                  radius of the frozen pooler's point p_u
-    sum_i w_i d(x_i, p_u)    pooling-weighted spread of the bag's token points around p_u
+    geo [2]      d0(p_u)                radius of the frozen pooler's point p_u
+                 sum_i w_i d(x_i, p_u)  pooling-weighted spread of the bag's tokens around p_u
+    ef  [d_ef]   mean edge feature over the real edges of u's walks; zeros if u has none
 
 Freezing happens once, in `from_checkpoint`: eval(), requires_grad_(False), and `encode`
 runs under no_grad. Nothing here is ever handed to an optimiser.
@@ -14,7 +15,7 @@ Replay: Tempest's RNG advances with every walk call and has no per-call seed, so
 tgbl-wiki). Every pass over the same split therefore draws identical walks.
 """
 import hashlib
-from typing import Iterator
+from typing import Iterator, Tuple
 
 import numpy as np
 import torch
@@ -36,7 +37,10 @@ class FrozenEncoder:
         self.device = device
         self.use_gpu_tempest = bool(use_gpu_tempest)
         self.seed = int(seed)
-        self.n_feat = 2
+        if graph.edge_feat is None:
+            raise ValueError("node classification needs edge features; the graph has none")
+        self.n_geo = 2
+        self.d_ef = int(graph.edge_feat.shape[1])
 
     @classmethod
     def from_checkpoint(cls, path: str, graph: SplitData, *, device: torch.device,
@@ -72,8 +76,8 @@ class FrozenEncoder:
         return walker
 
     @torch.no_grad()
-    def encode(self, split: SplitData, batch_size: int) -> Iterator[torch.Tensor]:
-        """One replayable pass over `split` in chronological batches -> features [B, 2] per batch."""
+    def encode(self, split: SplitData, batch_size: int) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        """One replayable pass over `split` in chronological batches -> (geo [B, 2], ef [B, d_ef])."""
         walker = self._fresh_walker()
         a = self.walk_args
         for batch in create_batches(split, batch_size):
@@ -83,14 +87,22 @@ class FrozenEncoder:
                 walker, self.device, src, ts,
                 max_walk_len=a["max_walk_len"], num_walks_per_node=a["num_walks_per_node"],
                 start_bias=a["start_bias"], walk_bias=a["walk_bias"])
-            yield self._features(tokens)
+            yield self._geo_features(tokens), self._edge_features(tokens)
 
-    def _features(self, tokens: WalkTokens) -> torch.Tensor:
+    def _geo_features(self, tokens: WalkTokens) -> torch.Tensor:
         geom = self.model.geom
         p_u, w, x_tokens = self.model.bag_weights.pool(tokens)               # [Q, d], [Q, T], [Q, T, d]
         radius = geom.dist0(p_u)                                             # [Q]
         spread = (w * geom.dist(x_tokens, p_u.unsqueeze(-2))).sum(dim=-1)    # [Q]; w = 0 on padding
         return torch.stack([radius, spread], dim=-1)                         # [Q, 2]
+
+    @staticmethod
+    def _edge_features(tokens: WalkTokens) -> torch.Tensor:
+        ef = tokens.edge_features.flatten(1, 2)                              # [Q, T, d_ef]
+        real_edge = (tokens.mask & ~tokens.seed_mask).flatten(1)             # [Q, T]
+        weight = real_edge.unsqueeze(-1).to(ef.dtype)                        # [Q, T, 1]
+        n_edges = weight.sum(dim=1).clamp_min(1.0)                           # [Q, 1]
+        return (ef * weight).sum(dim=1) / n_edges                            # [Q, d_ef]
 
     def state_hash(self) -> str:
         """Fingerprint of every encoder weight, for the before/after-training check."""

@@ -6,7 +6,8 @@
     weights bit-identical
   - replay: two encoding passes over the same split give bitwise-identical features
   - checkpoint round trip: the rebuilt encoder carries the trained weights exactly
-  - features are [d0(p_u), sum_i w_i d(x_i, p_u)], and pool()[0] is forward() exactly
+  - geo features are [d0(p_u), sum_i w_i d(x_i, p_u)], and pool()[0] is forward() exactly
+  - ef is the mean feature of u's real walk edges (seed slot and padding excluded)
 """
 import numpy as np
 import pytest
@@ -75,7 +76,7 @@ def test_optimiser_excludes_encoder_and_training_leaves_it_unchanged(encoder):
     labels = {name: (rng.random(len(s.sources)) < 0.3).astype(np.float32)
               for name, s in splits.items()}
 
-    classifier = NodeClassifier(n_feat=encoder.n_feat)
+    classifier = NodeClassifier(n_geo=encoder.n_geo, d_ef=encoder.d_ef)
     encoder_params = {id(p) for p in encoder.model.parameters()}
     assert not any(id(p) in encoder_params for p in classifier.parameters())
     assert not any(p.requires_grad for p in encoder.model.parameters())
@@ -90,8 +91,8 @@ def test_two_passes_replay_identical_features(encoder):
     first = list(encoder.encode(encoder.graph, batch_size=64))
     second = list(encoder.encode(encoder.graph, batch_size=64))
     assert len(first) == len(second)
-    for f1, f2 in zip(first, second):
-        assert torch.equal(f1, f2)
+    for (g1, e1), (g2, e2) in zip(first, second):
+        assert torch.equal(g1, g2) and torch.equal(e1, e2)
 
 
 def test_checkpoint_round_trip_restores_trained_weights(encoder):
@@ -111,7 +112,7 @@ def test_features_are_radius_and_weighted_spread(encoder):
     geom = encoder.model.geom
     with torch.no_grad():
         p_u, w, x_tokens = encoder.model.bag_weights.pool(tokens)
-        feats = encoder._features(tokens)
+        feats = encoder._geo_features(tokens)
         assert torch.equal(p_u, encoder.model.bag_weights(tokens))      # pool()[0] is forward()
         valid = w > 0
         spread = torch.stack([(w[q, valid[q]] * geom.dist(x_tokens[q, valid[q]], p_u[q])).sum()
@@ -119,3 +120,20 @@ def test_features_are_radius_and_weighted_spread(encoder):
     assert feats.shape == (len(p_u), 2)
     torch.testing.assert_close(feats[:, 0], geom.dist0(p_u))
     torch.testing.assert_close(feats[:, 1], spread)
+
+
+def test_edge_features_are_the_mean_over_real_walk_edges(encoder):
+    walker = encoder._fresh_walker()
+    graph = encoder.graph
+    tokens = build_query_walk_tokens(
+        walker, torch.device("cpu"),
+        torch.from_numpy(graph.sources[200:260]), torch.from_numpy(graph.timestamps[200:260]),
+        max_walk_len=5, num_walks_per_node=4,
+        start_bias="ExponentialWeight", walk_bias="ExponentialWeight")
+    ef = encoder._edge_features(tokens)
+    real_edge = (tokens.mask & ~tokens.seed_mask).flatten(1)
+    flat = tokens.edge_features.flatten(1, 2)
+    for q in range(len(ef)):
+        expected = (flat[q, real_edge[q]].mean(dim=0) if real_edge[q].any()
+                    else torch.zeros(flat.shape[-1]))
+        torch.testing.assert_close(ef[q], expected)
