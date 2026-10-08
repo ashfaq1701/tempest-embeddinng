@@ -32,17 +32,12 @@ ZENODO_RECORD = "https://zenodo.org/api/records/7213796"
 VAL_QUANTILE, TEST_QUANTILE = 0.70, 0.85
 
 
-class DyGLibData(NamedTuple):
-    loaded: Loaded                      # the vocabulary every suite shares
-    labels: Dict[str, np.ndarray]       # "train" / "val" / "test" -> [E_split] float32
-
-
 def _paths(name: str, root: str):
     data_dir = os.path.join(root, name)
     return data_dir, os.path.join(data_dir, f"ml_{name}.csv"), os.path.join(data_dir, f"ml_{name}.npy")
 
 
-def fetch_dyglib(name: str, root: str) -> None:
+def _fetch(name: str, root: str) -> None:
     """Download `<name>.zip` from the Zenodo record if its processed files are missing,
     verify the record's md5, and extract only `ml_<name>.csv` and `ml_<name>.npy`."""
     import requests
@@ -86,11 +81,17 @@ def fetch_dyglib(name: str, root: str) -> None:
     print(f"  [dyglib] extracted ml_{name}.csv / .npy into {data_dir}")
 
 
-def read_dyglib(name: str, root: str = "datasets") -> DyGLibData:
-    """The one parser of `ml_<name>.*`: splits, edge features and per-interaction labels."""
+class DyGLibDataset(NamedTuple):
+    """`Loaded.dataset` for this suite: what DyGLib carries beyond the shared splits."""
+    labels: Dict[str, np.ndarray]       # "train" / "val" / "test" -> [E_split] float32
+
+
+def load_dyglib(name: str, root: str = "datasets") -> Loaded:
+    """Native DyGLib load -> suite-agnostic `Loaded`, downloading on first use. The
+    per-interaction labels ride on `Loaded.dataset` (a `DyGLibDataset`)."""
     import pandas as pd
 
-    fetch_dyglib(name, root)
+    _fetch(name, root)
     _, csv_path, npy_path = _paths(name, root)
     df = pd.read_csv(csv_path)
     edge_feat_table = np.load(npy_path)
@@ -119,15 +120,14 @@ def read_dyglib(name: str, root: str = "datasets") -> DyGLibData:
         return SplitData(sources=src[mask], destinations=dst[mask],
                          timestamps=ts[mask], edge_feat=edge_feat[mask])
 
-    loaded = Loaded(
+    return Loaded(
         train=_split(masks["train"]),
         val=_split(masks["val"]),
         test=_split(masks["test"]),
-        dataset=None,                   # no live handle: negatives are ours, labels are below
+        dataset=DyGLibDataset(labels={k: labels[m] for k, m in masks.items()}),
         name=name,
         max_node_count=int(max(src.max(), dst.max())) + 1,
     )
-    return DyGLibData(loaded=loaded, labels={k: labels[m] for k, m in masks.items()})
 
 
 class DyGLibSuite(DataSuite):
@@ -135,7 +135,7 @@ class DyGLibSuite(DataSuite):
     negatives at `k_eval` (seeded, test one seed apart from val), scored by MRR."""
 
     def _load(self) -> Loaded:
-        return read_dyglib(self.name, self.root).loaded
+        return load_dyglib(self.name, self.root)
 
     def make_evaluator(self, split_mode: str) -> Evaluator:
         loaded = self.load()

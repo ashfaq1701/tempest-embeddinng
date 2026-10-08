@@ -16,7 +16,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 import torch
 
 from link_property_prediction.data import concat_splits
-from link_property_prediction.dyglib_eval import read_dyglib
+from link_property_prediction.dyglib_eval import load_dyglib
 from link_property_prediction.utils import seed_all
 from node_classification.classifier import NodeClassifier
 from node_classification.encoder import FrozenEncoder
@@ -46,11 +46,11 @@ def main() -> None:
     seed_all(args.seed)
     device = torch.device("cuda" if args.use_gpu and torch.cuda.is_available() else "cpu")
 
-    data = read_dyglib(args.dataset, args.data_root)
-    loaded = data.loaded
+    loaded = load_dyglib(args.dataset, args.data_root)
+    labels = loaded.dataset.labels
     splits = {"train": loaded.train, "val": loaded.val, "test": loaded.test}
     for name, split in splits.items():
-        n_pos = int(data.labels[name].sum())
+        n_pos = int(labels[name].sum())
         print(f"  {name:5s} interactions {len(split.sources):>8,}  positives {n_pos:>5,}")
 
     encoder = FrozenEncoder.from_checkpoint(
@@ -63,7 +63,7 @@ def main() -> None:
 
     hash_before = encoder.state_hash()
     result = fit_classifier(
-        encoder, classifier, splits, data.labels,
+        encoder, classifier, splits, labels,
         batch_size=args.batch_size, lr=args.lr,
         num_epochs=args.num_epochs, patience=args.early_stop_patience)
     if encoder.state_hash() != hash_before:
