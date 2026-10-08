@@ -9,8 +9,9 @@ beats every published dynamic-node-classification result on both DyGLib datasets
 | best published | JODIE 88.99 ± 1.05 | TAWRMAC 71.45 ± 0.92 |
 | margin | **+1.29** | **+2.18** |
 
-Every feature comes from the frozen encoder's Tempest instance: walks over the trained
-hyperbolic embedding, plus Tempest's own per-node event index for the history columns.
+Every feature comes from the frozen encoder and its Tempest instance: walks over the trained
+hyperbolic embedding, one embedding lookup, and Tempest's own per-node event index for the
+history columns. Section 2 lists which is which.
 
 Code: branch `feature/node-classification-geo-walk-hist`, recipe commit `85662e1`.
 Logs: `logs/node_cls_tempest_hist/k5/seed*/` (recipe); `logs/node_cls_final*/k5/seed*/`
@@ -59,6 +60,18 @@ Per interaction, 22 scalars:
 
 Here `p_u` is the frozen pooler's point, `w` its weights, `x_i` the bag's token points and `d0`
 the hyperbolic radius.
+
+**Where each feature comes from.** Not all 22 are walk features:
+
+| source | features | count |
+|---|---|---|
+| Tempest walks (sampled bag, pooled by the frozen pooler) | 11 geometric + 5 walk-time | 16 |
+| embedding table, no walk | `d0(E[u])`, the radius of `u`'s own trained point | 1 |
+| walk **and** embedding | `d(E[u], p_u)` | (counted in the 11) |
+| Tempest per-node event index (`get_latest_events_for_nodes`, `get_node_participation_counts`), no walk | the 5 history columns | 5 |
+
+`d0(E[u])` involves no sampling at classification time, but the table it reads was trained
+through walks during link prediction. It is the single strongest feature on Wikipedia.
 
 **Classifier:** `BatchNorm(22) → 22 → GELU → 32 → GELU → 32 → GELU → Dropout(0.1) → 1`.
 Adam at lr 1e-3, BCE, batch 200, **shuffled** batches, 100 epochs / patience 20 on validation
@@ -122,6 +135,12 @@ sit near the origin, which in this geometry means low activity. The history colu
 but the walk-time features (+3.8) and the history columns (+5.0) are what carry the margin over
 TAWRMAC. The Wikipedia ablation does not generalise; report both.
 
+**Without the history columns** (`--no-history`, 17 features) the model ranks **1st of 12 on
+Wikipedia** (89.91, +0.92 over JODIE) and **6th of 12 on Reddit** (68.63: below TAWRMAC
+71.45, DyG-Mamba 70.79, TGAT 70.04, TIDFormer 69.59 and TCL 68.87; above DyGFormer 68.00 and
+the rest). Its average rank, 3.5, ties TAWRMAC's and trails DyG-Mamba's 3.0. The full recipe
+is 1st on both.
+
 ## 4. How the recipe was chosen
 
 All exploration ran on the **Wikipedia seed-42 checkpoint**, on a cached feature table in
@@ -135,6 +154,8 @@ scratch. Sweeps printed train and validation AUC only; test AUC went to a sealed
   (val-selected, test 0.898). It did not drive any later choice.
 - **The recipe was frozen on Wikipedia and applied to Reddit unchanged.** There was no
   Reddit-specific selection of any kind.
+- Selection used the first, numpy-scan history columns. They were later swapped for the
+  Tempest-derived ones (section 3) for code reasons, without re-selecting anything.
 
 What moved the number:
 
@@ -142,7 +163,7 @@ What moved the number:
 |---|---|
 | starting classifier, `[d0(p_u), Σ w d(x, p_u)]` | val 0.69, test 0.779 |
 | + `d0(E[u])` (radius of the user's own point) | val 0.69 → 0.85 |
-| full geometric set + walk time + exact history | val 0.890 ± 0.003 (5 seeds) |
+| full geometric set + walk time + history (numpy-scan version) | val 0.890 ± 0.003 (5 seeds) |
 | 20 walks per node instead of 5 (50 lost) | +0.007 val, on both criteria |
 | shuffled classifier batches | +0.010 CV; in time order the rare positives arrive in clumps |
 
@@ -162,7 +183,7 @@ What moved the number:
 - **Head and optimiser variants** all tie or lose: wider, deeper, dropout 0.3, positive
   weighting, weight decay, batch 1000, lr 1e-4 (DyGLib's own).
 
-## 6. Bugs found on the way
+## 6. Bugs and pitfalls found on the way
 
 1. **`BagWeights` holds `E` as a submodule.** `bag_weights.requires_grad_(False)` therefore
    silently re-froze `E`, so the first "fine-tuning" runs were frozen. When fine-tuning, set
@@ -216,3 +237,7 @@ What moved the number:
 - **New `dyglib` data suite** (auto-download by name from Zenodo, MD5-checked), plus
   `--save-checkpoint` for link prediction, the `node_classification/` package, and
   `scripts/train_node_classification.py`.
+- **`walks.py` history helpers.** `get_candidate_recency/popularity` were renamed
+  `get_node_recency/popularity`, and a new `get_latest_events` returns both the partner and
+  the time of each node's last prior edge. `node_classification/history.py` (the numpy scan)
+  was removed.
