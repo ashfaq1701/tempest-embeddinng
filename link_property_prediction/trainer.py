@@ -197,7 +197,7 @@ class Trainer:
     def _head_probe(self) -> str:
         """The head's scalar parameters, for the epoch line. Read via hasattr so a head with a different
         set of knobs degrades to a shorter line rather than raising. w weights the scorer's
-        [-geo, spread_v, entropy_v] columns."""
+        [-geo, spread_v] columns."""
         parts = []
         if hasattr(self.model, "temperature"):
             parts.append(f"temp={float(self.model.temperature):.3f}")
