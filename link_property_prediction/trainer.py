@@ -202,6 +202,13 @@ class Trainer:
             parts.append(f"temp={float(self.model.temperature):.3f}")
         if hasattr(self.model, "geo_temp"):
             parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
+        # The residual pooler's linear branch, if present: the weighting's linear law in
+        # standardised units, one weight per feature. Without it a null cannot say whether
+        # the skip carried the model or stayed at its zero init.
+        bw = getattr(self.model, "bag_weights", None)
+        if bw is not None and hasattr(bw, "skip"):
+            w = bw.skip.weight.detach().flatten().tolist()
+            parts.append("skip=[" + ",".join(f"{x:+.4f}" for x in w) + "]")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad
