@@ -22,9 +22,9 @@ import torch
 from link_property_prediction.data import concat_splits
 from link_property_prediction.dyglib_eval import load_dyglib
 from link_property_prediction.utils import seed_all
-from node_classification.classifier import NodeClassifier
 from node_classification.encoder import FrozenEncoder
-from node_classification.train import fit_classifier
+from node_classification.model import NodeClassifier
+from node_classification.trainer import fit_classifier
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--early-stop-patience", default=20, type=int)
     p.add_argument("--lr", default=1e-3, type=float,
                    help="Classifier lr. DyGLib uses 1e-4; 1e-3 won on validation here.")
-    p.add_argument("--num-walks", default=20, type=int,
+    p.add_argument("--num-walks-per-node", default=20, type=int,
                    help="Walks per node at classification time (the checkpoint trained with 5).")
     p.add_argument("--seed", default=42, type=int,
                    help="Classifier init and walk seed; pair seed k with the seed-k checkpoint.")
@@ -63,7 +63,7 @@ def main() -> None:
     stream = concat_splits(loaded.train, loaded.val, loaded.test)
     encoder = FrozenEncoder.from_checkpoint(
         args.checkpoint, stream, device=device, use_gpu_tempest=args.use_gpu_tempest,
-        seed=args.seed, num_walks_per_node=args.num_walks)
+        seed=args.seed, num_walks_per_node=args.num_walks_per_node)
     hash_before = encoder.state_hash()
 
     features = {}

@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 
-from .classifier import NodeClassifier
+from .model import NodeClassifier
 
 
 class ClassifierResult(NamedTuple):

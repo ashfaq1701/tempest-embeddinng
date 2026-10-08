@@ -11,7 +11,7 @@ bag's token points, d the hyperbolic distance, d0 the radius.
     -sum_i a_i log a_i              and that attention's entropy (p_u as the key)
   Tempest history (2), from Tempest's per-node event index
     log1p(#u's prior edges)       get_node_popularity
-    log1p(t - u's last edge time) get_node_recency; a missing event maps to
+    log1p(t - u's last edge time) get_node_recency; no prior edge maps to
                                   log1p(time span of the whole graph), older than any real gap
 
 These seven were selected from a 22-column candidate set by group-drop then candidate pruning
@@ -127,10 +127,10 @@ class FrozenEncoder:
         src = src.astype(np.int64)
         ts = ts.astype(np.int64)
         out = np.zeros((len(src), 2), dtype=np.float32)
-        out[:, 0] = np.log1p(walker.get_node_popularity(src, ts))
-        _, t_last = walker.get_latest_events(src, ts)
-        out[:, 1] = np.where(t_last >= 0, np.log1p(np.maximum(ts - t_last, 0)),
-                             self.no_event_log_gap)
+        count = walker.get_node_popularity(src, ts)
+        recency = walker.get_node_recency(src, ts)        # t - t_last; meaningless if count == 0
+        out[:, 0] = np.log1p(count)
+        out[:, 1] = np.where(count > 0, np.log1p(recency), self.no_event_log_gap)
         return torch.from_numpy(out)
 
     def state_hash(self) -> str:

@@ -137,7 +137,6 @@ class TGBEvaluator(Evaluator):
 
         if split_mode not in ("val", "test"):
             raise ValueError(f"split_mode must be 'val' or 'test', got {split_mode!r}")
-        self._dataset = dataset
         self._split_mode = split_mode
         self._sampler = dataset.negative_sampler
         self.eval_metric = eval_metric
