@@ -19,6 +19,7 @@ Negatives follow OUR convention, not DyGLib's 1:1 random AP/AUC: val and test ea
 import hashlib
 import os
 import shutil
+import subprocess
 import zipfile
 from typing import Dict, NamedTuple
 
@@ -73,17 +74,33 @@ def _fetch(name: str, root: str) -> None:
                       f"(got {md5.hexdigest()}, record says {expected}); removed, retry.")
 
     wanted = {f"{name}/ml_{name}.csv": csv_path, f"{name}/ml_{name}.npy": npy_path}
-    with zipfile.ZipFile(zip_path) as zf:
-        for member, dest in wanted.items():
-            with zf.open(member) as packed, open(dest, "wb") as out:
-                shutil.copyfileobj(packed, out)
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            for member, dest in wanted.items():
+                with zf.open(member) as packed, open(dest, "wb") as out:
+                    shutil.copyfileobj(packed, out)
+    except NotImplementedError:
+        # reddit.zip is Deflate64, which Python's zipfile cannot decompress; Info-ZIP can.
+        subprocess.run(["unzip", "-o", "-j", zip_path, *wanted, "-d", data_dir], check=True,
+                       stdout=subprocess.DEVNULL)
     os.remove(zip_path)
     print(f"  [dyglib] extracted ml_{name}.csv / .npy into {data_dir}")
+
+
+def _integral_time_scale(name: str, ts: np.ndarray) -> int:
+    """Smallest power of ten that makes every timestamp integral, so the int64 cast keeps every
+    gap exact (Wikipedia ships whole seconds -> 1; Reddit ships milliseconds -> 1000)."""
+    for k in range(7):
+        scaled = ts * 10 ** k
+        if np.abs(scaled - np.round(scaled)).max() < 1e-3:
+            return 10 ** k
+    raise ValueError(f"{name}: timestamps are not integral at any scale up to 1e6")
 
 
 class DyGLibDataset(NamedTuple):
     """`Loaded.dataset` for this suite: what DyGLib carries beyond the shared splits."""
     labels: Dict[str, np.ndarray]       # "train" / "val" / "test" -> [E_split] float32
+    time_scale: int                     # int64 timestamps = shipped float ts * time_scale
 
 
 def load_dyglib(name: str, root: str = "datasets") -> Loaded:
@@ -97,14 +114,13 @@ def load_dyglib(name: str, root: str = "datasets") -> Loaded:
     edge_feat_table = np.load(npy_path)
 
     ts_float = df.ts.to_numpy(dtype=np.float64)
-    if not np.all(ts_float == np.floor(ts_float)):
-        raise ValueError(f"{name}: non-integral timestamps; the int64 cast would truncate")
+    time_scale = _integral_time_scale(name, ts_float)
     if not np.all(np.diff(ts_float) >= 0):
         raise ValueError(f"{name}: edges are not in time order")
 
     src = df.u.to_numpy(dtype=np.int64)
     dst = df.i.to_numpy(dtype=np.int64)
-    ts = ts_float.astype(np.int64)
+    ts = np.round(ts_float * time_scale).astype(np.int64)
     edge_feat = edge_feat_table[df.idx.to_numpy()].astype(np.float32)
     labels = df.label.to_numpy(dtype=np.float32)
 
@@ -124,7 +140,8 @@ def load_dyglib(name: str, root: str = "datasets") -> Loaded:
         train=_split(masks["train"]),
         val=_split(masks["val"]),
         test=_split(masks["test"]),
-        dataset=DyGLibDataset(labels={k: labels[m] for k, m in masks.items()}),
+        dataset=DyGLibDataset(labels={k: labels[m] for k, m in masks.items()},
+                              time_scale=time_scale),
         name=name,
         max_node_count=int(max(src.max(), dst.max())) + 1,
     )
