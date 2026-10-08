@@ -6,7 +6,7 @@
     weights bit-identical
   - replay: two encoding passes over the same split give bitwise-identical features
   - checkpoint round trip: the rebuilt encoder carries the trained weights exactly
-  - z_geo is the tangent vector at the origin: its norm is the radius dist0(p_u)
+  - features are [d0(p_u), sum_i w_i d(x_i, p_u)], and pool()[0] is forward() exactly
 """
 import numpy as np
 import pytest
@@ -75,7 +75,7 @@ def test_optimiser_excludes_encoder_and_training_leaves_it_unchanged(encoder):
     labels = {name: (rng.random(len(s.sources)) < 0.3).astype(np.float32)
               for name, s in splits.items()}
 
-    classifier = NodeClassifier(d_geo=encoder.d_geo, d_ef=encoder.d_ef)
+    classifier = NodeClassifier(n_feat=encoder.n_feat)
     encoder_params = {id(p) for p in encoder.model.parameters()}
     assert not any(id(p) in encoder_params for p in classifier.parameters())
     assert not any(p.requires_grad for p in encoder.model.parameters())
@@ -89,8 +89,9 @@ def test_optimiser_excludes_encoder_and_training_leaves_it_unchanged(encoder):
 def test_two_passes_replay_identical_features(encoder):
     first = list(encoder.encode(encoder.graph, batch_size=64))
     second = list(encoder.encode(encoder.graph, batch_size=64))
-    for (g1, e1), (g2, e2) in zip(first, second):
-        assert torch.equal(g1, g2) and torch.equal(e1, e2)
+    assert len(first) == len(second)
+    for f1, f2 in zip(first, second):
+        assert torch.equal(f1, f2)
 
 
 def test_checkpoint_round_trip_restores_trained_weights(encoder):
@@ -99,7 +100,7 @@ def test_checkpoint_round_trip_restores_trained_weights(encoder):
         assert torch.equal(tensor, reference[name]), name
 
 
-def test_z_geo_norm_is_the_radius(encoder):
+def test_features_are_radius_and_weighted_spread(encoder):
     walker = encoder._fresh_walker()
     graph = encoder.graph
     tokens = build_query_walk_tokens(
@@ -107,8 +108,14 @@ def test_z_geo_norm_is_the_radius(encoder):
         torch.from_numpy(graph.sources[200:260]), torch.from_numpy(graph.timestamps[200:260]),
         max_walk_len=5, num_walks_per_node=4,
         start_bias="ExponentialWeight", walk_bias="ExponentialWeight")
+    geom = encoder.model.geom
     with torch.no_grad():
-        p_u = encoder.model.bag_weights(tokens)
-        z_geo = encoder._z_geo(tokens)
-    torch.testing.assert_close(z_geo.norm(dim=-1), encoder.model.geom.dist0(p_u),
-                               rtol=1e-5, atol=1e-6)
+        p_u, w, x_tokens = encoder.model.bag_weights.pool(tokens)
+        feats = encoder._features(tokens)
+        assert torch.equal(p_u, encoder.model.bag_weights(tokens))      # pool()[0] is forward()
+        valid = w > 0
+        spread = torch.stack([(w[q, valid[q]] * geom.dist(x_tokens[q, valid[q]], p_u[q])).sum()
+                              for q in range(len(p_u))])
+    assert feats.shape == (len(p_u), 2)
+    torch.testing.assert_close(feats[:, 0], geom.dist0(p_u))
+    torch.testing.assert_close(feats[:, 1], spread)

@@ -37,8 +37,7 @@ def _label_batches(labels: np.ndarray, batch_size: int, device) -> Iterator[torc
 def evaluate_auc(encoder: FrozenEncoder, classifier: NodeClassifier, split: SplitData,
                  labels: np.ndarray, batch_size: int) -> float:
     classifier.eval()
-    scores = [classifier(z_geo, z_ef).cpu()
-              for z_geo, z_ef in encoder.encode(split, batch_size)]
+    scores = [classifier(feats).cpu() for feats in encoder.encode(split, batch_size)]
     return float(roc_auc_score(labels, torch.cat(scores).numpy()))
 
 
@@ -57,10 +56,10 @@ def fit_classifier(encoder: FrozenEncoder, classifier: NodeClassifier,
         loss_sum, n_batches = 0.0, 0
         batches = zip(encoder.encode(splits["train"], batch_size),
                       _label_batches(labels["train"], batch_size, encoder.device))
-        for (z_geo, z_ef), y in batches:
+        for feats, y in batches:
             if len(y) < 2:              # BatchNorm cannot train on a single row
                 continue
-            loss = F.binary_cross_entropy_with_logits(classifier(z_geo, z_ef), y)
+            loss = F.binary_cross_entropy_with_logits(classifier(feats), y)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()

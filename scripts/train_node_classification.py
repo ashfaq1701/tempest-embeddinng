@@ -2,7 +2,7 @@
 
 Loads a Run-1 link-prediction checkpoint (`train_link_property_prediction.py
 --data-suite dyglib --save-checkpoint ...`), freezes it, and trains only a small
-classifier on [log_O(p_u), mean walk edge feature] per interaction, source side.
+classifier on [d0(p_u), sum_i w_i d(x_i, p_u)] per interaction, source side.
 """
 
 import argparse
@@ -56,7 +56,7 @@ def main() -> None:
     encoder = FrozenEncoder.from_checkpoint(
         args.checkpoint, concat_splits(loaded.train, loaded.val, loaded.test),
         device=device, use_gpu_tempest=args.use_gpu_tempest, seed=args.seed)
-    classifier = NodeClassifier(d_geo=encoder.d_geo, d_ef=encoder.d_ef).to(device)
+    classifier = NodeClassifier(n_feat=encoder.n_feat).to(device)
     n_params = sum(p.numel() for p in classifier.parameters())
     print(f"  checkpoint: {args.checkpoint}")
     print(f"  classifier params: {n_params:,}  (encoder frozen)")
