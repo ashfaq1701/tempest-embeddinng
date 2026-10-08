@@ -1,32 +1,5 @@
-"""The frozen Run-1 encoder: trained E + pooler from a link-prediction checkpoint.
-
-For an interaction (u, t) it returns 5 numbers, every one causal (EXCLUSIVE cutoff t, so only
-edges strictly before t are seen). p_u is the frozen pooler's point for u's walk bag, x_i the
-bag's token points, d the hyperbolic distance, d0 the radius.
-
-  geometry (3)
-    d0(p_u)                       radius of the pooled point
-    d0(E[u])                      radius of u's own trained point
-    mean_i d(x_i, p_u)            unweighted spread: mean distance of the bag's valid tokens
-                                  to p_u
-  Tempest history (2), from Tempest's per-node event index
-    log1p(#u's prior edges)       get_node_popularity
-    log1p(t - u's last edge time) get_node_recency; no prior edge maps to
-                                  log1p(time span of the whole graph), older than any real gap
-
-These were selected from a 22-column candidate set by group-drop then candidate pruning
-on chronological CV over train ∪ val (reports/node_classification_2026-10-08.md); the spread
-was later switched from a separate softmax(-d) attention to a plain mean and the entropy
-column dropped.
-
-Freezing happens once, in `from_checkpoint`: eval(), requires_grad_(False), and `encode`
-runs under no_grad. Nothing here is ever handed to an optimiser.
-
-Replay: Tempest's RNG advances with every walk call and has no per-call seed, so each
-`encode` pass builds a FRESH walker with the same seed and re-ingests the graph. Every pass
-over the same split therefore draws identical walks, so one pass is exactly what every
-training epoch would see.
-"""
+"""Frozen link-prediction encoder -> 5 causal features per interaction (u, t):
+d0(p_u), d0(E[u]), mean_i d(x_i, p_u), log1p(#prior edges), log1p(t - last edge time)."""
 import hashlib
 
 import numpy as np
@@ -56,9 +29,6 @@ class FrozenEncoder:
     def from_checkpoint(cls, path: str, graph: SplitData, *, device: torch.device,
                         use_gpu_tempest: bool, seed: int,
                         num_walks_per_node: int = 0) -> "FrozenEncoder":
-        """Rebuild the Run-1 model from the checkpoint's own args and load its weights.
-        `graph` is the full stream (all splits) the walks run over. `num_walks_per_node`
-        overrides the checkpoint's walk count (0 keeps it)."""
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         args, state = ckpt["args"], ckpt["state_dict"]
         num_nodes, d_emb = state["E.weight"].shape
@@ -73,7 +43,8 @@ class FrozenEncoder:
         return cls(model, walk_args, graph, device, use_gpu_tempest, seed)
 
     def _fresh_walker(self) -> WalkGenerator:
-        """Same construction as Trainer's walker, seeded, with the whole graph ingested."""
+        # Tempest's RNG has no per-call seed: only a fresh walker with the same seed replays
+        # the same walks.
         a = self.walk_args
         walker = WalkGenerator(
             use_gpu=self.use_gpu_tempest,
@@ -91,7 +62,6 @@ class FrozenEncoder:
 
     @torch.no_grad()
     def encode(self, split: SplitData, batch_size: int = 200) -> torch.Tensor:
-        """One replayable pass over `split` in chronological batches -> features [N, 5]."""
         walker = self._fresh_walker()
         a = self.walk_args
         out = []
@@ -105,10 +75,9 @@ class FrozenEncoder:
             geometry = self._geometry(tokens, src.to(self.device))
             history = self._history(walker, batch.src, batch.ts)
             out.append(torch.cat([geometry, history.to(self.device)], dim=1))
-        return torch.cat(out)
+        return torch.cat(out)                                                # [N, 5]
 
     def _geometry(self, tokens: WalkTokens, src: torch.Tensor) -> torch.Tensor:
-        """The 3 geometric columns; see the module docstring."""
         geom = self.model.geom
         p_u, spread = self.model.bag_weights(tokens)                         # [Q, d], [Q]
         e_u = self.model.E.weight[src]                                       # [Q, d]
@@ -120,18 +89,17 @@ class FrozenEncoder:
         return torch.stack(geometry, dim=-1)                                 # [Q, 3]
 
     def _history(self, walker: WalkGenerator, src: np.ndarray, ts: np.ndarray) -> torch.Tensor:
-        """The 2 Tempest history columns for queries (u, t); see the module docstring."""
         src = src.astype(np.int64)
         ts = ts.astype(np.int64)
         out = np.zeros((len(src), 2), dtype=np.float32)
         count = walker.get_node_popularity(src, ts)
-        recency = walker.get_node_recency(src, ts)        # t - t_last; meaningless if count == 0
+        recency = walker.get_node_recency(src, ts)
         out[:, 0] = np.log1p(count)
+        # No prior edge: recency is undefined, use a gap older than any real one.
         out[:, 1] = np.where(count > 0, np.log1p(recency), self.no_event_log_gap)
         return torch.from_numpy(out)
 
     def state_hash(self) -> str:
-        """Fingerprint of every encoder weight, for the before/after-training check."""
         h = hashlib.sha256()
         for name, tensor in sorted(self.model.state_dict().items()):
             h.update(name.encode())

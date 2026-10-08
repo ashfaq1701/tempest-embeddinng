@@ -1,13 +1,3 @@
-"""The node classifier: 5 standardised scalars in (3 geometric + 2 history), one logit out.
-
-    BatchNorm1d(n) -> Linear(n, m) -> GELU -> Linear(m, 32) -> GELU      input stem, m = max(16, n)
-    -> Linear(32, 32) -> GELU -> Dropout(0.1) -> Linear(32, 1)            head
-
-BatchNorm standardises each feature over the batch (radii, distances, log-times and counts are
-on unrelated scales) and keeps running statistics for eval. Small on purpose:
-Wikipedia has 156 positive training interactions, and every wider or deeper variant tried tied
-or overfit.
-"""
 import torch
 import torch.nn as nn
 
@@ -30,5 +20,4 @@ class NodeClassifier(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """[B, n_in] -> logits [B]."""
-        return self.net(x).squeeze(-1)
+        return self.net(x).squeeze(-1)                                       # [B]

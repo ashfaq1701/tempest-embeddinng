@@ -1,21 +1,3 @@
-"""Walk-bag pooler and the link-prediction head.
-
-Pooling weights are `softmax(skip(f) + MLP(f))` over the walk-token bag with
-`f = standardise(features)`, features `[log1p(age), pos, d_mid]`, n_feat 3, pooler 1,220
-params at nl2 (164 at nl1). `skip` is a `Linear(3, 1, bias=False)` initialised at
-`[-1, -1, 0]`: the residual's identity branch, carrying whatever part of the weighting is
-linear in the standardised features, with the MLP left to carry the curved part. That init
-makes step 0 the sigma-unit recency prior rather than master, and the weights stay free, so
-`skip.weight` after training reads out the pooler's linear law in standardised units.
-The pooled point is a weighted Lorentz midpoint; the scorer is `geo_temp * (-d(p_u, p_v))`.
-
-`cos_o` -- the angle at the origin between token and bag centre -- was removed at
-791360a. It lowered the TRAINING loss and widened the val->test gap: on YouTube the loss
-ratio reached 2.15 at ep18, both runs reached the same best val (0.6823 vs 0.6819) and the
-gap to test was 0.0890 with it against 0.0714 without, worth +0.0159 on test to remove.
-Recover it from d36ce26^ if you want to re-run those arms; WikiLink is the one dataset
-that preferred it.
-"""
 import geoopt
 import torch
 import torch.nn as nn
@@ -28,7 +10,6 @@ _VAR_FLOOR = 1e-12
 
 
 def standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-    """Per-feature standardisation over the valid tokens of the whole batch."""
     m = valid.unsqueeze(-1).to(feat.dtype)                                   # [Q, T, 1]
     n = m.sum(dim=(0, 1)).clamp_min(1.0)                                     # [F]
     mu = (feat * m).sum(dim=(0, 1)) / n                                      # [F]
@@ -37,7 +18,6 @@ def standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
 
 
 class BagWeights(nn.Module):
-    """One query's walk bag -> one point on the manifold."""
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
                  n_layers: int = 2):
@@ -53,7 +33,7 @@ class BagWeights(nn.Module):
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
         layers.append(nn.Linear(self.hidden, 1))
-        self.net = nn.Sequential(*layers)                 # correction (residual) branch
+        self.net = nn.Sequential(*layers)
 
         self.skip = nn.Linear(self.n_feat, 1, bias=False)
         with torch.no_grad():
@@ -63,8 +43,6 @@ class BagWeights(nn.Module):
         return self.pool(tokens)
 
     def pool(self, tokens: WalkTokens):
-        """-> (pooled point p [Q, d], spread [Q]). spread is the unweighted mean distance of
-        the bag's valid tokens to p."""
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
         valid = tokens.mask.flatten(1).clone()                               # [Q, T]
         cold = ~valid.any(dim=-1)                                            # [Q]
@@ -117,8 +95,6 @@ class LinkPredHead(nn.Module):
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        # Each side is pooled once, independently of the other. The candidate rows arrive
-        # flattened as b*c, so the only reshaping left is folding c back out.
         p_u, _ = self.bag_weights(src_tokens)                                # [b, d]
         p_v, _ = self.bag_weights(cand_tokens)                               # [b*c, d]
         b, d = p_u.shape

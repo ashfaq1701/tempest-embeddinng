@@ -1,14 +1,3 @@
-"""Train the node classifier on frozen-encoder features (DyGLib's node-classification protocol).
-
-Adam over the classifier's parameters ONLY; BCE-with-logits on one label per interaction
-(source side); val ROC-AUC over the whole split drives early stopping; test AUC is read at
-the best-val classifier state.
-
-Training batches are shuffled. The features are already causal (each row was encoded with the
-exclusive cutoff of its own interaction), so the order rows are visited in carries no leak;
-in time order the rare positives arrive in clumps, which skews both the gradient and
-BatchNorm's batch statistics.
-"""
 import copy
 import time
 from typing import Dict, List, NamedTuple
@@ -52,6 +41,8 @@ def fit_classifier(classifier: NodeClassifier, features: Dict[str, torch.Tensor]
     for epoch in range(1, num_epochs + 1):
         classifier.train()
         t0 = time.time()
+        # Rows are encoded causally, so shuffling leaks nothing; in time order the rare
+        # positives arrive in clumps.
         perm = torch.randperm(len(x_train), generator=order).to(device)
         loss_sum, n_batches = 0.0, 0
         for start in range(0, len(perm), batch_size):
