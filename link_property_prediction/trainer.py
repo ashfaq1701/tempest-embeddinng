@@ -196,12 +196,14 @@ class Trainer:
     @torch.no_grad()
     def _head_probe(self) -> str:
         """The head's scalar parameters, for the epoch line. Read via hasattr so a head with a different
-        set of knobs degrades to a shorter line rather than raising. geo_temp scales the distance term."""
+        set of knobs degrades to a shorter line rather than raising. w weights the scorer's
+        [-geo, spread_v] columns."""
         parts = []
         if hasattr(self.model, "temperature"):
             parts.append(f"temp={float(self.model.temperature):.3f}")
-        if hasattr(self.model, "geo_temp"):
-            parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
+        if hasattr(self.model, "w"):
+            w = self.model.w.detach().flatten().tolist()
+            parts.append("w=[" + ",".join(f"{x:+.4f}" for x in w) + "]")
         # The residual pooler's linear branch, if present: the weighting's linear law in
         # standardised units, one weight per feature. Without it a null cannot say whether
         # the skip carried the model or stayed at its zero init.
