@@ -2,10 +2,10 @@
 
 Loads a Run-1 link-prediction checkpoint (`train_link_property_prediction.py
 --data-suite dyglib --save-checkpoint ...`), freezes it, and trains only a small classifier on
-22 scalars per interaction, source side, all from the frozen encoder's Tempest instance
-(node_classification/encoder.py): 12 geometric + 5 walk-time features of u's walks and 5
-history features from Tempest's per-node event lookups. Each split is encoded once: the walks
-replay identically on every pass, so that one pass is exactly what every epoch would see.
+7 scalars per interaction, source side (node_classification/encoder.py): 5 geometric features
+of u's walk bag and own point, and 2 history features from Tempest's per-node event index.
+Each split is encoded once: the walks replay identically on every pass, so that one pass is
+exactly what every epoch would see.
 """
 
 import argparse
@@ -23,7 +23,7 @@ from link_property_prediction.data import concat_splits
 from link_property_prediction.dyglib_eval import load_dyglib
 from link_property_prediction.utils import seed_all
 from node_classification.classifier import NodeClassifier
-from node_classification.encoder import FEATURE_SETS, FrozenEncoder
+from node_classification.encoder import FrozenEncoder
 from node_classification.train import fit_classifier
 
 
@@ -39,11 +39,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--early-stop-patience", default=20, type=int)
     p.add_argument("--lr", default=1e-3, type=float,
                    help="Classifier lr. DyGLib uses 1e-4; 1e-3 won on validation here.")
-    p.add_argument("--feature-set", default="all", choices=sorted(FEATURE_SETS),
-                   help="Columns fed to the classifier. 'all' is the recipe (22); 'geometry' (12) and "
-                        "'geometry+walk' (17) drop the history; 'history' (5), 'walk+history' (10) and "
-                        "'walk-strict+history' (9, no pooler weights) drop the geometry; 'minimal' (5) "
-                        "is r(p_u), mean token radius, r(E[u]), u's edge count and time since last.")
     p.add_argument("--num-walks", default=20, type=int,
                    help="Walks per node at classification time (the checkpoint trained with 5).")
     p.add_argument("--seed", default=42, type=int,
@@ -73,9 +68,8 @@ def main() -> None:
 
     features = {}
     for name, split in splits.items():
-        features[name] = encoder.encode(split)[:, FEATURE_SETS[args.feature_set]]
+        features[name] = encoder.encode(split)
     print(f"  checkpoint: {args.checkpoint}  (walks per node {encoder.walk_args['num_walks_per_node']})")
-    print(f"  feature set: {args.feature_set} ({features['train'].shape[1]} columns)")
 
     classifier = NodeClassifier(n_in=features["train"].shape[1]).to(device)
     n_params = sum(p.numel() for p in classifier.parameters())

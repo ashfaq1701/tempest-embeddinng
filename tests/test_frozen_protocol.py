@@ -6,8 +6,8 @@
     weights bit-identical
   - replay: two encoding passes over the same split give bitwise-identical features
   - checkpoint round trip: the rebuilt encoder carries the trained weights exactly
-  - geometric features match direct recomputation, and pool()[0] is forward() exactly
-  - the 5 Tempest history columns match a brute-force scan of strictly earlier edges
+  - the 5 geometric columns match direct recomputation, and pool()[0] is forward() exactly
+  - the 2 Tempest history columns match a brute-force scan of strictly earlier edges
 """
 import numpy as np
 import pytest
@@ -17,7 +17,7 @@ from link_property_prediction.data import SplitData
 from link_property_prediction.model import LinkPredHead
 from link_property_prediction.walk_tokens import build_query_walk_tokens
 from node_classification.classifier import NodeClassifier
-from node_classification.encoder import N_FEATURES, N_WALK, FrozenEncoder
+from node_classification.encoder import N_FEATURES, N_GEOMETRY, FrozenEncoder
 from node_classification.train import fit_classifier
 
 N_NODES, D_EMB, D_EF = 20, 8, 6
@@ -112,18 +112,20 @@ def test_geometric_features_match_direct_recomputation(encoder):
     geom = encoder.model.geom
     with torch.no_grad():
         p_u, w, x_tokens = encoder.model.bag_weights.pool(tokens)
-        feats = encoder._features(tokens, src)
+        feats = encoder._geometry(tokens, src)
         assert torch.equal(p_u, encoder.model.bag_weights(tokens))      # pool()[0] is forward()
         valid = w > 0
-        spread = torch.stack([(w[q, valid[q]] * geom.dist(x_tokens[q, valid[q]], p_u[q])).sum()
-                              for q in range(len(p_u))])
-        distinct = torch.tensor([float(len(set(tokens.nodes.flatten(1)[q][valid[q]].tolist())))
-                                 for q in range(len(p_u))])
-    assert feats.shape == (len(p_u), N_WALK)
-    torch.testing.assert_close(feats[:, 0], geom.dist0(p_u))
-    torch.testing.assert_close(feats[:, 1], spread)
-    torch.testing.assert_close(feats[:, 6], geom.dist0(encoder.model.E.weight[src]))
-    torch.testing.assert_close(feats[:, 16], distinct)
+        rows = []
+        for q in range(len(p_u)):
+            x = x_tokens[q, valid[q]]
+            d = geom.dist(x, p_u[q])
+            a = torch.softmax(-d, -1)
+            rows.append(torch.stack([geom.dist0(p_u[q]), geom.dist0(x).mean(),
+                                     geom.dist0(encoder.model.E.weight[src[q]]),
+                                     (a * d).sum(), -(a * a.log()).sum()]))
+        expected = torch.stack(rows)
+    assert feats.shape == (len(p_u), N_GEOMETRY)
+    torch.testing.assert_close(feats, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_tempest_history_matches_brute_force(encoder):
@@ -131,32 +133,11 @@ def test_tempest_history_matches_brute_force(encoder):
     q = slice(150, 400)
     src, ts = stream.sources[q], stream.timestamps[q]
     got = encoder._history(encoder._fresh_walker(), src, ts).numpy()
-    missing = encoder.no_event_log_gap
+    assert got.shape == (len(src), N_FEATURES - N_GEOMETRY)
     nodes_all = np.concatenate([stream.sources, stream.destinations])
-    other_all = np.concatenate([stream.destinations, stream.sources])
     times_all = np.concatenate([stream.timestamps, stream.timestamps])
-
-    def events(node, before):           # undirected: every incident edge strictly before
-        m = (nodes_all == node) & (times_all < before)
-        return times_all[m], other_all[m]
-
     for i, (u, t) in enumerate(zip(src, ts)):
-        times, partners = events(u, t)
+        times = times_all[(nodes_all == u) & (times_all < t)]   # undirected: every incident edge
         assert got[i, 0] == np.float32(np.log1p(len(times)))
-        if len(times) == 0:
-            assert got[i, 1] == np.float32(missing)
-            continue
-        t_last = times.max()
-        np.testing.assert_allclose(got[i, 1], np.log1p(t - t_last), rtol=1e-6)
-        earlier = times[times < t_last]
-        np.testing.assert_allclose(got[i, 2], np.log1p(t_last - earlier.max()) if len(earlier) else 0.0,
-                                   rtol=1e-6)
-        # Tempest picks one of the edges at t_last; check the partner columns against it
-        candidates = set(partners[times == t_last].tolist())
-        matches = []
-        for v in candidates:
-            v_times, _ = events(v, t)
-            pop = np.log1p(len(v_times))
-            rec = np.log1p(t - v_times.max()) if len(v_times) else missing
-            matches.append(np.isclose(got[i, 3], pop, rtol=1e-6) and np.isclose(got[i, 4], rec, rtol=1e-6))
-        assert any(matches)
+        expected = np.log1p(t - times.max()) if len(times) else encoder.no_event_log_gap
+        np.testing.assert_allclose(got[i, 1], expected, rtol=1e-6)
