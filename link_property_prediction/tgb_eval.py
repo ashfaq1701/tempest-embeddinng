@@ -23,6 +23,7 @@ array with a cursor and needs contiguous batches. That is why `reset()` is a no-
 here and rewinds the cursor there.
 """
 import re
+import zipfile
 from typing import List
 
 import numpy as np
@@ -37,6 +38,20 @@ def _strip_version_suffix(name: str) -> str:
     return re.sub(r"-v\d+$", "", name)
 
 
+def _missing_dataset_error(tgb_name: str, data_dir: str, detail: str) -> FileNotFoundError:
+    """One message for every way a TGB dataset can end up unusable: where its files
+    belong, and what the automatic download fetches."""
+    from tgb.utils.info import DATA_URL_DICT
+
+    return FileNotFoundError(
+        f"TGB dataset {tgb_name!r} is not usable ({detail}).\n"
+        f"Its files (edgelist + val/test negatives) belong in:\n"
+        f"  {data_dir}\n"
+        f"The automatic download fetches {DATA_URL_DICT.get(tgb_name, '(no URL registered)')}; "
+        f"if that host no longer serves the data, upgrade py-tgb for a newer URL or extract "
+        f"the dataset there by hand. Pass --data-root to use a different directory.")
+
+
 def load_tgb(name: str, root: str = "datasets") -> Loaded:
     """Load a TGB link-property-prediction dataset. `-vN` suffixes are stripped
     before the call — TGB's registry uses bare names.
@@ -47,7 +62,14 @@ def load_tgb(name: str, root: str = "datasets") -> Loaded:
     `.../site-packages/tgb//mnt/.../datasets/tgbl_review/` -- a real 2.1 GB download
     inside the venv, which is how this was found. Passing the relative path from
     PROJ_DIR makes `PROJ_DIR + root` resolve back to the directory the caller asked
-    for, so `--data-root` is honoured rather than silently ignored.
+    for, so `--data-root` is honoured rather than silently ignored. A RELATIVE root
+    (the default "datasets") therefore lands inside the tgb install dir.
+
+    A missing dataset is downloaded by TGB itself. TGB writes whatever the URL returns
+    to `<name>.zip` without checking it: py-tgb 2.2.0's host returned a `NoSuchBucket`
+    XML page, TGB crashed on it with `BadZipFile` and left the stub behind. So a bad zip
+    is deleted here and turned into an error naming the dataset directory, and the
+    val/test negative files are checked too, since TGB only checks the edgelist.
     """
     import os
     from tgb.linkproppred.dataset import LinkPropPredDataset
@@ -55,7 +77,19 @@ def load_tgb(name: str, root: str = "datasets") -> Loaded:
 
     tgb_name = _strip_version_suffix(name)
     tgb_root = os.path.relpath(root, PROJ_DIR) if os.path.isabs(root) else root
-    dataset = LinkPropPredDataset(name=tgb_name, root=tgb_root, preprocess=True)
+    # TGB's own resolution (dataset.py:75-81), reproduced only for the error message.
+    data_dir = os.path.normpath(os.path.join(PROJ_DIR + tgb_root, tgb_name.replace("-", "_")))
+    try:
+        dataset = LinkPropPredDataset(name=tgb_name, root=tgb_root, preprocess=True)
+    except zipfile.BadZipFile as err:
+        stub = os.path.join(data_dir, tgb_name + ".zip")
+        if os.path.exists(stub):
+            os.remove(stub)                       # else the next run trips on it too
+        raise _missing_dataset_error(tgb_name, data_dir, "download was not a zip") from err
+    missing = [dataset.meta_dict[k] for k in ("val_ns", "test_ns")
+               if not os.path.exists(dataset.meta_dict[k])]
+    if missing:
+        raise _missing_dataset_error(tgb_name, data_dir, "missing " + ", ".join(missing))
     full = dataset.full_data
     sources = np.asarray(full["sources"], dtype=np.int64)
     destinations = np.asarray(full["destinations"], dtype=np.int64)

@@ -11,7 +11,7 @@ torch==2.7.1+cu128
 
 # py-tgb imports as `tgb`. The PyPI package named `tgb` is unrelated -- do
 # not install it.
-py-tgb>=2.2.0
+py-tgb>=2.3.0
 
 # pandas 3 makes Copy-on-Write mandatory; TGB's preprocessing mutates
 # `df.iloc[:, k].values` in place and raises "output array is read-only".
