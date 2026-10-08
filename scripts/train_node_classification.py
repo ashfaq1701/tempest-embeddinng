@@ -2,10 +2,10 @@
 
 Loads a Run-1 link-prediction checkpoint (`train_link_property_prediction.py
 --data-suite dyglib --save-checkpoint ...`), freezes it, and trains only a small classifier on
-22 scalars per interaction, source side: 12 geometric + 5 walk-time features from the frozen
-encoder's walks (node_classification/encoder.py) and 5 exact history features of the user
-(node_classification/history.py). Each split is encoded once: the walks replay identically on
-every pass, so that one pass is exactly what every epoch would see.
+22 scalars per interaction, source side, all from the frozen encoder's Tempest instance
+(node_classification/encoder.py): 12 geometric + 5 walk-time features of u's walks and 5
+history features from Tempest's per-node event lookups. Each split is encoded once: the walks
+replay identically on every pass, so that one pass is exactly what every epoch would see.
 """
 
 import argparse
@@ -23,8 +23,7 @@ from link_property_prediction.data import concat_splits
 from link_property_prediction.dyglib_eval import load_dyglib
 from link_property_prediction.utils import seed_all
 from node_classification.classifier import NodeClassifier
-from node_classification.encoder import N_GEOMETRY, FrozenEncoder
-from node_classification.history import history_features
+from node_classification.encoder import N_GEOMETRY, N_WALK, FrozenEncoder
 from node_classification.train import fit_classifier
 
 
@@ -41,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", default=1e-3, type=float,
                    help="Classifier lr. DyGLib uses 1e-4; 1e-3 won on validation here.")
     p.add_argument("--no-history", action="store_true",
-                   help="Ablation: drop the 5 exact history features, keep the 17 walk features.")
+                   help="Ablation: drop the 5 Tempest history features, keep the 17 walk features.")
     p.add_argument("--geometry-only", action="store_true",
                    help="Ablation: only the 12 geometric features (no walk-time, no history).")
     p.add_argument("--num-walks", default=20, type=int,
@@ -73,14 +72,13 @@ def main() -> None:
 
     features = {}
     for name, split in splits.items():
-        walk = encoder.encode(split)
+        encoded = encoder.encode(split)
         if args.geometry_only:
-            features[name] = walk[:, :N_GEOMETRY]
+            features[name] = encoded[:, :N_GEOMETRY]
         elif args.no_history:
-            features[name] = walk
+            features[name] = encoded[:, :N_WALK]
         else:
-            hist = torch.from_numpy(history_features(stream, split)).to(device)
-            features[name] = torch.cat([walk, hist], dim=1)
+            features[name] = encoded
     print(f"  checkpoint: {args.checkpoint}  (walks per node {encoder.walk_args['num_walks_per_node']})")
 
     classifier = NodeClassifier(n_in=features["train"].shape[1]).to(device)

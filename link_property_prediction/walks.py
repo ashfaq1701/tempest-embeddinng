@@ -72,30 +72,33 @@ class WalkGenerator:
         """Ingest edges into Tempest (indexed by time; ingestion order is irrelevant)."""
         self.tempest.add_multiple_edges(src, tgt, ts, edge_features=edge_feat)
 
-    def get_candidate_recency(self, nodes: np.ndarray, cutoff_times: np.ndarray) -> np.ndarray:
-        """Recency (age) = t_query - t_last(v) per node: time since each node's freshest
-        edge strictly before its cutoff, via Tempest get_latest_events_for_nodes.
-        Backward_In_Time counts inbound edges, so a candidate that only ever receives (a
-        bipartite target) is covered. Tempest returns t_last = -1 when the node has no
-        prior edge, so the age is cutoff + 1 there -- maximally stale, the right signal
-        for a cold candidate. nodes int32, cutoff_times int64, equal length; returns an
-        int64 age of the same length."""
+    def get_latest_events(self, nodes: np.ndarray, cutoff_times: np.ndarray):
+        """Each node's most recent edge strictly before its cutoff, via Tempest
+        get_latest_events_for_nodes: (partner, t_last), both int64 and -1 where the node has
+        no prior edge. Backward_In_Time on this undirected walker covers every incident edge,
+        so a bipartite target (which only ever receives) is covered too. nodes int32,
+        cutoff_times int64, equal length."""
         node_arr = np.ascontiguousarray(nodes, dtype=np.int32)
         cutoff_arr = np.ascontiguousarray(cutoff_times, dtype=np.int64)
-        _, t_last = self.tempest.get_latest_events_for_nodes(
+        partners, t_last = self.tempest.get_latest_events_for_nodes(
             node_arr, cutoff_times=cutoff_arr, direction="Backward_In_Time")
-        return cutoff_arr - t_last
+        return np.asarray(partners, dtype=np.int64), np.asarray(t_last, dtype=np.int64)
 
-    def get_candidate_popularity(self, nodes: np.ndarray, cutoff_times: np.ndarray) -> np.ndarray:
+    def get_node_recency(self, nodes: np.ndarray, cutoff_times: np.ndarray) -> np.ndarray:
+        """Recency (age) = cutoff - t_last per node: time since each node's freshest edge
+        strictly before its cutoff. t_last = -1 when the node has no prior edge, so the age is
+        cutoff + 1 there -- maximally stale. Returns int64, same length as `nodes`."""
+        _, t_last = self.get_latest_events(nodes, cutoff_times)
+        return np.ascontiguousarray(cutoff_times, dtype=np.int64) - t_last
+
+    def get_node_popularity(self, nodes: np.ndarray, cutoff_times: np.ndarray) -> np.ndarray:
         """Popularity = number of edges each node participates in strictly before its
-        cutoff, via Tempest get_node_participation_counts. Backward_In_Time counts inbound
-        edges, i.e. a bipartite target's received interactions; 0 for a node with no prior
-        edge. nodes int32, cutoff_times int64, equal length; returns int64 counts of the
-        same length."""
+        cutoff, via Tempest get_node_participation_counts; 0 for a node with no prior edge.
+        nodes int32, cutoff_times int64, equal length; returns int64 counts."""
         node_arr = np.ascontiguousarray(nodes, dtype=np.int32)
         cutoff_arr = np.ascontiguousarray(cutoff_times, dtype=np.int64)
-        return self.tempest.get_node_participation_counts(
-            node_arr, cutoff_times=cutoff_arr, direction="Backward_In_Time")
+        return np.asarray(self.tempest.get_node_participation_counts(
+            node_arr, cutoff_times=cutoff_arr, direction="Backward_In_Time"), dtype=np.int64)
 
     def walks_for_nodes(self, seeds: np.ndarray, max_walk_len: Optional[int] = None,
                         num_walks_per_node: Optional[int] = None,

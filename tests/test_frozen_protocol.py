@@ -7,7 +7,7 @@
   - replay: two encoding passes over the same split give bitwise-identical features
   - checkpoint round trip: the rebuilt encoder carries the trained weights exactly
   - geometric features match direct recomputation, and pool()[0] is forward() exactly
-  - history features match a brute-force scan of u's strictly earlier edges
+  - the 5 Tempest history columns match a brute-force scan of strictly earlier edges
 """
 import numpy as np
 import pytest
@@ -17,8 +17,7 @@ from link_property_prediction.data import SplitData
 from link_property_prediction.model import LinkPredHead
 from link_property_prediction.walk_tokens import build_query_walk_tokens
 from node_classification.classifier import NodeClassifier
-from node_classification.encoder import N_FEATURES, FrozenEncoder
-from node_classification.history import history_features
+from node_classification.encoder import N_FEATURES, N_WALK, FrozenEncoder
 from node_classification.train import fit_classifier
 
 N_NODES, D_EMB, D_EF = 20, 8, 6
@@ -120,25 +119,44 @@ def test_geometric_features_match_direct_recomputation(encoder):
                               for q in range(len(p_u))])
         distinct = torch.tensor([float(len(set(tokens.nodes.flatten(1)[q][valid[q]].tolist())))
                                  for q in range(len(p_u))])
-    assert feats.shape == (len(p_u), N_FEATURES)
+    assert feats.shape == (len(p_u), N_WALK)
     torch.testing.assert_close(feats[:, 0], geom.dist0(p_u))
     torch.testing.assert_close(feats[:, 1], spread)
     torch.testing.assert_close(feats[:, 6], geom.dist0(encoder.model.E.weight[src]))
     torch.testing.assert_close(feats[:, 16], distinct)
 
 
-def test_history_features_match_brute_force():
-    stream = _graph()
-    queries = SplitData(*(arr[150:400] for arr in stream))
-    got = history_features(stream, queries)
-    for q in range(len(queries.sources)):
-        u, t = queries.sources[q], queries.timestamps[q]
-        times = np.sort(stream.timestamps[(stream.sources == u) & (stream.timestamps < t)])
-        expected = np.zeros(5, np.float32)
-        expected[0] = np.log1p(len(times))
-        expected[1] = np.log1p(t - times[-1]) if len(times) else np.log1p(1e7)
-        expected[2] = np.log1p(t - times[0]) if len(times) else 0.0
-        if len(times) >= 2:
-            expected[3] = np.log1p(np.diff(times).mean())
-            expected[4] = np.log1p(times[-1] - times[-2])
-        np.testing.assert_allclose(got[q], expected, rtol=1e-6)
+def test_tempest_history_matches_brute_force(encoder):
+    stream = encoder.graph
+    q = slice(150, 400)
+    src, ts = stream.sources[q], stream.timestamps[q]
+    got = encoder._history(encoder._fresh_walker(), src, ts).numpy()
+    missing = encoder.no_event_log_gap
+    nodes_all = np.concatenate([stream.sources, stream.destinations])
+    other_all = np.concatenate([stream.destinations, stream.sources])
+    times_all = np.concatenate([stream.timestamps, stream.timestamps])
+
+    def events(node, before):           # undirected: every incident edge strictly before
+        m = (nodes_all == node) & (times_all < before)
+        return times_all[m], other_all[m]
+
+    for i, (u, t) in enumerate(zip(src, ts)):
+        times, partners = events(u, t)
+        assert got[i, 0] == np.float32(np.log1p(len(times)))
+        if len(times) == 0:
+            assert got[i, 1] == np.float32(missing)
+            continue
+        t_last = times.max()
+        np.testing.assert_allclose(got[i, 1], np.log1p(t - t_last), rtol=1e-6)
+        earlier = times[times < t_last]
+        np.testing.assert_allclose(got[i, 2], np.log1p(t_last - earlier.max()) if len(earlier) else 0.0,
+                                   rtol=1e-6)
+        # Tempest picks one of the edges at t_last; check the partner columns against it
+        candidates = set(partners[times == t_last].tolist())
+        matches = []
+        for v in candidates:
+            v_times, _ = events(v, t)
+            pop = np.log1p(len(v_times))
+            rec = np.log1p(t - v_times.max()) if len(v_times) else missing
+            matches.append(np.isclose(got[i, 3], pop, rtol=1e-6) and np.isclose(got[i, 4], rec, rtol=1e-6))
+        assert any(matches)

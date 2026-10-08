@@ -1,7 +1,8 @@
 """The frozen Run-1 encoder: trained E + pooler from a link-prediction checkpoint.
 
-For an interaction (u, t) it summarises u's backward walks (EXCLUSIVE cutoff t, so only edges
-strictly before t are seen) into 17 numbers. p_u is the frozen pooler's point, w its pooling
+For an interaction (u, t) it returns 22 numbers, every one causal (EXCLUSIVE cutoff t, so only
+edges strictly before t are seen): 17 summarise u's backward walks, 5 are history read from
+Tempest's own per-node event index. p_u is the frozen pooler's point, w its pooling
 weights, x_i the bag's token points, d the hyperbolic distance, d0 the radius.
 
   geometry (12)
@@ -16,6 +17,12 @@ weights, x_i the bag's token points, d the hyperbolic distance, d0 the radius.
     spread and entropy under softmax(-d(x_i, p_u)), i.e. attention with p_u as the key
   walk time (5)
     log1p(#real edges), min / mean / w-weighted log1p(age), #distinct nodes in the bag
+  Tempest history (5), via get_node_popularity / get_node_recency / get_latest_events
+    log1p(#u's prior edges)              log1p(t - u's last edge time)
+    log1p(gap between u's last two edges, from a second lookup with cutoff t_last)
+    log1p(#prior edges of u's last partner), log1p(t - that partner's last edge time)
+  A missing event (no prior edge / no partner) maps to log1p(time span of the whole graph),
+  older than any real gap.
 
 Freezing happens once, in `from_checkpoint`: eval(), requires_grad_(False), and `encode`
 runs under no_grad. Nothing here is ever handed to an optimiser.
@@ -35,8 +42,9 @@ from link_property_prediction.model import LinkPredHead
 from link_property_prediction.walk_tokens import WalkTokens, build_query_walk_tokens
 from link_property_prediction.walks import WalkGenerator
 
-N_FEATURES = 17
-N_GEOMETRY = 12                 # the first 12 columns; the last 5 are walk-time
+N_GEOMETRY = 12                 # columns [0, 12)
+N_WALK = 17                     # columns [0, 17): geometry + walk time
+N_FEATURES = 22                 # columns [17, 22): Tempest history
 NO_EDGE_LOG_AGE = 16.0          # log1p(age) stand-in when u has no prior edge (> any real age)
 
 
@@ -51,6 +59,8 @@ class FrozenEncoder:
         self.device = device
         self.use_gpu_tempest = bool(use_gpu_tempest)
         self.seed = int(seed)
+        span = int(graph.timestamps.max()) - int(graph.timestamps.min()) + 1
+        self.no_event_log_gap = float(np.log1p(span))
 
     @classmethod
     def from_checkpoint(cls, path: str, graph: SplitData, *, device: torch.device,
@@ -91,7 +101,7 @@ class FrozenEncoder:
 
     @torch.no_grad()
     def encode(self, split: SplitData, batch_size: int = 200) -> torch.Tensor:
-        """One replayable pass over `split` in chronological batches -> features [N, 17]."""
+        """One replayable pass over `split` in chronological batches -> features [N, 22]."""
         walker = self._fresh_walker()
         a = self.walk_args
         out = []
@@ -102,8 +112,40 @@ class FrozenEncoder:
                 walker, self.device, src, ts,
                 max_walk_len=a["max_walk_len"], num_walks_per_node=a["num_walks_per_node"],
                 start_bias=a["start_bias"], walk_bias=a["walk_bias"])
-            out.append(self._features(tokens, src.to(self.device)))
+            walk = self._features(tokens, src.to(self.device))
+            history = self._history(walker, batch.src, batch.ts)
+            out.append(torch.cat([walk, history.to(self.device)], dim=1))
         return torch.cat(out)
+
+    def _history(self, walker: WalkGenerator, src: np.ndarray, ts: np.ndarray) -> torch.Tensor:
+        """The 5 Tempest history columns for queries (u, t); see the module docstring."""
+        src = src.astype(np.int64)
+        ts = ts.astype(np.int64)
+        missing = self.no_event_log_gap
+        out = np.zeros((len(src), 5), dtype=np.float32)
+
+        out[:, 0] = np.log1p(walker.get_node_popularity(src, ts))
+        partner, t_last = walker.get_latest_events(src, ts)
+        has_last = t_last >= 0
+        out[:, 1] = np.where(has_last, np.log1p(np.maximum(ts - t_last, 0)), missing)
+
+        # second lookup with cutoff t_last -> u's edge before its last one
+        out[:, 2] = 0.0
+        if has_last.any():
+            _, t_prev = walker.get_latest_events(src[has_last], t_last[has_last])
+            gap = np.where(t_prev >= 0, t_last[has_last] - t_prev, 0)
+            out[has_last, 2] = np.log1p(gap)
+
+        # u's last partner, as of t
+        out[:, 3] = 0.0
+        out[:, 4] = missing
+        has_partner = partner >= 0
+        if has_partner.any():
+            p, t = partner[has_partner], ts[has_partner]
+            out[has_partner, 3] = np.log1p(walker.get_node_popularity(p, t))
+            _, p_last = walker.get_latest_events(p, t)
+            out[has_partner, 4] = np.where(p_last >= 0, np.log1p(np.maximum(t - p_last, 0)), missing)
+        return torch.from_numpy(out)
 
     def _features(self, tokens: WalkTokens, src: torch.Tensor) -> torch.Tensor:
         geom = self.model.geom
