@@ -1,12 +1,18 @@
 """Walk-bag pooler and the link-prediction head.
 
 Pooling weights are `softmax(skip(f) + MLP(f))` over the walk-token bag with
-`f = standardise(features)`, features `[log1p(age), pos, d_mid]`, n_feat 3, pooler 1,220
-params at nl2 (164 at nl1). `skip` is a `Linear(3, 1, bias=False)` initialised at
-`[-1, -1, 0]`: the residual's identity branch, carrying whatever part of the weighting is
-linear in the standardised features, with the MLP left to carry the curved part. That init
-makes step 0 the sigma-unit recency prior rather than master, and the weights stay free, so
-`skip.weight` after training reads out the pooler's linear law in standardised units.
+`f = standardise(features)`, features `[log1p(age), pos, d_tok_mid, d0_tok, d0_mid]`,
+n_feat 5, three of them geometric, pooler 1,286 params at nl2 (230 at nl1). `skip` is a
+`Linear(5, 1, bias=False)` initialised at `[-1, -1, 0, 0, 0]`: the residual's identity
+branch, carrying whatever part of the weighting is linear in the standardised features,
+with the MLP left to carry the curved part. That init makes step 0 the sigma-unit recency
+prior, and the weights stay free, so `skip.weight` after training reads out the pooler's
+linear law in standardised units.
+
+`d0_mid` is constant across the tokens of a bag, so in the LINEAR branch it adds a
+per-bag constant to the logits and softmax is invariant to it -- `skip.weight[4]` cannot
+change the pooling weights. It acts only through the MLP's nonlinearity.
+
 The pooled point is a weighted Lorentz midpoint; the scorer is `geo_temp * (-d(p_u, p_v))`.
 
 `cos_o` -- the angle at the origin between token and bag centre -- was removed at
@@ -48,7 +54,7 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 3
+        self.n_feat = 5
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -57,7 +63,7 @@ class BagWeights(nn.Module):
 
         self.skip = nn.Linear(self.n_feat, 1, bias=False)
         with torch.no_grad():
-            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0]]))
+            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0, 0.0, 0.0]]))
 
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
         return self.pool(tokens)[0]
@@ -82,9 +88,11 @@ class BagWeights(nn.Module):
         pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
 
         d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
+        d0_tok = self.geom.dist0(xt)                                         # [Q, T]
+        d0_mid = self.geom.dist0(mid).unsqueeze(-1).expand_as(d0_tok)        # [Q, T]
 
-        feats = standardise(torch.stack([age, pos, d_tok_mid], dim=-1),
-                            valid).to(xt.dtype)                        # [Q, T, 3]
+        feats = standardise(torch.stack([age, pos, d_tok_mid, d0_tok, d0_mid], dim=-1),
+                            valid).to(xt.dtype)                        # [Q, T, 5]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.weighted_midpoint(x_tokens, w), w, x_tokens         # [Q, d], [Q, T], [Q, T, d]
