@@ -59,6 +59,10 @@ FEATURE_SETS = {
     "history": _HISTORY,
     "walk+history": _WALK_TIME + _HISTORY,
     "walk-strict+history": _WALK_TIME_STRICT + _HISTORY,
+    # Smallest set that holds the 22-column CV on both datasets (chronological CV over
+    # train ∪ val, Wikipedia 0.902 vs 0.893, Reddit 0.814 vs 0.813): the three radii and
+    # u's prior edge count and time since its last edge.
+    "minimal": [0, 5, 6, 17, 18],
 }
 NO_EDGE_LOG_AGE = 16.0          # log1p(age) stand-in when u has no prior edge (> any real age)
 

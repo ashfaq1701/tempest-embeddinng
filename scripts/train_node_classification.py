@@ -42,7 +42,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--feature-set", default="all", choices=sorted(FEATURE_SETS),
                    help="Columns fed to the classifier. 'all' is the recipe (22); 'geometry' (12) and "
                         "'geometry+walk' (17) drop the history; 'history' (5), 'walk+history' (10) and "
-                        "'walk-strict+history' (9, no pooler weights) drop the geometry.")
+                        "'walk-strict+history' (9, no pooler weights) drop the geometry; 'minimal' (5) "
+                        "is r(p_u), mean token radius, r(E[u]), u's edge count and time since last.")
     p.add_argument("--num-walks", default=20, type=int,
                    help="Walks per node at classification time (the checkpoint trained with 5).")
     p.add_argument("--seed", default=42, type=int,
