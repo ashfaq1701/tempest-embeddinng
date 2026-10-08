@@ -10,8 +10,8 @@ makes step 0 the sigma-unit recency prior rather than master, and the weights st
 The pooled point is a weighted Lorentz midpoint. The scorer is `w . [-d(p_u, p_v), spread_v]`
 with learned `w`, initialised at `[1, 1]`. `spread_v = sum a d(x_i, p_v)` under attention
 `a = softmax(-d(x_i, p_v))` over v's own walk tokens -- the attention spread the
-node-classification encoder reads off p_u, here taken on the candidate side, on detached
-inputs so it reads the geometry without training E.
+node-classification encoder reads off p_u, here taken on the candidate side, with the
+tokens x detached and the pooled point p_v not.
 
 `cos_o` -- the angle at the origin between token and bag centre -- was removed at
 791360a. It lowered the TRAINING loss and widened the val->test gap: on YouTube the loss
@@ -119,9 +119,9 @@ class LinkPredHead(nn.Module):
 
     def attention_spread(self, p: torch.Tensor, x: torch.Tensor, pool_w: torch.Tensor) -> torch.Tensor:
         """spread = sum a d(x_i, p) under attention a = softmax(-d(x_i, p)) over a bag's valid
-        tokens (padding has pool_w = 0), [Q]. p and x are detached, as the pooler's own
-        features are: the column reads the geometry, it does not train E."""
-        p, x = p.detach(), x.detach()
+        tokens (padding has pool_w = 0), [Q]. x is detached, as the pooler's own features are,
+        so the tokens are not moved to change the column; gradient still reaches p."""
+        x = x.detach()
         valid = pool_w > 0                                                   # [Q, T]
         d_tok = self.geom.dist(x, p.unsqueeze(-2))                           # [Q, T]
         attention = torch.softmax((-d_tok).masked_fill(~valid, float("-inf")), dim=-1)
