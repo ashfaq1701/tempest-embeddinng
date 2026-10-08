@@ -40,6 +40,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--early-stop-patience", default=20, type=int)
     p.add_argument("--lr", default=1e-3, type=float,
                    help="Classifier lr. DyGLib uses 1e-4; 1e-3 won on validation here.")
+    p.add_argument("--no-history", action="store_true",
+                   help="Ablation: drop the 5 exact history features, keep the 17 walk features.")
     p.add_argument("--num-walks", default=20, type=int,
                    help="Walks per node at classification time (the checkpoint trained with 5).")
     p.add_argument("--seed", default=42, type=int,
@@ -70,8 +72,11 @@ def main() -> None:
     features = {}
     for name, split in splits.items():
         walk = encoder.encode(split)
-        hist = torch.from_numpy(history_features(stream, split)).to(device)
-        features[name] = torch.cat([walk, hist], dim=1)
+        if args.no_history:
+            features[name] = walk
+        else:
+            hist = torch.from_numpy(history_features(stream, split)).to(device)
+            features[name] = torch.cat([walk, hist], dim=1)
     print(f"  checkpoint: {args.checkpoint}  (walks per node {encoder.walk_args['num_walks_per_node']})")
 
     classifier = NodeClassifier(n_in=features["train"].shape[1]).to(device)
