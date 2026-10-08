@@ -76,9 +76,9 @@ class BagWeights(nn.Module):
         age = torch.log1p(tokens.ages.flatten(1).clamp_min(0).to(xt.dtype))  # [Q, T]
         pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
 
-        a = self.geom.dist(xt, mid.unsqueeze(-2))                            # [Q, T]  d_mid
+        d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
 
-        feats = standardise(torch.stack([age, pos, a], dim=-1),
+        feats = standardise(torch.stack([age, pos, d_tok_mid], dim=-1),
                             valid).to(xt.dtype)                        # [Q, T, 3]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
