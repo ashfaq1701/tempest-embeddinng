@@ -1,11 +1,11 @@
 """Benchmark-agnostic evaluation interfaces (Evaluator, DataSuite) and the
 `make_suite` factory.
 
-Two suites: TGB-Seq in `tgb_seq_eval.py` and TGB in `tgb_eval.py`. Everything
-suite-specific lives behind these two ABCs -- `trainer.py`, `negatives.py` and
-`data.py` never branch on the suite, and `make_suite` is the single place a name
-maps to a class. A new suite is therefore additive: one module, one branch here,
-one `--data-suite` choice.
+Three suites: TGB-Seq in `tgb_seq_eval.py`, TGB in `tgb_eval.py` and DyGLib in
+`dyglib_eval.py`. Everything suite-specific lives behind these two ABCs --
+`trainer.py`, `negatives.py` and `data.py` never branch on the suite, and
+`make_suite` is the single place a name maps to a class. A new suite is therefore
+additive: one module, one branch here, one `--data-suite` choice.
 
 The suites agree on the vocabulary (`Loaded`, `SplitData`, `Batch`) and on the
 `Evaluator` contract; they differ only inside, which is what makes them
@@ -76,7 +76,7 @@ class DataSuite(abc.ABC):
 
 #: Valid `--data-suite` values. The train script reads this for its `choices`, so the
 #: flag and the dispatch below cannot drift apart.
-SUITES = ("tgb-seq", "tgb")
+SUITES = ("tgb-seq", "tgb", "dyglib")
 
 
 def make_suite(data_suite: str, **kwargs) -> DataSuite:
@@ -90,5 +90,8 @@ def make_suite(data_suite: str, **kwargs) -> DataSuite:
     if data_suite == "tgb":
         from .tgb_eval import TGBSuite
         return TGBSuite(**kwargs)
+    if data_suite == "dyglib":
+        from .dyglib_eval import DyGLibSuite
+        return DyGLibSuite(**kwargs)
     raise ValueError(
         f"unknown --data-suite {data_suite!r} (expected one of {sorted(SUITES)})")
