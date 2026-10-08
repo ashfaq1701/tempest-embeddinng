@@ -1,7 +1,12 @@
 """Walk-bag pooler and the link-prediction head.
 
-Pooling weights are `softmax(MLP(standardise(features)))` over the walk-token bag,
-features `[log1p(age), pos, d_mid]`, n_feat 3, pooler 1,217 params at nl2 (161 at nl1).
+Pooling weights are `softmax(skip(f) + MLP(f))` over the walk-token bag with
+`f = standardise(features)`, features `[log1p(age), pos, d_mid]`, n_feat 3, pooler 1,220
+params at nl2 (164 at nl1). `skip` is a `Linear(3, 1, bias=False)` initialised at
+`[-1, -1, 0]`: the residual's identity branch, carrying whatever part of the weighting is
+linear in the standardised features, with the MLP left to carry the curved part. That init
+makes step 0 the sigma-unit recency prior rather than master, and the weights stay free, so
+`skip.weight` after training reads out the pooler's linear law in standardised units.
 The pooled point is a weighted Lorentz midpoint; the scorer is `geo_temp * (-d(p_u, p_v))`.
 
 `cos_o` -- the angle at the origin between token and bag centre -- was removed at
@@ -48,7 +53,11 @@ class BagWeights(nn.Module):
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
         layers.append(nn.Linear(self.hidden, 1))
-        self.net = nn.Sequential(*layers)
+        self.net = nn.Sequential(*layers)                 # correction (residual) branch
+
+        self.skip = nn.Linear(self.n_feat, 1, bias=False)
+        with torch.no_grad():
+            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0]]))
 
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
@@ -71,7 +80,7 @@ class BagWeights(nn.Module):
 
         feats = standardise(torch.stack([age, pos, a], dim=-1),
                             valid).to(xt.dtype)                        # [Q, T, 3]
-        logits = self.net(feats).squeeze(-1)                                 # [Q, T]
+        logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         return self.geom.weighted_midpoint(x_tokens, w)                               # [Q, d]
 
