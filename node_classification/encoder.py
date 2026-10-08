@@ -35,9 +35,6 @@ from link_property_prediction.model import LinkPredHead
 from link_property_prediction.walk_tokens import WalkTokens, build_query_walk_tokens
 from link_property_prediction.walks import WalkGenerator
 
-N_GEOMETRY = 4                  # columns [0, 4)
-N_FEATURES = 6                  # columns [4, 6): Tempest history
-
 
 class FrozenEncoder:
 
