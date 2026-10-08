@@ -509,8 +509,8 @@ def test_optimizer_reduces_a_hyperbolic_loss(opt_cls, k):
         opt.step()
         assert torch.isfinite(p).all(), f"non-finite iterate at step {step}"
         if first is None:
-            first = float(loss)
-        last = float(loss)
+            first = loss.item()
+        last = loss.item()
 
     assert last < first * 0.02, f"{opt_cls.__name__}: {first:.4f} -> {last:.4f}"
     P = m._lift(p.detach())
@@ -575,8 +575,8 @@ def test_float32_end_to_end_training_stays_finite():
         opt.step()
         assert torch.isfinite(p).all()
         if first is None:
-            first = float(loss)
-        last = float(loss)
+            first = loss.item()
+        last = loss.item()
     assert p.dtype == torch.float32
     assert last < first * 0.02
 
@@ -865,7 +865,7 @@ def test_dist_self_pair_is_zero_with_zero_gradient(k):
         y = x.detach().clone()
         d = m.dist(x, y)
         d.sum().backward()
-        assert float(d.abs().max()) == 0.0, dt
+        assert d.abs().max().item() == 0.0, dt
         assert torch.isfinite(x.grad).all(), dt
         assert float(x.grad.abs().max()) == 0.0, dt
 
