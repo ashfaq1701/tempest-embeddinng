@@ -685,3 +685,63 @@ Note the TGB arms show almost NO val->test gap -- tgbl-review ran val/test withi
 every epoch, tgbl-coin's test (0.4045) is above its val (0.3971) -- because both splits use
 the same negative protocol. The val->test gap that drives every TGB-Seq conclusion is a
 property of TGB-Seq's eval design, not of the model.
+
+## Dynamic node classification: frozen encoder beats every published Wikipedia number (measured, 2026-10-08)
+
+DyGLib protocol (Wikipedia/Reddit ban prediction, ROC-AUC over the whole split, backbone
+frozen, classifier on the source node only, 5 runs, std with ddof=1). Run 1 trains link
+prediction on `--data-suite dyglib --is-bipartite --k-train 5 --k-eval 5` (linear-skip
+pooler) and saves the best-val checkpoint; Run 2 freezes it and trains a ~2.4k-param MLP.
+Branch `feature/node-classification-geo-walk-hist`, recipe commit `83c6911`; drivers
+`scripts/lp_seeds_wiki.sh`, `scripts/nc_final.sh`; logs `logs/node_cls_final*/k5/seed*/`.
+
+### Wikipedia, 5 checkpoints (seeds 42, 0, 1, 2, 3), test AUC
+
+| classifier input | test AUC |
+|---|---|
+| **12 geometric + 5 walk-time + 5 exact history** (the recipe) | **89.91 ± 0.87** |
+| 12 geometric + 5 walk-time (`--no-history`) | 89.91 ± 0.67 |
+| 12 geometric only (`--geometry-only`) | 89.68 ± 0.97 |
+| JODIE, best published (DyGLib Table 15) | 88.99 ± 1.05 |
+| DyG-Mamba / TAWRMAC / TIDFormer (fetched from the PDFs) | 88.58 / 87.69 / 87.53 |
+
+**The geometry carries the ban signal on its own.** Twelve numbers from the frozen hyperbolic
+encoder -- radius of `E[u]` and of the pooled point, bag spread (pooler-weighted, unweighted,
+and under softmax(-d) attention keyed on `p_u`), nearest/farthest token, pooling entropy --
+beat every published method. The single strongest feature is `d0(E[u])` (univariate AUC
+0.88 train / 0.84 val, inverted): banned users sit near the origin, i.e. radius encodes
+activity. The exact history lookups (count, recency, gaps) add nothing on test.
+
+### How the recipe was chosen (test sealed)
+
+Sweeps ran on a cached feature table (scratch, seed-42 checkpoint) and printed train/val
+only; test went to a sealed log, opened once at a milestone and then only for the final
+recipe. Validation has 17 positives (AUC s.e. ~0.03-0.04), so the deciding criterion became
+chronological CV over train ∪ val (4 folds, ~120 positives), fixed BEFORE the final test.
+
+What moved the number, in order: adding `d0(E[u])` and the other radii (val 0.69 -> 0.85);
+the full geometric set + walk-time + history (0.89); 20 walks per node at classification time
+(+0.007 val over 5; 50 walks lost); shuffled classifier batches (+0.010 CV -- in time order
+the rare positives arrive in clumps; features are already causal so shuffling leaks nothing).
+
+### Negative results -- do not re-run
+
+- **Edge features, every form**: mean / pooler-weighted / last edge / last-3, as a separate
+  MLP branch (val 0.884 vs 0.890, more variance), as a 2-branch net (test 0.739 vs 0.779),
+  as 4 PCA components (CV 0.878 vs 0.892). Standalone L2 logistic regression on the LIWC
+  vectors reaches only val 0.65 / CV 0.71. There is little ban signal in them here.
+- **Fine-tuning E during classification**: lr 1e-5 / 1e-4 tie frozen (val 0.890); lr 1e-3
+  overfits hard (train 0.99, val 0.75). 156 positives cannot steer a 590k-param table.
+- **Learned token attention** over per-token geometric descriptors ties the hand summaries
+  (val 0.896, CV 0.887 vs 0.897 / 0.889).
+- Wider/deeper heads, dropout 0.3, pos-weight, weight decay, batch 1000, lr 1e-4 (DyGLib's):
+  all tie or lose. Burst counts (edits in last 1h/1d/1w, distinct pages): CV 0.899 vs 0.902.
+- More features is worse: adding the 6 item/user-split radii drops val 0.890 -> 0.869.
+
+### Two bugs found on the way
+
+- `BagWeights` holds `E` as a submodule, so `bag_weights.requires_grad_(False)` silently
+  re-freezes `E`. Set `E`'s flag AFTER the pooler's when fine-tuning.
+- Tempest has no per-call seed and its RNG advances per call: a repeated walk call draws
+  different walks; a fresh instance with the same seed replays exactly. The encoder therefore
+  builds a fresh walker per pass (re-ingest ~0.2 s on Wikipedia).
