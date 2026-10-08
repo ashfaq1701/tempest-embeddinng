@@ -6,7 +6,7 @@
     weights bit-identical
   - replay: two encoding passes over the same split give bitwise-identical features
   - checkpoint round trip: the rebuilt encoder carries the trained weights exactly
-  - the 5 geometric columns match direct recomputation, and pool()[0] is forward() exactly
+  - the 4 geometric columns match direct recomputation, and pool()[0] is forward() exactly
   - the 2 Tempest history columns match a brute-force scan of strictly earlier edges
 """
 import numpy as np
@@ -120,7 +120,7 @@ def test_geometric_features_match_direct_recomputation(encoder):
             x = x_tokens[q, valid[q]]
             d = geom.dist(x, p_u[q])
             a = torch.softmax(-d, -1)
-            rows.append(torch.stack([geom.dist0(p_u[q]), geom.dist0(x).mean(),
+            rows.append(torch.stack([geom.dist0(p_u[q]),
                                      geom.dist0(encoder.model.E.weight[src[q]]),
                                      (a * d).sum(), -(a * a.log()).sum()]))
         expected = torch.stack(rows)

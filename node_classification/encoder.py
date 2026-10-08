@@ -1,12 +1,11 @@
 """The frozen Run-1 encoder: trained E + pooler from a link-prediction checkpoint.
 
-For an interaction (u, t) it returns 7 numbers, every one causal (EXCLUSIVE cutoff t, so only
+For an interaction (u, t) it returns 6 numbers, every one causal (EXCLUSIVE cutoff t, so only
 edges strictly before t are seen). p_u is the frozen pooler's point for u's walk bag, x_i the
 bag's token points, d the hyperbolic distance, d0 the radius.
 
-  geometry (5)
+  geometry (4)
     d0(p_u)                       radius of the pooled point
-    mean_i d0(x_i)                mean radius of the bag's tokens
     d0(E[u])                      radius of u's own trained point
     sum_i a_i d(x_i, p_u)         spread under attention a = softmax(-d(x_i, p_u)),
     -sum_i a_i log a_i              and that attention's entropy (p_u as the key)
@@ -36,8 +35,8 @@ from link_property_prediction.model import LinkPredHead
 from link_property_prediction.walk_tokens import WalkTokens, build_query_walk_tokens
 from link_property_prediction.walks import WalkGenerator
 
-N_GEOMETRY = 5                  # columns [0, 5)
-N_FEATURES = 7                  # columns [5, 7): Tempest history
+N_GEOMETRY = 4                  # columns [0, 4)
+N_FEATURES = 6                  # columns [4, 6): Tempest history
 
 
 class FrozenEncoder:
@@ -93,7 +92,7 @@ class FrozenEncoder:
 
     @torch.no_grad()
     def encode(self, split: SplitData, batch_size: int = 200) -> torch.Tensor:
-        """One replayable pass over `split` in chronological batches -> features [N, 7]."""
+        """One replayable pass over `split` in chronological batches -> features [N, 6]."""
         walker = self._fresh_walker()
         a = self.walk_args
         out = []
@@ -110,24 +109,21 @@ class FrozenEncoder:
         return torch.cat(out)
 
     def _geometry(self, tokens: WalkTokens, src: torch.Tensor) -> torch.Tensor:
-        """The 5 geometric columns; see the module docstring."""
+        """The 4 geometric columns; see the module docstring."""
         geom = self.model.geom
         p_u, w, x = self.model.bag_weights.pool(tokens)                      # [Q,d], [Q,T], [Q,T,d]
         valid = w > 0                                                        # padding has w = 0
-        valid_f = valid.float()
-        n_valid = valid_f.sum(-1).clamp_min(1)
         e_u = self.model.E.weight[src]                                       # [Q, d]
 
         d_tok = geom.dist(x, p_u.unsqueeze(-2))                              # [Q, T]
         attention = torch.softmax((-d_tok).masked_fill(~valid, float("-inf")), -1)
         geometry = [
             geom.dist0(p_u),
-            (geom.dist0(x) * valid_f).sum(-1) / n_valid,
             geom.dist0(e_u),
             (attention * d_tok).sum(-1),
             -(attention.clamp_min(1e-12).log() * attention).sum(-1),
         ]
-        return torch.stack(geometry, dim=-1)                                 # [Q, 5]
+        return torch.stack(geometry, dim=-1)                                 # [Q, 4]
 
     def _history(self, walker: WalkGenerator, src: np.ndarray, ts: np.ndarray) -> torch.Tensor:
         """The 2 Tempest history columns for queries (u, t); see the module docstring."""
