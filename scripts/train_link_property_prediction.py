@@ -98,6 +98,9 @@ def parse_args() -> argparse.Namespace:
     # ── Post-training outputs ───────────────────────────────────────
     p.add_argument("--export-best-embedding-table", action="store_true",
                    help="After training, dump the best-val embedding table to disk.")
+    p.add_argument("--save-checkpoint", default="", type=str,
+                   help="After training, save the best-val model (E, pooler, geo_temp) and "
+                        "these args to this path -- the frozen encoder for node classification.")
 
     return p.parse_args()
 
@@ -243,6 +246,23 @@ def main() -> Dict[str, Any]:
             trainer.model.E.weight.detach().cpu().numpy(),
         )
         print(f"  embedding_table:   saved to {emb_path}")
+
+    # Optional: the whole best-val model plus the args that rebuild it. train() has
+    # already restored the best-val weights, so the live model IS the checkpoint.
+    if args.save_checkpoint:
+        ckpt_path = pathlib.Path(args.save_checkpoint)
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        radius = trainer.model.geom.dist0(trainer.model.E.weight.detach())
+        torch.save({
+            "state_dict": trainer.model.state_dict(),
+            "args": vars(args),
+            "best_epoch": result["stopped_at_epoch"],
+            "best_val_mrr": result["best_val_mrr"],
+            "r_mean": float(radius.mean()),
+            "r_max": float(radius.max()),
+        }, ckpt_path)
+        print(f"  checkpoint:        saved to {ckpt_path} "
+              f"(r_mean={float(radius.mean()):.3f}, r_max={float(radius.max()):.3f})")
 
     return result
 

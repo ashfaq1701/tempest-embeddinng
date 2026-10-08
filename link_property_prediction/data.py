@@ -43,9 +43,10 @@ def concat_splits(*splits: SplitData) -> SplitData:
 def create_batches(split: SplitData, batch_size: int) -> Iterator[Batch]:
     """Fixed-size chronological batches (train and eval): consecutive
     `batch_size` chunks over the time-sorted stream. The final partial batch is kept
-    (drop_last=False). Timestamps split freely across boundaries, so same-timestamp
-    edges in different batches see each other's ingested state; within one batch they
-    don't (ingest is post-batch)."""
+    (drop_last=False). Batch boundaries carry no causal meaning: both the link-prediction
+    trainer and the node-classification encoder ingest the full graph once and give every
+    query its own EXCLUSIVE cutoff (t_edge < t), so same-timestamp edges never see each
+    other wherever the boundary falls."""
     n = int(split.sources.shape[0])
     for start in range(0, n, batch_size):
         yield _slice(split, start, min(start + batch_size, n))

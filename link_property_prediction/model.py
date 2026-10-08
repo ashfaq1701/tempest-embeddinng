@@ -60,6 +60,11 @@ class BagWeights(nn.Module):
             self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0]]))
 
     def forward(self, tokens: WalkTokens) -> torch.Tensor:
+        return self.pool(tokens)[0]
+
+    def pool(self, tokens: WalkTokens):
+        """-> (pooled point p [Q, d], pooling weights w [Q, T], token points x [Q, T, d]).
+        w is exactly 0 on padding, so sums over T need no extra mask."""
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
         valid = tokens.mask.flatten(1).clone()                               # [Q, T]
         cold = ~valid.any(dim=-1)                                            # [Q]
@@ -82,7 +87,7 @@ class BagWeights(nn.Module):
                             valid).to(xt.dtype)                        # [Q, T, 3]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
-        return self.geom.weighted_midpoint(x_tokens, w)                               # [Q, d]
+        return self.geom.weighted_midpoint(x_tokens, w), w, x_tokens         # [Q, d], [Q, T], [Q, T, d]
 
 
 class LinkPredHead(nn.Module):
