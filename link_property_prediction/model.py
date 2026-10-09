@@ -47,7 +47,7 @@ class BagWeights(nn.Module):
 
     def pool(self, tokens: WalkTokens):
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
-        valid = tokens.mask.flatten(1).clone()                               # [Q, T]
+        valid = (tokens.mask & ~tokens.seed_node_mask).flatten(1).clone()    # [Q, T]  non-seed tokens only
         cold = ~valid.any(dim=-1)                                            # [Q]
         if bool(cold.any()):
             nodes[cold, 0] = tokens.seeds[cold]
@@ -55,17 +55,17 @@ class BagWeights(nn.Module):
 
         x_tokens = F.embedding(nodes, self.E.weight)                         # [Q, T, d]
         xt = x_tokens.detach()                                               # [Q, T, d]
+        e_seed = F.embedding(tokens.seeds, self.E.weight).detach()           # [Q, d]
 
         u = valid.to(xt.dtype)                                               # [Q, T]
-        mid = self.geom.weighted_midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
 
         age = torch.log1p(tokens.ages.flatten(1).clamp_min(0).to(xt.dtype))  # [Q, T]
         pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
 
-        d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
+        d_tok_seed = self.geom.dist(xt, e_seed.unsqueeze(-2))                # [Q, T]
 
-        feats = standardise(torch.stack([age, pos, d_tok_mid], dim=-1),
-                            valid).to(xt.dtype)                        # [Q, T, 3]
+        feats = standardise(torch.stack([age, pos, d_tok_seed], dim=-1),
+                            valid).to(xt.dtype)                              # [Q, T, 3]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         p = self.geom.weighted_midpoint(x_tokens, w)                         # [Q, d]
@@ -101,7 +101,17 @@ class LinkPredHead(nn.Module):
         p_u, _ = self.bag_weights(src_tokens)                                # [b, d]
         p_v, _ = self.bag_weights(cand_tokens)                               # [b*c, d]
         b, d = p_u.shape
-        p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
+        c = p_v.shape[0] // b
+        p_v = p_v.view(b, c, d)                                              # [b, c, d]
 
-        geo = self.geom.dist(p_u.unsqueeze(1), p_v)                          # [b, c]
+        e_u = F.embedding(src_tokens.seeds, self.E.weight)                   # [b, d]
+        e_v = F.embedding(cand_tokens.seeds, self.E.weight).view(b, c, d)    # [b, c, d]
+
+        p_u = p_u.unsqueeze(1)                                               # [b, 1, d]
+        e_u = e_u.unsqueeze(1)                                               # [b, 1, d]
+
+        geo = (self.geom.dist(e_u, e_v)                                      # [b, c]  seed  - seed
+               + self.geom.dist(e_u, p_v)                                    # [b, c]  seed  - bag
+               + self.geom.dist(p_u, e_v)                                    # [b, c]  bag   - seed
+               + self.geom.dist(p_u, p_v))                                   # [b, c]  bag   - bag
         return self.geo_temp * (-geo)
