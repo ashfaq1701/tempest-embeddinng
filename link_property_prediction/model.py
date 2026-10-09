@@ -9,12 +9,15 @@ from .walk_tokens import WalkTokens
 _VAR_FLOOR = 1e-12
 
 
-def standardise(feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-    m = valid.unsqueeze(-1).to(feat.dtype)                                   # [Q, T, 1]
-    n = m.sum(dim=(0, 1)).clamp_min(1.0)                                     # [F]
-    mu = (feat * m).sum(dim=(0, 1)) / n                                      # [F]
-    var = (((feat - mu) ** 2) * m).sum(dim=(0, 1)) / n                       # [F]
-    return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m                # [Q, T, F]
+def standardise(feat: torch.Tensor, valid: torch.Tensor = None) -> torch.Tensor:
+    if valid is None:
+        valid = torch.ones(feat.shape[:-1], dtype=torch.bool, device=feat.device)
+    dims = tuple(range(feat.dim() - 1))
+    m = valid.unsqueeze(-1).to(feat.dtype)                                   # [..., 1]
+    n = m.sum(dim=dims).clamp_min(1.0)                                       # [F]
+    mu = (feat * m).sum(dim=dims) / n                                        # [F]
+    var = (((feat - mu) ** 2) * m).sum(dim=dims) / n                         # [F]
+    return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m                # [..., F]
 
 
 class BagWeights(nn.Module):
