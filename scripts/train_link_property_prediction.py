@@ -99,7 +99,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--export-best-embedding-table", action="store_true",
                    help="After training, dump the best-val embedding table to disk.")
     p.add_argument("--save-checkpoint", default="", type=str,
-                   help="After training, save the best-val model (E, pooler, geo_temp) and "
+                   help="After training, save the best-val model (E, pooler, scorer w) and "
                         "these args to this path -- the frozen encoder for node classification.")
 
     return p.parse_args()
