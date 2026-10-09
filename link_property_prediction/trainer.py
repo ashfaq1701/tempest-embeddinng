@@ -145,7 +145,15 @@ class Trainer:
             start_bias=self.config.start_bias,
             walk_bias=self.config.walk_bias)
 
-        return self.model(src_tokens, cand_tokens)
+        # Candidate history at each candidate's own query cutoff (EXCLUSIVE), query-major [B*C].
+        cand_seeds_np = cand_seeds.cpu().numpy()
+        cand_cutoffs_np = cand_cutoffs.cpu().numpy()
+        cand_recency = torch.from_numpy(
+            self.walk_gen.get_node_recency(cand_seeds_np, cand_cutoffs_np)).to(device, torch.float32)
+        cand_popularity = torch.from_numpy(
+            self.walk_gen.get_node_popularity(cand_seeds_np, cand_cutoffs_np)).to(device, torch.float32)
+
+        return self.model(src_tokens, cand_tokens, cand_recency, cand_popularity)
 
     # Per-batch training step
 
@@ -196,12 +204,14 @@ class Trainer:
     @torch.no_grad()
     def _head_probe(self) -> str:
         """The head's scalar parameters, for the epoch line. Read via hasattr so a head with a different
-        set of knobs degrades to a shorter line rather than raising. geo_temp scales the distance term."""
+        set of knobs degrades to a shorter line rather than raising. w weights the scorer's
+        [-geo, recency_v, popularity_v] columns."""
         parts = []
         if hasattr(self.model, "temperature"):
             parts.append(f"temp={float(self.model.temperature):.3f}")
-        if hasattr(self.model, "geo_temp"):
-            parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
+        if hasattr(self.model, "w"):
+            w = self.model.w.detach().flatten().tolist()
+            parts.append("w=[" + ",".join(f"{x:+.4f}" for x in w) + "]")
         # The residual pooler's linear branch, if present: the weighting's linear law in
         # standardised units, one weight per feature. Without it a null cannot say whether
         # the skip carried the model or stayed at its zero init.

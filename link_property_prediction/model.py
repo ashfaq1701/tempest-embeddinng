@@ -95,13 +95,18 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,
                                       n_layers=n_layers_pooler)
 
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+        self.w = nn.Parameter(torch.tensor([1.0, 0.0, 0.0]))
 
-    def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
+    def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens,
+                cand_recency: torch.Tensor, cand_popularity: torch.Tensor) -> torch.Tensor:
         p_u, _ = self.bag_weights(src_tokens)                                # [b, d]
         p_v, _ = self.bag_weights(cand_tokens)                               # [b*c, d]
         b, d = p_u.shape
-        p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
+        c = p_v.shape[0] // b
+        p_v = p_v.view(b, c, d)                                              # [b, c, d]
+        recency_v = standardise(torch.log1p(cand_recency).unsqueeze(-1)).view(b, c)  # [b, c]
+        popularity_v = standardise(torch.log1p(cand_popularity).unsqueeze(-1)).view(b, c)  # [b, c]
 
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                          # [b, c]
-        return self.geo_temp * (-geo)
+        feats = torch.stack([-geo, recency_v, popularity_v], dim=-1)         # [b, c, 3]
+        return (self.w * feats).sum(-1)                                      # [b, c]
