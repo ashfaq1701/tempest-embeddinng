@@ -41,9 +41,10 @@ class DataSuite(abc.ABC):
     """Benchmark adapter: native load + native evaluator construction. One instance
     per run."""
 
-    def __init__(self, name: str, root: str, k_eval: int, seed: int):
+    def __init__(self, name: str, root: str, is_bipartite: bool, k_eval: int, seed: int):
         self.name = name
         self.root = root
+        self.is_bipartite = bool(is_bipartite)
         self.k_eval = int(k_eval)
         self.seed = seed
         self._loaded: Optional[Loaded] = None
@@ -62,20 +63,31 @@ class DataSuite(abc.ABC):
     def make_evaluator(self, split_mode: str) -> Evaluator:
         """Native evaluator for `split_mode` in {'val', 'test'}."""
 
-    @cached_property
-    def train_dst_pool(self) -> np.ndarray:
-        """Training-negative universe (int32): unique destinations of the train split.
-        Nodes that first appear in val/test are never drawn, so training never sees a
-        future node only as a negative."""
-        return np.unique(self.load().train.destinations).astype(np.int32)
+    @property
+    def candidate_kind(self) -> str:
+        """What a negative can be: destinations on a bipartite graph, any node otherwise."""
+        return "destinations" if self.is_bipartite else "nodes"
+
+    def _candidates(self, *splits) -> np.ndarray:
+        """Unique negative candidates (int32) over `splits`: their destinations when the
+        graph is bipartite, their sources ∪ destinations when it is not."""
+        ids = [s.destinations for s in splits]
+        if not self.is_bipartite:
+            ids += [s.sources for s in splits]
+        return np.unique(np.concatenate(ids)).astype(np.int32)
 
     @cached_property
-    def eval_dst_pool(self) -> np.ndarray:
-        """Eval-negative universe (int32): unique destinations of the whole dataset
-        (train ∪ val ∪ test), as CRAFT/DyGLib draw val and test negatives."""
+    def train_negative_pool(self) -> np.ndarray:
+        """Training negatives come from the train split only, so a node that first appears
+        in val/test is never trained on purely as a negative."""
+        return self._candidates(self.load().train)
+
+    @cached_property
+    def eval_negative_pool(self) -> np.ndarray:
+        """Our val and test negatives come from the full dataset (train ∪ val ∪ test), as
+        CRAFT/DyGLib draw both."""
         loaded = self.load()
-        dsts = [loaded.train.destinations, loaded.val.destinations, loaded.test.destinations]
-        return np.unique(np.concatenate(dsts)).astype(np.int32)
+        return self._candidates(loaded.train, loaded.val, loaded.test)
 
 
 #: Valid `--data-suite` values. The train script reads this for its `choices`, so the

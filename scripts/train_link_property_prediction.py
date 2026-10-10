@@ -35,6 +35,9 @@ def parse_args() -> argparse.Namespace:
                    help="Dataset name within the suite.")
     p.add_argument("--data-root", default="datasets", type=str,
                    help="Data root directory.")
+    p.add_argument("--is-bipartite", action="store_true",
+                   help="Bipartite graph: negatives are destinations only. Otherwise any "
+                        "node (sources and destinations) can be a negative.")
     p.add_argument("--max-train-edges", default=0, type=int,
                    help="If >0, train on only the most-recent N train edges.")
     p.add_argument("--max-eval-edges", default=0, type=int,
@@ -120,7 +123,8 @@ def main() -> Dict[str, Any]:
     t0 = time.time()
     suite = make_suite(
         args.data_suite,
-        name=args.dataset, root=args.data_root, k_eval=args.k_eval, seed=args.seed,
+        name=args.dataset, root=args.data_root, is_bipartite=args.is_bipartite,
+        k_eval=args.k_eval, seed=args.seed,
     )
     loaded: Loaded = suite.load()
     print(f"loaded ({args.data_suite}) in {time.time() - t0:.1f}s")
@@ -142,12 +146,13 @@ def main() -> Dict[str, Any]:
     val_sp = _trunc(loaded.val, args.max_eval_edges, tail=False)
     test_sp = _trunc(loaded.test, args.max_eval_edges, tail=False)
 
-    # Training negatives come from train destinations; each suite's evaluators report
-    # their own eval negatives when built.
-    train_dst_pool = suite.train_dst_pool
+    # Training negatives come from the train split; each suite's evaluators report their
+    # own eval negatives when built.
+    train_negative_pool = suite.train_negative_pool
 
     print(f"  num_nodes:     {num_nodes:,}")
-    print(f"  neg_pool:      {len(train_dst_pool):,} train destinations (training negatives)")
+    print(f"  neg_pool:      {len(train_negative_pool):,} train {suite.candidate_kind} "
+          f"(training negatives)")
     print(f"  train edges:   {len(train_sp.sources):,}")
     print(f"  val edges:     {len(val_sp.sources):,}")
     print(f"  test edges:    {len(test_sp.sources):,}")
@@ -171,7 +176,7 @@ def main() -> Dict[str, Any]:
     # ─── Build TrainerConfig ───────────────────────────────────────
     config = TrainerConfig(
         num_nodes=num_nodes,
-        train_dst_pool=train_dst_pool,
+        train_negative_pool=train_negative_pool,
 
         d_emb=args.d_emb,
         hidden_dim=args.hidden_dim,

@@ -14,8 +14,8 @@ Conventions taken from DyGLib (`utils/DataLoader.py`), verified against its sour
   - `label` is per interaction, about the source user (e.g. banned after this edit).
 
 Negatives follow OUR convention, not DyGLib's 1:1 random AP/AUC: val and test each get fixed
-`[N, k_eval]` uniform negatives over the whole dataset's destinations (CRAFT's eval
-pool), scored by MRR.
+`[N, k_eval]` uniform negatives over the full dataset's candidates (CRAFT's eval
+splits), scored by MRR.
 """
 import hashlib
 import os
@@ -163,6 +163,6 @@ class DyGLibSuite(DataSuite):
             split, seed = loaded.test, self.seed + 1
         else:
             raise ValueError(f"split_mode must be 'val' or 'test', got {split_mode!r}")
-        neg = build_eval_negatives(split, self.eval_dst_pool, self.k_eval, seed,
+        neg = build_eval_negatives(split, self.eval_negative_pool, self.k_eval, seed,
                                    tag=f"[dyglib] {split_mode}")
         return TGBSeqEvaluator(neg_dst=neg)
