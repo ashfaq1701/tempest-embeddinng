@@ -40,11 +40,9 @@ class DataSuite(abc.ABC):
     """Benchmark adapter: native load + native evaluator construction. One instance
     per run."""
 
-    def __init__(self, name: str, root: str, is_bipartite: bool,
-                 k_eval: int, seed: int):
+    def __init__(self, name: str, root: str, k_eval: int, seed: int):
         self.name = name
         self.root = root
-        self.is_bipartite = bool(is_bipartite)
         self.k_eval = int(k_eval)
         self.seed = seed
         self._loaded: Optional[Loaded] = None
@@ -63,15 +61,18 @@ class DataSuite(abc.ABC):
     def make_evaluator(self, split_mode: str) -> Evaluator:
         """Native evaluator for `split_mode` in {'val', 'test'}."""
 
-    def dst_pool(self) -> np.ndarray:
-        """Negative-destination universe (int32) from the TRAIN split. Bipartite ->
-        unique train destinations; non-bipartite -> all unique train nodes (src ∪ dst)."""
-        train = self.load().train
-        if self.is_bipartite:
-            pool = np.unique(train.destinations)
-        else:
-            pool = np.unique(np.concatenate([train.sources, train.destinations]))
-        return pool.astype(np.int32)
+    def train_dst_pool(self) -> np.ndarray:
+        """Training-negative universe (int32): unique destinations of the train split.
+        Nodes that first appear in val/test are never drawn, so training never sees a
+        future node only as a negative."""
+        return np.unique(self.load().train.destinations).astype(np.int32)
+
+    def eval_dst_pool(self) -> np.ndarray:
+        """Eval-negative universe (int32): unique destinations of the whole dataset
+        (train ∪ val ∪ test), as CRAFT/DyGLib draw val and test negatives."""
+        loaded = self.load()
+        dsts = [loaded.train.destinations, loaded.val.destinations, loaded.test.destinations]
+        return np.unique(np.concatenate(dsts)).astype(np.int32)
 
 
 #: Valid `--data-suite` values. The train script reads this for its `choices`, so the

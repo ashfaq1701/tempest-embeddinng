@@ -31,7 +31,7 @@ from .walks import WalkGenerator
 class TrainerConfig:
     # Dataset-derived.
     num_nodes: int
-    dst_pool: np.ndarray
+    train_dst_pool: np.ndarray
 
     # Embedding dimension.
     d_emb: int = 64
@@ -97,7 +97,7 @@ class Trainer:
             seed=int(config.seed),
         )
         self.neg_sampler_train = UniformNegativeSampler(
-            num_neg_per_pos=config.K_train, dst_pool=config.dst_pool, seed=config.seed,
+            num_neg_per_pos=config.K_train, dst_pool=config.train_dst_pool, seed=config.seed,
         )
 
         # One param group at a single lr: Riemannian update for E, standard Adam for the rest.

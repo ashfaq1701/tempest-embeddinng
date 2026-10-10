@@ -16,15 +16,18 @@ Listed ascending by edge count.
 | 7 | Yelp | 19.8M | yes |
 | 8 | WikiLink | 34.2M | no |
 
-**Bipartite flags are authoritative from `tgb_seq/datasets/preprocess.py::bipartite_dict`,
-not from notes.** The four bipartite datasets — GoogleLocal, ML-20M, Yelp, Taobao — need
-`--is-bipartite`; passing it wrongly changes the negative-candidate pool.
+**Negative pools are destinations-only, on every suite (no `--is-bipartite` flag).** Training
+negatives are drawn from the train split's destinations; our eval negatives (TGB-Seq val, DyGLib
+val/test) from the whole dataset's destinations, as CRAFT does. Runs before this change drew both
+from the train split, and from src ∪ dst on non-bipartite graphs, so their MRRs are not directly
+comparable with runs after it. The bipartite column above is a dataset fact
+(`tgb_seq/datasets/preprocess.py::bipartite_dict`), no longer a flag.
 
 A bare run:
 
 ```
 scripts/train_link_property_prediction.py --data-suite tgb-seq --dataset <name> \
-  --use-gpu --use-gpu-tempest [--is-bipartite]
+  --use-gpu --use-gpu-tempest
 ```
 
 **Download.** TGBSeqLoader auto-downloads into a fresh dir, Taobao included. A
@@ -690,7 +693,7 @@ property of TGB-Seq's eval design, not of the model.
 
 DyGLib protocol (Wikipedia/Reddit ban prediction, ROC-AUC over the whole split, backbone
 frozen, classifier on the source node only, 5 runs, std with ddof=1). Run 1 trains link
-prediction on `--data-suite dyglib --is-bipartite --k-train 5 --k-eval 5` (linear-skip
+prediction on `--data-suite dyglib --is-bipartite --k-train 5 --k-eval 5` (flag since removed; linear-skip
 pooler) and saves the best-val checkpoint; Run 2 freezes it and trains a ~2.4k-param MLP.
 Branch `feature/node-classification-geo-walk-hist`, recipe commit `85662e1`; drivers
 `scripts/lp_seeds_wiki.sh`, `scripts/nc_final.sh`; logs `logs/node_cls_tempest_hist/k5/seed*/`

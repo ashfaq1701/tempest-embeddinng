@@ -1,8 +1,8 @@
 """TGB-Seq (`tgb_seq.LinkPred`) — native load, negatives, and MRR metric.
 
-VAL negatives are built once from `UniformNegativeSampler` at `k_eval` (fixed &
-seeded); TEST uses the shipped `test_ns` verbatim. Timestamps are cast to
-monotone int64 for Tempest's per-query cutoff.
+VAL negatives are built once from `UniformNegativeSampler` at `k_eval` over the
+whole dataset's destinations (fixed & seeded); TEST uses the shipped `test_ns`
+verbatim. Timestamps are cast to monotone int64 for Tempest's per-query cutoff.
 """
 from typing import List
 
@@ -107,7 +107,7 @@ class TGBSeqSuite(DataSuite):
     def make_evaluator(self, split_mode: str) -> Evaluator:
         loaded = self.load()
         if split_mode == "val":
-            neg = build_eval_negatives(loaded.val, self.dst_pool(), self.k_eval, self.seed)
+            neg = build_eval_negatives(loaded.val, self.eval_dst_pool(), self.k_eval, self.seed)
             return TGBSeqEvaluator(neg_dst=neg)
         if split_mode == "test":
             neg = loaded.dataset.negative_samples          # shipped test_ns.npy [N_test, K]

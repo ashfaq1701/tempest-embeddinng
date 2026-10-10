@@ -45,7 +45,7 @@ experiment_logs/            versioned run logs for the paper
 ```
 # link prediction (saves the frozen encoder for node classification)
 scripts/train_link_property_prediction.py --data-suite dyglib --dataset wikipedia \
-  --is-bipartite --k-train 5 --k-eval 5 --seed 42 --use-gpu --use-gpu-tempest \
+  --k-train 5 --k-eval 5 --seed 42 --use-gpu --use-gpu-tempest \
   --save-checkpoint <ckpt.pt>
 
 # node classification on that checkpoint

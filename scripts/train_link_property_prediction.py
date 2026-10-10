@@ -35,8 +35,6 @@ def parse_args() -> argparse.Namespace:
                    help="Dataset name within the suite.")
     p.add_argument("--data-root", default="datasets", type=str,
                    help="Data root directory.")
-    p.add_argument("--is-bipartite", action="store_true",
-                   help="Treat the graph as bipartite.")
     p.add_argument("--max-train-edges", default=0, type=int,
                    help="If >0, train on only the most-recent N train edges.")
     p.add_argument("--max-eval-edges", default=0, type=int,
@@ -122,8 +120,7 @@ def main() -> Dict[str, Any]:
     t0 = time.time()
     suite = make_suite(
         args.data_suite,
-        name=args.dataset, root=args.data_root,
-        is_bipartite=args.is_bipartite, k_eval=args.k_eval, seed=args.seed,
+        name=args.dataset, root=args.data_root, k_eval=args.k_eval, seed=args.seed,
     )
     loaded: Loaded = suite.load()
     print(f"loaded ({args.data_suite}) in {time.time() - t0:.1f}s")
@@ -145,12 +142,13 @@ def main() -> Dict[str, Any]:
     val_sp = _trunc(loaded.val, args.max_eval_edges, tail=False)
     test_sp = _trunc(loaded.test, args.max_eval_edges, tail=False)
 
-    # Negative-sampling pool, computed by the suite from the full train split.
-    dst_pool = suite.dst_pool()
+    # Training negatives come from train destinations; eval negatives (built inside the
+    # suite's evaluators) from the whole dataset's destinations.
+    train_dst_pool = suite.train_dst_pool()
 
     print(f"  num_nodes:     {num_nodes:,}")
-    _pool_kind = "destinations (bipartite)" if args.is_bipartite else "nodes (non-bipartite)"
-    print(f"  neg_pool:      {len(dst_pool):,} unique {_pool_kind}")
+    print(f"  neg_pool:      {len(train_dst_pool):,} train destinations (training), "
+          f"{len(suite.eval_dst_pool()):,} dataset destinations (eval)")
     print(f"  train edges:   {len(train_sp.sources):,}")
     print(f"  val edges:     {len(val_sp.sources):,}")
     print(f"  test edges:    {len(test_sp.sources):,}")
@@ -174,7 +172,7 @@ def main() -> Dict[str, Any]:
     # ─── Build TrainerConfig ───────────────────────────────────────
     config = TrainerConfig(
         num_nodes=num_nodes,
-        dst_pool=dst_pool,
+        train_dst_pool=train_dst_pool,
 
         d_emb=args.d_emb,
         hidden_dim=args.hidden_dim,
