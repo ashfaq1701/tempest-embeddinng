@@ -12,6 +12,7 @@ The suites agree on the vocabulary (`Loaded`, `SplitData`, `Batch`) and on the
 interchangeable. They do NOT agree on the negative-sampling protocol, so their
 MRRs are not comparable with each other -- see `tgb_eval.py`."""
 import abc
+from functools import cached_property
 from typing import List, Optional
 
 import numpy as np
@@ -61,12 +62,14 @@ class DataSuite(abc.ABC):
     def make_evaluator(self, split_mode: str) -> Evaluator:
         """Native evaluator for `split_mode` in {'val', 'test'}."""
 
+    @cached_property
     def train_dst_pool(self) -> np.ndarray:
         """Training-negative universe (int32): unique destinations of the train split.
         Nodes that first appear in val/test are never drawn, so training never sees a
         future node only as a negative."""
         return np.unique(self.load().train.destinations).astype(np.int32)
 
+    @cached_property
     def eval_dst_pool(self) -> np.ndarray:
         """Eval-negative universe (int32): unique destinations of the whole dataset
         (train ∪ val ∪ test), as CRAFT/DyGLib draw val and test negatives."""

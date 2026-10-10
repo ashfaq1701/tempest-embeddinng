@@ -142,13 +142,12 @@ def main() -> Dict[str, Any]:
     val_sp = _trunc(loaded.val, args.max_eval_edges, tail=False)
     test_sp = _trunc(loaded.test, args.max_eval_edges, tail=False)
 
-    # Training negatives come from train destinations; eval negatives (built inside the
-    # suite's evaluators) from the whole dataset's destinations.
-    train_dst_pool = suite.train_dst_pool()
+    # Training negatives come from train destinations; each suite's evaluators report
+    # their own eval negatives when built.
+    train_dst_pool = suite.train_dst_pool
 
     print(f"  num_nodes:     {num_nodes:,}")
-    print(f"  neg_pool:      {len(train_dst_pool):,} train destinations (training), "
-          f"{len(suite.eval_dst_pool()):,} dataset destinations (eval)")
+    print(f"  neg_pool:      {len(train_dst_pool):,} train destinations (training negatives)")
     print(f"  train edges:   {len(train_sp.sources):,}")
     print(f"  val edges:     {len(val_sp.sources):,}")
     print(f"  test edges:    {len(test_sp.sources):,}")

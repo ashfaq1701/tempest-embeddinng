@@ -2,7 +2,7 @@
 
   - NegativeSampler         : ABC (`sample(batch) → neg_tgt`).
   - UniformNegativeSampler  : random over a destination pool; used for training and
-                              to build TGB-Seq's fixed eval negatives.
+                              to build TGB-Seq's and DyGLib's fixed eval negatives.
 
 Eval-time negatives are suite-native and live behind `Evaluator.sample_negatives`
 (`tgb_seq_eval.py`, `tgb_eval.py`), not here: that interface allows a variable K

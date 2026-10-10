@@ -60,9 +60,12 @@ def load_tgb_seq(name: str, root: str = "datasets") -> Loaded:
 
 
 def build_eval_negatives(split: SplitData, dst_pool: np.ndarray,
-                         k_eval: int, seed: int) -> np.ndarray:
+                         k_eval: int, seed: int, tag: str) -> np.ndarray:
     """Fixed `[N_pos, k_eval]` negatives for a split, drawn once from
-    `UniformNegativeSampler` over `dst_pool` (seeded). Row i are positive i's negs."""
+    `UniformNegativeSampler` over `dst_pool` (seeded). Row i are positive i's negs.
+    `tag` names the suite and split in the one-line notice, e.g. "[dyglib] test"."""
+    print(f"  {tag} negatives: {k_eval} uniform per positive over "
+          f"{len(dst_pool):,} dataset destinations")
     sampler = UniformNegativeSampler(num_neg_per_pos=k_eval, dst_pool=dst_pool, seed=seed)
     whole = Batch(src=split.sources, tgt=split.destinations,
                   ts=split.timestamps, edge_feat=None)
@@ -107,7 +110,8 @@ class TGBSeqSuite(DataSuite):
     def make_evaluator(self, split_mode: str) -> Evaluator:
         loaded = self.load()
         if split_mode == "val":
-            neg = build_eval_negatives(loaded.val, self.eval_dst_pool(), self.k_eval, self.seed)
+            neg = build_eval_negatives(loaded.val, self.eval_dst_pool, self.k_eval, self.seed,
+                                       tag="[tgb-seq] val")
             return TGBSeqEvaluator(neg_dst=neg)
         if split_mode == "test":
             neg = loaded.dataset.negative_samples          # shipped test_ns.npy [N_test, K]
@@ -121,5 +125,6 @@ class TGBSeqSuite(DataSuite):
                 raise ValueError(
                     f"test_ns rows ({neg.shape[0]}) != test positives ({n_test}); "
                     "the shipped negatives are not row-aligned to the test split.")
+            print(f"  [tgb-seq] test negatives: shipped test_ns ({neg.shape[1]} per positive)")
             return TGBSeqEvaluator(neg_dst=neg)
         raise ValueError(f"split_mode must be 'val' or 'test', got {split_mode!r}")

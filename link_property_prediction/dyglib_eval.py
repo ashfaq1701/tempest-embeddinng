@@ -163,5 +163,6 @@ class DyGLibSuite(DataSuite):
             split, seed = loaded.test, self.seed + 1
         else:
             raise ValueError(f"split_mode must be 'val' or 'test', got {split_mode!r}")
-        neg = build_eval_negatives(split, self.eval_dst_pool(), self.k_eval, seed)
+        neg = build_eval_negatives(split, self.eval_dst_pool, self.k_eval, seed,
+                                   tag=f"[dyglib] {split_mode}")
         return TGBSeqEvaluator(neg_dst=neg)
