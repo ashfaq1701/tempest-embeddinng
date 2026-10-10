@@ -171,12 +171,37 @@ two, not CRAFT alone.
 **CRAFT does not report Patent.** It evaluates seven TGB-Seq datasets; Patent is ours only.
 No claim of the form "we beat CRAFT on Patent" can be made.
 
-### Current master, seed 5 — the honest column
+### OBSOLETE (2026-10-10): the `ours` column below is withdrawn
 
-Ours is `best_test_mrr` (val-selected) from `experiment_logs/geometries/lorentz/*/3.log`,
-commit `07dcc1e6`, d=64 K=5 lr=1e-3 patience 5, no popularity channel, single seed.
+**Only `ours` and `Δ vs bar` are obsolete. The SGNN-HN / CRAFT bar is still the bar** — those
+come from the papers, not from a run of ours.
 
-| dataset | ours (seed 5) | stop ep | SGNN-HN | CRAFT | bar | **Δ vs bar** | % walks ≥5 |
+Those `ours` numbers were `best_test_mrr` (val-selected) from
+`experiment_logs/geometries/lorentz/*/3.log` at commit `07dcc1e6`, d=64 K=5 lr=1e-3
+**patience 5**, no popularity channel, single seed. **That path no longer exists**: the
+`experiment_logs/` archive was emptied on 2026-10-10 (`79339b1`); working copies survive in
+`logs/lorentz`, and the deleted files are in git history at `79339b1^`.
+
+Four reasons not to quote the column:
+
+- the **linear-skip pooler** is now master (`a035e0e`): `softmax(skip(f) + MLP(f))` with
+  `skip = Linear(3,1,bias=False)` init `[-1,-1,0]`, which `07dcc1e6` does not have;
+- the **`triangle_cos` numerics fix** (`7e68aa7`) landed after it and is worth **+0.0398 on
+  YouTube** on its own;
+- the **negatives rework** (`78de031`, 2026-10-10) draws eval negatives from train ∪ val ∪ test
+  instead of the train split, so val MRRs before and after are not comparable;
+- **patience 5** truncates the late escape this suite shows between ep25 and ep50 — every stop
+  epoch in the table is 4-39, and YouTube's ep19 stop is exactly the window where a +0.068
+  three-epoch jump has since been measured.
+
+**Current skip-master TGB-Seq numbers live in**
+`logs/seq_skip/d64_k5_wpn5_mwl5_lr1e-3_pat10_h32_nl2_skip/run_1_seed5/` (WikiLink in the `nl1`
+sibling), seed 5, patience 10: GoogleLocal 0.6701, YouTube 0.6087, Flickr 0.6313, ML-20M 0.2468,
+Yelp 0.6537, WikiLink 0.6533. Against the bar above that is **3 of 6 clear** (GoogleLocal +4.13,
+YouTube +1.23, Flickr +0.79 in MRR %), not 2 of 7 — but those six were run before `78de031`, so
+they will need re-running on current master before they go in a paper.
+
+| dataset | ~~ours (seed 5)~~ | stop ep | SGNN-HN | CRAFT | bar | ~~**Δ vs bar**~~ | % walks ≥5 |
 |---|---|---|---|---|---|---|---|
 | GoogleLocal | **65.35** | 39 | 62.88 | 62.35 | 62.88 | **+2.47** ✅ | 72.4 |
 | Flickr | **62.51** | 13 | 60.15 | 62.34 | 62.34 | **+0.17** ✅ | 57.2 |
@@ -187,7 +212,8 @@ commit `07dcc1e6`, d=64 K=5 lr=1e-3 patience 5, no popularity channel, single se
 | Taobao | 53.13 | 4 | 68.58 | 70.68 | 70.68 | −17.55 ❌ | 93.0 |
 | Patent | 22.63 | 13 | — | — | — | (not reported) | 0.3 |
 
-**Standing: 2 of 7.** Total deficit across the five losses is 52.8 MRR points.
+~~**Standing: 2 of 7.** Total deficit across the five losses is 52.8 MRR points.~~
+**Stale** — see the obsolescence note above; on the skip-master runs the standing is 3 of 6.
 
 ### The old per-dataset records are withdrawn
 
