@@ -1,12 +1,16 @@
-import geoopt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
 _VAR_FLOOR = 1e-12
+_SQ_DIST_FLOOR = 1e-12
+
+
+def dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Euclidean distance over the last axis; the floor keeps the gradient finite at x == y."""
+    return ((x - y) ** 2).sum(-1).clamp_min(_SQ_DIST_FLOOR).sqrt()
 
 
 def standardise(feat: torch.Tensor, valid: torch.Tensor = None) -> torch.Tensor:
@@ -20,12 +24,15 @@ def standardise(feat: torch.Tensor, valid: torch.Tensor = None) -> torch.Tensor:
     return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m                # [..., F]
 
 
+def weighted_midpoint(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Weighted mean of points x [..., T, d] under weights w [..., T] summing to 1."""
+    return (w.unsqueeze(-1) * x).sum(-2)                                     # [..., d]
+
+
 class BagWeights(nn.Module):
 
-    def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
-                 n_layers: int = 2):
+    def __init__(self, E: nn.Embedding, hidden_dim: int = 32, n_layers: int = 2):
         super().__init__()
-        self.geom = geom
         self.E = E
         self.hidden = int(hidden_dim)
         self.n_layers = int(n_layers)
@@ -57,43 +64,42 @@ class BagWeights(nn.Module):
         xt = x_tokens.detach()                                               # [Q, T, d]
 
         u = valid.to(xt.dtype)                                               # [Q, T]
-        mid = self.geom.weighted_midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
+        mid = weighted_midpoint(xt, u / u.sum(-1, keepdim=True))             # [Q, d]
 
         age = torch.log1p(tokens.ages.flatten(1).clamp_min(0).to(xt.dtype))  # [Q, T]
         pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
 
-        d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
+        d_tok_mid = dist(xt, mid.unsqueeze(-2))                              # [Q, T]
 
         feats = standardise(torch.stack([age, pos, d_tok_mid], dim=-1),
                             valid).to(xt.dtype)                        # [Q, T, 3]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
-        p = self.geom.weighted_midpoint(x_tokens, w)                         # [Q, d]
+        p = weighted_midpoint(x_tokens, w)                                   # [Q, d]
 
-        d_tok_p = self.geom.dist(xt, p.unsqueeze(-2))                        # [Q, T]
+        d_tok_p = dist(xt, p.unsqueeze(-2))                                  # [Q, T]
         spread = (d_tok_p * u).sum(-1) / u.sum(-1)                           # [Q]
         return p, spread
 
 
 class LinkPredHead(nn.Module):
 
-    INIT_STD = 1e-3
-
     def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32,
                  n_layers_pooler: int = 2, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
-        self.geom = LorentzManifold()
         torch.manual_seed(seed)
 
+        # Uniform inside the unit ball: isotropic direction, radius U^(1/d) (uniform by volume).
+        # Only the starting scale; nothing constrains E once training spreads it.
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            init = self.geom.random(self.num_nodes, self.d_emb, std=self.INIT_STD)
-        self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
+            direction = F.normalize(torch.randn(self.num_nodes, self.d_emb), dim=-1)
+            radius = torch.rand(self.num_nodes, 1).pow(1.0 / self.d_emb)
+            self.E.weight.copy_(direction * radius)
 
-        self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,
-                                      n_layers=n_layers_pooler)
+        self.bag_weights = BagWeights(self.E, hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
@@ -103,5 +109,5 @@ class LinkPredHead(nn.Module):
         b, d = p_u.shape
         p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
 
-        geo = self.geom.dist(p_u.unsqueeze(1), p_v)                          # [b, c]
+        geo = dist(p_u.unsqueeze(1), p_v)                                    # [b, c]
         return self.geo_temp * (-geo)

@@ -14,7 +14,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
-import geoopt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -57,7 +56,7 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. One RiemannianAdam param group at a single `lr`: the
+    # Constant lr, no weight decay. One Adam param group at a single `lr`: the
     # embedding tables, the distance temperature and the NN pooler all step at the same rate.
     lr: float = 1e-3
 
@@ -100,10 +99,8 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.train_negative_pool, seed=config.seed,
         )
 
-        # One param group at a single lr: Riemannian update for E, standard Adam for the rest.
-        self.opt = geoopt.optim.RiemannianAdam(
-            self.model.parameters(), lr=float(config.lr), stabilize=10,
-        )
+        # One param group at a single lr: plain Adam for E and everything else.
+        self.opt = torch.optim.Adam(self.model.parameters(), lr=float(config.lr))
 
     # Full-graph ingestion (once, up front)
 
@@ -180,17 +177,9 @@ class Trainer:
 
     @torch.no_grad()
     def _geometry_probe(self) -> Dict[str, float]:
-        """Boundary watch: mean and max HYPERBOLIC RADIUS of E.
-
-        Was the Euclidean norm of the ambient (d+1)-vector. Under intrinsic
-        coordinates that vector no longer exists and ||x'|| = sqrt(k) sinh(r)
-        is not comparable to it, so this reports r = dist0(x) directly. r is
-        the quantity that matters anyway: float32 storage of an ambient point
-        loses the manifold constraint near r = 9, and float64 near r = 19.
-        Logged as r_mean/r_max, NOT |E|mean/|E|max -- old logs are on the other
-        scale and must not be compared line-for-line.
-        """
-        r = self.model.geom.dist0(self.model.E.weight.detach())
+        """Spread watch: mean and max Euclidean norm of E (its distance from the origin), logged
+        as r_mean/r_max. Not comparable with the hyperbolic radius in Lorentz-era logs."""
+        r = self.model.E.weight.detach().norm(dim=-1)
         return {"max_norm": float(r.max()), "mean_norm": float(r.mean())}
 
     @torch.no_grad()

@@ -254,7 +254,7 @@ def main() -> Dict[str, Any]:
     if args.save_checkpoint:
         ckpt_path = pathlib.Path(args.save_checkpoint)
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-        radius = trainer.model.geom.dist0(trainer.model.E.weight.detach())
+        radius = trainer.model.E.weight.detach().norm(dim=-1)
         torch.save({
             "state_dict": trainer.model.state_dict(),
             "args": vars(args),
