@@ -105,8 +105,8 @@ class LinkPredHead(nn.Module):
         src_ids = src_tokens.seeds.repeat_interleave(c)                      # [b*c]
         cand_ids = cand_tokens.seeds                                         # [b*c]
 
-        p_u, _ = self.bag_weights(src_tokens.repeat_interleave(c), cand_ids) # [b*c, d]
-        p_v, _ = self.bag_weights(cand_tokens, src_ids)                      # [b*c, d]
+        p_uv, _ = self.bag_weights(src_tokens.repeat_interleave(c), cand_ids)  # [b*c, d]
+        p_vu, _ = self.bag_weights(cand_tokens, src_ids)                     # [b*c, d]
 
-        geo = self.geom.dist(p_u, p_v).view(b, c)                            # [b, c]
+        geo = self.geom.dist(p_uv, p_vu).view(b, c)                          # [b, c]
         return self.geo_temp * (-geo)
