@@ -95,13 +95,27 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,
                                       n_layers=n_layers_pooler)
 
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+        self.w = nn.Parameter(torch.tensor([1.0, 0.0]))
+
+    @staticmethod
+    def bag_occurrences(src_tokens: WalkTokens, cand_ids: torch.Tensor) -> torch.Tensor:
+        """How many times each candidate appears among the source's valid walk tokens."""
+        u_nodes = src_tokens.nodes.flatten(1)                                # [b, T]
+        u_valid = src_tokens.mask.flatten(1)                                 # [b, T]
+        hits = (cand_ids.unsqueeze(-1) == u_nodes.unsqueeze(1)) & u_valid.unsqueeze(1)  # [b, c, T]
+        return hits.sum(-1)                                                  # [b, c]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         p_u, _ = self.bag_weights(src_tokens)                                # [b, d]
         p_v, _ = self.bag_weights(cand_tokens)                               # [b*c, d]
         b, d = p_u.shape
-        p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
+        c = p_v.shape[0] // b
+        p_v = p_v.view(b, c, d)                                              # [b, c, d]
+
+        occurrences = self.bag_occurrences(src_tokens, cand_tokens.seeds.view(b, c))   # [b, c]
+        occurrences = torch.log1p(occurrences.to(p_u.dtype))                 # [b, c]
+        occurrences = standardise(occurrences.unsqueeze(-1)).view(b, c)      # [b, c]
 
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                          # [b, c]
-        return self.geo_temp * (-geo)
+        feats = torch.stack([-geo, occurrences], dim=-1)                     # [b, c, 2]
+        return (self.w * feats).sum(-1)                                      # [b, c]
