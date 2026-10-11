@@ -55,7 +55,7 @@ class BagWeights(nn.Module):
 
         x_tokens = F.embedding(nodes, self.E.weight)                         # [Q, T, d]
         xt = x_tokens.detach()                                               # [Q, T, d]
-        x_other = F.embedding(other_side_nodes, self.E.weight).detach()      # [Q, d]
+        x_other = F.embedding(other_side_nodes, self.E.weight)               # [Q, d]
 
         u = valid.to(xt.dtype)                                               # [Q, T]
         mid = self.geom.weighted_midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
