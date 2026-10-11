@@ -1,6 +1,6 @@
 """Frozen link-prediction encoder -> 5 causal features per interaction (u, v, t):
-d0(p_u), d0(E[u]), mean_i d(x_i, p_u), log1p(#prior edges), log1p(t - last edge time).
-u's bag is pooled towards the interaction's destination v, as in link-prediction training."""
+d0(p_uv), d0(E[u]), mean_i d(x_i, p_uv), log1p(#prior edges), log1p(t - last edge time).
+p_uv is u's bag pooled towards the interaction's destination v, as in link-prediction training."""
 import hashlib
 
 import numpy as np
@@ -81,10 +81,10 @@ class FrozenEncoder:
 
     def _geometry(self, tokens: WalkTokens, src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
         geom = self.model.geom
-        p_u, spread = self.model.bag_weights(tokens, dst)                    # [Q, d], [Q]
+        p_uv, spread = self.model.bag_weights(tokens, dst)                   # [Q, d], [Q]
         e_u = self.model.E.weight[src]                                       # [Q, d]
         geometry = [
-            geom.dist0(p_u),
+            geom.dist0(p_uv),
             geom.dist0(e_u),
             spread,
         ]
