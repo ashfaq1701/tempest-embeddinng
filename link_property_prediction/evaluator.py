@@ -12,6 +12,7 @@ The suites agree on the vocabulary (`Loaded`, `SplitData`, `Batch`) and on the
 interchangeable. They do NOT agree on the negative-sampling protocol, so their
 MRRs are not comparable with each other -- see `tgb_eval.py`."""
 import abc
+from functools import cached_property
 from typing import List, Optional
 
 import numpy as np
@@ -40,8 +41,7 @@ class DataSuite(abc.ABC):
     """Benchmark adapter: native load + native evaluator construction. One instance
     per run."""
 
-    def __init__(self, name: str, root: str, is_bipartite: bool,
-                 k_eval: int, seed: int):
+    def __init__(self, name: str, root: str, is_bipartite: bool, k_eval: int, seed: int):
         self.name = name
         self.root = root
         self.is_bipartite = bool(is_bipartite)
@@ -63,15 +63,31 @@ class DataSuite(abc.ABC):
     def make_evaluator(self, split_mode: str) -> Evaluator:
         """Native evaluator for `split_mode` in {'val', 'test'}."""
 
-    def dst_pool(self) -> np.ndarray:
-        """Negative-destination universe (int32) from the TRAIN split. Bipartite ->
-        unique train destinations; non-bipartite -> all unique train nodes (src ∪ dst)."""
-        train = self.load().train
-        if self.is_bipartite:
-            pool = np.unique(train.destinations)
-        else:
-            pool = np.unique(np.concatenate([train.sources, train.destinations]))
-        return pool.astype(np.int32)
+    @property
+    def candidate_kind(self) -> str:
+        """What a negative can be: destinations on a bipartite graph, any node otherwise."""
+        return "destinations" if self.is_bipartite else "nodes"
+
+    def _candidates(self, *splits) -> np.ndarray:
+        """Unique negative candidates (int32) over `splits`: their destinations when the
+        graph is bipartite, their sources ∪ destinations when it is not."""
+        ids = [s.destinations for s in splits]
+        if not self.is_bipartite:
+            ids += [s.sources for s in splits]
+        return np.unique(np.concatenate(ids)).astype(np.int32)
+
+    @cached_property
+    def train_negative_pool(self) -> np.ndarray:
+        """Training negatives come from the train split only, so a node that first appears
+        in val/test is never trained on purely as a negative."""
+        return self._candidates(self.load().train)
+
+    @cached_property
+    def eval_negative_pool(self) -> np.ndarray:
+        """Our val and test negatives come from the full dataset (train ∪ val ∪ test), as
+        CRAFT/DyGLib draw both."""
+        loaded = self.load()
+        return self._candidates(loaded.train, loaded.val, loaded.test)
 
 
 #: Valid `--data-suite` values. The train script reads this for its `choices`, so the

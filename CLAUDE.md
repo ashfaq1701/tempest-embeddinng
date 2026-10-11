@@ -18,7 +18,11 @@ Listed ascending by edge count.
 
 **Bipartite flags are authoritative from `tgb_seq/datasets/preprocess.py::bipartite_dict`,
 not from notes.** The four bipartite datasets — GoogleLocal, ML-20M, Yelp, Taobao — need
-`--is-bipartite`; passing it wrongly changes the negative-candidate pool.
+`--is-bipartite`. The flag sets what a negative can be: destinations only when bipartite,
+sources ∪ destinations otherwise. Training negatives come from the train split; our eval
+negatives (TGB-Seq val, DyGLib val/test) from the full dataset (train ∪ val ∪ test), the splits
+CRAFT draws both val and test from. Runs before this change drew eval negatives from the train
+split only, so their val MRRs (and DyGLib test MRRs) are not directly comparable with runs after.
 
 A bare run:
 
@@ -167,12 +171,37 @@ two, not CRAFT alone.
 **CRAFT does not report Patent.** It evaluates seven TGB-Seq datasets; Patent is ours only.
 No claim of the form "we beat CRAFT on Patent" can be made.
 
-### Current master, seed 5 — the honest column
+### OBSOLETE (2026-10-10): the `ours` column below is withdrawn
 
-Ours is `best_test_mrr` (val-selected) from `experiment_logs/geometries/lorentz/*/3.log`,
-commit `07dcc1e6`, d=64 K=5 lr=1e-3 patience 5, no popularity channel, single seed.
+**Only `ours` and `Δ vs bar` are obsolete. The SGNN-HN / CRAFT bar is still the bar** — those
+come from the papers, not from a run of ours.
 
-| dataset | ours (seed 5) | stop ep | SGNN-HN | CRAFT | bar | **Δ vs bar** | % walks ≥5 |
+Those `ours` numbers were `best_test_mrr` (val-selected) from
+`experiment_logs/geometries/lorentz/*/3.log` at commit `07dcc1e6`, d=64 K=5 lr=1e-3
+**patience 5**, no popularity channel, single seed. **That path no longer exists**: the
+`experiment_logs/` archive was emptied on 2026-10-10 (`79339b1`); working copies survive in
+`logs/lorentz`, and the deleted files are in git history at `79339b1^`.
+
+Four reasons not to quote the column:
+
+- the **linear-skip pooler** is now master (`a035e0e`): `softmax(skip(f) + MLP(f))` with
+  `skip = Linear(3,1,bias=False)` init `[-1,-1,0]`, which `07dcc1e6` does not have;
+- the **`triangle_cos` numerics fix** (`7e68aa7`) landed after it and is worth **+0.0398 on
+  YouTube** on its own;
+- the **negatives rework** (`78de031`, 2026-10-10) draws eval negatives from train ∪ val ∪ test
+  instead of the train split, so val MRRs before and after are not comparable;
+- **patience 5** truncates the late escape this suite shows between ep25 and ep50 — every stop
+  epoch in the table is 4-39, and YouTube's ep19 stop is exactly the window where a +0.068
+  three-epoch jump has since been measured.
+
+**Current skip-master TGB-Seq numbers live in**
+`logs/seq_skip/d64_k5_wpn5_mwl5_lr1e-3_pat10_h32_nl2_skip/run_1_seed5/` (WikiLink in the `nl1`
+sibling), seed 5, patience 10: GoogleLocal 0.6701, YouTube 0.6087, Flickr 0.6313, ML-20M 0.2468,
+Yelp 0.6537, WikiLink 0.6533. Against the bar above that is **3 of 6 clear** (GoogleLocal +4.13,
+YouTube +1.23, Flickr +0.79 in MRR %), not 2 of 7 — but those six were run before `78de031`, so
+they will need re-running on current master before they go in a paper.
+
+| dataset | ~~ours (seed 5)~~ | stop ep | SGNN-HN | CRAFT | bar | ~~**Δ vs bar**~~ | % walks ≥5 |
 |---|---|---|---|---|---|---|---|
 | GoogleLocal | **65.35** | 39 | 62.88 | 62.35 | 62.88 | **+2.47** ✅ | 72.4 |
 | Flickr | **62.51** | 13 | 60.15 | 62.34 | 62.34 | **+0.17** ✅ | 57.2 |
@@ -183,7 +212,8 @@ commit `07dcc1e6`, d=64 K=5 lr=1e-3 patience 5, no popularity channel, single se
 | Taobao | 53.13 | 4 | 68.58 | 70.68 | 70.68 | −17.55 ❌ | 93.0 |
 | Patent | 22.63 | 13 | — | — | — | (not reported) | 0.3 |
 
-**Standing: 2 of 7.** Total deficit across the five losses is 52.8 MRR points.
+~~**Standing: 2 of 7.** Total deficit across the five losses is 52.8 MRR points.~~
+**Stale** — see the obsolescence note above; on the skip-master runs the standing is 3 of 6.
 
 ### The old per-dataset records are withdrawn
 
@@ -233,6 +263,57 @@ run, against Taobao's 1381 s and Yelp's 1780 s), and the extreme point on trunca
 mechanism there, then **confirm on Taobao before believing it generalises** — ML-20M is an
 outlier in density too (127 edges/node against Taobao ~8.6 and Yelp ~9.8), so a fix that
 exploits deep dense history need not transfer.
+
+## CRAFT's TGB numbers: an off-by-one in its test negatives, and how to report it (found 2026-10-10)
+
+**The bug.** CRAFT's TGB loader (`utils/DataLoader.py`, TGB branch) reads TGB's official
+test negatives from `dataset.ns_sampler.eval_set["test"]` in raw 0-based node ids, then shifts
+`src`/`dst` ids by +1 to reserve 0 for padding, and never shifts `test_ns`. Nothing downstream
+compensates (`evaluate_models_utils.py:69` reads them as-is; `models/CRAFT.py:163` transforms
+positive and negatives identically). Every test negative is scored as node `id - 1`. TGB's
+`hist_rnd` negatives include up to `hist_ratio` of the source's own past destinations (the hard
+ones); the shift turns them into unrelated nodes. Ruled out: no pre-shifted negatives file ships,
+the only writer of `<dataset>_test_ns.npy` is that loader (raw ids), and the vendored TGB loads
+the pickle unchanged. On tgbl-wiki the positive appears among its own shifted negatives in
+**99.4%** of test queries before the fix, **0.0%** after (TGB's official set: 0.0%).
+
+**Scope.** Only CRAFT's TGB columns: tgbl-review, tgbl-comment (its Table 2), tgbl-coin,
+tgbl-flight (Table 3). The TGB-Seq branch applies no id shift; its TGB-Seq and DyGLib numbers are
+unaffected. CRAFT's TGB val uses uniform random negatives (not TGB's val set); that only affects
+checkpoint selection.
+
+**Fixes, in our fork `ashfaq1701/CRAFT`:** `fix/tgb-test-negative-shift` (`e77bf60`, the shift
+only) and `fix/tgbl-wiki-ragged-test-negatives` (shift + trimming tgbl-wiki's 998/999 negatives to
+998 so it loads; trimming deviates slightly from TGB's protocol on tgbl-wiki only). First server
+run with the shift fix: **tgbl-review 0.2231 vs the paper's 41.77** (single run, not yet the
+paired protocol below).
+
+**How to handle it in the paper -- be direct, but airtight and neutral:**
+
+1. **Make the evidence decisive first.** Run CRAFT's official code twice on the same server,
+   config, seeds and hardware: unpatched, then with only the shift fix. Unpatched near 41.77 and
+   patched near 22.3 isolates the bug; without that pair a reviewer can call it a failed
+   reproduction. Use their protocol (3 runs, mean +/- std, their per-dataset hyperparameters),
+   and do all four affected TGB sets. State explicitly that their TGB-Seq and DyGLib numbers are
+   unaffected: it shows we are correcting one bug, not attacking the paper.
+2. **Contact the authors before submission.** Open an issue + PR on their repo with the fix (the
+   branch and its commit message already explain it); optionally email. If they confirm and update,
+   best case; if not, note "reported to the authors on <date>".
+3. **In the paper:** for CRAFT on TGB report three columns -- as reported, reproduced with the
+   official code, reproduced with corrected test negatives -- and rank/compare on the corrected one
+   only, saying so in the caption. Main text, short and factual, e.g. *"The official CRAFT
+   implementation evaluates TGB datasets against test negatives whose node ids are offset by one
+   relative to the positives (Appendix X). With this corrected, CRAFT obtains 22.3 on tgbl-review
+   (reported: 41.8)."* Appendix: the code lines, the one-line fix, the tgbl-wiki 99.4% -> 0.0%
+   check, and a link to the PR.
+4. **Tone.** Describe the evaluation, not the authors: "evaluates against misaligned negatives",
+   not "inflated", "wrong" or "flawed". No speculation about intent; off-by-ones are ordinary bugs.
+5. **Anchor to the TGB leaderboard.** Put corrected CRAFT next to the official tgbl-review entries
+   so it is on the same footing as everyone else -- fetch the leaderboard fresh, never from memory.
+
+Quietly using lower CRAFT numbers reads as a failed reproduction; quoting their published numbers
+silently makes our own comparisons wrong. A transparent, evidence-backed correction protects us
+either way.
 
 ## Four poolers, one null result (measured, 2026-09-28/29)
 
