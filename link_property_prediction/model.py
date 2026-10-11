@@ -101,7 +101,14 @@ class LinkPredHead(nn.Module):
         p_u, _ = self.bag_weights(src_tokens)                                # [b, d]
         p_v, _ = self.bag_weights(cand_tokens)                               # [b*c, d]
         b, d = p_u.shape
-        p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
+        c = p_v.shape[0] // b
+        p_u = p_u.unsqueeze(1)                                               # [b, 1, d]
+        p_v = p_v.view(b, c, d)                                              # [b, c, d]
 
-        geo = self.geom.dist(p_u.unsqueeze(1), p_v)                          # [b, c]
+        e_u = F.embedding(src_tokens.seeds, self.E.weight).unsqueeze(1)     # [b, 1, d]
+        e_v = F.embedding(cand_tokens.seeds, self.E.weight).view(b, c, d)   # [b, c, d]
+
+        geo = (self.geom.dist(e_u, p_v)                                      # [b, c]  seed - bag
+               + self.geom.dist(p_u, e_v)                                    # [b, c]  bag  - seed
+               + self.geom.dist(p_u, p_v))                                   # [b, c]  bag  - bag
         return self.geo_temp * (-geo)
