@@ -264,6 +264,57 @@ mechanism there, then **confirm on Taobao before believing it generalises** — 
 outlier in density too (127 edges/node against Taobao ~8.6 and Yelp ~9.8), so a fix that
 exploits deep dense history need not transfer.
 
+## CRAFT's TGB numbers: an off-by-one in its test negatives, and how to report it (found 2026-10-10)
+
+**The bug.** CRAFT's TGB loader (`utils/DataLoader.py`, TGB branch) reads TGB's official
+test negatives from `dataset.ns_sampler.eval_set["test"]` in raw 0-based node ids, then shifts
+`src`/`dst` ids by +1 to reserve 0 for padding, and never shifts `test_ns`. Nothing downstream
+compensates (`evaluate_models_utils.py:69` reads them as-is; `models/CRAFT.py:163` transforms
+positive and negatives identically). Every test negative is scored as node `id - 1`. TGB's
+`hist_rnd` negatives include up to `hist_ratio` of the source's own past destinations (the hard
+ones); the shift turns them into unrelated nodes. Ruled out: no pre-shifted negatives file ships,
+the only writer of `<dataset>_test_ns.npy` is that loader (raw ids), and the vendored TGB loads
+the pickle unchanged. On tgbl-wiki the positive appears among its own shifted negatives in
+**99.4%** of test queries before the fix, **0.0%** after (TGB's official set: 0.0%).
+
+**Scope.** Only CRAFT's TGB columns: tgbl-review, tgbl-comment (its Table 2), tgbl-coin,
+tgbl-flight (Table 3). The TGB-Seq branch applies no id shift; its TGB-Seq and DyGLib numbers are
+unaffected. CRAFT's TGB val uses uniform random negatives (not TGB's val set); that only affects
+checkpoint selection.
+
+**Fixes, in our fork `ashfaq1701/CRAFT`:** `fix/tgb-test-negative-shift` (`e77bf60`, the shift
+only) and `fix/tgbl-wiki-ragged-test-negatives` (shift + trimming tgbl-wiki's 998/999 negatives to
+998 so it loads; trimming deviates slightly from TGB's protocol on tgbl-wiki only). First server
+run with the shift fix: **tgbl-review 0.2231 vs the paper's 41.77** (single run, not yet the
+paired protocol below).
+
+**How to handle it in the paper -- be direct, but airtight and neutral:**
+
+1. **Make the evidence decisive first.** Run CRAFT's official code twice on the same server,
+   config, seeds and hardware: unpatched, then with only the shift fix. Unpatched near 41.77 and
+   patched near 22.3 isolates the bug; without that pair a reviewer can call it a failed
+   reproduction. Use their protocol (3 runs, mean +/- std, their per-dataset hyperparameters),
+   and do all four affected TGB sets. State explicitly that their TGB-Seq and DyGLib numbers are
+   unaffected: it shows we are correcting one bug, not attacking the paper.
+2. **Contact the authors before submission.** Open an issue + PR on their repo with the fix (the
+   branch and its commit message already explain it); optionally email. If they confirm and update,
+   best case; if not, note "reported to the authors on <date>".
+3. **In the paper:** for CRAFT on TGB report three columns -- as reported, reproduced with the
+   official code, reproduced with corrected test negatives -- and rank/compare on the corrected one
+   only, saying so in the caption. Main text, short and factual, e.g. *"The official CRAFT
+   implementation evaluates TGB datasets against test negatives whose node ids are offset by one
+   relative to the positives (Appendix X). With this corrected, CRAFT obtains 22.3 on tgbl-review
+   (reported: 41.8)."* Appendix: the code lines, the one-line fix, the tgbl-wiki 99.4% -> 0.0%
+   check, and a link to the PR.
+4. **Tone.** Describe the evaluation, not the authors: "evaluates against misaligned negatives",
+   not "inflated", "wrong" or "flawed". No speculation about intent; off-by-ones are ordinary bugs.
+5. **Anchor to the TGB leaderboard.** Put corrected CRAFT next to the official tgbl-review entries
+   so it is on the same footing as everyone else -- fetch the leaderboard fresh, never from memory.
+
+Quietly using lower CRAFT numbers reads as a failed reproduction; quoting their published numbers
+silently makes our own comparisons wrong. A transparent, evidence-backed correction protects us
+either way.
+
 ## Four poolers, one null result (measured, 2026-09-28/29)
 
 Four architectures were built off master, run on 3-5 datasets each and rejected in one session.
