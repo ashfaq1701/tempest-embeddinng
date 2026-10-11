@@ -23,7 +23,7 @@ def standardise(feat: torch.Tensor, valid: torch.Tensor = None) -> torch.Tensor:
 class BagWeights(nn.Module):
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
-                 n_layers: int = 2):
+                 n_layers: int = 2, dropout: float = 0.0):
         super().__init__()
         self.geom = geom
         self.E = E
@@ -31,10 +31,25 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
+        self.dropout = float(dropout)
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {dropout}")
         self.n_feat = 3
-        layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
+        # Dropout goes AFTER the GELU -- the standard FFN position (Linear -> act -> Dropout).
+        # Before the GELU it would scale PRE-activations by 1/(1-p), moving the nonlinearity's
+        # operating point rather than just masking units. There is deliberately NO dropout
+        # after the final Linear(hidden, 1): that output is a per-token logit fed to a masked
+        # softmax, and zeroing a logit is not a neutral act -- 0 is a HIGH value next to the
+        # typical logits here, so dropping it would promote the token rather than ignore it.
+        #
+        # Inserted ONLY when dropout > 0, so at the default the module tree and the
+        # state_dict keys are byte-identical to master (nn.Sequential names children by
+        # index, so an unconditional nn.Dropout(0.0) would shift net.2 -> net.3 and break
+        # checkpoint loading against every existing run).
+        drop = [nn.Dropout(self.dropout)] if self.dropout > 0.0 else []
+        layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()] + drop
         for _ in range(self.n_layers - 1):
-            layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
+            layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()] + drop
         layers.append(nn.Linear(self.hidden, 1))
         self.net = nn.Sequential(*layers)
 
@@ -80,7 +95,7 @@ class LinkPredHead(nn.Module):
     INIT_STD = 1e-3
 
     def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32,
-                 n_layers_pooler: int = 2, seed: int = 42):
+                 n_layers_pooler: int = 2, seed: int = 42, dropout_pooler: float = 0.0):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
@@ -93,7 +108,7 @@ class LinkPredHead(nn.Module):
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
         self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,
-                                      n_layers=n_layers_pooler)
+                                      n_layers=n_layers_pooler, dropout=dropout_pooler)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 

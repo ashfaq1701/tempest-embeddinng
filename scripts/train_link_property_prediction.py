@@ -69,6 +69,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", default=1e-3, type=float,
                    help="Learning rate. One param group: the embedding tables, the distance "
                         "temperature and the NN pooler all step at this rate.")
+    p.add_argument("--dropout-pooler", default=0.0, type=float,
+                   help="Dropout on the pooler MLP's hidden activations, applied after each "
+                        "GELU. 0.0 (default) disables it and keeps the module tree identical "
+                        "to a run without the option. Train-only; nn.Dropout is inert under "
+                        "eval(). The embedding table E is NOT touched.")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
@@ -181,6 +186,7 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
         hidden_dim=args.hidden_dim,
         n_layers_pooler=args.n_layers_pooler,
+        dropout_pooler=args.dropout_pooler,
 
         K_train=args.k_train,
 
