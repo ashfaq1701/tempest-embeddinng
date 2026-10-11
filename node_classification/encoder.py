@@ -1,5 +1,6 @@
-"""Frozen link-prediction encoder -> 5 causal features per interaction (u, t):
-d0(p_u), d0(E[u]), mean_i d(x_i, p_u), log1p(#prior edges), log1p(t - last edge time)."""
+"""Frozen link-prediction encoder -> 5 causal features per interaction (u, v, t):
+d0(p_u), d0(E[u]), mean_i d(x_i, p_u), log1p(#prior edges), log1p(t - last edge time).
+u's bag is pooled towards the interaction's destination v, as in link-prediction training."""
 import hashlib
 
 import numpy as np
@@ -67,20 +68,20 @@ class FrozenEncoder:
         out = []
         for batch in create_batches(split, batch_size):
             src = torch.from_numpy(batch.src.astype(np.int64))
+            dst = torch.from_numpy(batch.tgt.astype(np.int64))
             ts = torch.from_numpy(batch.ts.astype(np.int64))
             tokens = build_query_walk_tokens(
                 walker, self.device, src, ts,
                 max_walk_len=a["max_walk_len"], num_walks_per_node=a["num_walks_per_node"],
                 start_bias=a["start_bias"], walk_bias=a["walk_bias"])
-            geometry = self._geometry(tokens, src.to(self.device))
+            geometry = self._geometry(tokens, src.to(self.device), dst.to(self.device))
             history = self._history(walker, batch.src, batch.ts)
             out.append(torch.cat([geometry, history.to(self.device)], dim=1))
         return torch.cat(out)                                                # [N, 5]
 
-    def _geometry(self, tokens: WalkTokens, src: torch.Tensor) -> torch.Tensor:
+    def _geometry(self, tokens: WalkTokens, src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
         geom = self.model.geom
-        # No candidate when classifying a node: its bag is conditioned on the node itself.
-        p_u, spread = self.model.bag_weights(tokens, tokens.seeds)           # [Q, d], [Q]
+        p_u, spread = self.model.bag_weights(tokens, dst)                    # [Q, d], [Q]
         e_u = self.model.E.weight[src]                                       # [Q, d]
         geometry = [
             geom.dist0(p_u),
