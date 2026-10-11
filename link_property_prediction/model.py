@@ -42,10 +42,17 @@ class BagWeights(nn.Module):
         with torch.no_grad():
             self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0, 0.0]]))
 
-    def forward(self, tokens: WalkTokens, other_side_nodes: torch.Tensor):
+    def forward(self, tokens: WalkTokens, other_side_nodes: torch.Tensor = None):
         return self.pool(tokens, other_side_nodes)
 
-    def pool(self, tokens: WalkTokens, other_side_nodes: torch.Tensor):
+    def _distance_to_other(self, xt: torch.Tensor, other_side_nodes: torch.Tensor) -> torch.Tensor:
+        """Each token's distance to the other side's point; zeros when the bag is unconditioned."""
+        if other_side_nodes is None:
+            return xt.new_zeros(xt.shape[:-1])                               # [Q, T]
+        x_other = F.embedding(other_side_nodes, self.E.weight)               # [Q, d]
+        return self.geom.dist(xt, x_other.unsqueeze(-2))                     # [Q, T]
+
+    def pool(self, tokens: WalkTokens, other_side_nodes: torch.Tensor = None):
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
         valid = tokens.mask.flatten(1).clone()                               # [Q, T]
         cold = ~valid.any(dim=-1)                                            # [Q]
@@ -55,7 +62,6 @@ class BagWeights(nn.Module):
 
         x_tokens = F.embedding(nodes, self.E.weight)                         # [Q, T, d]
         xt = x_tokens.detach()                                               # [Q, T, d]
-        x_other = F.embedding(other_side_nodes, self.E.weight)               # [Q, d]
 
         u = valid.to(xt.dtype)                                               # [Q, T]
         mid = self.geom.weighted_midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
@@ -64,7 +70,7 @@ class BagWeights(nn.Module):
         pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
 
         d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
-        d_tok_other = self.geom.dist(xt, x_other.unsqueeze(-2))              # [Q, T]
+        d_tok_other = self._distance_to_other(xt, other_side_nodes)          # [Q, T]
 
         feats = standardise(torch.stack([age, pos, d_tok_mid, d_tok_other], dim=-1),
                             valid).to(xt.dtype)                              # [Q, T, 4]
@@ -103,10 +109,10 @@ class LinkPredHead(nn.Module):
         b = src_tokens.seeds.shape[0]
         c = cand_tokens.seeds.shape[0] // b
         src_ids = src_tokens.seeds.repeat_interleave(c)                      # [b*c]
-        cand_ids = cand_tokens.seeds                                         # [b*c]
 
-        p_uv, _ = self.bag_weights(src_tokens.repeat_interleave(c), cand_ids)  # [b*c, d]
+        p_u, _ = self.bag_weights(src_tokens)                                # [b, d]
         p_vu, _ = self.bag_weights(cand_tokens, src_ids)                     # [b*c, d]
+        p_vu = p_vu.view(b, c, -1)                                           # [b, c, d]
 
-        geo = self.geom.dist(p_uv, p_vu).view(b, c)                          # [b, c]
+        geo = self.geom.dist(p_u.unsqueeze(1), p_vu)                         # [b, c]
         return self.geo_temp * (-geo)
