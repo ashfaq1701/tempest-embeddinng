@@ -79,7 +79,8 @@ class FrozenEncoder:
 
     def _geometry(self, tokens: WalkTokens, src: torch.Tensor) -> torch.Tensor:
         geom = self.model.geom
-        p_u, spread = self.model.bag_weights(tokens)                         # [Q, d], [Q]
+        # No candidate when classifying a node: its bag is conditioned on the node itself.
+        p_u, spread = self.model.bag_weights(tokens, tokens.seeds)           # [Q, d], [Q]
         e_u = self.model.E.weight[src]                                       # [Q, d]
         geometry = [
             geom.dist0(p_u),

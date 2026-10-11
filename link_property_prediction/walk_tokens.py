@@ -3,7 +3,7 @@
 A query is a (seed, cutoff t) pair; K walks per query, each bounded by cutoff = t, each
 of length L. Requires shuffle_walk_order=False.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Optional
 
 import numpy as np
@@ -24,6 +24,14 @@ class WalkTokens:
     mask: torch.Tensor                              # [Q, K, L]   bool, real slots (nodes != -1), incl. seed
     seed_mask: torch.Tensor                         # [Q, K, L]   bool, ONLY the seed's walk-origin slot
     edge_features: Optional[torch.Tensor] = None    # [Q, K, L, d_ef]  seed slot + padding zeroed; None if no EF
+
+    def repeat_interleave(self, repeats: int) -> "WalkTokens":
+        """Each query repeated `repeats` times consecutively: [Q, ...] -> [Q*repeats, ...]."""
+        repeated = {}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            repeated[f.name] = None if value is None else value.repeat_interleave(repeats, dim=0)
+        return WalkTokens(**repeated)
 
 
 def build_query_walk_tokens(

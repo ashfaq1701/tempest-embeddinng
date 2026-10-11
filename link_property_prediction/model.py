@@ -31,7 +31,7 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 3
+        self.n_feat = 4
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -40,12 +40,12 @@ class BagWeights(nn.Module):
 
         self.skip = nn.Linear(self.n_feat, 1, bias=False)
         with torch.no_grad():
-            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0]]))
+            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0, 0.0]]))
 
-    def forward(self, tokens: WalkTokens):
-        return self.pool(tokens)
+    def forward(self, tokens: WalkTokens, other_side_nodes: torch.Tensor):
+        return self.pool(tokens, other_side_nodes)
 
-    def pool(self, tokens: WalkTokens):
+    def pool(self, tokens: WalkTokens, other_side_nodes: torch.Tensor):
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
         valid = tokens.mask.flatten(1).clone()                               # [Q, T]
         cold = ~valid.any(dim=-1)                                            # [Q]
@@ -55,6 +55,7 @@ class BagWeights(nn.Module):
 
         x_tokens = F.embedding(nodes, self.E.weight)                         # [Q, T, d]
         xt = x_tokens.detach()                                               # [Q, T, d]
+        x_other = F.embedding(other_side_nodes, self.E.weight).detach()      # [Q, d]
 
         u = valid.to(xt.dtype)                                               # [Q, T]
         mid = self.geom.weighted_midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
@@ -63,9 +64,10 @@ class BagWeights(nn.Module):
         pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
 
         d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
+        d_tok_other = self.geom.dist(xt, x_other.unsqueeze(-2))              # [Q, T]
 
-        feats = standardise(torch.stack([age, pos, d_tok_mid], dim=-1),
-                            valid).to(xt.dtype)                        # [Q, T, 3]
+        feats = standardise(torch.stack([age, pos, d_tok_mid, d_tok_other], dim=-1),
+                            valid).to(xt.dtype)                              # [Q, T, 4]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         p = self.geom.weighted_midpoint(x_tokens, w)                         # [Q, d]
@@ -98,10 +100,13 @@ class LinkPredHead(nn.Module):
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        p_u, _ = self.bag_weights(src_tokens)                                # [b, d]
-        p_v, _ = self.bag_weights(cand_tokens)                               # [b*c, d]
-        b, d = p_u.shape
-        p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
+        b = src_tokens.seeds.shape[0]
+        c = cand_tokens.seeds.shape[0] // b
+        src_ids = src_tokens.seeds.repeat_interleave(c)                      # [b*c]
+        cand_ids = cand_tokens.seeds                                         # [b*c]
 
-        geo = self.geom.dist(p_u.unsqueeze(1), p_v)                          # [b, c]
+        p_u, _ = self.bag_weights(src_tokens.repeat_interleave(c), cand_ids) # [b*c, d]
+        p_v, _ = self.bag_weights(cand_tokens, src_ids)                      # [b*c, d]
+
+        geo = self.geom.dist(p_u, p_v).view(b, c)                            # [b, c]
         return self.geo_temp * (-geo)
