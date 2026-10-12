@@ -176,7 +176,7 @@ def main() -> Dict[str, Any]:
     # ─── Build TrainerConfig ───────────────────────────────────────
     config = TrainerConfig(
         num_nodes=num_nodes,
-        train_negative_pool=train_negative_pool,
+        train_negative_sampler=suite.train_negative_sampler(args.k_train),
 
         d_emb=args.d_emb,
         hidden_dim=args.hidden_dim,

@@ -13,9 +13,9 @@ Conventions taken from DyGLib (`utils/DataLoader.py`), verified against its sour
     additionally holds out 10% of nodes, which we do NOT do -- one split serves both runs.
   - `label` is per interaction, about the source user (e.g. banned after this edit).
 
-Negatives follow OUR convention, not DyGLib's 1:1 random AP/AUC: val and test each get fixed
-`[N, k_eval]` uniform negatives over the full dataset's candidates (CRAFT's eval
-splits), scored by MRR.
+Negatives follow CRAFT's DyGLib protocol, not DyGLib's 1:1 random AP/AUC: training, val and
+test negatives are collision-free (`CollisionFreeNegativeSampler`); val and test each get fixed
+`[N, k_eval]` negatives over the full dataset's candidates, scored by MRR.
 """
 import hashlib
 import os
@@ -28,7 +28,8 @@ import numpy as np
 
 from .data import Loaded, SplitData
 from .evaluator import DataSuite, Evaluator
-from .tgb_seq_eval import TGBSeqEvaluator, build_eval_negatives
+from .negatives import CollisionFreeNegativeSampler, NegativeSampler
+from .tgb_seq_eval import TGBSeqEvaluator
 
 ZENODO_RECORD = "https://zenodo.org/api/records/7213796"
 VAL_QUANTILE, TEST_QUANTILE = 0.70, 0.85
@@ -149,7 +150,7 @@ def load_dyglib(name: str, root: str = "datasets") -> Loaded:
 
 
 class DyGLibSuite(DataSuite):
-    """DyGLib adapter for link prediction. Val and test both use our fixed uniform
+    """DyGLib adapter for link prediction. Val and test both use fixed collision-free
     negatives at `k_eval` (seeded, test one seed apart from val), scored by MRR."""
 
     def _load(self) -> Loaded:
@@ -163,6 +164,9 @@ class DyGLibSuite(DataSuite):
             split, seed = loaded.test, self.seed + 1
         else:
             raise ValueError(f"split_mode must be 'val' or 'test', got {split_mode!r}")
-        neg = build_eval_negatives(split, self.eval_negative_pool, self.k_eval, seed,
-                                   tag=f"[dyglib] {split_mode}")
+        neg = self.eval_negatives(split, seed, tag=f"[dyglib] {split_mode}")
         return TGBSeqEvaluator(neg_dst=neg)
+
+    def negative_sampler(self, pool: np.ndarray, k: int, seed: int,
+                         edges: SplitData) -> NegativeSampler:
+        return CollisionFreeNegativeSampler(num_neg_per_pos=k, dst_pool=pool, edges=edges, seed=seed)
