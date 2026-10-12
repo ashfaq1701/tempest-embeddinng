@@ -41,6 +41,9 @@ class UniformNegativeSampler(NegativeSampler):
         self.dst_pool = np.asarray(dst_pool, dtype=np.int32)
         self.rng = np.random.default_rng(seed)
 
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(k={self.num_neg_per_pos}, pool={len(self.dst_pool):,})"
+
     def sample(self, batch: Batch) -> np.ndarray:
         """[B, K] negative destinations. The positive's source is implicit -- every caller
         pairs the negatives with batch.src itself, so no source array is materialised."""
