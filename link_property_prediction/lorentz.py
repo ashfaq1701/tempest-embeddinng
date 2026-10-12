@@ -416,12 +416,11 @@ class LorentzManifold(geoopt.Manifold):
     # ------------------------------------------------------------------
     # initialisation (paper, section 3.2.2)
     # ------------------------------------------------------------------
-    def random(self, *size, dtype=None, device=None, std: float = 1e-3) -> Tensor:
-        """Isotropic tangent-normal init: u ~ N(0, (2 std)^2 / n) per coordinate,
-        x = expmap_O(u), so d(x, O) = |u| concentrates at 2 std. The 2 matches
-        geoopt.PoincareBall.random, whose dist0 carries a factor 2.
-        """
-        u = torch.randn(*size, dtype=dtype, device=device) * (2.0 * std / size[-1] ** 0.5)
+    def random(self, *size, dtype=None, device=None) -> Tensor:
+        """Unit init: a uniformly random direction at geodesic distance 1 from the origin,
+        x = expmap_O(z / |z|) with z ~ N(0, I)."""
+        u = torch.randn(*size, dtype=dtype, device=device)
+        u = u / u.norm(dim=-1, keepdim=True)
         return geoopt.ManifoldTensor(self.expmap(torch.zeros_like(u), u), manifold=self)
 
     def origin(self, *size, dtype=None, device=None, seed: int = 42) -> Tensor:

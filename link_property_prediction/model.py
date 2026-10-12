@@ -77,8 +77,6 @@ class BagWeights(nn.Module):
 
 class LinkPredHead(nn.Module):
 
-    INIT_STD = 1e-3
-
     def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32,
                  n_layers_pooler: int = 2, seed: int = 42):
         super().__init__()
@@ -89,7 +87,7 @@ class LinkPredHead(nn.Module):
 
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            init = self.geom.random(self.num_nodes, self.d_emb, std=self.INIT_STD)
+            init = self.geom.random(self.num_nodes, self.d_emb)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
         self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,

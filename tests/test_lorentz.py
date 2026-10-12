@@ -495,7 +495,8 @@ def test_base_class_composites_work(k):
 def test_optimizer_reduces_a_hyperbolic_loss(opt_cls, k):
     torch.manual_seed(7)
     m = LorentzManifold(k=k)
-    p = geoopt.ManifoldParameter(m.random(32, DIM, dtype=torch.float64), manifold=m)
+    u = torch.randn(32, DIM, dtype=torch.float64) * (2e-3 / DIM ** 0.5)
+    p = geoopt.ManifoldParameter(m.expmap(torch.zeros_like(u), u), manifold=m)
     target = m.expmap(torch.zeros(DIM, dtype=torch.float64),
                       torch.randn(DIM, dtype=torch.float64))
     lr = 0.2 if opt_cls is geoopt.optim.RiemannianSGD else 0.02
@@ -647,23 +648,18 @@ def test_transp_stays_isometric_in_float32(k):
         assert (ratio - 1).abs().max() < 1e-4
 
 
-def test_random_is_an_isotropic_tangent_normal():
-    """d(x, O) = |u| for u ~ N(0, (2 std)^2 / n), so the mean radius is
-    2 std E[chi_n]/sqrt(n): linear in std and independent of k."""
-    chi = math.sqrt(2.0) * math.gamma((DIM + 1) / 2) / math.gamma(DIM / 2)
+def test_random_is_a_unit_init():
+    """Every point at geodesic distance 1 from the origin, directions isotropic."""
     for k in KS:
         m = LorentzManifold(k=k)
-        for std in (1e-3, 1e-1):
-            torch.manual_seed(5)
-            x = m.random(8192, DIM, dtype=torch.float64, std=std)
-            r = m.dist0(x)
-            assert isinstance(x, geoopt.ManifoldTensor) and x.manifold is m
-            assert m.check_point_on_manifold(x)
-            assert (m.projx(x) - x).abs().max() == 0.0
-            assert abs(r.mean().item() / (2 * std * chi / math.sqrt(DIM)) - 1) < 0.01
-            assert abs(r.std().item() / r.mean().item() - 1 / math.sqrt(2 * DIM)) < 0.06
         torch.manual_seed(5)
-        assert m.random(65536, DIM, dtype=torch.float64).mean(0).abs().max() < 1e-4
+        x = m.random(4096, DIM, dtype=torch.float64)
+        assert isinstance(x, geoopt.ManifoldTensor) and x.manifold is m
+        assert m.check_point_on_manifold(x)
+        assert (m.dist0(x) - 1.0).abs().max() < 1e-12
+
+        torch.manual_seed(5)
+        assert m.random(65536, DIM, dtype=torch.float64).mean(0).abs().max() < 0.01
         for dt in (torch.float32, torch.float64):
             assert m.random(16, DIM, dtype=dt).dtype == dt
 
