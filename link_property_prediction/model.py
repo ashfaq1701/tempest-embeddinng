@@ -61,7 +61,7 @@ class BagWeights(nn.Module):
 
         self.skip = nn.Linear(self.n_feat, 1, bias=False)
         with torch.no_grad():
-            self.skip.weight.copy_(torch.tensor([[-1.0, 0.0, -1.0, 0.0, 0.0, 0.0]]))
+            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, -1.0, -1.0, 0.0, 0.0]]))
 
     def forward(self, tokens: WalkTokens):
         return self.pool(tokens)
