@@ -20,6 +20,27 @@ def standardise(feat: torch.Tensor, valid: torch.Tensor = None) -> torch.Tensor:
     return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m                # [..., F]
 
 
+def group_by_node(nodes: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """[Q, T] -> [Q, T]: each token's index among its row's distinct nodes. Invalid tokens
+    share one group of their own."""
+    keyed = torch.where(valid, nodes, torch.full_like(nodes, -1))
+    ordered, order = keyed.sort(dim=-1)
+    new_run = torch.ones_like(valid)
+    new_run[:, 1:] = ordered[:, 1:] != ordered[:, :-1]
+    run_id = new_run.cumsum(dim=-1) - 1
+    return torch.empty_like(run_id).scatter_(1, order, run_id)
+
+
+def group_sum(values: torch.Tensor, group: torch.Tensor) -> torch.Tensor:
+    return torch.zeros_like(values).scatter_add_(1, group, values)
+
+
+def group_min(values: torch.Tensor, group: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    inf = torch.full_like(values, float("inf"))
+    out = inf.scatter_reduce(1, group, values.masked_fill(~valid, float("inf")), "amin")
+    return out.masked_fill(out.isinf(), 0.0)
+
+
 class BagWeights(nn.Module):
 
     def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
@@ -31,7 +52,7 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 3
+        self.n_feat = 6
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -40,7 +61,7 @@ class BagWeights(nn.Module):
 
         self.skip = nn.Linear(self.n_feat, 1, bias=False)
         with torch.no_grad():
-            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0]]))
+            self.skip.weight.copy_(torch.tensor([[-1.0, 0.0, -1.0, 0.0, 0.0, 0.0]]))
 
     def forward(self, tokens: WalkTokens):
         return self.pool(tokens)
@@ -53,25 +74,36 @@ class BagWeights(nn.Module):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
 
-        x_tokens = F.embedding(nodes, self.E.weight)                         # [Q, T, d]
-        xt = x_tokens.detach()                                               # [Q, T, d]
+        group = group_by_node(nodes, valid)                                  # [Q, T]
+        tok = valid.to(self.E.weight.dtype)                                  # [Q, T]
+        count = group_sum(tok, group)                                        # [Q, U]
+        node_valid = count > 0                                               # [Q, U]
+        node_ids = torch.zeros_like(nodes).scatter_(1, group, nodes)         # [Q, U]
+        n = count.clamp_min(1.0)
 
-        u = valid.to(xt.dtype)                                               # [Q, T]
-        mid = self.geom.weighted_midpoint(xt, u / u.sum(-1, keepdim=True))            # [Q, d]
+        age = tokens.ages.flatten(1).clamp_min(0).to(tok.dtype)              # [Q, T]
+        pos = tokens.positions.flatten(1).to(tok.dtype)                      # [Q, T]
+        min_age = torch.log1p(group_min(age, group, valid))                  # [Q, U]
+        mean_age = torch.log1p(group_sum(age * tok, group) / n)              # [Q, U]
+        min_pos = group_min(pos, group, valid)                               # [Q, U]
+        mean_pos = group_sum(pos * tok, group) / n                           # [Q, U]
 
-        age = torch.log1p(tokens.ages.flatten(1).clamp_min(0).to(xt.dtype))  # [Q, T]
-        pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
+        x_nodes = F.embedding(node_ids, self.E.weight)                       # [Q, U, d]
+        xn = x_nodes.detach()                                                # [Q, U, d]
 
-        d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
+        u = node_valid.to(xn.dtype)                                          # [Q, U]
+        mid = self.geom.weighted_midpoint(xn, u / u.sum(-1, keepdim=True))   # [Q, d]
+        d_node_mid = self.geom.dist(xn, mid.unsqueeze(-2))                   # [Q, U]
 
-        feats = standardise(torch.stack([age, pos, d_tok_mid], dim=-1),
-                            valid).to(xt.dtype)                        # [Q, T, 3]
-        logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
-        w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
-        p = self.geom.weighted_midpoint(x_tokens, w)                         # [Q, d]
+        feats = torch.stack([min_age, mean_age, min_pos, mean_pos,
+                             torch.log1p(count), d_node_mid], dim=-1)        # [Q, U, 6]
+        feats = standardise(feats, node_valid).to(xn.dtype)                  # [Q, U, 6]
+        logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, U]
+        w = torch.softmax(logits.masked_fill(~node_valid, float("-inf")), dim=-1)  # [Q, U]
+        p = self.geom.weighted_midpoint(x_nodes, w)                          # [Q, d]
 
-        d_tok_p = self.geom.dist(xt, p.unsqueeze(-2))                        # [Q, T]
-        spread = (d_tok_p * u).sum(-1) / u.sum(-1)                           # [Q]
+        d_node_p = self.geom.dist(xn, p.unsqueeze(-2))                       # [Q, U]
+        spread = (d_node_p * u).sum(-1) / u.sum(-1)                          # [Q]
         return p, spread
 
 
