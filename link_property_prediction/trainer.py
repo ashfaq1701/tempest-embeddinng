@@ -39,12 +39,10 @@ class TrainerConfig:
     # Pooler MLP width, PINNED. It does NOT move with the feature count: under the
     # old 8*n_feat rule every feature ablation silently changed pooler capacity too
     # and the two effects could not be separated.
-    hidden_dim: int = 32
 
     # Hidden Linear->GELU stages in the pooler MLP. Each past the first inserts a
     # Linear(hidden, hidden) -> GELU. Depth and width are separate knobs so a capacity
     # change can be attributed to one of them. 1 reproduces the pre-c2a7c95 shape.
-    n_layers_pooler: int = 2
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
@@ -81,8 +79,6 @@ class Trainer:
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             d_emb=int(config.d_emb),
-            hidden_dim=int(config.hidden_dim),
-            n_layers_pooler=int(config.n_layers_pooler),
             seed=int(config.seed),
         ).to(self.device)
 
@@ -202,13 +198,12 @@ class Trainer:
             parts.append(f"temp={float(self.model.temperature):.3f}")
         if hasattr(self.model, "geo_temp"):
             parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
-        # The residual pooler's linear branch, if present: the weighting's linear law in
-        # standardised units, one weight per feature. Without it a null cannot say whether
-        # the skip carried the model or stayed at its zero init.
+        # The pooler IS these three weights now: the weighting's linear law in standardised
+        # units, one per feature, in the order [log1p(age), pos, d_tok_mid].
         bw = getattr(self.model, "bag_weights", None)
-        if bw is not None and hasattr(bw, "skip"):
-            w = bw.skip.weight.detach().flatten().tolist()
-            parts.append("skip=[" + ",".join(f"{x:+.4f}" for x in w) + "]")
+        if bw is not None and hasattr(bw, "w"):
+            w = bw.w.weight.detach().flatten().tolist()
+            parts.append("w=[" + ",".join(f"{x:+.4f}" for x in w) + "]")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad

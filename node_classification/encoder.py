@@ -32,9 +32,7 @@ class FrozenEncoder:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         args, state = ckpt["args"], ckpt["state_dict"]
         num_nodes, d_emb = state["E.weight"].shape
-        model = LinkPredHead(num_nodes=num_nodes, d_emb=d_emb,
-                             hidden_dim=args["hidden_dim"],
-                             n_layers_pooler=args["n_layers_pooler"], seed=args["seed"])
+        model = LinkPredHead(num_nodes=num_nodes, d_emb=d_emb, seed=args["seed"])
         model.load_state_dict(state)
         walk_args = {k: args[k] for k in (
             "num_walks_per_node", "max_walk_len", "walk_bias", "start_bias", "t2nv_p", "t2nv_q")}

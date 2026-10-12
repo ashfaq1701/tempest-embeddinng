@@ -22,25 +22,14 @@ def standardise(feat: torch.Tensor, valid: torch.Tensor = None) -> torch.Tensor:
 
 class BagWeights(nn.Module):
 
-    def __init__(self, geom: "LorentzManifold", E: nn.Embedding, hidden_dim: int = 32,
-                 n_layers: int = 2):
+    def __init__(self, geom: "LorentzManifold", E: nn.Embedding):
         super().__init__()
         self.geom = geom
         self.E = E
-        self.hidden = int(hidden_dim)
-        self.n_layers = int(n_layers)
-        if self.n_layers < 1:
-            raise ValueError(f"n_layers must be >= 1, got {n_layers}")
         self.n_feat = 3
-        layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
-        for _ in range(self.n_layers - 1):
-            layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
-        layers.append(nn.Linear(self.hidden, 1))
-        self.net = nn.Sequential(*layers)
-
-        self.skip = nn.Linear(self.n_feat, 1, bias=False)
+        self.w = nn.Linear(self.n_feat, 1, bias=False)
         with torch.no_grad():
-            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0]]))
+            self.w.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0]]))
 
     def forward(self, tokens: WalkTokens):
         return self.pool(tokens)
@@ -66,7 +55,7 @@ class BagWeights(nn.Module):
 
         feats = standardise(torch.stack([age, pos, d_tok_mid], dim=-1),
                             valid).to(xt.dtype)                        # [Q, T, 3]
-        logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
+        logits = self.w(feats).squeeze(-1)                                   # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         p = self.geom.weighted_midpoint(x_tokens, w)                         # [Q, d]
 
@@ -79,8 +68,7 @@ class LinkPredHead(nn.Module):
 
     INIT_STD = 1e-3
 
-    def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32,
-                 n_layers_pooler: int = 2, seed: int = 42):
+    def __init__(self, num_nodes: int, d_emb: int, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.d_emb = int(d_emb)
@@ -92,8 +80,7 @@ class LinkPredHead(nn.Module):
             init = self.geom.random(self.num_nodes, self.d_emb, std=self.INIT_STD)
         self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
 
-        self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,
-                                      n_layers=n_layers_pooler)
+        self.bag_weights = BagWeights(self.geom, self.E)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 

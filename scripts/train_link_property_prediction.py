@@ -86,16 +86,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use-gpu-tempest", action="store_true",
                    help="Run Tempest's walk sampler in GPU mode.")
 
-    # ── Pooler widths ───────────────────────────────────────────────
-    # Low-priority knobs: the defaults are the measured design and these are not swept.
-    p.add_argument("--hidden-dim", default=32, type=int,
-                   help="Hidden width of the pooler MLP. Pinned independently of the feature "
-                        "count so a feature change does not also move pooler capacity.")
-    p.add_argument("--n-layers-pooler", default=2, type=int,
-                   help="Hidden Linear->GELU stages in the pooler MLP (>= 1). Each past the "
-                        "first inserts a Linear(hidden, hidden) -> GELU before the output "
-                        "layer. 1 reproduces the single-hidden-layer shape used before.")
-
     # ── Post-training outputs ───────────────────────────────────────
     p.add_argument("--export-best-embedding-table", action="store_true",
                    help="After training, dump the best-val embedding table to disk.")
@@ -179,8 +169,6 @@ def main() -> Dict[str, Any]:
         train_negative_pool=train_negative_pool,
 
         d_emb=args.d_emb,
-        hidden_dim=args.hidden_dim,
-        n_layers_pooler=args.n_layers_pooler,
 
         K_train=args.k_train,
 
