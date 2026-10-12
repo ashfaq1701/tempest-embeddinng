@@ -32,24 +32,10 @@ class BagWeights(nn.Module):
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
         self.dropout = float(dropout)
-        if not 0.0 <= self.dropout < 1.0:
-            raise ValueError(f"dropout must be in [0, 1), got {dropout}")
         self.n_feat = 3
-        # Dropout goes AFTER the GELU -- the standard FFN position (Linear -> act -> Dropout).
-        # Before the GELU it would scale PRE-activations by 1/(1-p), moving the nonlinearity's
-        # operating point rather than just masking units. There is deliberately NO dropout
-        # after the final Linear(hidden, 1): that output is a per-token logit fed to a masked
-        # softmax, and zeroing a logit is not a neutral act -- 0 is a HIGH value next to the
-        # typical logits here, so dropping it would promote the token rather than ignore it.
-        #
-        # Inserted ONLY when dropout > 0, so at the default the module tree and the
-        # state_dict keys are byte-identical to master (nn.Sequential names children by
-        # index, so an unconditional nn.Dropout(0.0) would shift net.2 -> net.3 and break
-        # checkpoint loading against every existing run).
-        drop = [nn.Dropout(self.dropout)] if self.dropout > 0.0 else []
-        layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()] + drop
+        layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU(), nn.Dropout(self.dropout)]
         for _ in range(self.n_layers - 1):
-            layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()] + drop
+            layers += [nn.Linear(self.hidden, self.hidden), nn.GELU(), nn.Dropout(self.dropout)]
         layers.append(nn.Linear(self.hidden, 1))
         self.net = nn.Sequential(*layers)
 
