@@ -5,10 +5,10 @@ per query by the walk cutoff, not by ingestion order. A walk for (u, t) uses cut
 EXCLUSIVE: it traverses only edges with t_edge < t, so the target edge at t and any
 simultaneous/future edge are never seen. TGB-Seq splits are chronological (train < val < test).
 
-Training per batch: sample K_train uniform negatives, form candidates [pos | negs], score them
-TWO-SIDED (walks for the source u and for every candidate v, each cut off at the query time t_i),
-then cross-entropy with target 0 and a single optimizer step. E and the head train together under
-the link CE with no detach.
+Training per batch: sample K_train negatives by the suite's rule, form candidates [pos | negs],
+score them TWO-SIDED (walks for the source u and for every candidate v, each cut off at the query
+time t_i), then cross-entropy with target 0 and a single optimizer step. E and the head train
+together under the link CE with no detach.
 """
 import time
 from dataclasses import dataclass
@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import LinkPredHead
-from .negatives import UniformNegativeSampler
+from .negatives import NegativeSampler
 from .walk_tokens import build_query_walk_tokens
 from .walks import WalkGenerator
 
@@ -31,7 +31,7 @@ from .walks import WalkGenerator
 class TrainerConfig:
     # Dataset-derived.
     num_nodes: int
-    train_negative_pool: np.ndarray
+    train_negative_sampler: NegativeSampler
 
     # Embedding dimension.
     d_emb: int = 64
@@ -63,7 +63,7 @@ class TrainerConfig:
 
     # Run control.
     num_epochs: int = 100
-    early_stop_patience: int = 5
+    early_stop_patience: int = 10
 
     # System.
     seed: int = 42
@@ -96,9 +96,7 @@ class Trainer:
             temporal_node2vec_q=config.t2nv_q,
             seed=int(config.seed),
         )
-        self.neg_sampler_train = UniformNegativeSampler(
-            num_neg_per_pos=config.K_train, dst_pool=config.train_negative_pool, seed=config.seed,
-        )
+        self.neg_sampler_train = config.train_negative_sampler
 
         # One param group at a single lr: Riemannian update for E, standard Adam for the rest.
         self.opt = geoopt.optim.RiemannianAdam(

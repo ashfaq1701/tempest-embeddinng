@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
                    help="Val/test eval batch size.")
     p.add_argument("--num-epochs", default=100, type=int,
                    help="Max training epochs.")
-    p.add_argument("--early-stop-patience", default=5, type=int,
+    p.add_argument("--early-stop-patience", default=10, type=int,
                    help="Early-stop patience in epochs.")
 
     # ── System ──────────────────────────────────────────────────────
@@ -176,7 +176,7 @@ def main() -> Dict[str, Any]:
     # ─── Build TrainerConfig ───────────────────────────────────────
     config = TrainerConfig(
         num_nodes=num_nodes,
-        train_negative_pool=train_negative_pool,
+        train_negative_sampler=suite.train_negative_sampler(args.k_train),
 
         d_emb=args.d_emb,
         hidden_dim=args.hidden_dim,
