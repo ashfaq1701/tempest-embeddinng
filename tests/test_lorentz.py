@@ -647,23 +647,21 @@ def test_transp_stays_isometric_in_float32(k):
         assert (ratio - 1).abs().max() < 1e-4
 
 
-def test_random_is_an_isotropic_tangent_normal():
-    """d(x, O) = |u| for u ~ N(0, (2 std)^2 / n), so the mean radius is
-    2 std E[chi_n]/sqrt(n): linear in std and independent of k."""
+def test_random_is_a_wrapped_normal_at_the_given_radius():
+    """d(x, O) = |u| with u ~ N(0, radius^2 / n · I): mean radius E[chi_n] radius / sqrt(n),
+    linear in `radius` and independent of k; directions isotropic."""
     chi = math.sqrt(2.0) * math.gamma((DIM + 1) / 2) / math.gamma(DIM / 2)
     for k in KS:
         m = LorentzManifold(k=k)
-        for std in (1e-3, 1e-1):
+        for radius in (1e-3, 1e-1, 1.0):
             torch.manual_seed(5)
-            x = m.random(8192, DIM, dtype=torch.float64, std=std)
+            x = m.random(8192, DIM, dtype=torch.float64, radius=radius)
             r = m.dist0(x)
             assert isinstance(x, geoopt.ManifoldTensor) and x.manifold is m
             assert m.check_point_on_manifold(x)
-            assert (m.projx(x) - x).abs().max() == 0.0
-            assert abs(r.mean().item() / (2 * std * chi / math.sqrt(DIM)) - 1) < 0.01
-            assert abs(r.std().item() / r.mean().item() - 1 / math.sqrt(2 * DIM)) < 0.06
+            assert abs(r.mean().item() / (radius * chi / math.sqrt(DIM)) - 1) < 0.01
         torch.manual_seed(5)
-        assert m.random(65536, DIM, dtype=torch.float64).mean(0).abs().max() < 1e-4
+        assert m.random(65536, DIM, dtype=torch.float64).mean(0).abs().max() < 1e-5
         for dt in (torch.float32, torch.float64):
             assert m.random(16, DIM, dtype=dt).dtype == dt
 
