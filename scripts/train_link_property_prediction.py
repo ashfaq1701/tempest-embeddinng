@@ -74,6 +74,9 @@ def parse_args() -> argparse.Namespace:
                         "GELU. 0.0 (default) disables it and keeps the module tree identical "
                         "to a run without the option. Train-only; nn.Dropout is inert under "
                         "eval(). The embedding table E is NOT touched.")
+    p.add_argument("--wd-pooler", default=0.0, type=float,
+                   help="L2 weight decay on all pooler parameters (the MLP and the linear "
+                        "skip). The embedding table E and geo_temp always stay at 0.")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
@@ -187,6 +190,7 @@ def main() -> Dict[str, Any]:
         hidden_dim=args.hidden_dim,
         n_layers_pooler=args.n_layers_pooler,
         dropout_pooler=args.dropout_pooler,
+        wd_pooler=args.wd_pooler,
 
         K_train=args.k_train,
 

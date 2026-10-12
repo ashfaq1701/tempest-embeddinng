@@ -50,6 +50,12 @@ class TrainerConfig:
     # leaves the module tree identical to a run without this option.
     dropout_pooler: float = 0.0
 
+    # L2 weight decay on ALL pooler parameters (the MLP and the linear skip). E and geo_temp
+    # always stay at 0. NOTE BagWeights holds E as a submodule, so the decayed group is built
+    # from bag_weights.net and bag_weights.skip explicitly -- never bag_weights.parameters(),
+    # which includes E.weight.
+    wd_pooler: float = 0.0
+
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
 
@@ -105,9 +111,21 @@ class Trainer:
             num_neg_per_pos=config.K_train, dst_pool=config.train_negative_pool, seed=config.seed,
         )
 
-        # One param group at a single lr: Riemannian update for E, standard Adam for the rest.
+        # Two groups at the same lr, differing ONLY in weight decay: every pooler parameter
+        # at `wd_pooler`, and E / geo_temp pinned at exactly 0. Riemannian update for E,
+        # standard Adam for the rest, as before.
+        bw = self.model.bag_weights
+        pooler_params = list(bw.net.parameters()) + list(bw.skip.parameters())
+        pooler_ids = {id(p) for p in pooler_params}
+        other_params = [p for p in self.model.parameters() if id(p) not in pooler_ids]
+        assert len(pooler_params) + len(other_params) == len(list(self.model.parameters()))
+        assert all(p is not self.model.E.weight for p in pooler_params)
         self.opt = geoopt.optim.RiemannianAdam(
-            self.model.parameters(), lr=float(config.lr), stabilize=10,
+            [
+                {"params": pooler_params, "weight_decay": float(config.wd_pooler)},
+                {"params": other_params, "weight_decay": 0.0},
+            ],
+            lr=float(config.lr), stabilize=10,
         )
 
     # Full-graph ingestion (once, up front)
