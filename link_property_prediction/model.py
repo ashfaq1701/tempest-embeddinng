@@ -95,6 +95,9 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.geom, self.E, hidden_dim=hidden_dim,
                                       n_layers=n_layers_pooler)
 
+        self.pop_bias = nn.Embedding(self.num_nodes, 1)
+        nn.init.zeros_(self.pop_bias.weight)
+
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
@@ -104,4 +107,5 @@ class LinkPredHead(nn.Module):
         p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
 
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                          # [b, c]
-        return self.geo_temp * (-geo)
+        v_nodes = cand_tokens.seeds.view(b, p_v.shape[1])                    # [b, c]
+        return self.geo_temp * (-geo) + self.pop_bias(v_nodes).squeeze(-1)  # [b, c]
