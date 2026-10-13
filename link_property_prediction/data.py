@@ -28,6 +28,12 @@ class Loaded(NamedTuple):
     name: str                   # dataset name (for the Evaluator)
     max_node_count: int
 
+    @property
+    def T_train(self) -> int:
+        """Length of the training period: latest minus earliest train-edge timestamp."""
+        ts = self.train.timestamps
+        return int(ts.max() - ts.min())
+
 
 def concat_splits(*splits: SplitData) -> SplitData:
     """Concatenate splits into ONE SplitData for a one-shot ingest. edge_feat is

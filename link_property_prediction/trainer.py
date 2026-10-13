@@ -31,6 +31,7 @@ from .walks import WalkGenerator
 class TrainerConfig:
     # Dataset-derived.
     num_nodes: int
+    T_train: int
     train_negative_sampler: NegativeSampler
 
     # Embedding dimension.
@@ -80,6 +81,8 @@ class Trainer:
         # Owns the Poincare-ball node embeddings and the monotone metric score.
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
+            T_train=config.T_train,
+            max_walk_len=config.max_walk_len,
             d_emb=int(config.d_emb),
             hidden_dim=int(config.hidden_dim),
             n_layers_pooler=int(config.n_layers_pooler),
@@ -201,7 +204,7 @@ class Trainer:
         if hasattr(self.model, "geo_temp"):
             parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
         # The residual pooler's linear branch, if present: the weighting's linear law in
-        # standardised units, one weight per feature. Without it a null cannot say whether
+        # feature units, one weight per feature. Without it a null cannot say whether
         # the skip carried the model or stayed at its zero init.
         bw = getattr(self.model, "bag_weights", None)
         if bw is not None and hasattr(bw, "skip"):
