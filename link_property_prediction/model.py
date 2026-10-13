@@ -7,6 +7,8 @@ from .layers import MaskedBatchNorm
 from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
+_VAR_FLOOR = 1e-12
+
 
 class BagWeights(nn.Module):
 
@@ -26,7 +28,7 @@ class BagWeights(nn.Module):
         layers.append(nn.Linear(self.hidden, 1))
         self.net = nn.Sequential(*layers)
 
-        self.norm = MaskedBatchNorm(self.n_feat)
+        self.norm = MaskedBatchNorm(self.n_feat, eps=_VAR_FLOOR)
         self.skip = nn.Linear(self.n_feat, 1, bias=False)
         with torch.no_grad():
             self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0]]))
