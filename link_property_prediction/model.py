@@ -6,18 +6,35 @@ import torch.nn.functional as F
 from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
-_VAR_FLOOR = 1e-12
 
+class MaskedBatchNorm(nn.Module):
+    """BatchNorm1d over every axis but the last, counting only `valid` entries. Training
+    normalises by the batch statistics and updates running averages with `momentum`; eval
+    normalises by the running averages. Masked entries are excluded and returned as zero."""
 
-def standardise(feat: torch.Tensor, valid: torch.Tensor = None) -> torch.Tensor:
-    if valid is None:
-        valid = torch.ones(feat.shape[:-1], dtype=torch.bool, device=feat.device)
-    dims = tuple(range(feat.dim() - 1))
-    m = valid.unsqueeze(-1).to(feat.dtype)                                   # [..., 1]
-    n = m.sum(dim=dims).clamp_min(1.0)                                       # [F]
-    mu = (feat * m).sum(dim=dims) / n                                        # [F]
-    var = (((feat - mu) ** 2) * m).sum(dim=dims) / n                         # [F]
-    return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m                # [..., F]
+    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1):
+        super().__init__()
+        self.eps = eps
+        self.momentum = momentum
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer("running_mean", torch.zeros(num_features))
+        self.register_buffer("running_var", torch.ones(num_features))
+
+    def forward(self, feat: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        m = valid.unsqueeze(-1).to(feat.dtype)                               # [..., 1]
+        if self.training:
+            dims = tuple(range(feat.dim() - 1))
+            n = m.sum(dim=dims)                                              # [F]
+            mean = (feat * m).sum(dim=dims) / n.clamp_min(1.0)               # [F]
+            var = (((feat - mean) ** 2) * m).sum(dim=dims) / n.clamp_min(1.0)
+            with torch.no_grad():
+                self.running_mean.lerp_(mean, self.momentum)
+                self.running_var.lerp_(var * n / (n - 1).clamp_min(1.0), self.momentum)
+        else:
+            mean, var = self.running_mean, self.running_var
+        out = (feat - mean) / torch.sqrt(var + self.eps) * self.weight + self.bias
+        return out * m                                                       # [..., F]
 
 
 class BagWeights(nn.Module):
@@ -38,6 +55,7 @@ class BagWeights(nn.Module):
         layers.append(nn.Linear(self.hidden, 1))
         self.net = nn.Sequential(*layers)
 
+        self.norm = MaskedBatchNorm(self.n_feat)
         self.skip = nn.Linear(self.n_feat, 1, bias=False)
         with torch.no_grad():
             self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0]]))
@@ -64,8 +82,7 @@ class BagWeights(nn.Module):
 
         d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
 
-        feats = standardise(torch.stack([age, pos, d_tok_mid], dim=-1),
-                            valid).to(xt.dtype)                        # [Q, T, 3]
+        feats = self.norm(torch.stack([age, pos, d_tok_mid], dim=-1), valid)  # [Q, T, 3]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         p = self.geom.weighted_midpoint(x_tokens, w)                         # [Q, d]
