@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from link_property_prediction.model import MaskedBatchNorm
+from link_property_prediction.layers import MaskedBatchNorm
 
 
 def _pair(num_features=3):
