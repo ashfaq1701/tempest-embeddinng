@@ -27,11 +27,27 @@ def test_matches_batchnorm1d_on_the_valid_entries():
     torch.testing.assert_close(ours.running_mean, ref.running_mean)
     torch.testing.assert_close(ours.running_var, ref.running_var)
 
+    # Eval normalises by the BATCH statistics as well, i.e. BatchNorm1d with
+    # track_running_stats=False -- NOT by the running averages. That is the one variable.
+    free = nn.BatchNorm1d(3, track_running_stats=False)
+    with torch.no_grad():
+        free.weight.copy_(ref.weight)
+        free.bias.copy_(ref.bias)
     ours.eval()
-    ref.eval()
     feat = torch.randn(8, 25, 3)
     valid = torch.rand(8, 25) > 0.4
-    torch.testing.assert_close(ours(feat, valid)[valid], ref(feat[valid]))
+    torch.testing.assert_close(ours(feat, valid)[valid], free(feat[valid]))
+
+
+def test_train_and_eval_agree():
+    ours, _ = _pair()
+    feat = torch.randn(8, 25, 3)
+    valid = torch.rand(8, 25) > 0.4
+    ours.train()
+    a = ours(feat, valid)
+    ours.eval()
+    b = ours(feat, valid)
+    torch.testing.assert_close(a, b)
 
 
 def test_masked_entries_do_not_move_the_statistics():
