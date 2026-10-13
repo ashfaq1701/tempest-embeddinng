@@ -3,7 +3,7 @@
 A query is a (seed, cutoff t) pair; K walks per query, each bounded by cutoff = t, each
 of length L. Requires shuffle_walk_order=False.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Optional
 
 import numpy as np
@@ -24,6 +24,21 @@ class WalkTokens:
     mask: torch.Tensor                              # [Q, K, L]   bool, real slots (nodes != -1), incl. seed
     seed_mask: torch.Tensor                         # [Q, K, L]   bool, ONLY the seed's walk-origin slot
     edge_features: Optional[torch.Tensor] = None    # [Q, K, L, d_ef]  seed slot + padding zeroed; None if no EF
+
+
+def group_by_query(src: WalkTokens, cand: WalkTokens) -> WalkTokens:
+    """Query-major [B*(1+C)] tokens: each query's source bag followed by its C candidate bags.
+    `cand` must be query-major [B*C], as `trainer._score` builds it."""
+    b = src.seeds.shape[0]
+    grouped = {}
+    for f in fields(WalkTokens):
+        s, c = getattr(src, f.name), getattr(cand, f.name)
+        if s is None:
+            grouped[f.name] = None
+            continue
+        c = c.view(b, c.shape[0] // b, *c.shape[1:])                                   # [B, C, ...]
+        grouped[f.name] = torch.cat([s.unsqueeze(1), c], dim=1).flatten(0, 1)          # [B*(1+C), ...]
+    return WalkTokens(**grouped)
 
 
 def build_query_walk_tokens(
