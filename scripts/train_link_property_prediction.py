@@ -38,10 +38,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--is-bipartite", action="store_true",
                    help="Bipartite graph: negatives are destinations only. Otherwise any "
                         "node (sources and destinations) can be a negative.")
-    p.add_argument("--max-train-edges", default=0, type=int,
-                   help="If >0, train on only the most-recent N train edges.")
-    p.add_argument("--max-eval-edges", default=0, type=int,
-                   help="If >0, eval on only the first N val/test edges.")
 
     # ── Model ───────────────────────────────────────────────────────
     p.add_argument("--d-emb", default=64, type=int,
@@ -75,7 +71,7 @@ def parse_args() -> argparse.Namespace:
                    help="Val/test eval batch size.")
     p.add_argument("--num-epochs", default=100, type=int,
                    help="Max training epochs.")
-    p.add_argument("--early-stop-patience", default=5, type=int,
+    p.add_argument("--early-stop-patience", default=10, type=int,
                    help="Early-stop patience in epochs.")
 
     # ── System ──────────────────────────────────────────────────────
@@ -132,41 +128,28 @@ def main() -> Dict[str, Any]:
     # Derived dataset constants.
     num_nodes = loaded.max_node_count
 
-    # Optional chronological subsample: recent suffix of train, prefix of val/test.
-    def _trunc(split, n, tail):
-        if n <= 0 or n >= int(split.sources.shape[0]):
-            return split
-        sl = slice(-n, None) if tail else slice(0, n)
-        ef = split.edge_feat[sl] if split.edge_feat is not None else None
-        return split._replace(
-            sources=split.sources[sl], destinations=split.destinations[sl],
-            timestamps=split.timestamps[sl], edge_feat=ef)
-
-    train_sp = _trunc(loaded.train, args.max_train_edges, tail=True)
-    val_sp = _trunc(loaded.val, args.max_eval_edges, tail=False)
-    test_sp = _trunc(loaded.test, args.max_eval_edges, tail=False)
-
     # Training negatives come from the train split; each suite's evaluators report their
     # own eval negatives when built.
     train_negative_pool = suite.train_negative_pool
 
     print(f"  num_nodes:     {num_nodes:,}")
+    print(f"  T_train:       {loaded.T_train:,}")
     print(f"  neg_pool:      {len(train_negative_pool):,} train {suite.candidate_kind} "
           f"(training negatives)")
-    print(f"  train edges:   {len(train_sp.sources):,}")
-    print(f"  val edges:     {len(val_sp.sources):,}")
-    print(f"  test edges:    {len(test_sp.sources):,}")
+    print(f"  train edges:   {len(loaded.train.sources):,}")
+    print(f"  val edges:     {len(loaded.val.sources):,}")
+    print(f"  test edges:    {len(loaded.test.sources):,}")
 
     # ─── Build batch factories ─────────────────────────────────────
     # Wrapped in lambdas so the trainer can re-iterate each split every epoch.
     train_batches_factory = (
-        lambda: create_batches(train_sp, args.batch_size)
+        lambda: create_batches(loaded.train, args.batch_size)
     )
     val_batches_factory = (
-        lambda: create_batches(val_sp, args.eval_batch_size)
+        lambda: create_batches(loaded.val, args.eval_batch_size)
     )
     test_batches_factory = (
-        lambda: create_batches(test_sp, args.eval_batch_size)
+        lambda: create_batches(loaded.test, args.eval_batch_size)
     )
 
     # ─── Build evaluators (native to the suite) ────────────────────
@@ -176,7 +159,8 @@ def main() -> Dict[str, Any]:
     # ─── Build TrainerConfig ───────────────────────────────────────
     config = TrainerConfig(
         num_nodes=num_nodes,
-        train_negative_pool=train_negative_pool,
+        T_train=loaded.T_train,
+        train_negative_sampler=suite.train_negative_sampler(args.k_train),
 
         d_emb=args.d_emb,
         hidden_dim=args.hidden_dim,
@@ -220,7 +204,7 @@ def main() -> Dict[str, Any]:
     print("\n=== Training ===")
     result = trainer.train(
         train_batches_factory=train_batches_factory,
-        full_graph=concat_splits(train_sp, val_sp, test_sp),
+        full_graph=concat_splits(loaded.train, loaded.val, loaded.test),
         val_evaluator=val_eval,
         val_batches_factory=val_batches_factory,
         test_evaluator=test_eval,
@@ -258,6 +242,7 @@ def main() -> Dict[str, Any]:
         torch.save({
             "state_dict": trainer.model.state_dict(),
             "args": vars(args),
+            "T_train": loaded.T_train,
             "best_epoch": result["stopped_at_epoch"],
             "best_val_mrr": result["best_val_mrr"],
             "r_mean": float(radius.mean()),

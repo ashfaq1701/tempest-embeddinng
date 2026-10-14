@@ -1,6 +1,6 @@
 """TGB-Seq (`tgb_seq.LinkPred`) — native load, negatives, and MRR metric.
 
-VAL negatives are built once from `UniformNegativeSampler` at `k_eval` over the
+VAL negatives are built once by `DataSuite.eval_negatives` (uniform) at `k_eval` over the
 full dataset's candidates (fixed & seeded); TEST uses the shipped `test_ns`
 verbatim. Timestamps are cast to monotone int64 for Tempest's per-query cutoff.
 """
@@ -10,7 +10,6 @@ import numpy as np
 
 from .data import Batch, Loaded, SplitData
 from .evaluator import DataSuite, Evaluator
-from .negatives import UniformNegativeSampler
 
 
 def _to_int64_time(time: np.ndarray) -> np.ndarray:
@@ -59,19 +58,6 @@ def load_tgb_seq(name: str, root: str = "datasets") -> Loaded:
     )
 
 
-def build_eval_negatives(split: SplitData, dst_pool: np.ndarray,
-                         k_eval: int, seed: int, tag: str) -> np.ndarray:
-    """Fixed `[N_pos, k_eval]` negatives for a split, drawn once from
-    `UniformNegativeSampler` over `dst_pool` (seeded). Row i are positive i's negs.
-    `tag` names the suite and split in the one-line notice, e.g. "[dyglib] test"."""
-    print(f"  {tag} negatives: {k_eval} uniform per positive over "
-          f"{len(dst_pool):,} full-dataset candidates")
-    sampler = UniformNegativeSampler(num_neg_per_pos=k_eval, dst_pool=dst_pool, seed=seed)
-    whole = Batch(src=split.sources, tgt=split.destinations,
-                  ts=split.timestamps, edge_feat=None)
-    return sampler.sample(whole).astype(np.int32)         # [N_pos, k_eval]
-
-
 class TGBSeqEvaluator(Evaluator):
     """Fixed per-positive negatives (`[N_pos, K]`, row-aligned to the split's
     chronological order) + TGB-Seq's native batched-MRR `Evaluator`. A cursor
@@ -110,8 +96,7 @@ class TGBSeqSuite(DataSuite):
     def make_evaluator(self, split_mode: str) -> Evaluator:
         loaded = self.load()
         if split_mode == "val":
-            neg = build_eval_negatives(loaded.val, self.eval_negative_pool, self.k_eval, self.seed,
-                                       tag="[tgb-seq] val")
+            neg = self.eval_negatives(loaded.val, self.seed, tag="[tgb-seq] val")
             return TGBSeqEvaluator(neg_dst=neg)
         if split_mode == "test":
             neg = loaded.dataset.negative_samples          # shipped test_ns.npy [N_test, K]

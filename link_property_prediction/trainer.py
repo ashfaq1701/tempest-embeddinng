@@ -5,10 +5,10 @@ per query by the walk cutoff, not by ingestion order. A walk for (u, t) uses cut
 EXCLUSIVE: it traverses only edges with t_edge < t, so the target edge at t and any
 simultaneous/future edge are never seen. TGB-Seq splits are chronological (train < val < test).
 
-Training per batch: sample K_train uniform negatives, form candidates [pos | negs], score them
-TWO-SIDED (walks for the source u and for every candidate v, each cut off at the query time t_i),
-then cross-entropy with target 0 and a single optimizer step. E and the head train together under
-the link CE with no detach.
+Training per batch: sample K_train negatives by the suite's rule, form candidates [pos | negs],
+score them TWO-SIDED (walks for the source u and for every candidate v, each cut off at the query
+time t_i), then cross-entropy with target 0 and a single optimizer step. E and the head train
+together under the link CE with no detach.
 """
 import time
 from dataclasses import dataclass
@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from .data import Batch, SplitData
 from .evaluator import Evaluator
 from .model import LinkPredHead
-from .negatives import UniformNegativeSampler
+from .negatives import NegativeSampler
 from .walk_tokens import build_query_walk_tokens
 from .walks import WalkGenerator
 
@@ -30,7 +30,8 @@ from .walks import WalkGenerator
 class TrainerConfig:
     # Dataset-derived.
     num_nodes: int
-    train_negative_pool: np.ndarray
+    T_train: int
+    train_negative_sampler: NegativeSampler
 
     # Embedding dimension.
     d_emb: int = 64
@@ -62,7 +63,7 @@ class TrainerConfig:
 
     # Run control.
     num_epochs: int = 100
-    early_stop_patience: int = 5
+    early_stop_patience: int = 10
 
     # System.
     seed: int = 42
@@ -76,9 +77,11 @@ class Trainer:
         self.device = device or torch.device(
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
-        # Owns the Poincare-ball node embeddings and the monotone metric score.
+        # Owns the Euclidean node embeddings and the monotone metric score.
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
+            T_train=config.T_train,
+            max_walk_len=config.max_walk_len,
             d_emb=int(config.d_emb),
             hidden_dim=int(config.hidden_dim),
             n_layers_pooler=int(config.n_layers_pooler),
@@ -95,9 +98,7 @@ class Trainer:
             temporal_node2vec_q=config.t2nv_q,
             seed=int(config.seed),
         )
-        self.neg_sampler_train = UniformNegativeSampler(
-            num_neg_per_pos=config.K_train, dst_pool=config.train_negative_pool, seed=config.seed,
-        )
+        self.neg_sampler_train = config.train_negative_sampler
 
         # One param group at a single lr: plain Adam for E and everything else.
         self.opt = torch.optim.Adam(self.model.parameters(), lr=float(config.lr))
@@ -192,7 +193,7 @@ class Trainer:
         if hasattr(self.model, "geo_temp"):
             parts.append(f"geo_temp={float(self.model.geo_temp):.3f}")
         # The residual pooler's linear branch, if present: the weighting's linear law in
-        # standardised units, one weight per feature. Without it a null cannot say whether
+        # feature units, one weight per feature. Without it a null cannot say whether
         # the skip carried the model or stayed at its zero init.
         bw = getattr(self.model, "bag_weights", None)
         if bw is not None and hasattr(bw, "skip"):

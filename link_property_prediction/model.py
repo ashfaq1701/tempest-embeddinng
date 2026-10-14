@@ -1,27 +1,17 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .walk_tokens import WalkTokens
 
-_VAR_FLOOR = 1e-12
 _SQ_DIST_FLOOR = 1e-12
 
 
 def dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Euclidean distance over the last axis; the floor keeps the gradient finite at x == y."""
     return ((x - y) ** 2).sum(-1).clamp_min(_SQ_DIST_FLOOR).sqrt()
-
-
-def standardise(feat: torch.Tensor, valid: torch.Tensor = None) -> torch.Tensor:
-    if valid is None:
-        valid = torch.ones(feat.shape[:-1], dtype=torch.bool, device=feat.device)
-    dims = tuple(range(feat.dim() - 1))
-    m = valid.unsqueeze(-1).to(feat.dtype)                                   # [..., 1]
-    n = m.sum(dim=dims).clamp_min(1.0)                                       # [F]
-    mu = (feat * m).sum(dim=dims) / n                                        # [F]
-    var = (((feat - mu) ** 2) * m).sum(dim=dims) / n                         # [F]
-    return (feat - mu) / var.clamp_min(_VAR_FLOOR).sqrt() * m                # [..., F]
 
 
 def weighted_midpoint(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -31,14 +21,17 @@ def weighted_midpoint(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 class BagWeights(nn.Module):
 
-    def __init__(self, E: nn.Embedding, hidden_dim: int = 32, n_layers: int = 2):
+    def __init__(self, E: nn.Embedding, T_train: int, max_walk_len: int,
+                 hidden_dim: int = 32, n_layers: int = 2):
         super().__init__()
         self.E = E
+        self.log_T_train = math.log1p(T_train)
+        self.max_walk_len = int(max_walk_len)
         self.hidden = int(hidden_dim)
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 3
+        self.n_feat = 4
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -47,7 +40,7 @@ class BagWeights(nn.Module):
 
         self.skip = nn.Linear(self.n_feat, 1, bias=False)
         with torch.no_grad():
-            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0]]))
+            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0, 0.0]]))
 
     def forward(self, tokens: WalkTokens):
         return self.pool(tokens)
@@ -66,13 +59,21 @@ class BagWeights(nn.Module):
         u = valid.to(xt.dtype)                                               # [Q, T]
         mid = weighted_midpoint(xt, u / u.sum(-1, keepdim=True))             # [Q, d]
 
-        age = torch.log1p(tokens.ages.flatten(1).clamp_min(0).to(xt.dtype))  # [Q, T]
+        age = tokens.ages.flatten(1).clamp_min(0).to(xt.dtype)               # [Q, T]
         pos = tokens.positions.flatten(1).to(xt.dtype)                       # [Q, T]
+        age = torch.log1p(age) / self.log_T_train                            # [Q, T]
+        pos = pos / self.max_walk_len                                        # [Q, T]
+
+        tiny = torch.finfo(xt.dtype).tiny
 
         d_tok_mid = dist(xt, mid.unsqueeze(-2))                              # [Q, T]
+        d_mid_mean = (d_tok_mid * u).sum(-1, keepdim=True) / u.sum(-1, keepdim=True)  # [Q, 1]
+        d_mid = d_tok_mid * u / d_mid_mean.clamp_min(tiny)                   # [Q, T]
 
-        feats = standardise(torch.stack([age, pos, d_tok_mid], dim=-1),
-                            valid).to(xt.dtype)                        # [Q, T, 3]
+        r_mean = self.E.weight.detach().norm(dim=-1).mean()                  # []
+        d_0 = xt.norm(dim=-1) * u / r_mean.clamp_min(tiny)                   # [Q, T]
+
+        feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         p = weighted_midpoint(x_tokens, w)                                   # [Q, d]
@@ -84,22 +85,26 @@ class BagWeights(nn.Module):
 
 class LinkPredHead(nn.Module):
 
-    def __init__(self, num_nodes: int, d_emb: int, hidden_dim: int = 32,
-                 n_layers_pooler: int = 2, seed: int = 42):
+    INIT_RADIUS = 1e-3
+
+    def __init__(self, num_nodes: int, T_train: int, max_walk_len: int, d_emb: int,
+                 hidden_dim: int = 32, n_layers_pooler: int = 2, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
+        self.T_train = int(T_train)
+        self.max_walk_len = int(max_walk_len)
         self.d_emb = int(d_emb)
         torch.manual_seed(seed)
 
-        # Uniform inside the unit ball: isotropic direction, radius U^(1/d) (uniform by volume).
-        # Only the starting scale; nothing constrains E once training spreads it.
+        # Isotropic normal with |x| concentrating at INIT_RADIUS: master's wrapped normal at the
+        # origin, whose exponential map is the identity in Euclidean space.
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            direction = F.normalize(torch.randn(self.num_nodes, self.d_emb), dim=-1)
-            radius = torch.rand(self.num_nodes, 1).pow(1.0 / self.d_emb)
-            self.E.weight.copy_(direction * radius)
+            self.E.weight.copy_(torch.randn(self.num_nodes, self.d_emb)
+                                * (self.INIT_RADIUS / self.d_emb ** 0.5))
 
-        self.bag_weights = BagWeights(self.E, hidden_dim=hidden_dim, n_layers=n_layers_pooler)
+        self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
+                                      hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
         self.geo_temp = nn.Parameter(torch.tensor(1.0))
 

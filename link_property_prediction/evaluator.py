@@ -17,7 +17,8 @@ from typing import List, Optional
 
 import numpy as np
 
-from .data import Batch, Loaded
+from .data import Batch, Loaded, SplitData
+from .negatives import NegativeSampler, UniformNegativeSampler
 
 
 class Evaluator(abc.ABC):
@@ -88,6 +89,26 @@ class DataSuite(abc.ABC):
         CRAFT/DyGLib draw both."""
         loaded = self.load()
         return self._candidates(loaded.train, loaded.val, loaded.test)
+
+    def negative_sampler(self, pool: np.ndarray, k: int, seed: int,
+                         edges: SplitData) -> NegativeSampler:
+        """The suite's sampling rule for negatives of `edges` drawn from `pool`."""
+        return UniformNegativeSampler(num_neg_per_pos=k, dst_pool=pool, seed=seed)
+
+    def train_negative_sampler(self, k_train: int) -> NegativeSampler:
+        return self.negative_sampler(self.train_negative_pool, k_train, self.seed,
+                                     self.load().train)
+
+    def eval_negatives(self, split: SplitData, seed: int, tag: str) -> np.ndarray:
+        """Fixed `[N_pos, k_eval]` negatives for `split`, row i for positive i. `tag` names
+        the suite and split in the one-line notice, e.g. "[dyglib] test"."""
+        pool = self.eval_negative_pool
+        sampler = self.negative_sampler(pool, self.k_eval, seed, split)
+        print(f"  {tag} negatives: {self.k_eval} {sampler.rule} per positive over "
+              f"{len(pool):,} full-dataset candidates")
+        whole = Batch(src=split.sources, tgt=split.destinations,
+                      ts=split.timestamps, edge_feat=None)
+        return sampler.sample(whole).astype(np.int32)
 
 
 #: Valid `--data-suite` values. The train script reads this for its `choices`, so the

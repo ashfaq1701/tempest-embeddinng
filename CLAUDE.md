@@ -23,6 +23,9 @@ sources ∪ destinations otherwise. Training negatives come from the train split
 negatives (TGB-Seq val, DyGLib val/test) from the full dataset (train ∪ val ∪ test), the splits
 CRAFT draws both val and test from. Runs before this change drew eval negatives from the train
 split only, so their val MRRs (and DyGLib test MRRs) are not directly comparable with runs after.
+DyGLib negatives (training and eval) also follow CRAFT's collision check: never a destination the
+source links to at the query's timestamp, no repeats within a row unless the pool is smaller than
+K (MOOC). DyGLib runs before this are not directly comparable with runs after.
 
 A bare run:
 
