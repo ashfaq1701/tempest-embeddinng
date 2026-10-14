@@ -22,7 +22,7 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 3
+        self.n_feat = 4
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -31,7 +31,7 @@ class BagWeights(nn.Module):
 
         self.skip = nn.Linear(self.n_feat, 1, bias=False)
         with torch.no_grad():
-            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0]]))
+            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0, 0.0]]))
 
     def forward(self, tokens: WalkTokens):
         return self.pool(tokens)
@@ -55,11 +55,18 @@ class BagWeights(nn.Module):
         age = torch.log1p(age) / self.log_T_train                            # [Q, T]
         pos = pos / self.max_walk_len                                        # [Q, T]
 
-        d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
-        d_mean = (d_tok_mid * u).sum(-1, keepdim=True) / u.sum(-1, keepdim=True)  # [Q, 1]
-        d = d_tok_mid * u / d_mean.clamp_min(torch.finfo(xt.dtype).tiny)         # [Q, T]
+        tiny = torch.finfo(xt.dtype).tiny
 
-        feats = torch.stack([age, pos, d], dim=-1)                           # [Q, T, 3]
+        d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
+        d_mid_mean = (d_tok_mid * u).sum(-1, keepdim=True) / u.sum(-1, keepdim=True)  # [Q, 1]
+        d_mid = d_tok_mid * u / d_mid_mean.clamp_min(tiny)                   # [Q, T]
+
+        seed = F.embedding(tokens.seeds, self.E.weight).detach()             # [Q, d]
+        d_tok_seed = self.geom.dist(xt, seed.unsqueeze(-2))                  # [Q, T]
+        d_seed_mean = (d_tok_seed * u).sum(-1, keepdim=True) / u.sum(-1, keepdim=True)  # [Q, 1]
+        d_seed = d_tok_seed * u / d_seed_mean.clamp_min(tiny)                # [Q, T]
+
+        feats = torch.stack([age, pos, d_mid, d_seed], dim=-1)               # [Q, T, 4]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         p = self.geom.weighted_midpoint(x_tokens, w)                         # [Q, d]
