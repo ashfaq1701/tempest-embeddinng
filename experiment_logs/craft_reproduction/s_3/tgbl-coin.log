@@ -1,0 +1,408 @@
+# CRAFT reproduction with CORRECTED TGB test negatives -- tgbl-coin, seed 3
+# repo: ashfaq1701/CRAFT fork at /mnt/nfs2/inf/ms2420/CRAFT_fork
+#   branch fix/tgb-test-negative-shift  commit e77bf60  worktree /mnt/nfs2/inf/ms2420/craft_runs/wt-shift
+# slurm lane: s23  (--num_runs 2 --seed 2  (this file = Run 2 of 2))
+# lane completion marker: 2026-10-11 20:39:22 rc=0 70321s   [covers BOTH seeds 2 and 3 in one process]
+# CRAFT's own per-run logger file: /mnt/nfs2/inf/ms2420/craft_runs/wt-shift/logs/tgbl-coin/CRAFT/fixed_CRAFT_seed2_batchsize200_num_neighbors60_dropout0.1_sample_neighbor_strategyrecent_numlayers1_vfixed/1791680848.9377794.log
+# command: /mnt/nfs2/inf/ms2420/CRAFT_fork/venv/bin/python train_link_prediction.py --dataset_name tgbl-coin --model_name CRAFT --gpu 0 --dataset_path ./data/ --loss BPR --shuffle --use_pos --output_cat_time_intervals --num_output_layer 2 --num_runs 2 --seed 2 --batch_size 200 --embedding_size 128 --num_neighbors 60  --num_layers 1 --hidden_dropout 0.2 --attn_dropout_prob 0.2 --emb_dropout_prob 0.2 --output_cat_repeat_times --version fixed
+#
+# THIS RUN'S TEST METRICS (computed ONCE, after early stopping restored the best-val
+#   checkpoint -- CRAFT declares --test_interval_epochs and never reads it, so there is
+#   no mid-run test metric anywhere in this file):
+#   INFO:root:test average_precision, 0.97819509
+#   INFO:root:test roc_auc, 0.97277775
+#   INFO:root:test val_loss, 0.11311955
+#   INFO:root:test average_precision, 0.97819509
+#   INFO:root:test roc_auc, 0.97277775
+#   INFO:root:test val_loss, 0.11311955
+#   INFO:root:test mrr, 0.75124574
+#
+# HOW THIS FILE WAS MADE, so it can be audited or regenerated:
+#   source stdout: /mnt/nfs2/inf/ms2420/craft_runs/out/s23/coin.log  (UNMODIFIED, kept outside git)
+#   that stdout holds BOTH seeds sequentially; split at the
+#   '********** Run 2 starts. **********' marker. Run 1 = seed 2, Run 2 = seed 3.
+#   tqdm progress bars were collapsed to the final rendered state of each line
+#   (sed 's/.*\r//'). That drops 138.8 MB of carriage-return redraws across the lanes
+#   and loses NO log line -- INFO-line counts are identical before and after
+#   (verified 264/264 on s1/coin and 282/282 on s23/comment).
+#
+
+INFO:root:********** Run 2 starts. **********
+INFO:root:configuration is Namespace(dataset_name='tgbl-coin', batch_size=200, multi_negs_batch_size=20, model_name='CRAFT', gpu=0, output_dim=172, embedding_size=128, num_neighbors=60, save_model_path='./saved_models/', dataset_path='./data/', sample_neighbor_strategy='recent', time_scaling_factor=1e-06, num_walk_heads=8, num_heads=2, walk_length=1, time_gap=2000, time_feat_dim=100, position_feat_dim=172, edge_bank_memory_mode='unlimited_memory', time_window_mode='fixed_proportion', patch_size=1, channel_embedding_dim=50, max_input_sequence_length=64, learning_rate=0.0001, dropout=0.1, scale=12, num_epochs=200, optimizer='Adam', weight_decay=0.0, patience=15, val_ratio=0.15, test_ratio=0.15, num_runs=2, seed=2, test_interval_epochs=10, is_bipartite=False, negative_sample_strategy='random', load_best_configs=False, use_edge_feat=False, load_pretrained=False, use_node_feat=False, use_bn=False, use_bias=False, use_act=False, act_type='ReLU', use_feat=False, time_enc=False, use_mixer=False, use_positional=False, use_neighbor=False, use_layernorm=False, num_layers=1, num_mixer_layers=2, merge='cat', version='fixed', hidden_dropout=0.2, hidden_act='gelu', loss='BPR', inner_size=256, attn_dropout_prob=0.2, layer_norm_eps=1e-12, initializer_range=0.02, shuffle=True, use_pos=True, step=1, use_mean=False, output_cat_time_intervals=True, output_cat_repeat_times=True, input_cat_time_intervals=False, num_output_layer=2, collision_check=False, emb_dropout_prob=0.2, use_mrr_val=False, skip_connection=False, device='cuda:0', save_model_name='CRAFT_seed2_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed', user_size=np.int64(638486), item_size=np.int64(638486), node_size=np.int64(638486), dst_min_idx=1, src_min_idx=1)
+INFO:root:['train_link_prediction.py', '--dataset_name', 'tgbl-coin', '--model_name', 'CRAFT', '--gpu', '0', '--dataset_path', './data/', '--loss', 'BPR', '--shuffle', '--use_pos', '--output_cat_time_intervals', '--num_output_layer', '2', '--num_runs', '2', '--seed', '2', '--batch_size', '200', '--embedding_size', '128', '--num_neighbors', '60', '--num_layers', '1', '--hidden_dropout', '0.2', '--attn_dropout_prob', '0.2', '--emb_dropout_prob', '0.2', '--output_cat_repeat_times', '--version', 'fixed']
+INFO:root:model -> CRAFT(
+  (node_embedding): Embedding(638487, 128, padding_idx=0)
+  (position_embedding): Embedding(60, 128)
+  (cross_attention): CrossAttention(
+    (layer): ModuleList(
+      (0): CrossAttentionLayer(
+        (multi_head_attention): MultiHeadCrossAttentionbyHand(
+          (query): Linear(in_features=128, out_features=128, bias=True)
+          (key): Linear(in_features=128, out_features=128, bias=True)
+          (value): Linear(in_features=128, out_features=128, bias=True)
+          (softmax): Softmax(dim=-1)
+          (attn_dropout): Dropout(p=0.2, inplace=False)
+          (dense): Linear(in_features=128, out_features=128, bias=True)
+          (LayerNorm): LayerNorm((128,), eps=1e-12, elementwise_affine=True)
+          (out_dropout): Dropout(p=0.2, inplace=False)
+        )
+        (feed_forward): FeedForward4CrossAttn(
+          (dense_1): Linear(in_features=128, out_features=512, bias=True)
+          (LayerNorm): LayerNorm((128,), eps=1e-12, elementwise_affine=True)
+          (dense_2): Linear(in_features=512, out_features=128, bias=True)
+          (dropout): Dropout(p=0.2, inplace=False)
+        )
+      )
+    )
+  )
+  (time_projection): MLP(
+    (lins): ModuleList(
+      (0): Linear(in_features=1, out_features=128, bias=True)
+    )
+  )
+  (repeat_times_projection): MLP(
+    (lins): ModuleList(
+      (0): Linear(in_features=1, out_features=128, bias=True)
+    )
+  )
+  (output_layer): MLP(
+    (lins): ModuleList(
+      (0): Linear(in_features=384, out_features=384, bias=True)
+      (1): Linear(in_features=384, out_features=1, bias=True)
+    )
+    (dropout): Dropout(p=0.2, inplace=False)
+    (act): PReLU(num_parameters=1)
+  )
+  (LayerNorm): LayerNorm((128,), eps=1e-12, elementwise_affine=True)
+  (LayerNorm_time_intervals): LayerNorm((128,), eps=1e-12, elementwise_affine=True)
+  (LayerNorm_repeat_times): LayerNorm((128,), eps=1e-12, elementwise_affine=True)
+  (dropout): Dropout(p=0.2, inplace=False)
+  (emb_dropout): Dropout(p=0.2, inplace=False)
+  (loss_fct): BPRLoss()
+)
+INFO:root:model name: CRAFT, #parameters: 328327176 B, 320632.0078125 KB, 313.11719512939453 MB.
+INFO:root:Epoch: 1, learning rate: 0.0001, train loss: 0.10958354
+INFO:root:train average_precision, 0.95904318
+INFO:root:train roc_auc, 0.94301731
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:26<00:00, 196.68it/s]
+INFO:root:validate average_precision, 0.96562839
+INFO:root:validate roc_auc, 0.95335121
+INFO:root:validate val_loss, 0.10146492
+INFO:root:save model ./saved_models//tgbl-coin/CRAFT/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed.pkl
+INFO:root:Epoch: 2, learning rate: 0.0001, train loss: 0.06029038
+INFO:root:train average_precision, 0.98072176
+INFO:root:train roc_auc, 0.97584019
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:27<00:00, 196.16it/s]
+INFO:root:validate average_precision, 0.97200877
+INFO:root:validate roc_auc, 0.96327771
+INFO:root:validate val_loss, 0.08894664
+INFO:root:save model ./saved_models//tgbl-coin/CRAFT/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed.pkl
+INFO:root:Epoch: 3, learning rate: 0.0001, train loss: 0.04328998
+INFO:root:train average_precision, 0.98646286
+INFO:root:train roc_auc, 0.98375970
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:26<00:00, 198.69it/s]
+INFO:root:validate average_precision, 0.97447931
+INFO:root:validate roc_auc, 0.96710025
+INFO:root:validate val_loss, 0.08142119
+INFO:root:save model ./saved_models//tgbl-coin/CRAFT/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed.pkl
+INFO:root:Epoch: 4, learning rate: 0.0001, train loss: 0.03448097
+INFO:root:train average_precision, 0.98931758
+INFO:root:train roc_auc, 0.98753996
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:25<00:00, 200.39it/s]
+INFO:root:validate average_precision, 0.97780185
+INFO:root:validate roc_auc, 0.97165824
+INFO:root:validate val_loss, 0.07563015
+INFO:root:save model ./saved_models//tgbl-coin/CRAFT/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed.pkl
+INFO:root:Epoch: 5, learning rate: 0.0001, train loss: 0.02919598
+INFO:root:train average_precision, 0.99090857
+INFO:root:train roc_auc, 0.98960684
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:28<00:00, 192.66it/s]
+INFO:root:validate average_precision, 0.97940456
+INFO:root:validate roc_auc, 0.97411465
+INFO:root:validate val_loss, 0.07676835
+INFO:root:save model ./saved_models//tgbl-coin/CRAFT/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed.pkl
+INFO:root:Epoch: 6, learning rate: 0.0001, train loss: 0.02557553
+INFO:root:train average_precision, 0.99193531
+INFO:root:train roc_auc, 0.99092376
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:33<00:00, 182.67it/s]
+INFO:root:validate average_precision, 0.97965762
+INFO:root:validate roc_auc, 0.97446299
+INFO:root:validate val_loss, 0.07815631
+INFO:root:save model ./saved_models//tgbl-coin/CRAFT/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed.pkl
+INFO:root:Epoch: 7, learning rate: 0.0001, train loss: 0.02302103
+INFO:root:train average_precision, 0.99271580
+INFO:root:train roc_auc, 0.99190812
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:31<00:00, 186.39it/s]
+INFO:root:validate average_precision, 0.98057378
+INFO:root:validate roc_auc, 0.97557640
+INFO:root:validate val_loss, 0.07794577
+INFO:root:save model ./saved_models//tgbl-coin/CRAFT/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed.pkl
+INFO:root:Epoch: 8, learning rate: 0.0001, train loss: 0.02102018
+INFO:root:train average_precision, 0.99325838
+INFO:root:train roc_auc, 0.99258521
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:27<00:00, 195.06it/s]
+INFO:root:validate average_precision, 0.97975327
+INFO:root:validate roc_auc, 0.97476985
+INFO:root:validate val_loss, 0.07889891
+INFO:root:Epoch: 9, learning rate: 0.0001, train loss: 0.01959210
+INFO:root:train average_precision, 0.99369153
+INFO:root:train roc_auc, 0.99311965
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:30<00:00, 188.92it/s]
+INFO:root:validate average_precision, 0.98030399
+INFO:root:validate roc_auc, 0.97546251
+INFO:root:validate val_loss, 0.08129401
+INFO:root:Epoch: 10, learning rate: 0.0001, train loss: 0.01845541
+INFO:root:train average_precision, 0.99405667
+INFO:root:train roc_auc, 0.99357635
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:30<00:00, 188.25it/s]
+INFO:root:validate average_precision, 0.98094309
+INFO:root:validate roc_auc, 0.97614282
+INFO:root:validate val_loss, 0.08001800
+INFO:root:save model ./saved_models//tgbl-coin/CRAFT/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed.pkl
+INFO:root:Epoch: 11, learning rate: 0.0001, train loss: 0.01750930
+INFO:root:train average_precision, 0.99431831
+INFO:root:train roc_auc, 0.99388972
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:29<00:00, 191.15it/s]
+INFO:root:validate average_precision, 0.98087829
+INFO:root:validate roc_auc, 0.97617839
+INFO:root:validate val_loss, 0.08216675
+INFO:root:Epoch: 12, learning rate: 0.0001, train loss: 0.01669789
+INFO:root:train average_precision, 0.99455003
+INFO:root:train roc_auc, 0.99417182
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:29<00:00, 190.34it/s]
+INFO:root:validate average_precision, 0.98104237
+INFO:root:validate roc_auc, 0.97640322
+INFO:root:validate val_loss, 0.08187219
+INFO:root:save model ./saved_models//tgbl-coin/CRAFT/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed.pkl
+INFO:root:Epoch: 13, learning rate: 0.0001, train loss: 0.01599637
+INFO:root:train average_precision, 0.99479631
+INFO:root:train roc_auc, 0.99445837
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:29<00:00, 190.70it/s]
+INFO:root:validate average_precision, 0.98147430
+INFO:root:validate roc_auc, 0.97665381
+INFO:root:validate val_loss, 0.08019359
+INFO:root:save model ./saved_models//tgbl-coin/CRAFT/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed.pkl
+INFO:root:Epoch: 14, learning rate: 0.0001, train loss: 0.01541956
+INFO:root:train average_precision, 0.99497285
+INFO:root:train roc_auc, 0.99466809
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:31<00:00, 187.98it/s]
+INFO:root:validate average_precision, 0.98008716
+INFO:root:validate roc_auc, 0.97507749
+INFO:root:validate val_loss, 0.09144578
+INFO:root:Epoch: 15, learning rate: 0.0001, train loss: 0.01488950
+INFO:root:train average_precision, 0.99514734
+INFO:root:train roc_auc, 0.99486879
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:32<00:00, 184.60it/s]
+INFO:root:validate average_precision, 0.98022290
+INFO:root:validate roc_auc, 0.97533783
+INFO:root:validate val_loss, 0.08751762
+INFO:root:Epoch: 16, learning rate: 0.0001, train loss: 0.01437672
+INFO:root:train average_precision, 0.99527659
+INFO:root:train roc_auc, 0.99502057
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:32<00:00, 185.25it/s]
+INFO:root:validate average_precision, 0.98056298
+INFO:root:validate roc_auc, 0.97583021
+INFO:root:validate val_loss, 0.09258247
+INFO:root:Epoch: 17, learning rate: 0.0001, train loss: 0.01402023
+INFO:root:train average_precision, 0.99543434
+INFO:root:train roc_auc, 0.99520354
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:32<00:00, 184.36it/s]
+INFO:root:validate average_precision, 0.98142165
+INFO:root:validate roc_auc, 0.97672343
+INFO:root:validate val_loss, 0.08939852
+INFO:root:Epoch: 18, learning rate: 0.0001, train loss: 0.01357580
+INFO:root:train average_precision, 0.99555801
+INFO:root:train roc_auc, 0.99534647
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:37<00:00, 175.39it/s]
+INFO:root:validate average_precision, 0.98081658
+INFO:root:validate roc_auc, 0.97592976
+INFO:root:validate val_loss, 0.08930120
+INFO:root:Epoch: 19, learning rate: 0.0001, train loss: 0.01320065
+INFO:root:train average_precision, 0.99564930
+INFO:root:train roc_auc, 0.99545136
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:32<00:00, 185.53it/s]
+INFO:root:validate average_precision, 0.97992147
+INFO:root:validate roc_auc, 0.97548315
+INFO:root:validate val_loss, 0.09688145
+INFO:root:Epoch: 20, learning rate: 0.0001, train loss: 0.01287855
+INFO:root:train average_precision, 0.99577605
+INFO:root:train roc_auc, 0.99559201
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:31<00:00, 186.66it/s]
+INFO:root:validate average_precision, 0.98098276
+INFO:root:validate roc_auc, 0.97649684
+INFO:root:validate val_loss, 0.09278381
+INFO:root:Epoch: 21, learning rate: 0.0001, train loss: 0.01250827
+INFO:root:train average_precision, 0.99586960
+INFO:root:train roc_auc, 0.99570038
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:33<00:00, 182.96it/s]
+INFO:root:validate average_precision, 0.98019409
+INFO:root:validate roc_auc, 0.97550204
+INFO:root:validate val_loss, 0.09350468
+INFO:root:Epoch: 22, learning rate: 0.0001, train loss: 0.01234764
+INFO:root:train average_precision, 0.99594702
+INFO:root:train roc_auc, 0.99578953
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:31<00:00, 186.16it/s]
+INFO:root:validate average_precision, 0.98145379
+INFO:root:validate roc_auc, 0.97676780
+INFO:root:validate val_loss, 0.08985685
+INFO:root:Epoch: 23, learning rate: 0.0001, train loss: 0.01196743
+INFO:root:train average_precision, 0.99604886
+INFO:root:train roc_auc, 0.99590139
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:30<00:00, 188.99it/s]
+INFO:root:validate average_precision, 0.98101401
+INFO:root:validate roc_auc, 0.97635202
+INFO:root:validate val_loss, 0.09241242
+INFO:root:Epoch: 24, learning rate: 0.0001, train loss: 0.01163834
+INFO:root:train average_precision, 0.99611833
+INFO:root:train roc_auc, 0.99598192
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:31<00:00, 186.89it/s]
+INFO:root:validate average_precision, 0.98084632
+INFO:root:validate roc_auc, 0.97611731
+INFO:root:validate val_loss, 0.09479103
+INFO:root:Epoch: 25, learning rate: 0.0001, train loss: 0.01149014
+INFO:root:train average_precision, 0.99619228
+INFO:root:train roc_auc, 0.99606277
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:32<00:00, 184.46it/s]
+INFO:root:validate average_precision, 0.98144593
+INFO:root:validate roc_auc, 0.97676357
+INFO:root:validate val_loss, 0.09266889
+INFO:root:Epoch: 26, learning rate: 0.0001, train loss: 0.01129215
+INFO:root:train average_precision, 0.99624706
+INFO:root:train roc_auc, 0.99612431
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:32<00:00, 184.64it/s]
+INFO:root:validate average_precision, 0.98199641
+INFO:root:validate roc_auc, 0.97741957
+INFO:root:validate val_loss, 0.09712891
+INFO:root:save model ./saved_models//tgbl-coin/CRAFT/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed.pkl
+INFO:root:Epoch: 27, learning rate: 0.0001, train loss: 0.01108421
+INFO:root:train average_precision, 0.99632330
+INFO:root:train roc_auc, 0.99621262
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:31<00:00, 186.56it/s]
+INFO:root:validate average_precision, 0.98167223
+INFO:root:validate roc_auc, 0.97682392
+INFO:root:validate val_loss, 0.09370057
+INFO:root:Epoch: 28, learning rate: 0.0001, train loss: 0.01085756
+INFO:root:train average_precision, 0.99635677
+INFO:root:train roc_auc, 0.99624802
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:31<00:00, 186.45it/s]
+INFO:root:validate average_precision, 0.98122801
+INFO:root:validate roc_auc, 0.97649125
+INFO:root:validate val_loss, 0.09518504
+INFO:root:Epoch: 29, learning rate: 0.0001, train loss: 0.01075798
+INFO:root:train average_precision, 0.99642772
+INFO:root:train roc_auc, 0.99632449
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:31<00:00, 185.98it/s]
+INFO:root:validate average_precision, 0.98052864
+INFO:root:validate roc_auc, 0.97552865
+INFO:root:validate val_loss, 0.09942493
+INFO:root:Epoch: 30, learning rate: 0.0001, train loss: 0.01052443
+INFO:root:train average_precision, 0.99648943
+INFO:root:train roc_auc, 0.99639381
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:31<00:00, 187.94it/s]
+INFO:root:validate average_precision, 0.98142600
+INFO:root:validate roc_auc, 0.97675777
+INFO:root:validate val_loss, 0.10160309
+INFO:root:Epoch: 31, learning rate: 0.0001, train loss: 0.01040949
+INFO:root:train average_precision, 0.99650145
+INFO:root:train roc_auc, 0.99640524
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:32<00:00, 184.40it/s]
+INFO:root:validate average_precision, 0.98067366
+INFO:root:validate roc_auc, 0.97567048
+INFO:root:validate val_loss, 0.09848960
+INFO:root:Epoch: 32, learning rate: 0.0001, train loss: 0.01023018
+INFO:root:train average_precision, 0.99657346
+INFO:root:train roc_auc, 0.99648437
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:31<00:00, 186.30it/s]
+INFO:root:validate average_precision, 0.98032875
+INFO:root:validate roc_auc, 0.97496531
+INFO:root:validate val_loss, 0.10606560
+INFO:root:Epoch: 33, learning rate: 0.0001, train loss: 0.01012731
+INFO:root:train average_precision, 0.99659534
+INFO:root:train roc_auc, 0.99650996
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:31<00:00, 186.22it/s]
+INFO:root:validate average_precision, 0.98005280
+INFO:root:validate roc_auc, 0.97494390
+INFO:root:validate val_loss, 0.10289093
+INFO:root:Epoch: 34, learning rate: 0.0001, train loss: 0.01000558
+INFO:root:train average_precision, 0.99663979
+INFO:root:train roc_auc, 0.99655993
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:32<00:00, 185.58it/s]
+INFO:root:validate average_precision, 0.98012846
+INFO:root:validate roc_auc, 0.97481163
+INFO:root:validate val_loss, 0.10645847
+INFO:root:Epoch: 35, learning rate: 0.0001, train loss: 0.00988549
+INFO:root:train average_precision, 0.99669452
+INFO:root:train roc_auc, 0.99662093
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:32<00:00, 185.65it/s]
+INFO:root:validate average_precision, 0.97992409
+INFO:root:validate roc_auc, 0.97466021
+INFO:root:validate val_loss, 0.11320418
+INFO:root:Epoch: 36, learning rate: 0.0001, train loss: 0.00980664
+INFO:root:train average_precision, 0.99669696
+INFO:root:train roc_auc, 0.99662142
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:31<00:00, 186.24it/s]
+INFO:root:validate average_precision, 0.97992982
+INFO:root:validate roc_auc, 0.97456576
+INFO:root:validate val_loss, 0.10906250
+INFO:root:Epoch: 37, learning rate: 0.0001, train loss: 0.00961263
+INFO:root:train average_precision, 0.99674400
+INFO:root:train roc_auc, 0.99667310
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:32<00:00, 185.12it/s]
+INFO:root:validate average_precision, 0.97969919
+INFO:root:validate roc_auc, 0.97431830
+INFO:root:validate val_loss, 0.11264357
+INFO:root:Epoch: 38, learning rate: 0.0001, train loss: 0.00956897
+INFO:root:train average_precision, 0.99676430
+INFO:root:train roc_auc, 0.99669430
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:29<00:00, 190.50it/s]
+INFO:root:validate average_precision, 0.98008079
+INFO:root:validate roc_auc, 0.97482515
+INFO:root:validate val_loss, 0.11242056
+INFO:root:Epoch: 39, learning rate: 0.0001, train loss: 0.00951155
+INFO:root:train average_precision, 0.99680090
+INFO:root:train roc_auc, 0.99673633
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:30<00:00, 189.05it/s]
+INFO:root:validate average_precision, 0.97898583
+INFO:root:validate roc_auc, 0.97317414
+INFO:root:validate val_loss, 0.11501278
+INFO:root:Epoch: 40, learning rate: 0.0001, train loss: 0.00929070
+INFO:root:train average_precision, 0.99684512
+INFO:root:train roc_auc, 0.99678296
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:33<00:00, 183.38it/s]
+INFO:root:validate average_precision, 0.98016736
+INFO:root:validate roc_auc, 0.97488416
+INFO:root:validate val_loss, 0.11239194
+INFO:root:Epoch: 41, learning rate: 0.0001, train loss: 0.00930424
+INFO:root:train average_precision, 0.99689291
+INFO:root:train roc_auc, 0.99683439
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:32<00:00, 184.01it/s]
+INFO:root:validate average_precision, 0.97956058
+INFO:root:validate roc_auc, 0.97412072
+INFO:root:validate val_loss, 0.10980027
+INFO:root:load model ./saved_models//tgbl-coin/CRAFT/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed.pkl
+INFO:root:get final performance on dataset tgbl-coin...
+100%|████████████████████████████████████████████████████████████████████████████| 17108/17108 [01:31<00:00, 187.55it/s]
+INFO:root:load model ./saved_models//tgbl-coin/CRAFT/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed/CRAFT_seed3_batchsize200_num_neighbors60_dropout0.1_numlayers1_vfixed.pkl
+INFO:root:test average_precision, 0.97819509
+INFO:root:test roc_auc, 0.97277775
+INFO:root:test val_loss, 0.11311955
+100%|██████████████████████████████████████████████████████████████████████████| 171071/171071 [08:42<00:00, 327.37it/s]
+INFO:root:test average_precision, 0.97819509
+INFO:root:test roc_auc, 0.97277775
+INFO:root:test val_loss, 0.11311955
+INFO:root:test mrr, 0.75124574
+INFO:root:Run 2 cost 34515.76 seconds.
+
+# ---- APPENDIX: the 2-run aggregate this lane printed. It covers seeds 2 AND 3
+# ---- together and is the only place the +-std appears; per-seed values are
+# ---- recoverable exactly as mean +- std/sqrt(2).
+INFO:root:metrics over 2 runs:
+INFO:root:test average_precision, [np.float64(0.9775248797266748), np.float64(0.978195090897599)]
+INFO:root:average test average_precision, 0.97785999 ± 0.00047391
+INFO:root:test roc_auc, [np.float64(0.9720043002754016), np.float64(0.9727777487563211)]
+INFO:root:average test roc_auc, 0.97239102 ± 0.00054691
+INFO:root:test val_loss, [np.float64(0.11138670557752853), np.float64(0.11311955039416373)]
+INFO:root:average test val_loss, 0.11225313 ± 0.00122531
+INFO:root:test mrr, [np.float32(0.7419139), np.float32(0.75124574)]
+INFO:root:average test mrr, 0.74657983 ± 0.00659860
+/mnt/nfs2/inf/ms2420/craft_runs/wt-shift/logs/tgbl-coin/CRAFT/fixed_CRAFT_seed2_batchsize200_num_neighbors60_dropout0.1_sample_neighbor_strategyrecent_numlayers1_vfixed/1791680848.9377794.log
