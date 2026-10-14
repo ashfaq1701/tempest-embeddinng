@@ -22,7 +22,7 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 4
+        self.n_feat = 5
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -31,7 +31,7 @@ class BagWeights(nn.Module):
 
         self.skip = nn.Linear(self.n_feat, 1, bias=False)
         with torch.no_grad():
-            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0, 0.0]]))
+            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0, 0.0, 0.0]]))
 
     def forward(self, tokens: WalkTokens):
         return self.pool(tokens)
@@ -61,10 +61,11 @@ class BagWeights(nn.Module):
         d_mid_mean = (d_tok_mid * u).sum(-1, keepdim=True) / u.sum(-1, keepdim=True)  # [Q, 1]
         d_mid = d_tok_mid * u / d_mid_mean.clamp_min(tiny)                   # [Q, T]
 
-        r_mean = self.geom.dist0(self.E.weight.detach()).mean()              # []
-        d_0 = self.geom.dist0(xt) * u / r_mean.clamp_min(tiny)               # [Q, T]
+        r_mean = self.geom.dist0(self.E.weight.detach()).mean().clamp_min(tiny)  # []
+        d0_tok = self.geom.dist0(xt) * u / r_mean                            # [Q, T]
+        d0_mid = (self.geom.dist0(mid) / r_mean).unsqueeze(-1) * u           # [Q, T]
 
-        feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
+        feats = torch.stack([age, pos, d_mid, d0_tok, d0_mid], dim=-1)       # [Q, T, 5]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
         p = self.geom.weighted_midpoint(x_tokens, w)                         # [Q, d]
