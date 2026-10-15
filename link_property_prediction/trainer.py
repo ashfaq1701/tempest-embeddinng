@@ -9,6 +9,10 @@ Training per batch: sample K_train negatives by the suite's rule, form candidate
 score them TWO-SIDED (walks for the source u and for every candidate v, each cut off at the query
 time t_i), then the loss terms from `loss.py` summed 1:1 and a single optimizer step. E and the
 head train together with no detach.
+
+Loss terms: `link` (candidate cross-entropy) and `rad`, which pulls each candidate's radius toward
+the radius its causal popularity rank earns within the batch. `agree` (radius/popularity rank
+correlation) is logged beside them and never optimised.
 """
 import time
 from collections import defaultdict
@@ -21,7 +25,7 @@ import torch
 
 from .data import Batch, SplitData
 from .evaluator import Evaluator
-from .loss import link_loss
+from .loss import link_loss, radial_popularity_loss, rank_agreement
 from .model import LinkPredHead
 from .negatives import NegativeSampler
 from .walk_tokens import build_query_walk_tokens
@@ -164,14 +168,28 @@ class Trainer:
         t_query_t = torch.from_numpy(batch.ts.astype(np.int64)).to(device)
 
         logits = self._score(src_t, cand_t, t_query_t)                            # [B, 1+K]
-        terms = {"link": link_loss(logits)}
+        radii = self.model.geom.dist0(self.model.E.weight[cand_t]).reshape(-1)    # [B*(1+K)]
+        popularity = self._candidate_popularity(cand_np, batch.ts)                 # [B*(1+K)]
+        terms = {
+            "link": link_loss(logits),
+            "rad": radial_popularity_loss(radii, popularity),
+        }
         loss = sum(terms.values())
 
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         self.opt.step()
 
-        return {name: float(term.detach()) for name, term in terms.items()}
+        stats = {name: float(term.detach()) for name, term in terms.items()}
+        stats["agree"] = rank_agreement(radii.detach(), popularity)
+        return stats
+
+    def _candidate_popularity(self, cand_np: np.ndarray, ts: np.ndarray) -> torch.Tensor:
+        """Causal popularity of every candidate, flattened query-major to [B*C]: Tempest's count of
+        edges touching it strictly before its query's time."""
+        cutoffs = np.repeat(ts.astype(np.int64), cand_np.shape[1])                # [B*C]
+        counts = self.walk_gen.get_node_popularity(cand_np.reshape(-1), cutoffs)   # [B*C]
+        return torch.from_numpy(counts).to(self.device, torch.float32)
 
     # Geometry probe
 
