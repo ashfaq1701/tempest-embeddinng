@@ -80,7 +80,7 @@ class FrozenEncoder:
 
     def _geometry(self, tokens: WalkTokens, src: torch.Tensor) -> torch.Tensor:
         geom = self.model.geom
-        p_u, spread = self.model.bag_weights(tokens)                         # [Q, d], [Q]
+        p_u, spread = self.model.bag_weights(tokens, self.model.mean_radius())  # [Q, d], [Q]
         e_u = self.model.E.weight[src]                                       # [Q, d]
         geometry = [
             geom.dist0(p_u),
