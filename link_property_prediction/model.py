@@ -96,7 +96,7 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.geom, self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
-        self.geo_temp = nn.Parameter(torch.tensor(1.0))
+        self.w = nn.Parameter(torch.tensor([1.0]))
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         p_u, _ = self.bag_weights(src_tokens)                                # [b, d]
@@ -105,4 +105,4 @@ class LinkPredHead(nn.Module):
         p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
 
         geo = self.geom.dist(p_u.unsqueeze(1), p_v)                          # [b, c]
-        return self.geo_temp * (-geo)
+        return self.w * -geo
