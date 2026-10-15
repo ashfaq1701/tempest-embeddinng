@@ -58,8 +58,6 @@ def parse_args() -> argparse.Namespace:
     # ── Negatives ───────────────────────────────────────────────────
     p.add_argument("--k-train", default=5, type=int,
                    help="Per-query training negatives.")
-    p.add_argument("--label-smoothing", default=0.0, type=float,
-                   help="Label smoothing of the training link cross-entropy (0 = hard target).")
     p.add_argument("--k-eval", default=100, type=int,
                    help="Eval negatives per positive (tgb-seq val only).")
 
@@ -169,7 +167,6 @@ def main() -> Dict[str, Any]:
         n_layers_pooler=args.n_layers_pooler,
 
         K_train=args.k_train,
-        label_smoothing=args.label_smoothing,
 
         num_walks_per_node=args.num_walks_per_node,
         max_walk_len=args.max_walk_len,

@@ -50,9 +50,6 @@ class TrainerConfig:
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
 
-    # Label smoothing of the link cross-entropy over [pos | negs]; 0 is the hard target.
-    label_smoothing: float = 0.0
-
     # Walks: BACKWARD only, undirected; two-sided (source and every candidate).
     num_walks_per_node: int = 5
     max_walk_len: int = 5
@@ -169,7 +166,7 @@ class Trainer:
         logits = self._score(src_t, cand_t, t_query_t)                            # [B, 1+K]
         target = torch.zeros(B, dtype=torch.long, device=device)
         # link CE only; E trains end-to-end through the monotone head (no detach).
-        link_loss = F.cross_entropy(logits, target, label_smoothing=self.config.label_smoothing)
+        link_loss = F.cross_entropy(logits, target)
 
         self.opt.zero_grad(set_to_none=True)
         link_loss.backward()
