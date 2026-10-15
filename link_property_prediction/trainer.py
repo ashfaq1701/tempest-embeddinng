@@ -7,20 +7,21 @@ simultaneous/future edge are never seen. TGB-Seq splits are chronological (train
 
 Training per batch: sample K_train negatives by the suite's rule, form candidates [pos | negs],
 score them TWO-SIDED (walks for the source u and for every candidate v, each cut off at the query
-time t_i), then cross-entropy with target 0 and a single optimizer step. E and the head train
-together under the link CE with no detach.
+time t_i), then the loss terms from `loss.py` summed 1:1 and a single optimizer step. E and the
+head train together with no detach.
 """
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 import geoopt
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from .data import Batch, SplitData
 from .evaluator import Evaluator
+from .loss import link_loss
 from .model import LinkPredHead
 from .negatives import NegativeSampler
 from .walk_tokens import build_query_walk_tokens
@@ -152,7 +153,6 @@ class Trainer:
 
     def _train_step(self, batch: Batch) -> Dict[str, float]:
         device = self.device
-        B = len(batch.src)
 
         # Full graph already ingested; each query walks with cutoff = t (EXCLUSIVE).
         neg_tgt = self.neg_sampler_train.sample(batch)                 # [B, K_train]
@@ -164,18 +164,14 @@ class Trainer:
         t_query_t = torch.from_numpy(batch.ts.astype(np.int64)).to(device)
 
         logits = self._score(src_t, cand_t, t_query_t)                            # [B, 1+K]
-        target = torch.zeros(B, dtype=torch.long, device=device)
-        # link CE only; E trains end-to-end through the monotone head (no detach).
-        link_loss = F.cross_entropy(logits, target)
+        terms = {"link": link_loss(logits)}
+        loss = sum(terms.values())
 
         self.opt.zero_grad(set_to_none=True)
-        link_loss.backward()
+        loss.backward()
         self.opt.step()
 
-        return {
-            "link": float(link_loss.detach()),
-            "lr": float(self.opt.param_groups[0]["lr"]),
-        }
+        return {name: float(term.detach()) for name, term in terms.items()}
 
     # Geometry probe
 
@@ -294,16 +290,18 @@ class Trainer:
             self.model.train()
 
             t0 = time.time()
-            link_sum, n_batches = 0.0, 0
+            term_sums: Dict[str, float] = defaultdict(float)
+            n_batches = 0
             for batch in train_batches_factory():
-                m = self._train_step(batch)
-                link_sum += m["link"]
+                for name, value in self._train_step(batch).items():
+                    term_sums[name] += value
                 n_batches += 1
             train_dt = time.time() - t0
 
+            term_means = "  ".join(
+                f"{name}={total / max(n_batches, 1):.4f}" for name, total in term_sums.items())
             line = (
-                f"epoch {ep}/{n_epochs}  "
-                f"link={link_sum / max(n_batches, 1):.4f}  "
+                f"epoch {ep}/{n_epochs}  {term_means}  "
                 f"lr={self.opt.param_groups[0]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
