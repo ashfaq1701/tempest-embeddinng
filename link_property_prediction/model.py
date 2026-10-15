@@ -110,6 +110,6 @@ class LinkPredHead(nn.Module):
         p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
 
         d_uv = self.geom.dist(p_u.unsqueeze(1), p_v)                         # [b, c]
-        d_0v = self.geom.dist0(p_v)                                          # [b, c]
+        d_0v = self.geom.dist0(p_v) / r_mean.clamp_min(torch.finfo(p_v.dtype).tiny)  # [b, c]
         feats = torch.stack([-d_uv, -d_0v], dim=-1)                          # [b, c, 2]
         return (self.w * feats).sum(-1)                                      # [b, c]
