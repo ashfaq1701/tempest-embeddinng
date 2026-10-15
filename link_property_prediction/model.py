@@ -42,10 +42,11 @@ class BagWeights(nn.Module):
         with torch.no_grad():
             self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0, 0.0]]))
 
-    def forward(self, tokens: WalkTokens):
-        return self.pool(tokens)
+    def forward(self, tokens: WalkTokens, r_mean: torch.Tensor):
+        return self.pool(tokens, r_mean)
 
-    def pool(self, tokens: WalkTokens):
+    def pool(self, tokens: WalkTokens, r_mean: torch.Tensor):
+        """`r_mean` is the embedding table's mean radius, computed once per forward by the caller."""
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
         valid = tokens.mask.flatten(1).clone()                               # [Q, T]
         cold = ~valid.any(dim=-1)                                            # [Q]
@@ -70,7 +71,6 @@ class BagWeights(nn.Module):
         d_mid_mean = (d_tok_mid * u).sum(-1, keepdim=True) / u.sum(-1, keepdim=True)  # [Q, 1]
         d_mid = d_tok_mid * u / d_mid_mean.clamp_min(tiny)                   # [Q, T]
 
-        r_mean = self.E.weight.detach().norm(dim=-1).mean()                  # []
         d_0 = xt.norm(dim=-1) * u / r_mean.clamp_min(tiny)                   # [Q, T]
 
         feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
@@ -108,9 +108,14 @@ class LinkPredHead(nn.Module):
 
         self.w = nn.Parameter(torch.tensor([1.0]))
 
+    def mean_radius(self) -> torch.Tensor:
+        """Mean distance of the embedding table from the origin, detached; the d_0 scale."""
+        return self.E.weight.detach().norm(dim=-1).mean()                    # []
+
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        p_u, _ = self.bag_weights(src_tokens)                                # [b, d]
-        p_v, _ = self.bag_weights(cand_tokens)                               # [b*c, d]
+        r_mean = self.mean_radius()                                          # []
+        p_u, _ = self.bag_weights(src_tokens, r_mean)                        # [b, d]
+        p_v, _ = self.bag_weights(cand_tokens, r_mean)                       # [b*c, d]
         b, d = p_u.shape
         p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
 
