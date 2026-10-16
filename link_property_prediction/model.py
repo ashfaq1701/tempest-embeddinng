@@ -96,18 +96,27 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.geom, self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
-        self.w = nn.Parameter(torch.tensor([1.0]))
+        self.w = nn.Parameter(torch.tensor([1.0, 0.0]))
 
     def mean_radius(self) -> torch.Tensor:
         """Mean distance of the embedding table from the origin, detached; the d_0 scale."""
         return self.geom.dist0(self.E.weight.detach()).mean()                # []
 
-    def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
+    def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens,
+                cand_popularity: torch.Tensor) -> torch.Tensor:
+        """cand_popularity [b*c]: each candidate's edge count before its query's cutoff."""
         r_mean = self.mean_radius()                                          # []
         p_u, _ = self.bag_weights(src_tokens, r_mean)                        # [b, d]
         p_v, _ = self.bag_weights(cand_tokens, r_mean)                       # [b*c, d]
         b, d = p_u.shape
-        p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
+        c = p_v.shape[0] // b
+        p_v = p_v.view(b, c, d)                                              # [b, c, d]
 
         d_uv = self.geom.dist(p_u.unsqueeze(1), p_v)                         # [b, c]
-        return self.w * -d_uv
+        d0_v = self.geom.dist0(self.E.weight[cand_tokens.seeds]).view(b, c)  # [b, c]
+        # ln(p + 2) >= ln 2, so a never-seen candidate pays the steepest finite radius cost.
+        pop_v = torch.log1p(cand_popularity + 1).view(b, c)                  # [b, c]
+
+        # Popular at the root scores best: the term rises with popularity and falls with radius.
+        feats = torch.stack([-d_uv, -d0_v / pop_v], dim=-1)                  # [b, c, 2]
+        return (self.w * feats).sum(-1)                                      # [b, c]

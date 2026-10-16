@@ -146,7 +146,11 @@ class Trainer:
             start_bias=self.config.start_bias,
             walk_bias=self.config.walk_bias)
 
-        return self.model(src_tokens, cand_tokens)
+        # Each candidate's edge count strictly before its query's cutoff, query-major [B*C].
+        cand_popularity = torch.from_numpy(self.walk_gen.get_node_popularity(
+            cand_seeds.cpu().numpy(), cand_cutoffs.cpu().numpy())).to(device, torch.float32)
+
+        return self.model(src_tokens, cand_tokens, cand_popularity)
 
     # Per-batch training step
 
