@@ -96,7 +96,7 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.geom, self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
-        self.w = nn.Parameter(torch.tensor([1.0, 0.0]))
+        self.w = nn.Parameter(torch.tensor([1.0, 1.0]))
 
     def mean_radius(self) -> torch.Tensor:
         """Mean distance of the embedding table from the origin, detached; the d_0 scale."""
