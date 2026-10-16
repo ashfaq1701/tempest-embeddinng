@@ -76,7 +76,7 @@ class BagWeights(nn.Module):
 
 class LinkPredHead(nn.Module):
 
-    INIT_RADIUS = 1e-2
+    INIT_RADIUS = 1e-3
 
     def __init__(self, num_nodes: int, T_train: int, max_walk_len: int, d_emb: int,
                  hidden_dim: int = 32, n_layers_pooler: int = 2, seed: int = 42):
