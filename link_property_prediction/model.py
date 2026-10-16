@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
 
+_SCALE_FLOOR = 1e-12   # smallest normaliser a pooler feature is divided by
+
 
 class BagWeights(nn.Module):
 
@@ -56,13 +58,11 @@ class BagWeights(nn.Module):
         age = torch.log1p(age) / self.log_T_train                            # [Q, T]
         pos = pos / self.max_walk_len                                        # [Q, T]
 
-        tiny = torch.finfo(xt.dtype).tiny
-
         d_tok_mid = self.geom.dist(xt, mid.unsqueeze(-2))                    # [Q, T]
         d_mid_mean = (d_tok_mid * u).sum(-1, keepdim=True) / u.sum(-1, keepdim=True)  # [Q, 1]
-        d_mid = d_tok_mid * u / d_mid_mean.clamp_min(tiny)                   # [Q, T]
+        d_mid = d_tok_mid * u / d_mid_mean.clamp_min(_SCALE_FLOOR)           # [Q, T]
 
-        d_0 = self.geom.dist0(xt) * u / r_mean.clamp_min(tiny)               # [Q, T]
+        d_0 = self.geom.dist0(xt) * u / r_mean.clamp_min(_SCALE_FLOOR)       # [Q, T]
 
         feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
