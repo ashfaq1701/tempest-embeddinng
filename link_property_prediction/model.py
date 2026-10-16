@@ -96,7 +96,7 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.geom, self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
-        self.w = nn.Parameter(torch.tensor([1.0]))
+        self.w = nn.Parameter(torch.tensor([1.0, 1.0]))
 
     def mean_radius(self) -> torch.Tensor:
         """Mean distance of the embedding table from the origin, detached; the d_0 scale."""
@@ -111,6 +111,7 @@ class LinkPredHead(nn.Module):
 
         d_uv = self.geom.dist(p_u.unsqueeze(1), p_v)                         # [b, c]
         d0_v = self.geom.dist0(p_v)                                          # [b, c]
-        # -d_uv + d0_v = 2 (u|v)_o - d0_u: the Gromov product at the origin, up to a per-query
-        # constant. In a tree it is the depth of the lowest common ancestor of u and v.
-        return self.w * (-d_uv + d0_v)
+        # At w = [1, 1] the score is the Gromov product at the origin, 2 (u|v)_o - d0_u, up to a
+        # per-query constant; separate weights let training rebalance the two terms.
+        feats = torch.stack([-d_uv, d0_v], dim=-1)                           # [b, c, 2]
+        return (self.w * feats).sum(-1)                                      # [b, c]
