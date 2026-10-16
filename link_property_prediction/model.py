@@ -110,4 +110,7 @@ class LinkPredHead(nn.Module):
         p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
 
         d_uv = self.geom.dist(p_u.unsqueeze(1), p_v)                         # [b, c]
-        return self.w * -d_uv
+        d0_v = self.geom.dist0(p_v)                                          # [b, c]
+        # -d_uv + d0_v = 2 (u|v)_o - d0_u: the Gromov product at the origin, up to a per-query
+        # constant. In a tree it is the depth of the lowest common ancestor of u and v.
+        return self.w * (-d_uv + d0_v)
