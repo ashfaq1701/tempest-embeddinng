@@ -106,7 +106,7 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
-        self.w = nn.Parameter(torch.tensor([1.0]))
+        self.w = nn.Parameter(torch.tensor([1.0, 1.0]))
 
     def mean_radius(self) -> torch.Tensor:
         """Mean distance of the embedding table from the origin, detached; the d_0 scale."""
@@ -120,4 +120,8 @@ class LinkPredHead(nn.Module):
         p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
 
         d_uv = dist(p_u.unsqueeze(1), p_v)                                   # [b, c]
-        return self.w * -d_uv
+        d0_v = p_v.norm(dim=-1)                                              # [b, c]
+        # At w = [1, 1] the score is the Gromov product at the origin, up to a per-query
+        # constant; separate weights let training rebalance the two terms.
+        feats = torch.stack([-d_uv, d0_v], dim=-1)                           # [b, c, 2]
+        return (self.w * feats).sum(-1)                                      # [b, c]
