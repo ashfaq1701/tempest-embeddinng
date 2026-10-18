@@ -34,9 +34,10 @@ class BagWeights(nn.Module):
             self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0, 0.0]]))
 
     def forward(self, tokens: WalkTokens, r_mean: torch.Tensor):
-        """The bag's token points [Q, T, d] and their log-weights [Q, T]: a log-softmax over the
-        valid tokens, -inf on padding. A bag with no walks holds its seed alone. `r_mean` is the
-        table's mean radius, computed once per forward by the caller."""
+        """The bag's token points [Q, T, d], their log-weights [Q, T] (a log-softmax over the valid
+        tokens, -inf on padding) and the pooled point [Q, d], the bag's weighted midpoint. A bag
+        with no walks holds its seed alone. `r_mean` is the table's mean radius, computed once per
+        forward by the caller."""
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
         valid = tokens.mask.flatten(1).clone()                               # [Q, T]
         cold = ~valid.any(dim=-1)                                            # [Q]
@@ -67,7 +68,8 @@ class BagWeights(nn.Module):
         feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
         log_weights = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T]
-        return points, log_weights
+        pooled = self.geom.weighted_midpoint(points, log_weights.exp())      # [Q, d]
+        return points, log_weights, pooled
 
 
 class LinkPredHead(nn.Module):
@@ -111,18 +113,16 @@ class LinkPredHead(nn.Module):
         return -torch.logsumexp(log_weights - beta * dist_to_tokens, dim=-1) / beta
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Score each candidate v of source u by the point-to-bag gaps both ways: u's point
-        against v's bag, and v's point against u's bag."""
+        """Score each candidate v of source u by the point-to-bag gaps both ways: u's pooled
+        point against v's bag, and v's pooled point against u's bag."""
         r_mean = self.mean_radius()                                          # []
-        points_u, log_weights_u = self.bag_weights(src_tokens, r_mean)       # [b, T, d], [b, T]
-        points_v, log_weights_v = self.bag_weights(cand_tokens, r_mean)      # [b*c, T, d], [b*c, T]
+        points_u, log_weights_u, pooled_u = self.bag_weights(src_tokens, r_mean)   # [b, T, d], [b, T], [b, d]
+        points_v, log_weights_v, pooled_v = self.bag_weights(cand_tokens, r_mean)  # [b*c, T, d], [b*c, T], [b*c, d]
         b, t, d = points_u.shape
         points_v = points_v.view(b, -1, t, d)                                # [b, c, T, d]
         log_weights_v = log_weights_v.view(b, -1, t)                         # [b, c, T]
+        pooled_v = pooled_v.view(b, -1, d)                                   # [b, c, d]
 
-        e_u = self.E.weight[src_tokens.seeds].unsqueeze(1)                   # [b, 1, d]
-        e_v = self.E.weight[cand_tokens.seeds].view(b, -1, d)                # [b, c, d]
-
-        gap_uv = (self.gap_to_bag(e_u, points_v, log_weights_v, r_mean)
-                  + self.gap_to_bag(e_v, points_u.unsqueeze(1), log_weights_u.unsqueeze(1), r_mean))  # [b, c]
+        gap_uv = (self.gap_to_bag(pooled_u.unsqueeze(1), points_v, log_weights_v, r_mean)
+                  + self.gap_to_bag(pooled_v, points_u.unsqueeze(1), log_weights_u.unsqueeze(1), r_mean))  # [b, c]
         return self.w * -gap_uv

@@ -1,5 +1,5 @@
-"""Frozen link-prediction encoder -> 4 causal features per interaction (u, t):
-d0(E[u]), gap(E[u], bag_u), log1p(#prior edges), log1p(t - last edge time)."""
+"""Frozen link-prediction encoder -> 5 causal features per interaction (u, t):
+d0(E[u]), d0(p_u), gap(p_u, bag_u), log1p(#prior edges), log1p(t - last edge time)."""
 import hashlib
 
 import numpy as np
@@ -76,19 +76,20 @@ class FrozenEncoder:
             geometry = self._geometry(tokens, src.to(self.device))
             history = self._history(walker, batch.src, batch.ts)
             out.append(torch.cat([geometry, history.to(self.device)], dim=1))
-        return torch.cat(out)                                                # [N, 4]
+        return torch.cat(out)                                                # [N, 5]
 
     def _geometry(self, tokens: WalkTokens, src: torch.Tensor) -> torch.Tensor:
-        """u's own radius, and the link scorer's gap from u's point to u's own bag."""
+        """u's own radius, its pooled point's radius, and the gap from the pooled point to u's bag."""
         model = self.model
         r_mean = model.mean_radius()                                         # []
-        points, log_weights = model.bag_weights(tokens, r_mean)              # [Q, T, d], [Q, T]
+        points, log_weights, pooled = model.bag_weights(tokens, r_mean)      # [Q, T, d], [Q, T], [Q, d]
         e_u = model.E.weight[src]                                            # [Q, d]
         geometry = [
             model.geom.dist0(e_u),
-            model.gap_to_bag(e_u, points, log_weights, r_mean),
+            model.geom.dist0(pooled),
+            model.gap_to_bag(pooled, points, log_weights, r_mean),
         ]
-        return torch.stack(geometry, dim=-1)                                 # [Q, 2]
+        return torch.stack(geometry, dim=-1)                                 # [Q, 3]
 
     def _history(self, walker: WalkGenerator, src: np.ndarray, ts: np.ndarray) -> torch.Tensor:
         src = src.astype(np.int64)
