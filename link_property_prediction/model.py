@@ -98,18 +98,19 @@ class LinkPredHead(nn.Module):
         self.log_beta = nn.Parameter(torch.tensor([0.0]))                   # soft-min sharpness, 1
 
     def mean_radius(self) -> torch.Tensor:
-        """Mean distance of the embedding table from the origin, detached: the distance scale."""
+        """Mean distance of the embedding table from the origin, detached: the d_0 scale."""
         r_mean = self.geom.dist0(self.E.weight.detach()).mean()              # []
         return r_mean.clamp_min(torch.finfo(r_mean.dtype).tiny)
 
-    def gap_to_bag(self, x: torch.Tensor, points: torch.Tensor, log_weights: torch.Tensor,
-                   r_mean: torch.Tensor) -> torch.Tensor:
+    def gap_to_bag(self, x: torch.Tensor, points: torch.Tensor,
+                   log_weights: torch.Tensor) -> torch.Tensor:
         """Soft-min gap from a point x [..., d] to a weighted bag, points [..., T, d] with
-        log_weights [..., T]: -(1/beta) log sum_j w_j exp(-beta d(x, y_j)), distances in units of
-        the mean radius. beta -> 0 gives the weighted mean distance, beta -> inf the nearest
-        token. Non-negative, but not a metric."""
+        log_weights [..., T]: -(1/beta) log sum_j w_j exp(-beta d(x, y_j)), raw geodesic distances.
+        beta * d -> 0 gives the weighted mean distance, beta * d -> inf the nearest token: the gap
+        starts near the weighted mean on the init table and sharpens as the table spreads.
+        Non-negative, but not a metric."""
         beta = self.log_beta.exp()                                           # [1]
-        dist_to_tokens = self.geom.dist(x.unsqueeze(-2), points) / r_mean    # [..., T]
+        dist_to_tokens = self.geom.dist(x.unsqueeze(-2), points)             # [..., T]
         return -torch.logsumexp(log_weights - beta * dist_to_tokens, dim=-1) / beta
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
@@ -123,6 +124,6 @@ class LinkPredHead(nn.Module):
         log_weights_v = log_weights_v.view(b, -1, t)                         # [b, c, T]
         pooled_v = pooled_v.view(b, -1, d)                                   # [b, c, d]
 
-        gap_uv = (self.gap_to_bag(pooled_u.unsqueeze(1), points_v, log_weights_v, r_mean)
-                  + self.gap_to_bag(pooled_v, points_u.unsqueeze(1), log_weights_u.unsqueeze(1), r_mean))  # [b, c]
+        gap_uv = (self.gap_to_bag(pooled_u.unsqueeze(1), points_v, log_weights_v)
+                  + self.gap_to_bag(pooled_v, points_u.unsqueeze(1), log_weights_u.unsqueeze(1)))  # [b, c]
         return self.w * -gap_uv
