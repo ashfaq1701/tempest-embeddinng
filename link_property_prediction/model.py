@@ -34,10 +34,7 @@ class BagWeights(nn.Module):
             self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0, 0.0]]))
 
     def forward(self, tokens: WalkTokens, r_mean: torch.Tensor):
-        """The bag's token points [Q, T, d], their log-weights [Q, T] (a log-softmax over the valid
-        tokens, -inf on padding) and the pooled point [Q, d], the bag's weighted midpoint. A bag
-        with no walks holds its seed alone. `r_mean` is the table's mean radius, computed once per
-        forward by the caller."""
+        """Token points [Q, T, d], log-weights [Q, T] (-inf on padding) and weighted midpoint [Q, d]."""
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
         valid = tokens.mask.flatten(1).clone()                               # [Q, T]
         cold = ~valid.any(dim=-1)                                            # [Q]
@@ -46,7 +43,7 @@ class BagWeights(nn.Module):
             valid[cold, 0] = True
 
         points = F.embedding(nodes, self.E.weight)                           # [Q, T, d]
-        # The features read where the tokens sit; gradient reaches E through the points only.
+        # Features see positions only; E's gradient flows through `points`.
         fixed = points.detach()                                              # [Q, T, d]
 
         valid_f = valid.to(fixed.dtype)                                      # [Q, T]
@@ -95,33 +92,27 @@ class LinkPredHead(nn.Module):
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
         self.w = nn.Parameter(torch.tensor([1.0]))
-        self.beta = nn.Parameter(torch.tensor([0.0]))                       # 0: weighted mean; kept >= 0 by project_
+        self.beta = nn.Parameter(torch.tensor([0.0]))                       # >= 0; 0 is the weighted mean
 
     @torch.no_grad()
     def project_(self) -> None:
-        """Restore parameter constraints after an optimiser step: beta >= 0, so the gap stays a
-        soft-min between the weighted mean (beta = 0) and the nearest token."""
+        """Clamp beta to >= 0 after an optimiser step."""
         self.beta.clamp_(min=0.0)
 
     def mean_radius(self) -> torch.Tensor:
-        """Mean distance of the embedding table from the origin, detached: the d_0 scale."""
+        """Mean geodesic radius of the table, detached."""
         r_mean = self.geom.dist0(self.E.weight.detach()).mean()              # []
         return r_mean.clamp_min(torch.finfo(r_mean.dtype).tiny)
 
     def gap_to_bag(self, x: torch.Tensor, points: torch.Tensor,
                    log_weights: torch.Tensor) -> torch.Tensor:
-        """Attention-weighted distance from a point x [..., d] to a bag, points [..., T, d] with
-        log_weights [..., T]: the bag's raw geodesic distances averaged under
-        softmax(log w_j - beta * d_j). beta * d -> 0 gives the weighted mean distance, beta * d ->
-        inf the nearest token. Nothing divides by beta, so any beta is stable; beta is a plain
-        parameter, so under Adam it grows additively. Non-negative, but not a metric."""
+        """Distance from x to a bag under softmax(log w_j - beta * d_j): mean at 0, nearest as beta grows."""
         dist_to_tokens = self.geom.dist(x.unsqueeze(-2), points)             # [..., T]
         attn = torch.softmax(log_weights - self.beta * dist_to_tokens, dim=-1)  # [..., T]
         return (attn * dist_to_tokens).sum(-1)                               # [...]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Score each candidate v of source u by the point-to-bag gaps both ways: u's pooled
-        point against v's bag, and v's pooled point against u's bag."""
+        """Score candidates by the pooled-point-to-bag gaps in both directions."""
         r_mean = self.mean_radius()                                          # []
         points_u, log_weights_u, pooled_u = self.bag_weights(src_tokens, r_mean)   # [b, T, d], [b, T], [b, d]
         points_v, log_weights_v, pooled_v = self.bag_weights(cand_tokens, r_mean)  # [b*c, T, d], [b*c, T], [b*c, d]
