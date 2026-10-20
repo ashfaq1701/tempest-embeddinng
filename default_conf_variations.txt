@@ -1,0 +1,124 @@
+DEFAULT CONFIG VARIATIONS
+=========================
+
+Every flag not listed in this file is left at its argparse default in
+scripts/train_link_property_prediction.py. To run a dataset, pass --dataset, the two GPU
+flags, the always-passed flags, and that dataset's row below -- nothing else. Anything
+further you pass is a deviation from the protocol and has to be reported with the number.
+
+Flag names here are the real ones. There is no --patience (it is --early-stop-patience) and
+no --nl (it is --n-layers-pooler).
+
+
+DEFAULTS, as of master 95adcad
+------------------------------
+  --data-suite tgb-seq        --d-emb 64              --num-walks-per-node 10
+  --max-walk-len 5            --walk-bias ExponentialWeight
+  --start-bias ExponentialWeight                      --t2nv-p 4.0   --t2nv-q 0.25
+  --k-train 5                 --k-eval 100            --lr 1e-3
+  --batch-size 1000           --eval-batch-size 1000
+  --num-epochs 100            --early-stop-patience 10
+  --hidden-dim 32             --n-layers-pooler 2     --seed 42
+  --is-bipartite              OFF (store_true)
+
+  NOTE --num-walks-per-node became 10 at 95adcad (was 5). Every reference number recorded
+  in logs/ before that commit is wpn 5 and is NOT comparable to a default run today.
+
+
+ALWAYS PASSED, on every dataset
+-------------------------------
+  --use-gpu --use-gpu-tempest     GPU model and GPU walk sampling.
+  --seed 5                        The argparse default is 42, but every comparison number
+                                  in this repo is seed 5. Use 5 or the run is comparable to
+                                  nothing. Training is exactly deterministic per seed, so a
+                                  differing trajectory means a differing input, not variance.
+
+
+SUITE tgb-seq  (the default suite; no --data-suite needed)
+----------------------------------------------------------
+  dataset       variations from default                why
+  -----------   ------------------------------------   ----------------------------------------
+  GoogleLocal   --is-bipartite                         bipartite_dict
+  YouTube       --early-stop-patience 20               flat val surface, see below
+  Flickr        (none)
+  Patent        (none)                                  see the Patent note below
+  ML-20M        --is-bipartite                         bipartite_dict
+  Taobao        --is-bipartite                         bipartite_dict
+  Yelp          --is-bipartite                         bipartite_dict
+  WikiLink      --n-layers-pooler 1                    every reference on this cell is nl1
+
+
+SUITE tgb  (--data-suite tgb on every dataset -- the default is tgb-seq)
+------------------------------------------------------------------------
+  dataset        variations from default                              why
+  ------------   --------------------------------------------------   -----------------------
+  tgbl-wiki      --is-bipartite --eval-batch-size 100                 disjoint ids; OOM
+  tgbl-review    --n-layers-pooler 1                                  references are nl1
+  tgbl-coin      (none)
+  tgbl-comment   (none)
+  tgbl-flight    (none)
+
+
+SUITE dyglib  (--data-suite dyglib; link-prediction stage of the node-classification recipe)
+--------------------------------------------------------------------------------------------
+  Wikipedia, Reddit   --is-bipartite --k-train 5 --k-eval 5
+  Recipe commit 85662e1; see reports/node_classification_2026-10-08.md. This is a different
+  protocol from the MRR suites above and its numbers do not belong in the same tables.
+
+
+WHY EACH VARIATION EXISTS
+-------------------------
+
+--is-bipartite  (GoogleLocal, ML-20M, Taobao, Yelp, tgbl-wiki)
+    It decides what a negative can BE: destinations only when bipartite, sources union
+    destinations otherwise. Getting it wrong silently changes the eval, so it is not a
+    tuning knob.
+    tgb-seq is authoritative from tgb_seq/datasets/preprocess.py::bipartite_dict:
+        ML-20M True, Taobao True, Yelp True, GoogleLocal True,
+        Flickr False, YouTube False, Patent False, WikiLink False
+    tgb ships no such dict. MEASURED by intersecting src/dst id ranges on the shipped
+    edgelists -- never trust the papers here, which relabel ids:
+        tgbl-wiki     u[0, 8226]      i[8227, 9226]     DISJOINT  -> bipartite
+        tgbl-review   u[0, 352636]    i[0, 352621]      overlap   -> NOT bipartite
+        tgbl-coin     u[0, 638485]    i[0, 638485]      overlap   -> NOT bipartite
+        tgbl-comment  u[0, 994787]    i[0, 994789]      overlap   -> NOT bipartite
+        tgbl-flight   u[0, 18142]     i[0, 18142]       overlap   -> NOT bipartite
+
+--n-layers-pooler 1  (WikiLink, tgbl-review)
+    Not a preference -- it is the only depth these two cells have ever been run at, so an
+    nl2 run on them is comparable to nothing. WikiLink has NO clean nl2 baseline, and an
+    earlier table silently mixed an nl1 WikiLink reference against nl2 arms, contaminating
+    every WikiLink delta in it. If you ever want nl2 here, run a fresh nl2 baseline first.
+
+--early-stop-patience 20  (YouTube only)
+    YouTube's val surface is flat to ~0.0002 near the optimum, so patience 10 cuts runs
+    that have not finished improving. Measured: master-rawd stopped at ep30 with a later
+    epoch within 0.0009 of its own best; the linear-beta arm stopped at ep41 within 0.0002.
+    Two other arms on the same cell peaked at ep54 and ep70. Three 200/20 runs there had
+    best-vals 0.0114 apart and selected test numbers 0.031 apart, i.e. patience, not the
+    model, set the reported figure.
+
+--eval-batch-size 100  (tgbl-wiki only)
+    tgbl-wiki ships ~999 negatives per positive, so the default eval batch of 1000 queries
+    means ~1e6 candidate nodes, each needing --num-walks-per-node walks. At the new default
+    of 10 walks this overflows the GPU walk arena on a 96 GB RTX:
+        RuntimeError: CUDA error in .../device_arena.cuh:131 code=2 (out of memory)
+        at walks.py:126 get_random_walks_and_times_for_nodes, during the first val eval
+    Measured 2026-10-20 on master 95adcad at both nl1 and nl2. 100 brings the candidate
+    count back in line with the other datasets; the exact ceiling has not been bisected, so
+    treat 100 as "known to be needed", not "known to be optimal".
+    Note --k-eval only sets tgb-seq VAL negatives; tgb and tgb-seq test use the shipped
+    negative sets, so it cannot be used to shrink this.
+
+
+WHAT IS NOT A VARIATION
+-----------------------
+  --max-walk-len on Patent    Patent's walks are structurally dead at length 2 (mean 2.20,
+                              max 9 over 100k walks, only 0.3% reach length 5) because an
+                              edge points at prior art. Raising the cap cannot help; the
+                              history is not there. A low Patent MRR is the dataset, not the
+                              model, and Patent must stay out of any depth conclusion.
+  --n-layers-pooler on tgbl-coin  Both nl1 and nl2 master references exist (0.6682 / 0.6795
+                              at 52ff92d, wpn 5). nl2 is the default and the standard cell.
+  --batch-size                1000 everywhere. Only --eval-batch-size has ever needed a
+                              per-dataset value.
