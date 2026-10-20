@@ -95,7 +95,7 @@ class LinkPredHead(nn.Module):
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
         self.w = nn.Parameter(torch.tensor([1.0]))
-        self.log_beta = nn.Parameter(torch.tensor([0.0]))                   # soft-min sharpness, 1
+        self.beta = nn.Parameter(torch.tensor([1.0]))                       # soft-min sharpness, 1 as before
 
     def mean_radius(self) -> torch.Tensor:
         """Mean distance of the embedding table from the origin, detached: the d_0 scale."""
@@ -104,14 +104,14 @@ class LinkPredHead(nn.Module):
 
     def gap_to_bag(self, x: torch.Tensor, points: torch.Tensor,
                    log_weights: torch.Tensor) -> torch.Tensor:
-        """Soft-min gap from a point x [..., d] to a weighted bag, points [..., T, d] with
-        log_weights [..., T]: -(1/beta) log sum_j w_j exp(-beta d(x, y_j)), raw geodesic distances.
-        beta * d -> 0 gives the weighted mean distance, beta * d -> inf the nearest token: the gap
-        starts near the weighted mean on the init table and sharpens as the table spreads.
-        Non-negative, but not a metric."""
-        beta = self.log_beta.exp()                                           # [1]
+        """Attention-weighted distance from a point x [..., d] to a bag, points [..., T, d] with
+        log_weights [..., T]: the bag's raw geodesic distances averaged under
+        softmax(log w_j - beta * d_j). beta * d -> 0 gives the weighted mean distance, beta * d ->
+        inf the nearest token. Nothing divides by beta, so any beta is stable; beta is a plain
+        parameter, so under Adam it grows additively. Non-negative, but not a metric."""
         dist_to_tokens = self.geom.dist(x.unsqueeze(-2), points)             # [..., T]
-        return -torch.logsumexp(log_weights - beta * dist_to_tokens, dim=-1) / beta
+        attn = torch.softmax(log_weights - self.beta * dist_to_tokens, dim=-1)  # [..., T]
+        return (attn * dist_to_tokens).sum(-1)                               # [...]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Score each candidate v of source u by the point-to-bag gaps both ways: u's pooled
