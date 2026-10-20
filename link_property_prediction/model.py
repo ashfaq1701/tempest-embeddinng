@@ -80,8 +80,6 @@ class BagWeights(nn.Module):
 
 class LinkPredHead(nn.Module):
 
-    INIT_RADIUS = 1e-3
-
     def __init__(self, num_nodes: int, T_train: int, max_walk_len: int, d_emb: int,
                  hidden_dim: int = 32, n_layers_pooler: int = 2, seed: int = 42):
         super().__init__()
@@ -91,12 +89,12 @@ class LinkPredHead(nn.Module):
         self.d_emb = int(d_emb)
         torch.manual_seed(seed)
 
-        # Isotropic normal with |x| concentrating at INIT_RADIUS: master's wrapped normal at the
-        # origin, whose exponential map is the identity in Euclidean space.
+        # Uniform inside the unit ball: isotropic direction, radius U^(1/d) (uniform by volume).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            self.E.weight.copy_(torch.randn(self.num_nodes, self.d_emb)
-                                * (self.INIT_RADIUS / self.d_emb ** 0.5))
+            direction = F.normalize(torch.randn(self.num_nodes, self.d_emb), dim=-1)
+            radius = torch.rand(self.num_nodes, 1).pow(1.0 / self.d_emb)
+            self.E.weight.copy_(direction * radius)
 
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
