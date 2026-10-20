@@ -50,7 +50,7 @@ class TrainerConfig:
     K_train: int = 5
 
     # Walks: BACKWARD only, undirected; two-sided (source and every candidate).
-    num_walks_per_node: int = 5
+    num_walks_per_node: int = 10
     max_walk_len: int = 5
     walk_bias: str = "ExponentialWeight"
     start_bias: str = "ExponentialWeight"
@@ -168,6 +168,7 @@ class Trainer:
         self.opt.zero_grad(set_to_none=True)
         link_loss.backward()
         self.opt.step()
+        self.model.project_()                                                 # keep constrained parameters valid
 
         return {
             "link": float(link_loss.detach()),
@@ -193,6 +194,8 @@ class Trainer:
         if hasattr(self.model, "w"):
             w = self.model.w.detach().flatten().tolist()
             parts.append("w=[" + ",".join(f"{x:+.4f}" for x in w) + "]")
+        if hasattr(self.model, "beta"):
+            parts.append(f"beta={float(self.model.beta):+.4f}")
         # The residual pooler's linear branch, if present: the weighting's linear law in
         # feature units, one weight per feature. Without it a null cannot say whether
         # the skip carried the model or stayed at its zero init.
