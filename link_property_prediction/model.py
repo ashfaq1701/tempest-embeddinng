@@ -33,11 +33,15 @@ class BagWeights(nn.Module):
         with torch.no_grad():
             self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0, 0.0]]))
 
-    def forward(self, tokens: WalkTokens, r_mean: torch.Tensor):
-        return self.pool(tokens, r_mean)
+        # Focus sharpness: beta -> 0 pools with the pooler's own weights (master); 0.1 ~ master.
+        self.log_beta = nn.Parameter(torch.tensor([math.log(0.1)]))
 
-    def pool(self, tokens: WalkTokens, r_mean: torch.Tensor):
-        """`r_mean` is the embedding table's mean radius, computed once per forward by the caller."""
+    def forward(self, tokens: WalkTokens, others: torch.Tensor, r_mean: torch.Tensor) -> torch.Tensor:
+        """Pool each bag once per point it is seen from. others [Q, K, d]: K query points per bag
+        (the other side's E). Returns pooled [Q, K, d], the midpoint under the pooler's weights
+        tilted toward tokens near each query: softmax(log w_j - beta * d(query, y_j) / r_mean).
+        A bag with no walks holds its seed alone. `r_mean` is the embedding table's mean radius,
+        computed once per forward by the caller."""
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
         valid = tokens.mask.flatten(1).clone()                               # [Q, T]
         cold = ~valid.any(dim=-1)                                            # [Q]
@@ -66,8 +70,12 @@ class BagWeights(nn.Module):
 
         feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
-        w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
-        return self.geom.weighted_midpoint(x_tokens, w)                      # [Q, d]
+        log_w = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T]
+
+        # The query only selects tokens; detached so E is not pulled through the focus path.
+        d_query = self.geom.dist(others.detach().unsqueeze(-2), xt.unsqueeze(1)) / r_mean.clamp_min(tiny)  # [Q, K, T]
+        focus = torch.softmax(log_w.unsqueeze(1) - self.log_beta.exp() * d_query, dim=-1)  # [Q, K, T]
+        return self.geom.weighted_midpoint(x_tokens.unsqueeze(1), focus)     # [Q, K, d]
 
 
 class LinkPredHead(nn.Module):
@@ -99,11 +107,17 @@ class LinkPredHead(nn.Module):
         return self.geom.dist0(self.E.weight.detach()).mean()                # []
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
+        """Score each candidate v of source u by the distance between u's bag seen from v and v's
+        bag seen from u. At beta -> 0 both are the plain pooled points: master."""
         r_mean = self.mean_radius()                                          # []
-        p_u = self.bag_weights(src_tokens, r_mean)                           # [b, d]
-        p_v = self.bag_weights(cand_tokens, r_mean)                          # [b*c, d]
-        b, d = p_u.shape
-        p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
+        b = src_tokens.seeds.shape[0]
+        e_u = self.E.weight[src_tokens.seeds]                                # [b, d]
+        e_v = self.E.weight[cand_tokens.seeds].view(b, -1, e_u.shape[-1])    # [b, c, d]
+        c = e_v.shape[1]
 
-        d_uv = self.geom.dist(p_u.unsqueeze(1), p_v)                         # [b, c]
+        p_u_from_v = self.bag_weights(src_tokens, e_v, r_mean)               # [b, c, d]
+        e_u_per_cand = e_u.repeat_interleave(c, dim=0).unsqueeze(1)          # [b*c, 1, d]
+        p_v_from_u = self.bag_weights(cand_tokens, e_u_per_cand, r_mean).view(b, c, -1)  # [b, c, d]
+
+        d_uv = self.geom.dist(p_u_from_v, p_v_from_u)                        # [b, c]
         return self.w * -d_uv

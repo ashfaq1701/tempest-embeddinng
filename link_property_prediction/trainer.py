@@ -208,6 +208,8 @@ class Trainer:
         # feature units, one weight per feature. Without it a null cannot say whether
         # the skip carried the model or stayed at its zero init.
         bw = getattr(self.model, "bag_weights", None)
+        if bw is not None and hasattr(bw, "log_beta"):
+            parts.append(f"beta={float(bw.log_beta.exp()):.4f}")
         if bw is not None and hasattr(bw, "skip"):
             w = bw.skip.weight.detach().flatten().tolist()
             parts.append("skip=[" + ",".join(f"{x:+.4f}" for x in w) + "]")
