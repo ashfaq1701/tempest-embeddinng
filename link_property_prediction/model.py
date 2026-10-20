@@ -67,11 +67,7 @@ class BagWeights(nn.Module):
         feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
         w = torch.softmax(logits.masked_fill(~valid, float("-inf")), dim=-1) # [Q, T]
-        p = self.geom.weighted_midpoint(x_tokens, w)                         # [Q, d]
-
-        d_tok_p = self.geom.dist(xt, p.unsqueeze(-2))                        # [Q, T]
-        spread = (d_tok_p * u).sum(-1) / u.sum(-1)                           # [Q]
-        return p, spread
+        return self.geom.weighted_midpoint(x_tokens, w)                      # [Q, d]
 
 
 class LinkPredHead(nn.Module):
@@ -104,8 +100,8 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         r_mean = self.mean_radius()                                          # []
-        p_u, _ = self.bag_weights(src_tokens, r_mean)                        # [b, d]
-        p_v, _ = self.bag_weights(cand_tokens, r_mean)                       # [b*c, d]
+        p_u = self.bag_weights(src_tokens, r_mean)                           # [b, d]
+        p_v = self.bag_weights(cand_tokens, r_mean)                          # [b*c, d]
         b, d = p_u.shape
         p_v = p_v.view(b, p_v.shape[0] // b, d)                              # [b, c, d]
 
