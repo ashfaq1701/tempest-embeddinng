@@ -16,3 +16,12 @@ tgbl-review:   --n-layers-pooler 1
 tgbl-coin:     -
 tgbl-comment:  -
 tgbl-flight:   -
+
+DyGLib (--data-suite dyglib):
+
+wikipedia:     --is-bipartite --eval-batch-size 200
+reddit:        --is-bipartite --eval-batch-size 200
+mooc:          --is-bipartite --eval-batch-size 200
+lastfm:        --is-bipartite --eval-batch-size 200
+uci:           --eval-batch-size 200
+Flights:       --eval-batch-size 200
