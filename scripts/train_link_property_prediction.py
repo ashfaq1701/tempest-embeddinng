@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
                         "node (sources and destinations) can be a negative.")
 
     # ── Model ───────────────────────────────────────────────────────
-    p.add_argument("--d-emb", default=64, type=int,
+    p.add_argument("--d-emb", default=128, type=int,
                    help="Embedding dimension.")
     p.add_argument("--num-walks-per-node", default=10, type=int,
                    help="Walks per query node.")

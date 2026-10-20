@@ -34,7 +34,7 @@ class TrainerConfig:
     train_negative_sampler: NegativeSampler
 
     # Embedding dimension.
-    d_emb: int = 64
+    d_emb: int = 128
 
     # Pooler MLP width, PINNED. It does NOT move with the feature count: under the
     # old 8*n_feat rule every feature ablation silently changed pooler capacity too
