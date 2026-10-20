@@ -171,6 +171,7 @@ class Trainer:
         self.opt.zero_grad(set_to_none=True)
         link_loss.backward()
         self.opt.step()
+        self.model.project_()                                                 # keep constrained parameters valid
 
         return {
             "link": float(link_loss.detach()),

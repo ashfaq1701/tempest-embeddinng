@@ -95,7 +95,13 @@ class LinkPredHead(nn.Module):
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
         self.w = nn.Parameter(torch.tensor([1.0]))
-        self.beta = nn.Parameter(torch.tensor([1.0]))                       # soft-min sharpness, 1 as before
+        self.beta = nn.Parameter(torch.tensor([0.0]))                       # 0: weighted mean; kept >= 0 by project_
+
+    @torch.no_grad()
+    def project_(self) -> None:
+        """Restore parameter constraints after an optimiser step: beta >= 0, so the gap stays a
+        soft-min between the weighted mean (beta = 0) and the nearest token."""
+        self.beta.clamp_(min=0.0)
 
     def mean_radius(self) -> torch.Tensor:
         """Mean distance of the embedding table from the origin, detached: the d_0 scale."""
