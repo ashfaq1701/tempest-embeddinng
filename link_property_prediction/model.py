@@ -1,5 +1,6 @@
 import math
 
+import geoopt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +13,17 @@ _SQ_DIST_FLOOR = 1e-12
 def dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Euclidean distance over the last axis; the floor keeps the gradient finite at x == y."""
     return ((x - y) ** 2).sum(-1).clamp_min(_SQ_DIST_FLOOR).sqrt()
+
+
+class RowAdaptiveEuclidean(geoopt.Euclidean):
+    """Flat R^d with one Adam second-moment scalar per row, the Lorentz arm's optimiser rule."""
+
+    def __init__(self) -> None:
+        super().__init__(ndim=1)
+
+    def component_inner(self, x: torch.Tensor, u: torch.Tensor, v: torch.Tensor = None) -> torch.Tensor:
+        """<u, v> summed over the row, [..., 1]: RiemannianAdam normalises each embedding as a whole."""
+        return self.inner(x, u, v, keepdim=True)
 
 
 def weighted_midpoint(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -97,6 +109,7 @@ class LinkPredHead(nn.Module):
         with torch.no_grad():
             self.E.weight.copy_(torch.randn(self.num_nodes, self.d_emb)
                                 * (self.INIT_RADIUS / self.d_emb ** 0.5))
+        self.E.weight = geoopt.ManifoldParameter(self.E.weight.data, manifold=RowAdaptiveEuclidean())
 
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)

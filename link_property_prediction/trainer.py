@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
+import geoopt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -100,8 +101,9 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # One param group at a single lr: plain Adam for E and everything else.
-        self.opt = torch.optim.Adam(self.model.parameters(), lr=float(config.lr))
+        # One param group at a single lr, the hyperbolic arm's optimiser: E steps with one Adam
+        # second moment per row (RowAdaptiveEuclidean), everything else with per-coordinate Adam.
+        self.opt = geoopt.optim.RiemannianAdam(self.model.parameters(), lr=float(config.lr))
 
     # Full-graph ingestion (once, up front)
 
