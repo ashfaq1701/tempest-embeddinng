@@ -34,11 +34,8 @@ class TrainerConfig:
     T_train: int
     train_negative_sampler: NegativeSampler
 
-    # Embedding geometry: "hyperbolic" (Lorentz) or "euclidean".
-    geometry: str = "hyperbolic"
-
-    # Embedding dimension.
-    d_emb: int = 64
+    # Embedding dimension, split in half: Euclidean | Lorentz.
+    d_emb: int = 128
 
     # Pooler MLP width, PINNED. It does NOT move with the feature count: under the
     # old 8*n_feat rule every feature ablation silently changed pooler capacity too
@@ -81,7 +78,7 @@ class Trainer:
         self.device = device or torch.device(
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
-        # Owns the node embeddings (in config.geometry) and the monotone metric score.
+        # Owns the product-manifold node embeddings and the monotone metric score.
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             T_train=config.T_train,
@@ -89,7 +86,6 @@ class Trainer:
             d_emb=int(config.d_emb),
             hidden_dim=int(config.hidden_dim),
             n_layers_pooler=int(config.n_layers_pooler),
-            geometry=config.geometry,
             seed=int(config.seed),
         ).to(self.device)
 
@@ -105,8 +101,8 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # One param group at a single lr: Riemannian update for E (plain Adam when Euclidean),
-        # standard Adam for the rest.
+        # One param group at a single lr: Riemannian update for E, factor by factor (plain Adam on
+        # the Euclidean half), standard Adam for the rest.
         self.opt = geoopt.optim.RiemannianAdam(
             self.model.parameters(), lr=float(config.lr), stabilize=10,
         )
@@ -187,8 +183,8 @@ class Trainer:
 
     @torch.no_grad()
     def _geometry_probe(self) -> Dict[str, float]:
-        """Boundary watch: mean and max radius of E, dist0 in the run's geometry (hyperbolic
-        radius or Euclidean norm; the two scales are not comparable).
+        """Boundary watch: mean and max product radius of E, plus each factor's mean radius
+        (Euclidean norm, hyperbolic radius) so a factor taking over is visible.
 
         Was the Euclidean norm of the ambient (d+1)-vector. Under intrinsic
         coordinates that vector no longer exists and ||x'|| = sqrt(k) sinh(r)
@@ -198,8 +194,11 @@ class Trainer:
         Logged as r_mean/r_max, NOT |E|mean/|E|max -- old logs are on the other
         scale and must not be compared line-for-line.
         """
-        r = self.model.geom.dist0(self.model.E.weight.detach())
-        return {"max_norm": float(r.max()), "mean_norm": float(r.mean())}
+        E = self.model.E.weight.detach()
+        r = self.model.geom.dist0(E)
+        r_E, r_H = self.model.geom.factor_radii(E)
+        return {"max_norm": float(r.max()), "mean_norm": float(r.mean()),
+                "mean_norm_E": float(r_E.mean()), "mean_norm_H": float(r_H.mean())}
 
     @torch.no_grad()
     def _head_probe(self) -> str:
@@ -319,7 +318,8 @@ class Trainer:
 
             # Geometry watch: boundary radius (|E|mean vs |E|max).
             g = self._geometry_probe()
-            line += f"  r_mean={g['mean_norm']:.3f}  r_max={g['max_norm']:.3f}"
+            line += (f"  r_mean={g['mean_norm']:.3f}  r_max={g['max_norm']:.3f}"
+                     f"  rE_mean={g['mean_norm_E']:.3f}  rH_mean={g['mean_norm_H']:.3f}")
             line += self._head_probe()
 
             if val_evaluator is not None and val_batches_factory is not None:

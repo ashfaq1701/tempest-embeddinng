@@ -3,7 +3,6 @@ import geoopt
 import torch
 
 from link_property_prediction.euclidean import EuclideanManifold
-from link_property_prediction.model import LinkPredHead
 
 
 def test_dist_is_norm_and_finite_at_coincident_points():
@@ -44,8 +43,3 @@ def test_riemannian_adam_matches_adam():
         opt_r.step(); opt_a.step()
     assert torch.allclose(p_r, p_a, atol=1e-6)
 
-
-def test_head_uses_the_selected_geometry():
-    head = LinkPredHead(num_nodes=50, T_train=100, max_walk_len=5, d_emb=8, geometry="euclidean")
-    assert isinstance(head.geom, EuclideanManifold)
-    assert head.E.weight.manifold is head.geom

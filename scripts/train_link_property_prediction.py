@@ -19,7 +19,6 @@ import torch
 
 from link_property_prediction.data import Loaded, concat_splits, create_batches
 from link_property_prediction.evaluator import SUITES, make_suite
-from link_property_prediction.model import GEOMETRIES
 from link_property_prediction.trainer import Trainer, TrainerConfig
 from link_property_prediction.utils import seed_all
 
@@ -41,10 +40,8 @@ def parse_args() -> argparse.Namespace:
                         "node (sources and destinations) can be a negative.")
 
     # ── Model ───────────────────────────────────────────────────────
-    p.add_argument("--geometry", default="hyperbolic", choices=list(GEOMETRIES),
-                   help="Embedding geometry: hyperbolic (Lorentz) or euclidean.")
-    p.add_argument("--d-emb", default=64, type=int,
-                   help="Embedding dimension.")
+    p.add_argument("--d-emb", default=128, type=int,
+                   help="Embedding dimension, split in half: Euclidean | Lorentz.")
     p.add_argument("--num-walks-per-node", default=10, type=int,
                    help="Walks per query node.")
     p.add_argument("--max-walk-len", default=5, type=int,
@@ -165,7 +162,6 @@ def main() -> Dict[str, Any]:
         T_train=loaded.T_train,
         train_negative_sampler=suite.train_negative_sampler(args.k_train),
 
-        geometry=args.geometry,
         d_emb=args.d_emb,
         hidden_dim=args.hidden_dim,
         n_layers_pooler=args.n_layers_pooler,

@@ -1,1 +1,1 @@
-"""Walk-supervised temporal link prediction: data suites, Tempest walks, hyperbolic / Euclidean model, trainer."""
+"""Walk-supervised temporal link prediction: data suites, Tempest walks, Euclidean x Lorentz product model, trainer."""
