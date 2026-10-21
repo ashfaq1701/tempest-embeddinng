@@ -32,6 +32,7 @@ class TrainerConfig:
     # Dataset-derived.
     num_nodes: int
     T_train: int
+    max_degree_train: int
     train_negative_sampler: NegativeSampler
 
     # Embedding geometry: "hyperbolic" (Lorentz) or "euclidean".
@@ -39,6 +40,9 @@ class TrainerConfig:
 
     # Embedding dimension.
     d_emb: int = 64
+
+    # Score each candidate's popularity before t as a second channel next to the gap.
+    use_cand_pop: bool = False
 
     # Pooler MLP width, PINNED. It does NOT move with the feature count: under the
     # old 8*n_feat rule every feature ablation silently changed pooler capacity too
@@ -90,6 +94,8 @@ class Trainer:
             hidden_dim=int(config.hidden_dim),
             n_layers_pooler=int(config.n_layers_pooler),
             geometry=config.geometry,
+            use_cand_pop=config.use_cand_pop,
+            max_degree_train=config.max_degree_train,
             seed=int(config.seed),
         ).to(self.device)
 
@@ -128,7 +134,8 @@ class Trainer:
                t_query_t: torch.Tensor):
         """src_t [B], cand_t [B, C], t_query_t [B] (all long) -> logits [B, C]. Two-sided per-query
         walks: K backward walks for the source and for every candidate, each cut off at t_i. Both
-        bags go to the head; only the logits are returned."""
+        bags (and, under use_cand_pop, each candidate's popularity before t_i) go to the head; only
+        the logits are returned."""
         device = self.device
 
         # Source side: K backward walks for each query (u_i, t_i), cutoff = t_i.
@@ -151,7 +158,14 @@ class Trainer:
             start_bias=self.config.start_bias,
             walk_bias=self.config.walk_bias)
 
-        return self.model(src_tokens, cand_tokens)
+        pop_v = None
+        if self.config.use_cand_pop:
+            # Edges each candidate takes part in strictly before its query's t_i.
+            pop_v = self.walk_gen.get_node_popularity(
+                cand_seeds.cpu().numpy(), cand_cutoffs.cpu().numpy())     # [B*C]
+            pop_v = torch.from_numpy(pop_v).to(device, torch.float32).view(b, c)  # [B, C]
+
+        return self.model(src_tokens, cand_tokens, pop_v)
 
     # Per-batch training step
 

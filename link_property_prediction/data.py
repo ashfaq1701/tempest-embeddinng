@@ -34,6 +34,12 @@ class Loaded(NamedTuple):
         ts = self.train.timestamps
         return int(ts.max() - ts.min())
 
+    @property
+    def max_degree_train(self) -> int:
+        """Largest node degree in the train split: each edge counts once at each endpoint."""
+        train = self.train
+        return int(np.bincount(np.concatenate([train.sources, train.destinations])).max())
+
 
 def concat_splits(*splits: SplitData) -> SplitData:
     """Concatenate splits into ONE SplitData for a one-shot ingest. edge_feat is

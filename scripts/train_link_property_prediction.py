@@ -45,6 +45,9 @@ def parse_args() -> argparse.Namespace:
                    help="Embedding geometry: hyperbolic (Lorentz) or euclidean.")
     p.add_argument("--d-emb", default=64, type=int,
                    help="Embedding dimension.")
+    p.add_argument("--use-cand-pop", action="store_true",
+                   help="Add each candidate's popularity before t (log edge count, in units of the "
+                        "table's mean radius) as a second score channel.")
     p.add_argument("--num-walks-per-node", default=10, type=int,
                    help="Walks per query node.")
     p.add_argument("--max-walk-len", default=5, type=int,
@@ -137,6 +140,7 @@ def main() -> Dict[str, Any]:
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  T_train:       {loaded.T_train:,}")
+    print(f"  max_degree:    {loaded.max_degree_train:,} (train split)")
     print(f"  neg_pool:      {len(train_negative_pool):,} train {suite.candidate_kind} "
           f"(training negatives)")
     print(f"  train edges:   {len(loaded.train.sources):,}")
@@ -163,10 +167,12 @@ def main() -> Dict[str, Any]:
     config = TrainerConfig(
         num_nodes=num_nodes,
         T_train=loaded.T_train,
+        max_degree_train=loaded.max_degree_train,
         train_negative_sampler=suite.train_negative_sampler(args.k_train),
 
         geometry=args.geometry,
         d_emb=args.d_emb,
+        use_cand_pop=args.use_cand_pop,
         hidden_dim=args.hidden_dim,
         n_layers_pooler=args.n_layers_pooler,
 
@@ -247,6 +253,7 @@ def main() -> Dict[str, Any]:
             "state_dict": trainer.model.state_dict(),
             "args": vars(args),
             "T_train": loaded.T_train,
+            "max_degree_train": loaded.max_degree_train,
             "best_epoch": result["stopped_at_epoch"],
             "best_val_mrr": result["best_val_mrr"],
             "r_mean": float(radius.mean()),

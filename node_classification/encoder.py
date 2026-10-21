@@ -36,7 +36,9 @@ class FrozenEncoder:
                              max_walk_len=args["max_walk_len"], d_emb=d_emb,
                              hidden_dim=args["hidden_dim"],
                              n_layers_pooler=args["n_layers_pooler"],
-                             geometry=args.get("geometry", "hyperbolic"), seed=args["seed"])
+                             geometry=args.get("geometry", "hyperbolic"),
+                             use_cand_pop=args.get("use_cand_pop", False),
+                             max_degree_train=ckpt.get("max_degree_train"), seed=args["seed"])
         model.load_state_dict(state)
         walk_args = {k: args[k] for k in (
             "num_walks_per_node", "max_walk_len", "walk_bias", "start_bias", "t2nv_p", "t2nv_q")}
