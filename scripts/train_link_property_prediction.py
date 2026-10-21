@@ -134,6 +134,7 @@ def main() -> Dict[str, Any]:
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  T_train:       {loaded.T_train:,}")
+    print(f"  max_degree:    {loaded.max_degree_train:,} (train split)")
     print(f"  neg_pool:      {len(train_negative_pool):,} train {suite.candidate_kind} "
           f"(training negatives)")
     print(f"  train edges:   {len(loaded.train.sources):,}")
@@ -160,6 +161,7 @@ def main() -> Dict[str, Any]:
     config = TrainerConfig(
         num_nodes=num_nodes,
         T_train=loaded.T_train,
+        max_degree_train=loaded.max_degree_train,
         train_negative_sampler=suite.train_negative_sampler(args.k_train),
 
         d_emb=args.d_emb,
@@ -243,6 +245,7 @@ def main() -> Dict[str, Any]:
             "state_dict": trainer.model.state_dict(),
             "args": vars(args),
             "T_train": loaded.T_train,
+            "max_degree_train": loaded.max_degree_train,
             "best_epoch": result["stopped_at_epoch"],
             "best_val_mrr": result["best_val_mrr"],
             "r_mean": float(radius.mean()),

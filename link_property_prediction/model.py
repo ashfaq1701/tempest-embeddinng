@@ -73,11 +73,12 @@ class LinkPredHead(nn.Module):
 
     INIT_RADIUS = 1e-3
 
-    def __init__(self, num_nodes: int, T_train: int, max_walk_len: int, d_emb: int,
-                 hidden_dim: int = 32, n_layers_pooler: int = 2, seed: int = 42):
+    def __init__(self, num_nodes: int, T_train: int, max_degree_train: int, max_walk_len: int,
+                 d_emb: int, hidden_dim: int = 32, n_layers_pooler: int = 2, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.T_train = int(T_train)
+        self.log_max_degree = math.log1p(max_degree_train)
         self.max_walk_len = int(max_walk_len)
         self.d_emb = int(d_emb)
         self.geom = LorentzManifold()
@@ -91,7 +92,7 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.geom, self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
-        self.w = nn.Parameter(torch.tensor([1.0]))
+        self.w = nn.Parameter(torch.tensor([1.0, 0.0]))                  # [geometry, popularity]
         self.beta = nn.Parameter(torch.tensor([0.0]))                       # >= 0; 0 is the weighted mean
 
     @torch.no_grad()
@@ -104,6 +105,10 @@ class LinkPredHead(nn.Module):
         r_mean = self.geom.dist0(self.E.weight.detach()).mean()              # []
         return r_mean.clamp_min(torch.finfo(r_mean.dtype).tiny)
 
+    def popularity(self, pop_v: torch.Tensor, r_mean: torch.Tensor) -> torch.Tensor:
+        """Candidate popularity in units of the table's mean radius: [0, r_mean] at the train max degree."""
+        return r_mean * torch.log1p(pop_v) / self.log_max_degree
+
     def gap_to_bag(self, x: torch.Tensor, points: torch.Tensor,
                    log_weights: torch.Tensor) -> torch.Tensor:
         """Distance from x to a bag under softmax(log w_j - beta * d_j): mean at 0, nearest as beta grows."""
@@ -111,8 +116,9 @@ class LinkPredHead(nn.Module):
         attn = torch.softmax(log_weights - self.beta * dist_to_tokens, dim=-1)  # [..., T]
         return (attn * dist_to_tokens).sum(-1)                               # [...]
 
-    def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Score candidates by the pooled-point-to-bag gaps in both directions."""
+    def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens,
+                pop_v: torch.Tensor) -> torch.Tensor:
+        """Score candidates by the pooled-point-to-bag gaps in both directions and their popularity."""
         r_mean = self.mean_radius()                                          # []
         points_u, log_weights_u, pooled_u = self.bag_weights(src_tokens, r_mean)   # [b, T, d], [b, T], [b, d]
         points_v, log_weights_v, pooled_v = self.bag_weights(cand_tokens, r_mean)  # [b*c, T, d], [b*c, T], [b*c, d]
@@ -123,4 +129,5 @@ class LinkPredHead(nn.Module):
 
         gap_uv = (self.gap_to_bag(pooled_u.unsqueeze(1), points_v, log_weights_v)
                   + self.gap_to_bag(pooled_v, points_u.unsqueeze(1), log_weights_u.unsqueeze(1)))  # [b, c]
-        return self.w * -gap_uv
+        features = torch.stack([-gap_uv, self.popularity(pop_v, r_mean)], dim=-1)  # [b, c, 2]
+        return features @ self.w                                             # [b, c]

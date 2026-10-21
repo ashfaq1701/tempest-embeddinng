@@ -32,6 +32,7 @@ class TrainerConfig:
     # Dataset-derived.
     num_nodes: int
     T_train: int
+    max_degree_train: int
     train_negative_sampler: NegativeSampler
 
     # Embedding dimension.
@@ -82,6 +83,7 @@ class Trainer:
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             T_train=config.T_train,
+            max_degree_train=config.max_degree_train,
             max_walk_len=config.max_walk_len,
             d_emb=int(config.d_emb),
             hidden_dim=int(config.hidden_dim),
@@ -123,7 +125,7 @@ class Trainer:
                t_query_t: torch.Tensor):
         """src_t [B], cand_t [B, C], t_query_t [B] (all long) -> logits [B, C]. Two-sided per-query
         walks: K backward walks for the source and for every candidate, each cut off at t_i. Both
-        bags go to the head; only the logits are returned."""
+        bags and each candidate's popularity before t_i go to the head; only the logits are returned."""
         device = self.device
 
         # Source side: K backward walks for each query (u_i, t_i), cutoff = t_i.
@@ -146,7 +148,12 @@ class Trainer:
             start_bias=self.config.start_bias,
             walk_bias=self.config.walk_bias)
 
-        return self.model(src_tokens, cand_tokens)
+        # Candidate popularity: edges each candidate takes part in strictly before its query's t_i.
+        pop_v = self.walk_gen.get_node_popularity(
+            cand_seeds.cpu().numpy(), cand_cutoffs.cpu().numpy())         # [B*C]
+        pop_v = torch.from_numpy(pop_v).to(device, torch.float32).view(b, c)  # [B, C]
+
+        return self.model(src_tokens, cand_tokens, pop_v)
 
     # Per-batch training step
 

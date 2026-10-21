@@ -33,6 +33,7 @@ class FrozenEncoder:
         args, state = ckpt["args"], ckpt["state_dict"]
         num_nodes, d_emb = state["E.weight"].shape
         model = LinkPredHead(num_nodes=num_nodes, T_train=ckpt["T_train"],
+                             max_degree_train=ckpt["max_degree_train"],
                              max_walk_len=args["max_walk_len"], d_emb=d_emb,
                              hidden_dim=args["hidden_dim"],
                              n_layers_pooler=args["n_layers_pooler"], seed=args["seed"])
