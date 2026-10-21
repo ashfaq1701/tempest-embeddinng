@@ -5,13 +5,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .euclidean import EuclideanManifold
 from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
+
+GEOMETRIES = {"hyperbolic": LorentzManifold, "euclidean": EuclideanManifold}
 
 
 class BagWeights(nn.Module):
 
-    def __init__(self, geom: "LorentzManifold", E: nn.Embedding, T_train: int,
+    def __init__(self, geom: geoopt.Manifold, E: nn.Embedding, T_train: int,
                  max_walk_len: int, hidden_dim: int = 32, n_layers: int = 2):
         super().__init__()
         self.geom = geom
@@ -74,13 +77,14 @@ class LinkPredHead(nn.Module):
     INIT_RADIUS = 1e-3
 
     def __init__(self, num_nodes: int, T_train: int, max_walk_len: int, d_emb: int,
-                 hidden_dim: int = 32, n_layers_pooler: int = 2, seed: int = 42):
+                 hidden_dim: int = 32, n_layers_pooler: int = 2, geometry: str = "hyperbolic",
+                 seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.T_train = int(T_train)
         self.max_walk_len = int(max_walk_len)
         self.d_emb = int(d_emb)
-        self.geom = LorentzManifold()
+        self.geom = GEOMETRIES[geometry]()
         torch.manual_seed(seed)
 
         self.E = nn.Embedding(self.num_nodes, self.d_emb)

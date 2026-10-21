@@ -34,6 +34,9 @@ class TrainerConfig:
     T_train: int
     train_negative_sampler: NegativeSampler
 
+    # Embedding geometry: "hyperbolic" (Lorentz) or "euclidean".
+    geometry: str = "hyperbolic"
+
     # Embedding dimension.
     d_emb: int = 64
 
@@ -78,7 +81,7 @@ class Trainer:
         self.device = device or torch.device(
             "cuda" if (config.use_gpu and torch.cuda.is_available()) else "cpu"
         )
-        # Owns the Poincare-ball node embeddings and the monotone metric score.
+        # Owns the node embeddings (in config.geometry) and the monotone metric score.
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
             T_train=config.T_train,
@@ -86,6 +89,7 @@ class Trainer:
             d_emb=int(config.d_emb),
             hidden_dim=int(config.hidden_dim),
             n_layers_pooler=int(config.n_layers_pooler),
+            geometry=config.geometry,
             seed=int(config.seed),
         ).to(self.device)
 
@@ -101,7 +105,8 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # One param group at a single lr: Riemannian update for E, standard Adam for the rest.
+        # One param group at a single lr: Riemannian update for E (plain Adam when Euclidean),
+        # standard Adam for the rest.
         self.opt = geoopt.optim.RiemannianAdam(
             self.model.parameters(), lr=float(config.lr), stabilize=10,
         )
@@ -182,7 +187,8 @@ class Trainer:
 
     @torch.no_grad()
     def _geometry_probe(self) -> Dict[str, float]:
-        """Boundary watch: mean and max HYPERBOLIC RADIUS of E.
+        """Boundary watch: mean and max radius of E, dist0 in the run's geometry (hyperbolic
+        radius or Euclidean norm; the two scales are not comparable).
 
         Was the Euclidean norm of the ambient (d+1)-vector. Under intrinsic
         coordinates that vector no longer exists and ||x'|| = sqrt(k) sinh(r)
