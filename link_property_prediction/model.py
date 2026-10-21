@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from .walk_tokens import WalkTokens
 
 _SQ_DIST_FLOOR = 1e-12
+_NORM_FLOOR = 1e-12
 
 
 def dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -101,7 +102,7 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
-        self.w = nn.Parameter(torch.tensor([1.0]))
+        self.w = nn.Parameter(torch.tensor([1.0, 1.0, 1.0]))            # [distance, dot, cosine]; equal at init
         self.beta = nn.Parameter(torch.tensor([0.0]))                       # >= 0; 0 is the weighted mean
 
     @torch.no_grad()
@@ -114,15 +115,24 @@ class LinkPredHead(nn.Module):
         r_mean = self.E.weight.detach().norm(dim=-1).mean()                  # []
         return r_mean.clamp_min(torch.finfo(r_mean.dtype).tiny)
 
-    def gap_to_bag(self, x: torch.Tensor, points: torch.Tensor,
-                   log_weights: torch.Tensor) -> torch.Tensor:
-        """Distance from x to a bag under softmax(log w_j - beta * d_j): mean at 0, nearest as beta grows."""
-        dist_to_tokens = dist(x.unsqueeze(-2), points)                       # [..., T]
-        attn = torch.softmax(log_weights - self.beta * dist_to_tokens, dim=-1)  # [..., T]
-        return (attn * dist_to_tokens).sum(-1)                               # [...]
+    @staticmethod
+    def pair_metrics(x: torch.Tensor, points: torch.Tensor, r_mean: torch.Tensor) -> torch.Tensor:
+        """[-distance, dot / r_mean, cos * r_mean] from x to every token, all in units of the mean radius."""
+        x = x.unsqueeze(-2)                                                  # [..., 1, d]
+        dist_to_tokens = dist(x, points)                                     # [..., T]
+        dot = (x * points).sum(-1)                                           # [..., T]
+        cos = dot / (x.norm(dim=-1) * points.norm(dim=-1)).clamp_min(_NORM_FLOOR)  # [..., T]
+        return torch.stack([-dist_to_tokens, dot / r_mean, cos * r_mean], dim=-1)  # [..., T, 3]
+
+    def bag_metrics(self, x: torch.Tensor, points: torch.Tensor, log_weights: torch.Tensor,
+                    r_mean: torch.Tensor) -> torch.Tensor:
+        """The pair metrics averaged over a bag under softmax(log w_j - beta * d_j): mean at 0, nearest as beta grows."""
+        metrics = self.pair_metrics(x, points, r_mean)                       # [..., T, 3]
+        attn = torch.softmax(log_weights + self.beta * metrics[..., 0], dim=-1)  # [..., T]; metrics[..., 0] = -d
+        return (attn.unsqueeze(-1) * metrics).sum(-2)                        # [..., 3]
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Score candidates by the pooled-point-to-bag gaps in both directions."""
+        """Score candidates by distance, dot and cosine from each side's pooled point to the other's bag."""
         r_mean = self.mean_radius()                                          # []
         points_u, log_weights_u, pooled_u = self.bag_weights(src_tokens, r_mean)   # [b, T, d], [b, T], [b, d]
         points_v, log_weights_v, pooled_v = self.bag_weights(cand_tokens, r_mean)  # [b*c, T, d], [b*c, T], [b*c, d]
@@ -131,6 +141,7 @@ class LinkPredHead(nn.Module):
         log_weights_v = log_weights_v.view(b, -1, t)                         # [b, c, T]
         pooled_v = pooled_v.view(b, -1, d)                                   # [b, c, d]
 
-        gap_uv = (self.gap_to_bag(pooled_u.unsqueeze(1), points_v, log_weights_v)
-                  + self.gap_to_bag(pooled_v, points_u.unsqueeze(1), log_weights_u.unsqueeze(1)))  # [b, c]
-        return self.w * -gap_uv
+        features = (self.bag_metrics(pooled_u.unsqueeze(1), points_v, log_weights_v, r_mean)
+                    + self.bag_metrics(pooled_v, points_u.unsqueeze(1), log_weights_u.unsqueeze(1),
+                                       r_mean))                              # [b, c, 3]
+        return features @ self.w                                             # [b, c]

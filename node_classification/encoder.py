@@ -87,7 +87,7 @@ class FrozenEncoder:
         geometry = [
             e_u.norm(dim=-1),
             pooled.norm(dim=-1),
-            model.gap_to_bag(pooled, points, log_weights),
+            -model.bag_metrics(pooled, points, log_weights, r_mean)[..., 0],
         ]
         return torch.stack(geometry, dim=-1)                                 # [Q, 3]
 
