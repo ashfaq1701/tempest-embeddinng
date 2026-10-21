@@ -102,7 +102,7 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
-        self.w = nn.Parameter(torch.tensor([1.0, 1.0, 1.0]))            # [distance, dot, cosine]; equal at init
+        self.w = nn.Parameter(torch.tensor([1.0, 0.0, 0.0]))            # [distance, dot, cosine]; distance only at init
         self.beta = nn.Parameter(torch.tensor([0.0]))                       # >= 0; 0 is the weighted mean
 
     @torch.no_grad()
