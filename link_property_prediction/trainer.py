@@ -57,9 +57,12 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. One Adam param group at a single `lr`: the
-    # embedding tables, the distance temperature and the NN pooler all step at the same rate.
+    # Constant lr: the embedding tables, the distance temperature and the NN pooler all step at
+    # the same rate.
     lr: float = 1e-3
+
+    # Decoupled (AdamW) weight decay on the embedding table E only; 0 is plain Adam.
+    wd: float = 0.0
 
     # Run control.
     num_epochs: int = 100
@@ -100,8 +103,13 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # One param group at a single lr: plain Adam for E and everything else.
-        self.opt = torch.optim.Adam(self.model.parameters(), lr=float(config.lr))
+        # AdamW at a single lr; only E decays (x <- x - lr * wd * x per step), the head does not.
+        emb = self.model.E.weight
+        head = [p for p in self.model.parameters() if p is not emb]
+        self.opt = torch.optim.AdamW([
+            {"params": [emb], "weight_decay": float(config.wd)},
+            {"params": head, "weight_decay": 0.0},
+        ], lr=float(config.lr))
 
     # Full-graph ingestion (once, up front)
 
