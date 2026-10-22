@@ -48,7 +48,7 @@ class TrainerConfig:
     t2nv_q: float = 0.25   # node2vec in-out param
 
     # Constant lr, no weight decay. One Adam param group at a single `lr`: the
-    # embedding table, the score weight w, beta and the bag attention all step at the same rate.
+    # embedding table, the score weight w and the bag attention all step at the same rate.
     lr: float = 1e-3
 
     # Run control.
@@ -157,7 +157,6 @@ class Trainer:
         self.opt.zero_grad(set_to_none=True)
         link_loss.backward()
         self.opt.step()
-        self.model.project_()                                                 # keep constrained parameters valid
 
         return {
             "link": float(link_loss.detach()),
@@ -175,9 +174,9 @@ class Trainer:
 
     @torch.no_grad()
     def _head_probe(self) -> str:
-        """The head's scalar parameters for the epoch line: score weight w and attention sharpness beta."""
+        """The head's score weight w, for the epoch line."""
         w = ",".join(f"{x:+.4f}" for x in self.model.w.detach().flatten().tolist())
-        return f"  w=[{w}]  beta={float(self.model.beta):+.4f}"
+        return f"  w=[{w}]"
 
     # Eval — strict-causal, no_grad
 

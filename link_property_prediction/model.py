@@ -82,18 +82,15 @@ class BagSelfAttention(nn.Module):
         valid_f = valid.to(attn.dtype)                                       # [Q, T]
         return (valid_f.unsqueeze(-1) * attn).sum(1) / valid_f.sum(-1, keepdim=True)
 
-    def forward(self, tokens: WalkTokens, r_mean: torch.Tensor):
-        """Token points [Q, T, d], log pooling weights [Q, T] (-inf on padding) and pooled point [Q, d]."""
+    def forward(self, tokens: WalkTokens, r_mean: torch.Tensor) -> torch.Tensor:
+        """The bag's attention-pooled point [Q, d]."""
         nodes, valid, hop = self.bag_slots(tokens)                           # [Q, T] each
         points = F.embedding(nodes, self.E.weight)                           # [Q, T, d]
         # Attention sees positions only; E's gradient flows through `points`.
         x = self.encode(points.detach(), tokens.ages.flatten(1), hop, r_mean)  # [Q, T, d_model]
 
-        weights = self.pooling_weights(self.attention(x, valid), valid)   # [Q, T]
-        log_weights = torch.log(weights.clamp_min(torch.finfo(weights.dtype).tiny))
-        log_weights = log_weights.masked_fill(~valid, float("-inf"))         # [Q, T]
-        pooled = weighted_midpoint(points, weights)                          # [Q, d] = mean_j sum_k A_jk E_k
-        return points, log_weights, pooled
+        weights = self.pooling_weights(self.attention(x, valid), valid)      # [Q, T]
+        return weighted_midpoint(points, weights)                            # [Q, d] = mean_j sum_k A_jk E_k
 
 
 class LinkPredHead(nn.Module):
@@ -113,37 +110,17 @@ class LinkPredHead(nn.Module):
         self.bag_attention = BagSelfAttention(self.E, max_walk_len, d_model=d_model, n_heads=n_heads)
 
         self.w = nn.Parameter(torch.tensor([1.0]))
-        self.beta = nn.Parameter(torch.tensor([0.0]))                       # >= 0; 0 is the weighted mean
-
-    @torch.no_grad()
-    def project_(self) -> None:
-        """Clamp beta to >= 0 after an optimiser step."""
-        self.beta.clamp_(min=0.0)
 
     def mean_radius(self) -> torch.Tensor:
         """Mean norm of the table (its distance from the origin), detached."""
         r_mean = self.E.weight.detach().norm(dim=-1).mean()                  # []
         return r_mean.clamp_min(torch.finfo(r_mean.dtype).tiny)
 
-    def gap_to_bag(self, x: torch.Tensor, points: torch.Tensor, log_weights: torch.Tensor,
-                   r_mean: torch.Tensor) -> torch.Tensor:
-        """Distance from x to a bag in units of the table's mean radius, under softmax(log w_j - beta * d_j):
-        mean at 0, nearest as beta grows. Invariant to rescaling the whole table."""
-        dist_to_tokens = dist(x.unsqueeze(-2), points) / r_mean              # [..., T]
-        attn = torch.softmax(log_weights - self.beta * dist_to_tokens, dim=-1)  # [..., T]
-        return (attn * dist_to_tokens).sum(-1)                               # [...]
-
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Score candidates by the pooled-point-to-bag gaps in both directions."""
+        """Score candidates by the distance between the two attention-pooled points, in units of the
+        table's mean radius."""
         r_mean = self.mean_radius()                                          # []
-        points_u, log_weights_u, pooled_u = self.bag_attention(src_tokens, r_mean)   # [b, T, d], [b, T], [b, d]
-        points_v, log_weights_v, pooled_v = self.bag_attention(cand_tokens, r_mean)  # [b*c, T, d], [b*c, T], [b*c, d]
-        b, t, d = points_u.shape
-        points_v = points_v.view(b, -1, t, d)                                # [b, c, T, d]
-        log_weights_v = log_weights_v.view(b, -1, t)                         # [b, c, T]
-        pooled_v = pooled_v.view(b, -1, d)                                   # [b, c, d]
-
-        gap_uv = (self.gap_to_bag(pooled_u.unsqueeze(1), points_v, log_weights_v, r_mean)
-                  + self.gap_to_bag(pooled_v, points_u.unsqueeze(1), log_weights_u.unsqueeze(1),
-                                    r_mean))                                 # [b, c]
-        return self.w * -gap_uv
+        pooled_u = self.bag_attention(src_tokens, r_mean)                    # [b, d]
+        pooled_v = self.bag_attention(cand_tokens, r_mean)                   # [b*c, d]
+        pooled_v = pooled_v.view(pooled_u.shape[0], -1, pooled_u.shape[-1])  # [b, c, d]
+        return self.w * -dist(pooled_u.unsqueeze(1), pooled_v) / r_mean      # [b, c]
