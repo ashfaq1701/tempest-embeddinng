@@ -104,10 +104,11 @@ class LinkPredHead(nn.Module):
         r_mean = self.geom.dist0(self.E.weight.detach()).mean()              # []
         return r_mean.clamp_min(torch.finfo(r_mean.dtype).tiny)
 
-    def gap_to_bag(self, x: torch.Tensor, points: torch.Tensor,
-                   log_weights: torch.Tensor) -> torch.Tensor:
-        """Distance from x to a bag under softmax(log w_j - beta * d_j): mean at 0, nearest as beta grows."""
-        dist_to_tokens = self.geom.dist(x.unsqueeze(-2), points)             # [..., T]
+    def gap_to_bag(self, x: torch.Tensor, points: torch.Tensor, log_weights: torch.Tensor,
+                   r_mean: torch.Tensor) -> torch.Tensor:
+        """Distance from x to a bag in units of the table's mean radius, under softmax(log w_j - beta * d_j):
+        mean at 0, nearest as beta grows."""
+        dist_to_tokens = self.geom.dist(x.unsqueeze(-2), points) / r_mean    # [..., T]
         attn = torch.softmax(log_weights - self.beta * dist_to_tokens, dim=-1)  # [..., T]
         return (attn * dist_to_tokens).sum(-1)                               # [...]
 
@@ -121,6 +122,7 @@ class LinkPredHead(nn.Module):
         log_weights_v = log_weights_v.view(b, -1, t)                         # [b, c, T]
         pooled_v = pooled_v.view(b, -1, d)                                   # [b, c, d]
 
-        gap_uv = (self.gap_to_bag(pooled_u.unsqueeze(1), points_v, log_weights_v)
-                  + self.gap_to_bag(pooled_v, points_u.unsqueeze(1), log_weights_u.unsqueeze(1)))  # [b, c]
+        gap_uv = (self.gap_to_bag(pooled_u.unsqueeze(1), points_v, log_weights_v, r_mean)
+                  + self.gap_to_bag(pooled_v, points_u.unsqueeze(1), log_weights_u.unsqueeze(1),
+                                    r_mean))                                 # [b, c]
         return self.w * -gap_uv

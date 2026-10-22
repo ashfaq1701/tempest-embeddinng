@@ -87,7 +87,7 @@ class FrozenEncoder:
         geometry = [
             model.geom.dist0(e_u),
             model.geom.dist0(pooled),
-            model.gap_to_bag(pooled, points, log_weights),
+            model.gap_to_bag(pooled, points, log_weights, r_mean),
         ]
         return torch.stack(geometry, dim=-1)                                 # [Q, 3]
 
