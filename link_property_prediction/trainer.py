@@ -180,7 +180,7 @@ class Trainer:
     @torch.no_grad()
     def _geometry_probe(self) -> Dict[str, float]:
         """Spread watch: mean and max Euclidean norm of E (its distance from the origin), logged
-        as r_mean/r_max. Not comparable with the hyperbolic radius in Lorentz-era logs."""
+        as r_mean/r_max."""
         r = self.model.E.weight.detach().norm(dim=-1)
         return {"max_norm": float(r.max()), "mean_norm": float(r.mean())}
 

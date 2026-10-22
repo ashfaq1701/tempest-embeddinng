@@ -91,8 +91,7 @@ class LinkPredHead(nn.Module):
         self.d_emb = int(d_emb)
         torch.manual_seed(seed)
 
-        # Isotropic normal with |x| concentrating at INIT_RADIUS: master's wrapped normal at the
-        # origin, whose exponential map is the identity in Euclidean space.
+        # Isotropic normal with |x| concentrating at INIT_RADIUS.
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
             self.E.weight.copy_(torch.randn(self.num_nodes, self.d_emb)
