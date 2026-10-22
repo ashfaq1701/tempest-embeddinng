@@ -43,8 +43,9 @@ class BagSelfAttention(nn.Module):
         nn.init.xavier_uniform_(self.W_q.weight)
         nn.init.xavier_uniform_(self.W_k.weight)
 
-    def forward(self, tokens: WalkTokens, r_mean: torch.Tensor):
-        """Token points [Q, T, d], log pooling weights [Q, T] (-inf on padding) and pooled point [Q, d]."""
+    @staticmethod
+    def bag_slots(tokens: WalkTokens):
+        """Flattened bag: node ids, real-slot mask and hop index [Q, T]. A cold bag keeps its seed."""
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
         valid = tokens.mask.flatten(1).clone()                               # [Q, T]
         hop = tokens.positions.flatten(1).clone()                            # [Q, T]
@@ -53,27 +54,42 @@ class BagSelfAttention(nn.Module):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
             hop[cold, 0] = 1
+        return nodes, valid, hop
 
-        points = F.embedding(nodes, self.E.weight)                           # [Q, T, d]
-        # Attention sees positions only; E's gradient flows through `points`.
-        fixed = points.detach()                                              # [Q, T, d]
-        log_age = torch.log1p(tokens.ages.flatten(1).clamp_min(0).to(fixed.dtype))  # [Q, T]
+    def time_encode(self, ages: torch.Tensor) -> torch.Tensor:
+        """cos(w * log1p(age) + phi) per channel: [Q, T] ages -> [Q, T, d_model]."""
+        log_age = torch.log1p(ages.clamp_min(0).to(self.time_freq.dtype))    # [Q, T]
+        return torch.cos(log_age.unsqueeze(-1) * self.time_freq + self.time_phase)
 
-        x = (self.content(fixed / r_mean)
-             + torch.cos(log_age.unsqueeze(-1) * self.time_freq + self.time_phase)
-             + self.hop(hop))                                                # [Q, T, d_model]
-        x = self.norm(x)                                                     # [Q, T, d_model]
+    def encode(self, fixed: torch.Tensor, ages: torch.Tensor, hop: torch.Tensor,
+               r_mean: torch.Tensor) -> torch.Tensor:
+        """Token vectors: content + time + hop, layer-normalised. [Q, T, d] -> [Q, T, d_model]."""
+        x = self.content(fixed / r_mean) + self.time_encode(ages) + self.hop(hop)
+        return self.norm(x)
 
+    def attention(self, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """Scaled dot-product self-attention over real tokens, heads averaged: [Q, T, T], rows sum to 1."""
         q_len, t_len, _ = x.shape
         q = self.W_q(x).view(q_len, t_len, self.n_heads, self.d_head).transpose(1, 2)   # [Q, H, T, d_head]
         k = self.W_k(x).view(q_len, t_len, self.n_heads, self.d_head).transpose(1, 2)   # [Q, H, T, d_head]
         scores = q @ k.transpose(-1, -2) / self.d_head ** 0.5                # [Q, H, T, T]
         scores = scores.masked_fill(~valid[:, None, None, :], float("-inf"))
-        attn = torch.softmax(scores, dim=-1).mean(1)                         # [Q, T, T], heads averaged
+        return torch.softmax(scores, dim=-1).mean(1)                         # [Q, T, T]
 
-        # Pooling weight of token k: the attention it receives, averaged over the bag's real tokens.
-        valid_f = valid.to(fixed.dtype)                                      # [Q, T]
-        weights = (valid_f.unsqueeze(-1) * attn).sum(1) / valid_f.sum(-1, keepdim=True)  # [Q, T]
+    @staticmethod
+    def received_attention(attn: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """Pooling weight of each token: the attention it receives, averaged over the real tokens. [Q, T]."""
+        valid_f = valid.to(attn.dtype)                                       # [Q, T]
+        return (valid_f.unsqueeze(-1) * attn).sum(1) / valid_f.sum(-1, keepdim=True)
+
+    def forward(self, tokens: WalkTokens, r_mean: torch.Tensor):
+        """Token points [Q, T, d], log pooling weights [Q, T] (-inf on padding) and pooled point [Q, d]."""
+        nodes, valid, hop = self.bag_slots(tokens)                           # [Q, T] each
+        points = F.embedding(nodes, self.E.weight)                           # [Q, T, d]
+        # Attention sees positions only; E's gradient flows through `points`.
+        x = self.encode(points.detach(), tokens.ages.flatten(1), hop, r_mean)  # [Q, T, d_model]
+
+        weights = self.received_attention(self.attention(x, valid), valid)   # [Q, T]
         log_weights = torch.log(weights.clamp_min(torch.finfo(weights.dtype).tiny))
         log_weights = log_weights.masked_fill(~valid, float("-inf"))         # [Q, T]
         pooled = weighted_midpoint(points, weights)                          # [Q, d] = mean_j sum_k A_jk E_k
