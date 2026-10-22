@@ -30,7 +30,6 @@ from .walks import WalkGenerator
 class TrainerConfig:
     # Dataset-derived.
     num_nodes: int
-    T_train: int
     train_negative_sampler: NegativeSampler
 
     # Embedding dimension.
@@ -39,9 +38,6 @@ class TrainerConfig:
     # Bag self-attention: token width and number of heads (d_model divisible by n_heads).
     d_model: int = 64
     n_heads: int = 4
-
-    # Per-query training negatives ([B, 1+K_train]).
-    K_train: int = 5
 
     # Walks: BACKWARD only, undirected; two-sided (source and every candidate).
     num_walks_per_node: int = 10
@@ -52,7 +48,7 @@ class TrainerConfig:
     t2nv_q: float = 0.25   # node2vec in-out param
 
     # Constant lr, no weight decay. One Adam param group at a single `lr`: the
-    # embedding tables, the distance temperature and the NN pooler all step at the same rate.
+    # embedding table, the score weight w, beta and the bag attention all step at the same rate.
     lr: float = 1e-3
 
     # Run control.
@@ -74,7 +70,6 @@ class Trainer:
         # Owns the Euclidean node embeddings and the monotone metric score.
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
-            T_train=config.T_train,
             max_walk_len=config.max_walk_len,
             d_emb=int(config.d_emb),
             d_model=int(config.d_model),
@@ -180,17 +175,9 @@ class Trainer:
 
     @torch.no_grad()
     def _head_probe(self) -> str:
-        """The head's scalar parameters, for the epoch line. Read via hasattr so a head with a different
-        set of knobs degrades to a shorter line rather than raising. w weights the score terms."""
-        parts = []
-        if hasattr(self.model, "temperature"):
-            parts.append(f"temp={float(self.model.temperature):.3f}")
-        if hasattr(self.model, "w"):
-            w = self.model.w.detach().flatten().tolist()
-            parts.append("w=[" + ",".join(f"{x:+.4f}" for x in w) + "]")
-        if hasattr(self.model, "beta"):
-            parts.append(f"beta={float(self.model.beta):+.4f}")
-        return ("  " + "  ".join(parts)) if parts else ""
+        """The head's scalar parameters for the epoch line: score weight w and attention sharpness beta."""
+        w = ",".join(f"{x:+.4f}" for x in self.model.w.detach().flatten().tolist())
+        return f"  w=[{w}]  beta={float(self.model.beta):+.4f}"
 
     # Eval — strict-causal, no_grad
 

@@ -84,22 +84,17 @@ class LinkPredHead(nn.Module):
 
     INIT_RADIUS = 1e-3
 
-    def __init__(self, num_nodes: int, T_train: int, max_walk_len: int, d_emb: int,
+    def __init__(self, num_nodes: int, max_walk_len: int, d_emb: int,
                  d_model: int = 64, n_heads: int = 4, seed: int = 42):
         super().__init__()
-        self.num_nodes = int(num_nodes)
-        self.T_train = int(T_train)
-        self.max_walk_len = int(max_walk_len)
-        self.d_emb = int(d_emb)
         torch.manual_seed(seed)
 
         # Isotropic normal with |x| concentrating at INIT_RADIUS.
-        self.E = nn.Embedding(self.num_nodes, self.d_emb)
+        self.E = nn.Embedding(num_nodes, d_emb)
         with torch.no_grad():
-            self.E.weight.copy_(torch.randn(self.num_nodes, self.d_emb)
-                                * (self.INIT_RADIUS / self.d_emb ** 0.5))
+            self.E.weight.copy_(torch.randn(num_nodes, d_emb) * (self.INIT_RADIUS / d_emb ** 0.5))
 
-        self.bag_attention = BagSelfAttention(self.E, self.max_walk_len, d_model=d_model, n_heads=n_heads)
+        self.bag_attention = BagSelfAttention(self.E, max_walk_len, d_model=d_model, n_heads=n_heads)
 
         self.w = nn.Parameter(torch.tensor([1.0]))
         self.beta = nn.Parameter(torch.tensor([0.0]))                       # >= 0; 0 is the weighted mean

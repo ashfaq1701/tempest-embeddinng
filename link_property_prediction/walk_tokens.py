@@ -14,16 +14,13 @@ _TS_SENTINEL = torch.iinfo(torch.int64).max     # Tempest's seed-slot timestamp 
 
 @dataclass
 class WalkTokens:
-    """[Q, K, L] fields (walk axis explicit), or [Q, K, L, d_ef] for edge_features."""
+    """[Q, K, L] fields (walk axis explicit)."""
 
     seeds: torch.Tensor                             # [Q]      query/source node u (kept even when cold)
-    cutoffs: torch.Tensor                           # [Q]      exclusive cutoff t per query
     nodes: torch.Tensor                             # [Q, K, L]   walk node ids; padding = -1
     ages: torch.Tensor                              # [Q, K, L]   cutoff - t_edge; seed = 0, ctx >= 1, pad = -1
     positions: torch.Tensor                         # [Q, K, L]   hop from seed: 1 = seed, ..., lens = oldest; pad 0
     mask: torch.Tensor                              # [Q, K, L]   bool, real slots (nodes != -1), incl. seed
-    seed_mask: torch.Tensor                         # [Q, K, L]   bool, ONLY the seed's walk-origin slot
-    edge_features: Optional[torch.Tensor] = None    # [Q, K, L, d_ef]  seed slot + padding zeroed; None if no EF
 
 
 def build_query_walk_tokens(
@@ -46,7 +43,7 @@ def build_query_walk_tokens(
         k, length = num_walks_per_node, max_walk_len
         empty_i = torch.empty((0, k, length), dtype=torch.int64, device=device)
         empty_b = torch.empty((0, k, length), dtype=torch.bool, device=device)
-        return WalkTokens(seeds_t, cutoffs_t, empty_i, empty_i, empty_i, empty_b, empty_b)
+        return WalkTokens(seeds_t, empty_i, empty_i, empty_i, empty_b)
 
     wd = walk_gen.walks_for_nodes(
         np.ascontiguousarray(seeds_t.cpu().numpy(), dtype=np.int32),
@@ -73,23 +70,10 @@ def build_query_walk_tokens(
     arange = torch.arange(length, device=device).view(1, 1, length)
     positions = (lens - arange).clamp_min(0)
 
-    seed_mask = node_mask & (ages == 0)
-
-    # Per-token edge features; seed slot (age 0) and padding forced to [0]*d_ef.
-    edge_features = None
-    if wd.edge_feats is not None:
-        d_ef = int(wd.edge_feats.shape[-1])
-        ef = wd.edge_feats.to(device=device, dtype=torch.float32).reshape(q, k, length, d_ef)
-        real = (node_mask & (ages != 0)).unsqueeze(-1)
-        edge_features = ef * real                                                       # [Q, K, L, d_ef]
-
     return WalkTokens(
         seeds_t,
-        cutoffs_t,
         nodes,                              # [Q, K, L]
         ages,
         positions,
         node_mask,
-        seed_mask,
-        edge_features,
     )
