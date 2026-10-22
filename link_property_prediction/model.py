@@ -77,8 +77,8 @@ class BagSelfAttention(nn.Module):
         return torch.softmax(scores, dim=-1).mean(1)                         # [Q, T, T]
 
     @staticmethod
-    def received_attention(attn: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        """Pooling weight of each token: the attention it receives, averaged over the real tokens. [Q, T]."""
+    def pooling_weights(attn: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """Each token's weight in the bag: the attention it receives from the real tokens, averaged. [Q, T], sums to 1."""
         valid_f = valid.to(attn.dtype)                                       # [Q, T]
         return (valid_f.unsqueeze(-1) * attn).sum(1) / valid_f.sum(-1, keepdim=True)
 
@@ -89,7 +89,7 @@ class BagSelfAttention(nn.Module):
         # Attention sees positions only; E's gradient flows through `points`.
         x = self.encode(points.detach(), tokens.ages.flatten(1), hop, r_mean)  # [Q, T, d_model]
 
-        weights = self.received_attention(self.attention(x, valid), valid)   # [Q, T]
+        weights = self.pooling_weights(self.attention(x, valid), valid)   # [Q, T]
         log_weights = torch.log(weights.clamp_min(torch.finfo(weights.dtype).tiny))
         log_weights = log_weights.masked_fill(~valid, float("-inf"))         # [Q, T]
         pooled = weighted_midpoint(points, weights)                          # [Q, d] = mean_j sum_k A_jk E_k
