@@ -18,7 +18,6 @@ py-tgb>=2.3.0
 pandas>=2,<3
 
 tempest-rw>=1.0.6
-geoopt>=0.5.0
 tgb-seq
 
 # node classification: ROC-AUC; DyGLib datasets download from Zenodo.

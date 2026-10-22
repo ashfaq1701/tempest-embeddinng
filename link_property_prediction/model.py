@@ -1,20 +1,29 @@
 import math
 
-import geoopt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .lorentz import LorentzManifold
 from .walk_tokens import WalkTokens
+
+_SQ_DIST_FLOOR = 1e-12
+
+
+def dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Euclidean distance over the last axis; the floor keeps the gradient finite at x == y."""
+    return ((x - y) ** 2).sum(-1).clamp_min(_SQ_DIST_FLOOR).sqrt()
+
+
+def weighted_midpoint(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Weighted mean of points x [..., T, d] under weights w [..., T] summing to 1."""
+    return (w.unsqueeze(-1) * x).sum(-2)                                     # [..., d]
 
 
 class BagWeights(nn.Module):
 
-    def __init__(self, geom: "LorentzManifold", E: nn.Embedding, T_train: int,
-                 max_walk_len: int, hidden_dim: int = 32, n_layers: int = 2):
+    def __init__(self, E: nn.Embedding, T_train: int, max_walk_len: int,
+                 hidden_dim: int = 32, n_layers: int = 2):
         super().__init__()
-        self.geom = geom
         self.E = E
         self.log_T_train = math.log1p(T_train)
         self.max_walk_len = int(max_walk_len)
@@ -47,7 +56,7 @@ class BagWeights(nn.Module):
         fixed = points.detach()                                              # [Q, T, d]
 
         valid_f = valid.to(fixed.dtype)                                      # [Q, T]
-        mid = self.geom.weighted_midpoint(fixed, valid_f / valid_f.sum(-1, keepdim=True))  # [Q, d]
+        mid = weighted_midpoint(fixed, valid_f / valid_f.sum(-1, keepdim=True))  # [Q, d]
 
         age = tokens.ages.flatten(1).clamp_min(0).to(fixed.dtype)            # [Q, T]
         pos = tokens.positions.flatten(1).to(fixed.dtype)                    # [Q, T]
@@ -56,16 +65,16 @@ class BagWeights(nn.Module):
 
         tiny = torch.finfo(fixed.dtype).tiny
 
-        d_tok_mid = self.geom.dist(fixed, mid.unsqueeze(-2))                 # [Q, T]
+        d_tok_mid = dist(fixed, mid.unsqueeze(-2))                           # [Q, T]
         d_mid_mean = (d_tok_mid * valid_f).sum(-1, keepdim=True) / valid_f.sum(-1, keepdim=True)  # [Q, 1]
         d_mid = d_tok_mid * valid_f / d_mid_mean.clamp_min(tiny)             # [Q, T]
 
-        d_0 = self.geom.dist0(fixed) * valid_f / r_mean                      # [Q, T]
+        d_0 = fixed.norm(dim=-1) * valid_f / r_mean                          # [Q, T]
 
         feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
         logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
         log_weights = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T]
-        pooled = self.geom.weighted_midpoint(points, log_weights.exp())      # [Q, d]
+        pooled = weighted_midpoint(points, log_weights.exp())                # [Q, d]
         return points, log_weights, pooled
 
 
@@ -80,15 +89,16 @@ class LinkPredHead(nn.Module):
         self.T_train = int(T_train)
         self.max_walk_len = int(max_walk_len)
         self.d_emb = int(d_emb)
-        self.geom = LorentzManifold()
         torch.manual_seed(seed)
 
+        # Isotropic normal with |x| concentrating at INIT_RADIUS: master's wrapped normal at the
+        # origin, whose exponential map is the identity in Euclidean space.
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            init = self.geom.random(self.num_nodes, self.d_emb, radius=self.INIT_RADIUS)
-        self.E.weight = geoopt.ManifoldParameter(init, manifold=self.geom)
+            self.E.weight.copy_(torch.randn(self.num_nodes, self.d_emb)
+                                * (self.INIT_RADIUS / self.d_emb ** 0.5))
 
-        self.bag_weights = BagWeights(self.geom, self.E, self.T_train, self.max_walk_len,
+        self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
         self.w = nn.Parameter(torch.tensor([1.0]))
@@ -100,14 +110,14 @@ class LinkPredHead(nn.Module):
         self.beta.clamp_(min=0.0)
 
     def mean_radius(self) -> torch.Tensor:
-        """Mean geodesic radius of the table, detached."""
-        r_mean = self.geom.dist0(self.E.weight.detach()).mean()              # []
+        """Mean norm of the table (its distance from the origin), detached."""
+        r_mean = self.E.weight.detach().norm(dim=-1).mean()                  # []
         return r_mean.clamp_min(torch.finfo(r_mean.dtype).tiny)
 
     def gap_to_bag(self, x: torch.Tensor, points: torch.Tensor,
                    log_weights: torch.Tensor) -> torch.Tensor:
         """Distance from x to a bag under softmax(log w_j - beta * d_j): mean at 0, nearest as beta grows."""
-        dist_to_tokens = self.geom.dist(x.unsqueeze(-2), points)             # [..., T]
+        dist_to_tokens = dist(x.unsqueeze(-2), points)                       # [..., T]
         attn = torch.softmax(log_weights - self.beta * dist_to_tokens, dim=-1)  # [..., T]
         return (attn * dist_to_tokens).sum(-1)                               # [...]
 

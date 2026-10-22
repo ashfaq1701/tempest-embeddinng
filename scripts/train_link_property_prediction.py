@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
                         "node (sources and destinations) can be a negative.")
 
     # ── Model ───────────────────────────────────────────────────────
-    p.add_argument("--d-emb", default=64, type=int,
+    p.add_argument("--d-emb", default=128, type=int,
                    help="Embedding dimension.")
     p.add_argument("--num-walks-per-node", default=10, type=int,
                    help="Walks per query node.")
@@ -238,7 +238,7 @@ def main() -> Dict[str, Any]:
     if args.save_checkpoint:
         ckpt_path = pathlib.Path(args.save_checkpoint)
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-        radius = trainer.model.geom.dist0(trainer.model.E.weight.detach())
+        radius = trainer.model.E.weight.detach().norm(dim=-1)
         torch.save({
             "state_dict": trainer.model.state_dict(),
             "args": vars(args),
