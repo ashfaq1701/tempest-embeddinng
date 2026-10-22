@@ -34,8 +34,7 @@ class FrozenEncoder:
         num_nodes, d_emb = state["E.weight"].shape
         model = LinkPredHead(num_nodes=num_nodes, T_train=ckpt["T_train"],
                              max_walk_len=args["max_walk_len"], d_emb=d_emb,
-                             hidden_dim=args["hidden_dim"],
-                             n_layers_pooler=args["n_layers_pooler"], seed=args["seed"])
+                             d_model=args["d_model"], n_heads=args["n_heads"], seed=args["seed"])
         model.load_state_dict(state)
         walk_args = {k: args[k] for k in (
             "num_walks_per_node", "max_walk_len", "walk_bias", "start_bias", "t2nv_p", "t2nv_q")}
@@ -82,7 +81,7 @@ class FrozenEncoder:
         """u's own radius, its pooled point's radius, and the gap from the pooled point to u's bag."""
         model = self.model
         r_mean = model.mean_radius()                                         # []
-        points, log_weights, pooled = model.bag_weights(tokens, r_mean)      # [Q, T, d], [Q, T], [Q, d]
+        points, log_weights, pooled = model.bag_attention(tokens, r_mean)      # [Q, T, d], [Q, T], [Q, d]
         e_u = model.E.weight[src]                                            # [Q, d]
         geometry = [
             e_u.norm(dim=-1),

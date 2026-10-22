@@ -2,7 +2,7 @@
 
 Walk-supervised temporal graph learning with Tempest. Two arms share one encoder:
 
-- **Link prediction** trains a Euclidean embedding table and a walk-bag pooler on TGB-Seq, TGB and
+- **Link prediction** trains a Euclidean embedding table and walk-bag self-attention on TGB-Seq, TGB and
   DyGLib, scored by MRR.
 - **Dynamic node classification** freezes a link-prediction checkpoint and trains a small
   classifier on features of its walks (DyGLib Wikipedia / Reddit, ROC-AUC).
@@ -22,7 +22,7 @@ link_property_prediction/      encoder + link-prediction arm
   negatives.py      uniform negative sampler
   walks.py          Tempest wrapper: walks + per-node history (recency, popularity)
   walk_tokens.py    per-query walk token bags
-  model.py          Euclidean dist / midpoint, embedding table, walk-bag pooler, link-pred head
+  model.py          Euclidean dist / midpoint, embedding table, bag self-attention, link-pred head
   trainer.py        strict-causal train + eval loop
   utils.py          seeding
 node_classification/           node-classification arm, on a frozen checkpoint

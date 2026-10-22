@@ -1,5 +1,3 @@
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,62 +17,66 @@ def weighted_midpoint(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return (w.unsqueeze(-1) * x).sum(-2)                                     # [..., d]
 
 
-class BagWeights(nn.Module):
+class BagSelfAttention(nn.Module):
+    """Pre-norm multi-head self-attention over a query's walk-token bag, replacing a learned pooler.
 
-    def __init__(self, E: nn.Embedding, T_train: int, max_walk_len: int,
-                 hidden_dim: int = 32, n_layers: int = 2):
+    Tokens are content (detached embedding / r_mean) + time encoding + hop embedding. Values are the
+    raw embeddings and the heads' attention maps are averaged, so each token's contextual point
+    sum_k A_jk E_k is a convex point in E-space; the bag's pooled point is their mean, i.e. each token
+    is weighted by the attention it receives."""
+
+    def __init__(self, E: nn.Embedding, max_walk_len: int, d_model: int = 64, n_heads: int = 4):
         super().__init__()
+        if d_model % n_heads:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
         self.E = E
-        self.log_T_train = math.log1p(T_train)
-        self.max_walk_len = int(max_walk_len)
-        self.hidden = int(hidden_dim)
-        self.n_layers = int(n_layers)
-        if self.n_layers < 1:
-            raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 4
-        layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
-        for _ in range(self.n_layers - 1):
-            layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
-        layers.append(nn.Linear(self.hidden, 1))
-        self.net = nn.Sequential(*layers)
+        self.n_heads = int(n_heads)
+        self.d_head = int(d_model) // self.n_heads
 
-        self.skip = nn.Linear(self.n_feat, 1, bias=False)
-        with torch.no_grad():
-            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0, 0.0]]))
+        self.content = nn.Linear(E.weight.shape[1], d_model, bias=False)
+        self.time_freq = nn.Parameter(torch.randn(d_model))                # time encoding cos(w * t + phi)
+        self.time_phase = nn.Parameter(torch.zeros(d_model))
+        self.hop = nn.Embedding(int(max_walk_len) + 1, d_model)            # 0 = padding, 1 = seed, ... = older
+        self.norm = nn.LayerNorm(d_model)
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_k = nn.Linear(d_model, d_model, bias=False)
+        nn.init.xavier_uniform_(self.W_q.weight)
+        nn.init.xavier_uniform_(self.W_k.weight)
 
     def forward(self, tokens: WalkTokens, r_mean: torch.Tensor):
-        """Token points [Q, T, d], log-weights [Q, T] (-inf on padding) and weighted midpoint [Q, d]."""
+        """Token points [Q, T, d], log pooling weights [Q, T] (-inf on padding) and pooled point [Q, d]."""
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
         valid = tokens.mask.flatten(1).clone()                               # [Q, T]
+        hop = tokens.positions.flatten(1).clone()                            # [Q, T]
         cold = ~valid.any(dim=-1)                                            # [Q]
         if bool(cold.any()):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
+            hop[cold, 0] = 1
 
         points = F.embedding(nodes, self.E.weight)                           # [Q, T, d]
-        # Features see positions only; E's gradient flows through `points`.
+        # Attention sees positions only; E's gradient flows through `points`.
         fixed = points.detach()                                              # [Q, T, d]
+        log_age = torch.log1p(tokens.ages.flatten(1).clamp_min(0).to(fixed.dtype))  # [Q, T]
 
+        x = (self.content(fixed / r_mean)
+             + torch.cos(log_age.unsqueeze(-1) * self.time_freq + self.time_phase)
+             + self.hop(hop))                                                # [Q, T, d_model]
+        x = self.norm(x)                                                     # [Q, T, d_model]
+
+        q_len, t_len, _ = x.shape
+        q = self.W_q(x).view(q_len, t_len, self.n_heads, self.d_head).transpose(1, 2)   # [Q, H, T, d_head]
+        k = self.W_k(x).view(q_len, t_len, self.n_heads, self.d_head).transpose(1, 2)   # [Q, H, T, d_head]
+        scores = q @ k.transpose(-1, -2) / self.d_head ** 0.5                # [Q, H, T, T]
+        scores = scores.masked_fill(~valid[:, None, None, :], float("-inf"))
+        attn = torch.softmax(scores, dim=-1).mean(1)                         # [Q, T, T], heads averaged
+
+        # Pooling weight of token k: the attention it receives, averaged over the bag's real tokens.
         valid_f = valid.to(fixed.dtype)                                      # [Q, T]
-        mid = weighted_midpoint(fixed, valid_f / valid_f.sum(-1, keepdim=True))  # [Q, d]
-
-        age = tokens.ages.flatten(1).clamp_min(0).to(fixed.dtype)            # [Q, T]
-        pos = tokens.positions.flatten(1).to(fixed.dtype)                    # [Q, T]
-        age = torch.log1p(age) / self.log_T_train                            # [Q, T]
-        pos = pos / self.max_walk_len                                        # [Q, T]
-
-        tiny = torch.finfo(fixed.dtype).tiny
-
-        d_tok_mid = dist(fixed, mid.unsqueeze(-2))                           # [Q, T]
-        d_mid_mean = (d_tok_mid * valid_f).sum(-1, keepdim=True) / valid_f.sum(-1, keepdim=True)  # [Q, 1]
-        d_mid = d_tok_mid * valid_f / d_mid_mean.clamp_min(tiny)             # [Q, T]
-
-        d_0 = fixed.norm(dim=-1) * valid_f / r_mean                          # [Q, T]
-
-        feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
-        logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
-        log_weights = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T]
-        pooled = weighted_midpoint(points, log_weights.exp())                # [Q, d]
+        weights = (valid_f.unsqueeze(-1) * attn).sum(1) / valid_f.sum(-1, keepdim=True)  # [Q, T]
+        log_weights = torch.log(weights.clamp_min(torch.finfo(weights.dtype).tiny))
+        log_weights = log_weights.masked_fill(~valid, float("-inf"))         # [Q, T]
+        pooled = weighted_midpoint(points, weights)                          # [Q, d] = mean_j sum_k A_jk E_k
         return points, log_weights, pooled
 
 
@@ -83,7 +85,7 @@ class LinkPredHead(nn.Module):
     INIT_RADIUS = 1e-3
 
     def __init__(self, num_nodes: int, T_train: int, max_walk_len: int, d_emb: int,
-                 hidden_dim: int = 32, n_layers_pooler: int = 2, seed: int = 42):
+                 d_model: int = 64, n_heads: int = 4, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.T_train = int(T_train)
@@ -97,8 +99,7 @@ class LinkPredHead(nn.Module):
             self.E.weight.copy_(torch.randn(self.num_nodes, self.d_emb)
                                 * (self.INIT_RADIUS / self.d_emb ** 0.5))
 
-        self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
-                                      hidden_dim=hidden_dim, n_layers=n_layers_pooler)
+        self.bag_attention = BagSelfAttention(self.E, self.max_walk_len, d_model=d_model, n_heads=n_heads)
 
         self.w = nn.Parameter(torch.tensor([1.0]))
         self.beta = nn.Parameter(torch.tensor([0.0]))                       # >= 0; 0 is the weighted mean
@@ -124,8 +125,8 @@ class LinkPredHead(nn.Module):
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Score candidates by the pooled-point-to-bag gaps in both directions."""
         r_mean = self.mean_radius()                                          # []
-        points_u, log_weights_u, pooled_u = self.bag_weights(src_tokens, r_mean)   # [b, T, d], [b, T], [b, d]
-        points_v, log_weights_v, pooled_v = self.bag_weights(cand_tokens, r_mean)  # [b*c, T, d], [b*c, T], [b*c, d]
+        points_u, log_weights_u, pooled_u = self.bag_attention(src_tokens, r_mean)   # [b, T, d], [b, T], [b, d]
+        points_v, log_weights_v, pooled_v = self.bag_attention(cand_tokens, r_mean)  # [b*c, T, d], [b*c, T], [b*c, d]
         b, t, d = points_u.shape
         points_v = points_v.view(b, -1, t, d)                                # [b, c, T, d]
         log_weights_v = log_weights_v.view(b, -1, t)                         # [b, c, T]

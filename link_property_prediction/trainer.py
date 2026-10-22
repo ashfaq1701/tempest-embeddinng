@@ -36,15 +36,9 @@ class TrainerConfig:
     # Embedding dimension.
     d_emb: int = 128
 
-    # Pooler MLP width, PINNED. It does NOT move with the feature count: under the
-    # old 8*n_feat rule every feature ablation silently changed pooler capacity too
-    # and the two effects could not be separated.
-    hidden_dim: int = 32
-
-    # Hidden Linear->GELU stages in the pooler MLP. Each past the first inserts a
-    # Linear(hidden, hidden) -> GELU. Depth and width are separate knobs so a capacity
-    # change can be attributed to one of them. 1 reproduces the pre-c2a7c95 shape.
-    n_layers_pooler: int = 2
+    # Bag self-attention: token width and number of heads (d_model divisible by n_heads).
+    d_model: int = 64
+    n_heads: int = 4
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
@@ -83,8 +77,8 @@ class Trainer:
             T_train=config.T_train,
             max_walk_len=config.max_walk_len,
             d_emb=int(config.d_emb),
-            hidden_dim=int(config.hidden_dim),
-            n_layers_pooler=int(config.n_layers_pooler),
+            d_model=int(config.d_model),
+            n_heads=int(config.n_heads),
             seed=int(config.seed),
         ).to(self.device)
 
@@ -196,13 +190,6 @@ class Trainer:
             parts.append("w=[" + ",".join(f"{x:+.4f}" for x in w) + "]")
         if hasattr(self.model, "beta"):
             parts.append(f"beta={float(self.model.beta):+.4f}")
-        # The residual pooler's linear branch, if present: the weighting's linear law in
-        # feature units, one weight per feature. Without it a null cannot say whether
-        # the skip carried the model or stayed at its zero init.
-        bw = getattr(self.model, "bag_weights", None)
-        if bw is not None and hasattr(bw, "skip"):
-            w = bw.skip.weight.detach().flatten().tolist()
-            parts.append("skip=[" + ",".join(f"{x:+.4f}" for x in w) + "]")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad
