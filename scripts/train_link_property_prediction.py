@@ -87,8 +87,6 @@ def parse_args() -> argparse.Namespace:
                    help="Token width of the bag self-attention over token features (divisible by --n-heads).")
     p.add_argument("--n-heads", default=4, type=int,
                    help="Attention heads in the bag self-attention.")
-    p.add_argument("--n-layers", default=1, type=int,
-                   help="Encoder layers in the bag self-attention (>= 1).")
 
     # ── Post-training outputs ───────────────────────────────────────
     p.add_argument("--export-best-embedding-table", action="store_true",
@@ -163,7 +161,6 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
         d_model=args.d_model,
         n_heads=args.n_heads,
-        n_layers=args.n_layers,
 
         K_train=args.k_train,
 

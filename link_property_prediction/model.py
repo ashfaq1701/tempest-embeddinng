@@ -45,42 +45,35 @@ class BagWeights(nn.Module):
     """Pooling weights from self-attention over the bag's token features.
 
     Each token is its feature vector [age, pos, d_mid, d_0] -- no embedding content. Tokens see each
-    other through a Transformer encoder whose attention carries relative biases: time gap, hop gap,
-    pairwise distance / r_mean and a same-node indicator. One logit per token, softmax over the bag;
-    the pooled point is the weighted midpoint of the raw embeddings."""
+    other through a Transformer encoder whose attention adds the two relations the per-token features
+    cannot express: pairwise distance / r_mean and a same-node indicator. One logit per token, softmax
+    over the bag; the pooled point is the weighted midpoint of the raw embeddings."""
 
     N_FEAT = 4                                                               # age, pos, d_mid, d_0
-    N_PAIR = 3                                                               # |age gap|, hop gap, distance
 
     def __init__(self, E: nn.Embedding, T_train: int, max_walk_len: int,
-                 d_model: int = 32, n_heads: int = 4, n_layers: int = 1):
+                 d_model: int = 32, n_heads: int = 4):
         super().__init__()
         if d_model % n_heads:
             raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
-        if n_layers < 1:
-            raise ValueError(f"n_layers must be >= 1, got {n_layers}")
         self.E = E
         self.log_T_train = math.log1p(T_train)
         self.max_walk_len = int(max_walk_len)
         self.n_heads = int(n_heads)
 
         self.embed = nn.Linear(self.N_FEAT, d_model)
-        self.pair_bias = nn.Linear(self.N_PAIR, n_heads, bias=False)         # relative bias, shared by layers
-        self.same_node = nn.Parameter(torch.zeros(n_heads))                  # bias for repeats of one node
-        self.layers = nn.ModuleList(EncoderLayer(d_model, n_heads) for _ in range(n_layers))
+        self.dist_bias = nn.Parameter(torch.zeros(n_heads))                  # per head: weight on pairwise distance
+        self.same_node = nn.Parameter(torch.zeros(n_heads))                  # per head: bias for repeats of a node
+        self.encoder = EncoderLayer(d_model, n_heads)
         self.logit = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))
 
-    def attention_bias(self, nodes: torch.Tensor, valid: torch.Tensor, age: torch.Tensor,
-                       pos: torch.Tensor, fixed: torch.Tensor, r_mean: torch.Tensor) -> torch.Tensor:
-        """Additive bias [Q, H, T, T]: relative time / hop / distance, same node, -inf on padding keys."""
-        age_gap = (age.unsqueeze(-1) - age.unsqueeze(-2)).abs()              # [Q, T, T]
-        hop_gap = pos.unsqueeze(-1) - pos.unsqueeze(-2)                      # [Q, T, T]
-        pair_dist = torch.cdist(fixed, fixed) / r_mean                       # [Q, T, T]
-        pairs = torch.stack([age_gap, hop_gap, pair_dist], dim=-1)           # [Q, T, T, 3]
-        bias = self.pair_bias(pairs).permute(0, 3, 1, 2)                     # [Q, H, T, T]
-
-        same = (nodes.unsqueeze(-1) == nodes.unsqueeze(-2)).to(bias.dtype)  # [Q, T, T]
-        bias = bias + self.same_node.view(1, -1, 1, 1) * same.unsqueeze(1)
+    def attention_bias(self, nodes: torch.Tensor, valid: torch.Tensor, fixed: torch.Tensor,
+                       r_mean: torch.Tensor) -> torch.Tensor:
+        """Additive bias [Q, H, T, T] from pairwise distance and same node; -inf on padding keys."""
+        pair_dist = (torch.cdist(fixed, fixed) / r_mean).unsqueeze(1)        # [Q, 1, T, T]
+        same = (nodes.unsqueeze(-1) == nodes.unsqueeze(-2)).to(fixed.dtype).unsqueeze(1)  # [Q, 1, T, T]
+        bias = (self.dist_bias.view(1, -1, 1, 1) * pair_dist
+                + self.same_node.view(1, -1, 1, 1) * same)                   # [Q, H, T, T]
         return bias.masked_fill(~valid[:, None, None, :], float("-inf"))
 
     def forward(self, tokens: WalkTokens, r_mean: torch.Tensor):
@@ -113,10 +106,8 @@ class BagWeights(nn.Module):
         d_0 = fixed.norm(dim=-1) * valid_f / r_mean                          # [Q, T]
 
         feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
-        attn_bias = self.attention_bias(nodes, valid, age, pos, fixed, r_mean)  # [Q, H, T, T]
-        h = self.embed(feats)                                                # [Q, T, d_model]
-        for layer in self.layers:
-            h = layer(h, attn_bias)                                          # [Q, T, d_model]
+        attn_bias = self.attention_bias(nodes, valid, fixed, r_mean)          # [Q, H, T, T]
+        h = self.encoder(self.embed(feats), attn_bias)                       # [Q, T, d_model]
         logits = self.logit(h).squeeze(-1)                                   # [Q, T]
         log_weights = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T]
         pooled = weighted_midpoint(points, log_weights.exp())                # [Q, d]
@@ -128,7 +119,7 @@ class LinkPredHead(nn.Module):
     INIT_RADIUS = 1e-3
 
     def __init__(self, num_nodes: int, T_train: int, max_walk_len: int, d_emb: int,
-                 d_model: int = 32, n_heads: int = 4, n_layers: int = 1, seed: int = 42):
+                 d_model: int = 32, n_heads: int = 4, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.T_train = int(T_train)
@@ -143,7 +134,7 @@ class LinkPredHead(nn.Module):
                                 * (self.INIT_RADIUS / self.d_emb ** 0.5))
 
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
-                                      d_model=d_model, n_heads=n_heads, n_layers=n_layers)
+                                      d_model=d_model, n_heads=n_heads)
 
         self.w = nn.Parameter(torch.tensor([1.0]))
         self.beta = nn.Parameter(torch.tensor([0.0]))                       # >= 0; 0 is the weighted mean

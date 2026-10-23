@@ -36,10 +36,9 @@ class TrainerConfig:
     # Embedding dimension.
     d_emb: int = 128
 
-    # Bag self-attention over token features: width, heads (d_model divisible by n_heads), layers.
+    # Bag self-attention over token features: width and heads (d_model divisible by n_heads).
     d_model: int = 32
     n_heads: int = 4
-    n_layers: int = 1
 
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
@@ -80,7 +79,6 @@ class Trainer:
             d_emb=int(config.d_emb),
             d_model=int(config.d_model),
             n_heads=int(config.n_heads),
-            n_layers=int(config.n_layers),
             seed=int(config.seed),
         ).to(self.device)
 

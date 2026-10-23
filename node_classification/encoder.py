@@ -34,8 +34,7 @@ class FrozenEncoder:
         num_nodes, d_emb = state["E.weight"].shape
         model = LinkPredHead(num_nodes=num_nodes, T_train=ckpt["T_train"],
                              max_walk_len=args["max_walk_len"], d_emb=d_emb,
-                             d_model=args["d_model"], n_heads=args["n_heads"],
-                             n_layers=args["n_layers"], seed=args["seed"])
+                             d_model=args["d_model"], n_heads=args["n_heads"], seed=args["seed"])
         model.load_state_dict(state)
         walk_args = {k: args[k] for k in (
             "num_walks_per_node", "max_walk_len", "walk_bias", "start_bias", "t2nv_p", "t2nv_q")}
