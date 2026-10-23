@@ -51,7 +51,7 @@ class BagWeights(nn.Module):
     """Pooling weights from self-attention over the bag's token features.
 
     Each token is its feature vector [age, pos, d_mid, d_0] -- no embedding content. Tokens see each
-    other through one self-attention with a residual, then each gets one logit; softmax over the bag.
+    other through one post-LN self-attention with a residual, then each gets one logit; softmax over the bag.
     The pooled point is the weighted midpoint of the raw embeddings."""
 
     N_FEAT = 4                                                               # age, pos, d_mid, d_0
@@ -67,6 +67,7 @@ class BagWeights(nn.Module):
 
         self.embed = nn.Linear(self.N_FEAT, d_model)
         self.attn = SelfAttention(d_model, n_heads)
+        self.attn_norm = nn.LayerNorm(d_model)                              # post-LN: after the residual
         self.logit = nn.Linear(d_model, 1)
 
     def forward(self, tokens: WalkTokens, r_mean: torch.Tensor):
@@ -100,7 +101,7 @@ class BagWeights(nn.Module):
 
         feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
         h = F.gelu(self.embed(feats))                                        # [Q, T, d_model]
-        h = h + self.attn(h, valid)                                          # [Q, T, d_model]
+        h = self.attn_norm(h + self.attn(h, valid))                          # [Q, T, d_model]
         logits = self.logit(h).squeeze(-1)                                   # [Q, T]
         log_weights = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T]
         pooled = weighted_midpoint(points, log_weights.exp())                # [Q, d]
