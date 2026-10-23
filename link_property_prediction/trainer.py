@@ -196,13 +196,6 @@ class Trainer:
             parts.append("w=[" + ",".join(f"{x:+.4f}" for x in w) + "]")
         if hasattr(self.model, "beta"):
             parts.append(f"beta={float(self.model.beta):+.4f}")
-        # The residual pooler's linear branch, if present: the weighting's linear law in
-        # feature units, one weight per feature. Without it a null cannot say whether
-        # the skip carried the model or stayed at its zero init.
-        bw = getattr(self.model, "bag_weights", None)
-        if bw is not None and hasattr(bw, "skip"):
-            w = bw.skip.weight.detach().flatten().tolist()
-            parts.append("skip=[" + ",".join(f"{x:+.4f}" for x in w) + "]")
         return ("  " + "  ".join(parts)) if parts else ""
 
     # Eval — strict-causal, no_grad

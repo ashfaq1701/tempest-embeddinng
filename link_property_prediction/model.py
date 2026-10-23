@@ -38,10 +38,6 @@ class BagWeights(nn.Module):
         layers.append(nn.Linear(self.hidden, 1))
         self.net = nn.Sequential(*layers)
 
-        self.skip = nn.Linear(self.n_feat, 1, bias=False)
-        with torch.no_grad():
-            self.skip.weight.copy_(torch.tensor([[-1.0, -1.0, 0.0, 0.0]]))
-
     def forward(self, tokens: WalkTokens, r_mean: torch.Tensor):
         """Token points [Q, T, d], log-weights [Q, T] (-inf on padding) and weighted midpoint [Q, d]."""
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
@@ -72,7 +68,7 @@ class BagWeights(nn.Module):
         d_0 = fixed.norm(dim=-1) * valid_f / r_mean                          # [Q, T]
 
         feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
-        logits = (self.skip(feats) + self.net(feats)).squeeze(-1)            # [Q, T]
+        logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         log_weights = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T]
         pooled = weighted_midpoint(points, log_weights.exp())                # [Q, d]
         return points, log_weights, pooled
