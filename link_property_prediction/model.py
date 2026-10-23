@@ -30,6 +30,13 @@ class SelfAttention(nn.Module):
         self.qkv = nn.Linear(d_model, 3 * d_model)                          # query, key, value, fused
         self.out = nn.Linear(d_model, d_model)
 
+    @staticmethod
+    def chunked_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """SDPA over chunks of at most _SDPA_MAX_BATCH bags; bags are independent, so this is exact."""
+        return torch.cat([F.scaled_dot_product_attention(qc, kc, vc, attn_mask=mc)
+                          for qc, kc, vc, mc in zip(q.split(_SDPA_MAX_BATCH), k.split(_SDPA_MAX_BATCH),
+                                                    v.split(_SDPA_MAX_BATCH), mask.split(_SDPA_MAX_BATCH))])
+
     def forward(self, h: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """h [Q, T, d_model], valid [Q, T] (keys that may be attended to) -> [Q, T, d_model]."""
         q_len, t_len, d_model = h.shape
@@ -38,13 +45,6 @@ class SelfAttention(nn.Module):
                    for x in (q, k, v))                                       # [Q, H, T, d_head] each
         attended = self.chunked_sdpa(q, k, v, valid[:, None, None, :])      # [Q, H, T, d_head]
         return self.out(attended.transpose(1, 2).reshape(q_len, t_len, d_model))
-
-    @staticmethod
-    def chunked_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """SDPA over chunks of at most _SDPA_MAX_BATCH bags; bags are independent, so this is exact."""
-        return torch.cat([F.scaled_dot_product_attention(qc, kc, vc, attn_mask=mc)
-                          for qc, kc, vc, mc in zip(q.split(_SDPA_MAX_BATCH), k.split(_SDPA_MAX_BATCH),
-                                                    v.split(_SDPA_MAX_BATCH), mask.split(_SDPA_MAX_BATCH))])
 
 
 class BagWeights(nn.Module):
