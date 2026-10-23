@@ -94,7 +94,7 @@ class BagWeights(nn.Module):
             valid[cold, 0] = True
 
         points = F.embedding(nodes, self.E.weight)                           # [Q, T, d]
-        # Features see token positions only; E's gradient flows through `points` and the anchors.
+        # Features and anchors see token positions only; E's gradient flows through `points`.
         fixed = points.detach()                                              # [Q, T, d]
         valid_f = valid.to(fixed.dtype)                                      # [Q, T]
 
@@ -103,7 +103,7 @@ class BagWeights(nn.Module):
         age = torch.log1p(age) / self.log_T_train                            # [Q, T]
         pos = pos / self.max_walk_len                                        # [Q, T]
 
-        anchors = self.anchors(points, valid, r_mean)                        # [Q, m, d]
+        anchors = self.anchors(fixed, valid, r_mean)                         # [Q, m, d]
         d_anchor = self.anchor_distances(fixed, anchors, valid_f)            # [Q, T, m]
 
         feats = torch.cat([torch.stack([age, pos], dim=-1), d_anchor], dim=-1)  # [Q, T, 2 + m]
