@@ -14,15 +14,53 @@ def dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return ((x - y) ** 2).sum(-1).clamp_min(_SQ_DIST_FLOOR).sqrt()
 
 
+def pairwise_dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Euclidean distances between x [..., N, d] and y [..., M, d] -> [..., N, M], with no [N, M, d] tensor."""
+    sq = (x * x).sum(-1, keepdim=True) + (y * y).sum(-1).unsqueeze(-2) - 2 * x @ y.transpose(-1, -2)
+    return sq.clamp_min(_SQ_DIST_FLOOR).sqrt()
+
+
 def weighted_midpoint(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """Weighted mean of points x [..., T, d] under weights w [..., T] summing to 1."""
     return (w.unsqueeze(-1) * x).sum(-2)                                     # [..., d]
 
 
+class BagAnchors(nn.Module):
+    """m anchor points per bag by learned-query cross-attention (Set Transformer PMA / ISAB inducing points).
+
+    Each head scores the bag's tokens by their scale-free position against one learned query, then
+    averages the raw embeddings under those weights. Values are E itself (no W_v / W_o) and the heads
+    stay separate, so every anchor is a convex point in the bag's neighbourhood."""
+
+    def __init__(self, d_emb: int, n_anchors: int = 4):
+        super().__init__()
+        if d_emb % n_anchors:
+            raise ValueError(f"d_emb ({d_emb}) must be divisible by n_anchors ({n_anchors})")
+        self.n_anchors = int(n_anchors)
+        self.d_key = d_emb // self.n_anchors
+        self.W_k = nn.Linear(d_emb, d_emb, bias=False)                       # the heads' key projections, stacked
+        self.queries = nn.Parameter(torch.randn(self.n_anchors, self.d_key))  # one learned query per head
+        nn.init.xavier_uniform_(self.W_k.weight)
+
+    def attention(self, points: torch.Tensor, valid: torch.Tensor, r_mean: torch.Tensor) -> torch.Tensor:
+        """Each head's weights over the bag's real tokens [Q, m, T]; every row sums to 1."""
+        q_len, t_len, _ = points.shape
+        keys = self.W_k(points / r_mean).view(q_len, t_len, self.n_anchors, self.d_key)  # [Q, T, m, d_key]
+        scores = torch.einsum("qtmk,mk->qmt", keys, self.queries) / self.d_key ** 0.5     # [Q, m, T]
+        scores = scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
+        return torch.softmax(scores, dim=-1)
+
+    def forward(self, points: torch.Tensor, valid: torch.Tensor, r_mean: torch.Tensor) -> torch.Tensor:
+        """Anchor points [Q, m, d]: each head's attention-weighted mean of the bag's raw embeddings."""
+        return self.attention(points, valid, r_mean) @ points
+
+
 class BagWeights(nn.Module):
+    """Pooling weights from token features [age, pos, d_0, d_anchor_1..m]: an MLP scores each token by
+    its time, hop, radius and distance to each of the bag's m learned anchors."""
 
     def __init__(self, E: nn.Embedding, T_train: int, max_walk_len: int,
-                 hidden_dim: int = 32, n_layers: int = 2):
+                 hidden_dim: int = 32, n_layers: int = 2, n_anchors: int = 4):
         super().__init__()
         self.E = E
         self.log_T_train = math.log1p(T_train)
@@ -31,12 +69,20 @@ class BagWeights(nn.Module):
         self.n_layers = int(n_layers)
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 4
+        self.anchors = BagAnchors(E.weight.shape[1], n_anchors)
+        self.n_feat = 3 + n_anchors                                          # age, pos, d_0, d_anchor_1..m
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
         layers.append(nn.Linear(self.hidden, 1))
         self.net = nn.Sequential(*layers)
+
+    @staticmethod
+    def anchor_distances(fixed: torch.Tensor, anchors: torch.Tensor, valid_f: torch.Tensor) -> torch.Tensor:
+        """Each token's distance to each anchor, over its bag's mean for that anchor: [Q, T, m], 0 on padding."""
+        d_tok_anchor = pairwise_dist(fixed, anchors) * valid_f.unsqueeze(-1)  # [Q, T, m]
+        d_mean = d_tok_anchor.sum(1, keepdim=True) / valid_f.sum(-1).view(-1, 1, 1)  # [Q, 1, m]
+        return d_tok_anchor / d_mean.clamp_min(torch.finfo(d_mean.dtype).tiny)
 
     def forward(self, tokens: WalkTokens, r_mean: torch.Tensor):
         """Token points [Q, T, d], log-weights [Q, T] (-inf on padding) and weighted midpoint [Q, d]."""
@@ -48,26 +94,21 @@ class BagWeights(nn.Module):
             valid[cold, 0] = True
 
         points = F.embedding(nodes, self.E.weight)                           # [Q, T, d]
-        # Features see positions only; E's gradient flows through `points`.
+        # Features see token positions only; E's gradient flows through `points` and the anchors.
         fixed = points.detach()                                              # [Q, T, d]
-
         valid_f = valid.to(fixed.dtype)                                      # [Q, T]
-        mid = weighted_midpoint(fixed, valid_f / valid_f.sum(-1, keepdim=True))  # [Q, d]
 
         age = tokens.ages.flatten(1).clamp_min(0).to(fixed.dtype)            # [Q, T]
         pos = tokens.positions.flatten(1).to(fixed.dtype)                    # [Q, T]
         age = torch.log1p(age) / self.log_T_train                            # [Q, T]
         pos = pos / self.max_walk_len                                        # [Q, T]
 
-        tiny = torch.finfo(fixed.dtype).tiny
-
-        d_tok_mid = dist(fixed, mid.unsqueeze(-2))                           # [Q, T]
-        d_mid_mean = (d_tok_mid * valid_f).sum(-1, keepdim=True) / valid_f.sum(-1, keepdim=True)  # [Q, 1]
-        d_mid = d_tok_mid * valid_f / d_mid_mean.clamp_min(tiny)             # [Q, T]
-
         d_0 = fixed.norm(dim=-1) * valid_f / r_mean                          # [Q, T]
 
-        feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
+        anchors = self.anchors(points, valid, r_mean)                        # [Q, m, d]
+        d_anchor = self.anchor_distances(fixed, anchors, valid_f)            # [Q, T, m]
+
+        feats = torch.cat([torch.stack([age, pos, d_0], dim=-1), d_anchor], dim=-1)  # [Q, T, 3 + m]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         log_weights = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T]
         pooled = weighted_midpoint(points, log_weights.exp())                # [Q, d]
@@ -79,7 +120,7 @@ class LinkPredHead(nn.Module):
     INIT_RADIUS = 1e-3
 
     def __init__(self, num_nodes: int, T_train: int, max_walk_len: int, d_emb: int,
-                 hidden_dim: int = 32, n_layers_pooler: int = 2, seed: int = 42):
+                 hidden_dim: int = 32, n_layers_pooler: int = 2, n_anchors: int = 4, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.T_train = int(T_train)
@@ -94,7 +135,7 @@ class LinkPredHead(nn.Module):
                                 * (self.INIT_RADIUS / self.d_emb ** 0.5))
 
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
-                                      hidden_dim=hidden_dim, n_layers=n_layers_pooler)
+                                      hidden_dim=hidden_dim, n_layers=n_layers_pooler, n_anchors=n_anchors)
 
         self.w = nn.Parameter(torch.tensor([1.0]))
         self.beta = nn.Parameter(torch.tensor([0.0]))                       # >= 0; 0 is the weighted mean

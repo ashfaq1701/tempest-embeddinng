@@ -46,6 +46,9 @@ class TrainerConfig:
     # change can be attributed to one of them. 1 reproduces the pre-c2a7c95 shape.
     n_layers_pooler: int = 2
 
+    # Anchors per bag: learned-query attention heads whose weighted means replace the bag centroid.
+    n_anchors: int = 4
+
     # Per-query training negatives ([B, 1+K_train]).
     K_train: int = 5
 
@@ -85,6 +88,7 @@ class Trainer:
             d_emb=int(config.d_emb),
             hidden_dim=int(config.hidden_dim),
             n_layers_pooler=int(config.n_layers_pooler),
+            n_anchors=int(config.n_anchors),
             seed=int(config.seed),
         ).to(self.device)
 

@@ -91,6 +91,9 @@ def parse_args() -> argparse.Namespace:
                    help="Hidden Linear->GELU stages in the pooler MLP (>= 1). Each past the "
                         "first inserts a Linear(hidden, hidden) -> GELU before the output "
                         "layer. 1 reproduces the single-hidden-layer shape used before.")
+    p.add_argument("--n-anchors", default=4, type=int,
+                   help="Learned anchors per bag (attention heads; must divide --d-emb). Each token's "
+                        "distance to each anchor replaces its distance to the bag centroid.")
 
     # ── Post-training outputs ───────────────────────────────────────
     p.add_argument("--export-best-embedding-table", action="store_true",
@@ -165,6 +168,7 @@ def main() -> Dict[str, Any]:
         d_emb=args.d_emb,
         hidden_dim=args.hidden_dim,
         n_layers_pooler=args.n_layers_pooler,
+        n_anchors=args.n_anchors,
 
         K_train=args.k_train,
 
