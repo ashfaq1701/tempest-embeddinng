@@ -19,34 +19,30 @@ def weighted_midpoint(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return (w.unsqueeze(-1) * x).sum(-2)                                     # [..., d]
 
 
-class EncoderLayer(nn.Module):
-    """Pre-LN Transformer encoder layer over token features; attention only over real tokens."""
+class SelfAttention(nn.Module):
+    """Multi-head scaled dot-product self-attention over the real tokens (no LayerNorm, no FFN)."""
 
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
         self.n_heads = n_heads
-        self.ln_attn = nn.LayerNorm(d_model)
         self.qkv = nn.Linear(d_model, 3 * d_model)
         self.out = nn.Linear(d_model, d_model)
-        self.ln_ffn = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model))
 
     def forward(self, h: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """h [Q, T, d_model], valid [Q, T] (keys that may be attended to) -> [Q, T, d_model]."""
         q_len, t_len, d_model = h.shape
-        qkv = self.qkv(self.ln_attn(h)).view(q_len, t_len, 3, self.n_heads, d_model // self.n_heads)
+        qkv = self.qkv(h).view(q_len, t_len, 3, self.n_heads, d_model // self.n_heads)
         q, k, v = qkv.permute(2, 0, 3, 1, 4)                                 # [Q, H, T, d_head] each
         attended = F.scaled_dot_product_attention(q, k, v, attn_mask=valid[:, None, None, :])  # [Q, H, T, d_head]
-        h = h + self.out(attended.transpose(1, 2).reshape(q_len, t_len, d_model))
-        return h + self.ffn(self.ln_ffn(h))
+        return self.out(attended.transpose(1, 2).reshape(q_len, t_len, d_model))
 
 
 class BagWeights(nn.Module):
     """Pooling weights from self-attention over the bag's token features.
 
     Each token is its feature vector [age, pos, d_mid, d_0] -- no embedding content. Tokens see each
-    other through one Transformer encoder layer, then each gets one logit; softmax over the bag. The
-    pooled point is the weighted midpoint of the raw embeddings."""
+    other through one self-attention with a residual, then each gets one logit; softmax over the bag.
+    The pooled point is the weighted midpoint of the raw embeddings."""
 
     N_FEAT = 4                                                               # age, pos, d_mid, d_0
 
@@ -60,8 +56,8 @@ class BagWeights(nn.Module):
         self.max_walk_len = int(max_walk_len)
 
         self.embed = nn.Linear(self.N_FEAT, d_model)
-        self.encoder = EncoderLayer(d_model, n_heads)
-        self.logit = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))
+        self.attn = SelfAttention(d_model, n_heads)
+        self.logit = nn.Linear(d_model, 1)
 
     def forward(self, tokens: WalkTokens, r_mean: torch.Tensor):
         """Token points [Q, T, d], log-weights [Q, T] (-inf on padding) and weighted midpoint [Q, d]."""
@@ -93,7 +89,8 @@ class BagWeights(nn.Module):
         d_0 = fixed.norm(dim=-1) * valid_f / r_mean                          # [Q, T]
 
         feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
-        h = self.encoder(self.embed(feats), valid)                           # [Q, T, d_model]
+        h = F.gelu(self.embed(feats))                                        # [Q, T, d_model]
+        h = h + self.attn(h, valid)                                          # [Q, T, d_model]
         logits = self.logit(h).squeeze(-1)                                   # [Q, T]
         log_weights = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T]
         pooled = weighted_midpoint(points, log_weights.exp())                # [Q, d]
