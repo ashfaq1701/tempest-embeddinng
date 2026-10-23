@@ -20,7 +20,7 @@ def weighted_midpoint(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 
 class SelfAttention(nn.Module):
-    """Multi-head scaled dot-product self-attention over the real tokens (no LayerNorm, no FFN)."""
+    """Multi-head scaled dot-product self-attention over the real tokens."""
 
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
