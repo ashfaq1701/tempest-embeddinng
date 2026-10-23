@@ -25,14 +25,16 @@ class SelfAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
         self.n_heads = n_heads
-        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.d_head = d_model // n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model)                          # query, key, value, fused
         self.out = nn.Linear(d_model, d_model)
 
     def forward(self, h: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """h [Q, T, d_model], valid [Q, T] (keys that may be attended to) -> [Q, T, d_model]."""
         q_len, t_len, d_model = h.shape
-        qkv = self.qkv(h).view(q_len, t_len, 3, self.n_heads, d_model // self.n_heads)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4)                                 # [Q, H, T, d_head] each
+        q, k, v = self.qkv(h).chunk(3, dim=-1)                               # [Q, T, d_model] each
+        q, k, v = (x.view(q_len, t_len, self.n_heads, self.d_head).transpose(1, 2)
+                   for x in (q, k, v))                                       # [Q, H, T, d_head] each
         attended = F.scaled_dot_product_attention(q, k, v, attn_mask=valid[:, None, None, :])  # [Q, H, T, d_head]
         return self.out(attended.transpose(1, 2).reshape(q_len, t_len, d_model))
 
