@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from .walk_tokens import WalkTokens
 
 _SQ_DIST_FLOOR = 1e-12
+_SDPA_MAX_BATCH = 65_535        # CUDA's grid y/z limit: the most bags one memory-efficient SDPA call can launch
 
 
 def dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -35,8 +36,15 @@ class SelfAttention(nn.Module):
         q, k, v = self.qkv(h).chunk(3, dim=-1)                               # [Q, T, d_model] each
         q, k, v = (x.view(q_len, t_len, self.n_heads, self.d_head).transpose(1, 2)
                    for x in (q, k, v))                                       # [Q, H, T, d_head] each
-        attended = F.scaled_dot_product_attention(q, k, v, attn_mask=valid[:, None, None, :])  # [Q, H, T, d_head]
+        attended = self.chunked_sdpa(q, k, v, valid[:, None, None, :])      # [Q, H, T, d_head]
         return self.out(attended.transpose(1, 2).reshape(q_len, t_len, d_model))
+
+    @staticmethod
+    def chunked_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """SDPA over chunks of at most _SDPA_MAX_BATCH bags; bags are independent, so this is exact."""
+        return torch.cat([F.scaled_dot_product_attention(qc, kc, vc, attn_mask=mc)
+                          for qc, kc, vc, mc in zip(q.split(_SDPA_MAX_BATCH), k.split(_SDPA_MAX_BATCH),
+                                                    v.split(_SDPA_MAX_BATCH), mask.split(_SDPA_MAX_BATCH))])
 
 
 class BagWeights(nn.Module):
