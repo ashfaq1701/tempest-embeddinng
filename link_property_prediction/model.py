@@ -20,7 +20,7 @@ def weighted_midpoint(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 
 class EncoderLayer(nn.Module):
-    """Pre-LN Transformer encoder layer over token features, with an additive attention bias."""
+    """Pre-LN Transformer encoder layer over token features; attention only over real tokens."""
 
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
@@ -31,12 +31,12 @@ class EncoderLayer(nn.Module):
         self.ln_ffn = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model))
 
-    def forward(self, h: torch.Tensor, attn_bias: torch.Tensor) -> torch.Tensor:
-        """h [Q, T, d_model], attn_bias [Q, H, T, T] (-inf on padding keys) -> [Q, T, d_model]."""
+    def forward(self, h: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """h [Q, T, d_model], valid [Q, T] (keys that may be attended to) -> [Q, T, d_model]."""
         q_len, t_len, d_model = h.shape
         qkv = self.qkv(self.ln_attn(h)).view(q_len, t_len, 3, self.n_heads, d_model // self.n_heads)
         q, k, v = qkv.permute(2, 0, 3, 1, 4)                                 # [Q, H, T, d_head] each
-        attended = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)  # [Q, H, T, d_head]
+        attended = F.scaled_dot_product_attention(q, k, v, attn_mask=valid[:, None, None, :])  # [Q, H, T, d_head]
         h = h + self.out(attended.transpose(1, 2).reshape(q_len, t_len, d_model))
         return h + self.ffn(self.ln_ffn(h))
 
@@ -45,9 +45,8 @@ class BagWeights(nn.Module):
     """Pooling weights from self-attention over the bag's token features.
 
     Each token is its feature vector [age, pos, d_mid, d_0] -- no embedding content. Tokens see each
-    other through a Transformer encoder whose attention adds the two relations the per-token features
-    cannot express: pairwise distance / r_mean and a same-node indicator. One logit per token, softmax
-    over the bag; the pooled point is the weighted midpoint of the raw embeddings."""
+    other through one Transformer encoder layer, then each gets one logit; softmax over the bag. The
+    pooled point is the weighted midpoint of the raw embeddings."""
 
     N_FEAT = 4                                                               # age, pos, d_mid, d_0
 
@@ -59,22 +58,10 @@ class BagWeights(nn.Module):
         self.E = E
         self.log_T_train = math.log1p(T_train)
         self.max_walk_len = int(max_walk_len)
-        self.n_heads = int(n_heads)
 
         self.embed = nn.Linear(self.N_FEAT, d_model)
-        self.dist_bias = nn.Parameter(torch.zeros(n_heads))                  # per head: weight on pairwise distance
-        self.same_node = nn.Parameter(torch.zeros(n_heads))                  # per head: bias for repeats of a node
         self.encoder = EncoderLayer(d_model, n_heads)
         self.logit = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))
-
-    def attention_bias(self, nodes: torch.Tensor, valid: torch.Tensor, fixed: torch.Tensor,
-                       r_mean: torch.Tensor) -> torch.Tensor:
-        """Additive bias [Q, H, T, T] from pairwise distance and same node; -inf on padding keys."""
-        pair_dist = (torch.cdist(fixed, fixed) / r_mean).unsqueeze(1)        # [Q, 1, T, T]
-        same = (nodes.unsqueeze(-1) == nodes.unsqueeze(-2)).to(fixed.dtype).unsqueeze(1)  # [Q, 1, T, T]
-        bias = (self.dist_bias.view(1, -1, 1, 1) * pair_dist
-                + self.same_node.view(1, -1, 1, 1) * same)                   # [Q, H, T, T]
-        return bias.masked_fill(~valid[:, None, None, :], float("-inf"))
 
     def forward(self, tokens: WalkTokens, r_mean: torch.Tensor):
         """Token points [Q, T, d], log-weights [Q, T] (-inf on padding) and weighted midpoint [Q, d]."""
@@ -106,8 +93,7 @@ class BagWeights(nn.Module):
         d_0 = fixed.norm(dim=-1) * valid_f / r_mean                          # [Q, T]
 
         feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
-        attn_bias = self.attention_bias(nodes, valid, fixed, r_mean)          # [Q, H, T, T]
-        h = self.encoder(self.embed(feats), attn_bias)                       # [Q, T, d_model]
+        h = self.encoder(self.embed(feats), valid)                           # [Q, T, d_model]
         logits = self.logit(h).squeeze(-1)                                   # [Q, T]
         log_weights = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T]
         pooled = weighted_midpoint(points, log_weights.exp())                # [Q, d]
