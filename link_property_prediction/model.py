@@ -56,8 +56,8 @@ class BagAnchors(nn.Module):
 
 
 class BagWeights(nn.Module):
-    """Pooling weights from token features [age, pos, d_0, d_anchor_1..m]: an MLP scores each token by
-    its time, hop, radius and distance to each of the bag's m learned anchors."""
+    """Pooling weights from token features [age, pos, d_anchor_1..m]: an MLP scores each token by its
+    time, hop and distance to each of the bag's m learned anchors."""
 
     def __init__(self, E: nn.Embedding, T_train: int, max_walk_len: int,
                  hidden_dim: int = 32, n_layers: int = 2, n_anchors: int = 4):
@@ -70,7 +70,7 @@ class BagWeights(nn.Module):
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
         self.anchors = BagAnchors(E.weight.shape[1], n_anchors)
-        self.n_feat = 3 + n_anchors                                          # age, pos, d_0, d_anchor_1..m
+        self.n_feat = 2 + n_anchors                                          # age, pos, d_anchor_1..m
         layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
         for _ in range(self.n_layers - 1):
             layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
@@ -103,12 +103,10 @@ class BagWeights(nn.Module):
         age = torch.log1p(age) / self.log_T_train                            # [Q, T]
         pos = pos / self.max_walk_len                                        # [Q, T]
 
-        d_0 = fixed.norm(dim=-1) * valid_f / r_mean                          # [Q, T]
-
         anchors = self.anchors(points, valid, r_mean)                        # [Q, m, d]
         d_anchor = self.anchor_distances(fixed, anchors, valid_f)            # [Q, T, m]
 
-        feats = torch.cat([torch.stack([age, pos, d_0], dim=-1), d_anchor], dim=-1)  # [Q, T, 3 + m]
+        feats = torch.cat([torch.stack([age, pos], dim=-1), d_anchor], dim=-1)  # [Q, T, 2 + m]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         log_weights = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T]
         pooled = weighted_midpoint(points, log_weights.exp())                # [Q, d]
