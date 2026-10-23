@@ -19,24 +19,69 @@ def weighted_midpoint(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return (w.unsqueeze(-1) * x).sum(-2)                                     # [..., d]
 
 
+class EncoderLayer(nn.Module):
+    """Pre-LN Transformer encoder layer over token features, with an additive attention bias."""
+
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        self.n_heads = n_heads
+        self.ln_attn = nn.LayerNorm(d_model)
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.out = nn.Linear(d_model, d_model)
+        self.ln_ffn = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model))
+
+    def forward(self, h: torch.Tensor, attn_bias: torch.Tensor) -> torch.Tensor:
+        """h [Q, T, d_model], attn_bias [Q, H, T, T] (-inf on padding keys) -> [Q, T, d_model]."""
+        q_len, t_len, d_model = h.shape
+        qkv = self.qkv(self.ln_attn(h)).view(q_len, t_len, 3, self.n_heads, d_model // self.n_heads)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4)                                 # [Q, H, T, d_head] each
+        attended = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)  # [Q, H, T, d_head]
+        h = h + self.out(attended.transpose(1, 2).reshape(q_len, t_len, d_model))
+        return h + self.ffn(self.ln_ffn(h))
+
+
 class BagWeights(nn.Module):
+    """Pooling weights from self-attention over the bag's token features.
+
+    Each token is its feature vector [age, pos, d_mid, d_0] -- no embedding content. Tokens see each
+    other through a Transformer encoder whose attention carries relative biases: time gap, hop gap,
+    pairwise distance / r_mean and a same-node indicator. One logit per token, softmax over the bag;
+    the pooled point is the weighted midpoint of the raw embeddings."""
+
+    N_FEAT = 4                                                               # age, pos, d_mid, d_0
+    N_PAIR = 3                                                               # |age gap|, hop gap, distance
 
     def __init__(self, E: nn.Embedding, T_train: int, max_walk_len: int,
-                 hidden_dim: int = 32, n_layers: int = 2):
+                 d_model: int = 32, n_heads: int = 4, n_layers: int = 1):
         super().__init__()
+        if d_model % n_heads:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+        if n_layers < 1:
+            raise ValueError(f"n_layers must be >= 1, got {n_layers}")
         self.E = E
         self.log_T_train = math.log1p(T_train)
         self.max_walk_len = int(max_walk_len)
-        self.hidden = int(hidden_dim)
-        self.n_layers = int(n_layers)
-        if self.n_layers < 1:
-            raise ValueError(f"n_layers must be >= 1, got {n_layers}")
-        self.n_feat = 4
-        layers = [nn.Linear(self.n_feat, self.hidden), nn.GELU()]
-        for _ in range(self.n_layers - 1):
-            layers += [nn.Linear(self.hidden, self.hidden), nn.GELU()]
-        layers.append(nn.Linear(self.hidden, 1))
-        self.net = nn.Sequential(*layers)
+        self.n_heads = int(n_heads)
+
+        self.embed = nn.Linear(self.N_FEAT, d_model)
+        self.pair_bias = nn.Linear(self.N_PAIR, n_heads, bias=False)         # relative bias, shared by layers
+        self.same_node = nn.Parameter(torch.zeros(n_heads))                  # bias for repeats of one node
+        self.layers = nn.ModuleList(EncoderLayer(d_model, n_heads) for _ in range(n_layers))
+        self.logit = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))
+
+    def attention_bias(self, nodes: torch.Tensor, valid: torch.Tensor, age: torch.Tensor,
+                       pos: torch.Tensor, fixed: torch.Tensor, r_mean: torch.Tensor) -> torch.Tensor:
+        """Additive bias [Q, H, T, T]: relative time / hop / distance, same node, -inf on padding keys."""
+        age_gap = (age.unsqueeze(-1) - age.unsqueeze(-2)).abs()              # [Q, T, T]
+        hop_gap = pos.unsqueeze(-1) - pos.unsqueeze(-2)                      # [Q, T, T]
+        pair_dist = torch.cdist(fixed, fixed) / r_mean                       # [Q, T, T]
+        pairs = torch.stack([age_gap, hop_gap, pair_dist], dim=-1)           # [Q, T, T, 3]
+        bias = self.pair_bias(pairs).permute(0, 3, 1, 2)                     # [Q, H, T, T]
+
+        same = (nodes.unsqueeze(-1) == nodes.unsqueeze(-2)).to(bias.dtype)  # [Q, T, T]
+        bias = bias + self.same_node.view(1, -1, 1, 1) * same.unsqueeze(1)
+        return bias.masked_fill(~valid[:, None, None, :], float("-inf"))
 
     def forward(self, tokens: WalkTokens, r_mean: torch.Tensor):
         """Token points [Q, T, d], log-weights [Q, T] (-inf on padding) and weighted midpoint [Q, d]."""
@@ -68,7 +113,11 @@ class BagWeights(nn.Module):
         d_0 = fixed.norm(dim=-1) * valid_f / r_mean                          # [Q, T]
 
         feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
-        logits = self.net(feats).squeeze(-1)                                 # [Q, T]
+        attn_bias = self.attention_bias(nodes, valid, age, pos, fixed, r_mean)  # [Q, H, T, T]
+        h = self.embed(feats)                                                # [Q, T, d_model]
+        for layer in self.layers:
+            h = layer(h, attn_bias)                                          # [Q, T, d_model]
+        logits = self.logit(h).squeeze(-1)                                   # [Q, T]
         log_weights = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T]
         pooled = weighted_midpoint(points, log_weights.exp())                # [Q, d]
         return points, log_weights, pooled
@@ -79,7 +128,7 @@ class LinkPredHead(nn.Module):
     INIT_RADIUS = 1e-3
 
     def __init__(self, num_nodes: int, T_train: int, max_walk_len: int, d_emb: int,
-                 hidden_dim: int = 32, n_layers_pooler: int = 2, seed: int = 42):
+                 d_model: int = 32, n_heads: int = 4, n_layers: int = 1, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.T_train = int(T_train)
@@ -94,7 +143,7 @@ class LinkPredHead(nn.Module):
                                 * (self.INIT_RADIUS / self.d_emb ** 0.5))
 
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
-                                      hidden_dim=hidden_dim, n_layers=n_layers_pooler)
+                                      d_model=d_model, n_heads=n_heads, n_layers=n_layers)
 
         self.w = nn.Parameter(torch.tensor([1.0]))
         self.beta = nn.Parameter(torch.tensor([0.0]))                       # >= 0; 0 is the weighted mean
