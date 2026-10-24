@@ -59,11 +59,8 @@ class BagWeights(nn.Module):
         age = torch.log1p(age) / self.log_T_train                            # [Q, T]
         pos = pos / self.max_walk_len                                        # [Q, T]
 
-        tiny = torch.finfo(fixed.dtype).tiny
-
         d_tok_mid = dist(fixed, mid.unsqueeze(-2))                           # [Q, T]
-        d_mid_mean = (d_tok_mid * valid_f).sum(-1, keepdim=True) / valid_f.sum(-1, keepdim=True)  # [Q, 1]
-        d_mid = d_tok_mid * valid_f / d_mid_mean.clamp_min(tiny)             # [Q, T]
+        d_mid = d_tok_mid * valid_f / r_mean                                 # [Q, T]
 
         d_0 = fixed.norm(dim=-1) * valid_f / r_mean                          # [Q, T]
 
