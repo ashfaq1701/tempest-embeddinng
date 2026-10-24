@@ -13,8 +13,8 @@ TGB (--data-suite tgb):
 
 tgbl-wiki:     --is-bipartite --eval-batch-size 200
 tgbl-review:   --n-layers-pooler 1
-tgbl-coin:     -
-tgbl-comment:  -
+tgbl-coin:     --n-layers-pooler 1
+tgbl-comment:  --n-layers-pooler 1
 tgbl-flight:   -
 
 DyGLib (--data-suite dyglib):
