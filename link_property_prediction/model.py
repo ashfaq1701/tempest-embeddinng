@@ -113,9 +113,9 @@ class LinkPredHead(nn.Module):
                    r_mean: torch.Tensor) -> torch.Tensor:
         """Distance from x to a bag in units of the table's mean radius, under softmax(log w_j - beta * d_j):
         mean at 0, nearest as beta grows. Invariant to rescaling the whole table."""
-        dist_to_tokens = dist(x.unsqueeze(-2), points) / r_mean              # [..., T]
-        attn = torch.softmax(log_weights - self.beta * dist_to_tokens, dim=-1)  # [..., T]
-        return (attn * dist_to_tokens).sum(-1)                               # [...]
+        dist_to_tokens = dist(x.unsqueeze(-2), points)              # [..., T]
+        attn = torch.softmax(log_weights - self.beta * dist_to_tokens / r_mean, dim=-1)  # [..., T]
+        return (attn * dist_to_tokens).sum(-1)
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Score candidates by the pooled-point-to-bag gaps in both directions."""
