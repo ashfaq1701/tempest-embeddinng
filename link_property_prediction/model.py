@@ -111,8 +111,10 @@ class LinkPredHead(nn.Module):
 
     def gap_to_bag(self, x: torch.Tensor, points: torch.Tensor, log_weights: torch.Tensor,
                    r_mean: torch.Tensor) -> torch.Tensor:
-        """Distance from x to a bag in units of the table's mean radius, under softmax(log w_j - beta * d_j):
-        mean at 0, nearest as beta grows. Invariant to rescaling the whole table."""
+        """Raw distance from x to a bag under softmax(log w_j - beta * d_j / r_mean):
+        mean at 0, nearest as beta grows. The attention is invariant to rescaling the whole
+        table; the returned gap is NOT -- it carries the table's scale, which the learned w
+        then has to track as r_mean grows."""
         dist_to_tokens = dist(x.unsqueeze(-2), points)              # [..., T]
         attn = torch.softmax(log_weights - self.beta * dist_to_tokens / r_mean, dim=-1)  # [..., T]
         return (attn * dist_to_tokens).sum(-1)
