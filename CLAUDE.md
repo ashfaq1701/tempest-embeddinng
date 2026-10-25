@@ -849,3 +849,75 @@ the rare positives arrive in clumps; features are already causal so shuffling le
 - Tempest has no per-call seed and its RNG advances per call: a repeated walk call draws
   different walks; a fresh instance with the same seed replays exactly. The encoder therefore
   builds a fresh walker per pass (re-ingest ~0.2 s on Wikipedia).
+
+## Degree-proportional training negatives: a clear loss, do not re-run (measured, 2026-10-25)
+
+`--train-negatives degree` draws training negatives in proportion to train-split degree
+(word2vec's unigram rule on nodes) instead of uniformly over the train split's distinct
+candidates: the pool keeps every endpoint occurrence rather than `np.unique`-ing it. Branch
+`feature/degree-negatives` (`3f14de4`), one commit directly on top of master `633a5a0`, so this
+is a one-variable A/B. Evaluation negatives are untouched in both lanes -- TGB's shipped val and
+test sets -- and the train pool still comes from the train split only, so nothing leaks.
+
+TGB suite, 5 datasets, seed 5, d128 k5 keval100 wpn10 mwl5 lr1e-3 h32, per-dataset flags from
+`default_conf_variations.txt`. Control is master `633a5a0` run in the same sweep.
+Logs: `logs/dneg_m633a5a0` (control), `logs/dneg_dn3f14de4` (degree).
+
+| dataset | control | degree | d | sel/ran (ctl / deg) |
+|---|---|---|---|---|
+| tgbl-wiki | **0.7834** | 0.7775 | -0.0059 | 23/33 · 21/31 |
+| tgbl-review | **0.1463** | **0.1463** | 0.0000 | 2/12 · 1/11 |
+| tgbl-coin | **0.7031** | 0.5815 | **-0.1216** | 3/13 · 30/40 |
+| tgbl-flight | **0.7777** | 0.5960 | **-0.1817** | 1/11 · 1/11 |
+| tgbl-comment | (control pending) | 0.5389 | — | — · 1/11 |
+
+Max test equals the reported number on every degree cell and on control flight; control wiki
+peaked 0.7848 (0.0014 of drift) and control coin 0.7036 (0.0005).
+
+**It never wins a cell.** Where it ties (review) or nearly ties (wiki) the control itself selects
+within two epochs, so there is little for harder negatives to spoil. On the two cells where the
+control has something to lose it loses 0.12 and 0.18.
+
+**The mechanism is that it does not fit the harder negatives at all, and then spends the rest of
+the run reparameterising.** On tgbl-coin the train loss falls 0.6620 -> 0.3824 in five epochs and
+then moves only 0.3824 -> 0.3578 over the next 35, against the control reaching 0.0836 by ep6 and
+still falling. Through those 35 epochs `r_mean` grows near-linearly at ~+0.68/epoch to **29.5**
+and `r_max` to **141.6** -- the largest this project has logged -- while `w` decays 15x and the
+product `w * r_mean` sits pinned at 8.72-8.85 from ep5 onward. The effective score scale is
+constant to within 1%: every unit of radius growth is divided back out. Val sits in a 0.0092 band
+from ep6 to ep40 while +0.0003 flickers keep resetting patience, so 34 of 40 epochs bought
+nothing. tgbl-flight and tgbl-comment are the degenerate version of the same thing -- both select
+at **epoch 1 of 11**, i.e. best val is the first epoch and every subsequent epoch is worse.
+
+**Do not re-run this, and do not read the nulls as "degree negatives are neutral".** They are a
+0.12-0.18 regression on the cells that can express one. A lower lr or a radius bound might stop
+the inflation, but the inflation is a symptom: the loss is already flat before it starts.
+
+### `--k-train 3` is free on TGB (same sweep)
+
+A third lane ran the control code (`633a5a0`, unmodified) with `--k-train 3`, `k_eval` and the
+shipped eval negatives unchanged. Logs: `logs/dneg_k3_633a5a0`.
+
+| dataset | control (k5) | k3 | d |
+|---|---|---|---|
+| tgbl-wiki | 0.7834 | **0.7847** | +0.0013 |
+| tgbl-review | **0.1463** | 0.1401 | -0.0062 |
+| tgbl-coin | **0.7031** | 0.6943 | -0.0088 |
+| tgbl-flight | **0.7777** | 0.7761 | -0.0016 |
+| tgbl-comment | (control pending) | 0.6458 | — |
+
+**A genuine null: four cells, nothing above 0.009 either way, summing to -0.0153.** Note this is
+not symmetric with the k_train result on YouTube, where doubling 5 -> 10 cost 0.0124 (no `cos_o`)
+to 0.0498 (with `cos_o`). More negatives hurt on that suite; three instead of five costs nothing
+here. Useful as a cheap setting -- k3 ran 2.4x faster per epoch than k5 on the same node for
+tgbl-coin -- not as an improvement.
+
+### Three of five TGB cells are one-epoch datasets
+
+Across all three lanes, tgbl-flight selects at **ep1 in every arm** (control val 0.7936, k3
+0.7938 -- 0.0002 apart), tgbl-review at ep1-2, tgbl-comment at ep1-2. The radius-inflation /
+`w`-cancellation pattern is present in the **control** too, not just the degree arm: control
+flight holds `w * r_mean` at ~29 across ep1-4 while `r_mean` triples. So on TGB the model
+largely gets what it is going to get in a single pass, and the epochs after are patience
+bookkeeping. Read a TGB A/B off its first two epochs; a change that only moves epochs 5+ on
+this suite is probably moving nothing.
