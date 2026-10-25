@@ -103,9 +103,10 @@ class LinkPredHead(nn.Module):
         return r_mean.clamp_min(torch.finfo(r_mean.dtype).tiny)
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Score candidates by the raw distance between the two pooled points."""
-        r_mean = self.mean_radius()                                          # [] (the pooler's own units)
+        """Score candidates by the distance between the two pooled points, in units of the table's
+        mean radius."""
+        r_mean = self.mean_radius()                                          # []
         pooled_u = self.bag_weights(src_tokens, r_mean)                      # [b, d]
         pooled_v = self.bag_weights(cand_tokens, r_mean)                     # [b*c, d]
         pooled_v = pooled_v.view(pooled_u.shape[0], -1, pooled_u.shape[-1])  # [b, c, d]
-        return self.w * -dist(pooled_u.unsqueeze(1), pooled_v)               # [b, c]
+        return self.w * -dist(pooled_u.unsqueeze(1), pooled_v) / r_mean      # [b, c]
