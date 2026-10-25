@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from link_property_prediction.data import Loaded, concat_splits, create_batches
-from link_property_prediction.evaluator import SUITES, make_suite
+from link_property_prediction.evaluator import SUITES, TRAIN_NEGATIVES, make_suite
 from link_property_prediction.trainer import Trainer, TrainerConfig
 from link_property_prediction.utils import seed_all
 
@@ -60,6 +60,9 @@ def parse_args() -> argparse.Namespace:
                    help="Per-query training negatives.")
     p.add_argument("--k-eval", default=100, type=int,
                    help="Eval negatives per positive (tgb-seq val only).")
+    p.add_argument("--train-negatives", default="uniform", choices=TRAIN_NEGATIVES,
+                   help="Training negatives: uniform over the train split's distinct candidates, "
+                        "or in proportion to their train-split degree. Eval negatives are unaffected.")
 
     # ── Optimisation / training ─────────────────────────────────────
     p.add_argument("--lr", default=1e-3, type=float,
@@ -120,7 +123,7 @@ def main() -> Dict[str, Any]:
     suite = make_suite(
         args.data_suite,
         name=args.dataset, root=args.data_root, is_bipartite=args.is_bipartite,
-        k_eval=args.k_eval, seed=args.seed,
+        k_eval=args.k_eval, seed=args.seed, train_negatives=args.train_negatives,
     )
     loaded: Loaded = suite.load()
     print(f"loaded ({args.data_suite}) in {time.time() - t0:.1f}s")
@@ -134,8 +137,8 @@ def main() -> Dict[str, Any]:
 
     print(f"  num_nodes:     {num_nodes:,}")
     print(f"  T_train:       {loaded.T_train:,}")
-    print(f"  neg_pool:      {len(train_negative_pool):,} train {suite.candidate_kind} "
-          f"(training negatives)")
+    print(f"  neg_pool:      {len(np.unique(train_negative_pool)):,} train {suite.candidate_kind} "
+          f"(training negatives, {args.train_negatives})")
     print(f"  train edges:   {len(loaded.train.sources):,}")
     print(f"  val edges:     {len(loaded.val.sources):,}")
     print(f"  test edges:    {len(loaded.test.sources):,}")

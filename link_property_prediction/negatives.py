@@ -112,13 +112,14 @@ class CollisionFreeNegativeSampler(UniformNegativeSampler):
         seed: Optional[int] = None,
     ):
         super().__init__(num_neg_per_pos, dst_pool, seed)
+        self.n_distinct = len(np.unique(self.dst_pool))                     # a degree pool repeats nodes
         num_nodes = max(self.dst_pool.max(), edges.sources.max(), edges.destinations.max()) + 1
         self.same_time = SameTimeDestinations(edges, num_nodes)
 
     def sample(self, batch: Batch) -> np.ndarray:
         neg = super().sample(batch)
         src, ts = batch.src, batch.ts
-        distinct = len(self.dst_pool) - self.same_time.count(src, ts) >= self.num_neg_per_pos
+        distinct = self.n_distinct - self.same_time.count(src, ts) >= self.num_neg_per_pos
         rows = np.arange(len(neg))
         while len(rows):
             bad = self.same_time.contains(src[rows], ts[rows], neg[rows])

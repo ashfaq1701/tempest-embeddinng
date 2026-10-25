@@ -42,12 +42,16 @@ class DataSuite(abc.ABC):
     """Benchmark adapter: native load + native evaluator construction. One instance
     per run."""
 
-    def __init__(self, name: str, root: str, is_bipartite: bool, k_eval: int, seed: int):
+    def __init__(self, name: str, root: str, is_bipartite: bool, k_eval: int, seed: int,
+                 train_negatives: str = "uniform"):
+        if train_negatives not in TRAIN_NEGATIVES:
+            raise ValueError(f"train_negatives must be one of {TRAIN_NEGATIVES}, got {train_negatives!r}")
         self.name = name
         self.root = root
         self.is_bipartite = bool(is_bipartite)
         self.k_eval = int(k_eval)
         self.seed = seed
+        self.train_negatives = train_negatives
         self._loaded: Optional[Loaded] = None
 
     def load(self) -> Loaded:
@@ -69,19 +73,23 @@ class DataSuite(abc.ABC):
         """What a negative can be: destinations on a bipartite graph, any node otherwise."""
         return "destinations" if self.is_bipartite else "nodes"
 
-    def _candidates(self, *splits) -> np.ndarray:
-        """Unique negative candidates (int32) over `splits`: their destinations when the
-        graph is bipartite, their sources ∪ destinations when it is not."""
+    def _candidates(self, *splits, unique: bool = True) -> np.ndarray:
+        """Negative candidates (int32) over `splits`: their destinations when the graph is
+        bipartite, their sources and destinations when it is not. unique=False keeps every
+        endpoint occurrence, so a node appears once per edge -- sampling is then by degree."""
         ids = [s.destinations for s in splits]
         if not self.is_bipartite:
             ids += [s.sources for s in splits]
-        return np.unique(np.concatenate(ids)).astype(np.int32)
+        ids = np.concatenate(ids).astype(np.int32)
+        return np.unique(ids) if unique else ids
 
     @cached_property
     def train_negative_pool(self) -> np.ndarray:
         """Training negatives come from the train split only, so a node that first appears
-        in val/test is never trained on purely as a negative."""
-        return self._candidates(self.load().train)
+        in val/test is never trained on purely as a negative. Under train_negatives="degree"
+        the pool keeps every endpoint occurrence, so negatives are drawn in proportion to
+        train-split degree."""
+        return self._candidates(self.load().train, unique=self.train_negatives == "uniform")
 
     @cached_property
     def eval_negative_pool(self) -> np.ndarray:
@@ -110,6 +118,10 @@ class DataSuite(abc.ABC):
                       ts=split.timestamps, edge_feat=None)
         return sampler.sample(whole).astype(np.int32)
 
+
+#: Valid `--train-negatives` values: uniform over the train split's distinct candidates, or in
+#: proportion to their train-split degree. Evaluation negatives are unaffected.
+TRAIN_NEGATIVES = ("uniform", "degree")
 
 #: Valid `--data-suite` values. The train script reads this for its `choices`, so the
 #: flag and the dispatch below cannot drift apart.
