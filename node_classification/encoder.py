@@ -1,5 +1,6 @@
 """Frozen link-prediction encoder -> 5 causal features per interaction (u, t):
-|E[u]|, |p_u|, d(E[u], p_u) / r_mean, log1p(#prior edges), log1p(t - last edge time)."""
+|E[u]|, |p_u|, d(E[u], p_u) / r_mean, log1p(#prior edges), log1p(t - last edge time), where p_u
+is u's bag pooled as seen from v, the node u interacts with in the event."""
 import hashlib
 
 import numpy as np
@@ -73,16 +74,18 @@ class FrozenEncoder:
                 walker, self.device, src, ts,
                 max_walk_len=a["max_walk_len"], num_walks_per_node=a["num_walks_per_node"],
                 start_bias=a["start_bias"], walk_bias=a["walk_bias"])
-            geometry = self._geometry(tokens, src.to(self.device))
+            dst = torch.from_numpy(batch.tgt.astype(np.int64))
+            geometry = self._geometry(tokens, src.to(self.device), dst.to(self.device))
             history = self._history(walker, batch.src, batch.ts)
             out.append(torch.cat([geometry, history.to(self.device)], dim=1))
         return torch.cat(out)                                                # [N, 5]
 
-    def _geometry(self, tokens: WalkTokens, src: torch.Tensor) -> torch.Tensor:
-        """u's own radius, its pooled point's radius, and the distance between the two."""
+    def _geometry(self, tokens: WalkTokens, src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+        """u's own radius, its pooled point's radius, and the distance between the two. u's bag is
+        pooled as seen from v, the node u interacts with in this event."""
         model = self.model
         r_mean = model.mean_radius()                                         # []
-        pooled = model.bag_weights(tokens, r_mean)                           # [Q, d]
+        pooled = model.bag_weights(tokens, dst.unsqueeze(1), r_mean).squeeze(1)  # [Q, d]
         e_u = model.E.weight[src]                                            # [Q, d]
         geometry = [
             e_u.norm(dim=-1),
