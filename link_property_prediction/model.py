@@ -95,17 +95,19 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
+        self.temp = nn.Parameter(torch.tensor([1.0]))                       # exponent: odds ~ d^-temp
+
     def mean_radius(self) -> torch.Tensor:
         """Mean norm of the table (its distance from the origin), detached."""
         r_mean = self.E.weight.detach().norm(dim=-1).mean()                  # []
         return r_mean.clamp_min(torch.finfo(r_mean.dtype).tiny)
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Logits: minus the log distance between the two pooled points, so a candidate's odds are
-        inversely proportional to its distance. Scale-free (a rescaled table shifts every logit
-        of a query equally) and parameter-free: the loss can fall only by better distance ratios."""
+        """Logits: -temp * log of the distance between the two pooled points, so a candidate's odds
+        are proportional to distance^-temp. Scale-free: a rescaled table shifts every logit of a
+        query equally. temp is the one learned scale, an exponent on distance ratios."""
         r_mean = self.mean_radius()                                          # [] (the pooler's own units)
         pooled_u = self.bag_weights(src_tokens, r_mean)                      # [b, d]
         pooled_v = self.bag_weights(cand_tokens, r_mean)                     # [b*c, d]
         pooled_v = pooled_v.view(pooled_u.shape[0], -1, pooled_u.shape[-1])  # [b, c, d]
-        return -torch.log(dist(pooled_u.unsqueeze(1), pooled_v))             # [b, c]
+        return -self.temp * torch.log(dist(pooled_u.unsqueeze(1), pooled_v))  # [b, c]

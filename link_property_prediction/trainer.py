@@ -281,6 +281,7 @@ class Trainer:
             # Geometry watch: boundary radius (|E|mean vs |E|max).
             g = self._geometry_probe()
             line += f"  r_mean={g['mean_norm']:.3f}  r_max={g['max_norm']:.3f}"
+            line += f"  temp={float(self.model.temp):+.4f}"
 
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()
