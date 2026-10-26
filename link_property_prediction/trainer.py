@@ -58,7 +58,7 @@ class TrainerConfig:
     t2nv_q: float = 0.25   # node2vec in-out param
 
     # Constant lr, no weight decay. One Adam param group at a single `lr`: the
-    # embedding tables, the distance temperature and the NN pooler all step at the same rate.
+    # embedding table and the NN pooler step at the same rate.
     lr: float = 1e-3
 
     # Run control.
@@ -183,20 +183,6 @@ class Trainer:
         r = self.model.E.weight.detach().norm(dim=-1)
         return {"max_norm": float(r.max()), "mean_norm": float(r.mean())}
 
-    @torch.no_grad()
-    def _head_probe(self) -> str:
-        """The head's scalar parameters, for the epoch line. Read via hasattr so a head with a different
-        set of knobs degrades to a shorter line rather than raising. w weights the score terms."""
-        parts = []
-        if hasattr(self.model, "temperature"):
-            parts.append(f"temp={float(self.model.temperature):.3f}")
-        if hasattr(self.model, "w"):
-            w = self.model.w.detach().flatten().tolist()
-            parts.append("w=[" + ",".join(f"{x:+.4f}" for x in w) + "]")
-        if hasattr(self.model, "beta"):
-            parts.append(f"beta={float(self.model.beta):+.4f}")
-        return ("  " + "  ".join(parts)) if parts else ""
-
     # Eval — strict-causal, no_grad
 
     def _eval(self, evaluator: Evaluator, batches: Iterable[Batch]) -> float:
@@ -295,7 +281,6 @@ class Trainer:
             # Geometry watch: boundary radius (|E|mean vs |E|max).
             g = self._geometry_probe()
             line += f"  r_mean={g['mean_norm']:.3f}  r_max={g['max_norm']:.3f}"
-            line += self._head_probe()
 
             if val_evaluator is not None and val_batches_factory is not None:
                 t1 = time.time()

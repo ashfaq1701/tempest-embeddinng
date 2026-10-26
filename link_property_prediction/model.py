@@ -95,17 +95,16 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
-        self.w = nn.Parameter(torch.tensor([1.0]))
-
     def mean_radius(self) -> torch.Tensor:
         """Mean norm of the table (its distance from the origin), detached."""
         r_mean = self.E.weight.detach().norm(dim=-1).mean()                  # []
         return r_mean.clamp_min(torch.finfo(r_mean.dtype).tiny)
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Score candidates by the raw distance between the two pooled points."""
-        r_mean = self.mean_radius()                                          # [] (the pooler's own units)
+        """Logits: minus the distance between the two pooled points in units of the table's mean
+        radius. No learned scale: the loss can fall only by better relative separation."""
+        r_mean = self.mean_radius()                                          # []
         pooled_u = self.bag_weights(src_tokens, r_mean)                      # [b, d]
         pooled_v = self.bag_weights(cand_tokens, r_mean)                     # [b*c, d]
         pooled_v = pooled_v.view(pooled_u.shape[0], -1, pooled_u.shape[-1])  # [b, c, d]
-        return self.w * -dist(pooled_u.unsqueeze(1), pooled_v)               # [b, c]
+        return -dist(pooled_u.unsqueeze(1), pooled_v) / r_mean               # [b, c]

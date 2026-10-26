@@ -63,8 +63,8 @@ def parse_args() -> argparse.Namespace:
 
     # ── Optimisation / training ─────────────────────────────────────
     p.add_argument("--lr", default=1e-3, type=float,
-                   help="Learning rate. One param group: the embedding tables, the distance "
-                        "temperature and the NN pooler all step at this rate.")
+                   help="Learning rate. One param group: the embedding table and the NN pooler "
+                        "step at this rate.")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
@@ -96,7 +96,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--export-best-embedding-table", action="store_true",
                    help="After training, dump the best-val embedding table to disk.")
     p.add_argument("--save-checkpoint", default="", type=str,
-                   help="After training, save the best-val model (E, pooler, score weights w) and "
+                   help="After training, save the best-val model (E, pooler) and "
                         "these args to this path -- the frozen encoder for node classification.")
 
     return p.parse_args()
