@@ -175,7 +175,7 @@ class TGBSuite(DataSuite):
 
     def negative_sampler(self, pool: np.ndarray, k: int, seed: int,
                          edges: SplitData) -> NegativeSampler:
-        return HistoricalNegativeSampler(num_neg_per_pos=k, dst_pool=pool, edges=edges,
+        return HistoricalNegativeSampler(num_neg_per_pos=k, dst_pool=pool,
                                          hist_ratio=self.hist_negative_ratio, seed=seed)
 
     def make_evaluator(self, split_mode: str) -> Evaluator:

@@ -99,6 +99,7 @@ class Trainer:
             seed=int(config.seed),
         )
         self.neg_sampler_train = config.train_negative_sampler
+        self.neg_sampler_train.use_walker(self.walk_gen)                     # historical negatives walk on it
 
         # One param group at a single lr: plain Adam for E and everything else.
         self.opt = torch.optim.Adam(self.model.parameters(), lr=float(config.lr))

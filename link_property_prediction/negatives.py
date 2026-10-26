@@ -27,6 +27,9 @@ class NegativeSampler(abc.ABC):
     def sample(self, batch: Batch) -> np.ndarray:
         ...
 
+    def use_walker(self, walker: WalkGenerator) -> None:
+        """Receive the run's Tempest walker; samplers that do not walk ignore it."""
+
 
 class UniformNegativeSampler(NegativeSampler):
     """Random destinations from `dst_pool`."""
@@ -137,16 +140,15 @@ class HistoricalNegativeSampler(UniformNegativeSampler):
     """TGB's hist_rnd idea for training negatives, from Tempest walks.
 
     For each query (s, t) the first floor(hist_ratio * K) slots are nodes s interacted with
-    strictly before t, one per uniform one-hop backward walk over `edges` (the train split). A
-    query with no past, or a draw equal to its own positive, keeps the uniform draw. The walker is
-    the sampler's own, on CPU, so the model's walks are untouched. hist_ratio = 0 builds no walker
-    and is UniformNegativeSampler exactly."""
+    strictly before t, one per uniform one-hop backward walk on the run's walker (set by the
+    trainer through `use_walker`; the exclusive cutoff t keeps every edge it can reach a train
+    edge). A query with no past, or a draw equal to its own positive, keeps the uniform draw.
+    hist_ratio = 0 never walks and is UniformNegativeSampler exactly."""
 
     def __init__(
         self,
         num_neg_per_pos: int,
         dst_pool: np.ndarray,
-        edges: SplitData,
         hist_ratio: float,
         seed: Optional[int] = None,
     ):
@@ -155,9 +157,10 @@ class HistoricalNegativeSampler(UniformNegativeSampler):
             raise ValueError(f"hist_ratio must be in [0, 1], got {hist_ratio}")
         self.n_hist = int(hist_ratio * num_neg_per_pos)                      # floor: explicit, not round()
         self.rule = f"{hist_ratio:g} historical + uniform"
-        if self.n_hist:
-            self.walker = WalkGenerator(use_gpu=False, seed=seed)
-            self.walker.add_edges(edges.sources, edges.destinations, edges.timestamps)
+        self.walker: Optional[WalkGenerator] = None
+
+    def use_walker(self, walker: WalkGenerator) -> None:
+        self.walker = walker
 
     def __repr__(self) -> str:
         return (f"{type(self).__name__}(k={self.num_neg_per_pos}, hist={self.n_hist}, "
