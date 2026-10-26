@@ -30,6 +30,7 @@ import numpy as np
 
 from .data import Batch, Loaded, SplitData
 from .evaluator import DataSuite, Evaluator
+from .negatives import HistoricalNegativeSampler, NegativeSampler
 
 
 def _strip_version_suffix(name: str) -> str:
@@ -162,10 +163,20 @@ class TGBSuite(DataSuite):
     """TGB adapter. TGB's own pre-generated negatives are used for BOTH val and test,
     so `--k-eval` has no effect on this path: the leaderboard fixes the negatives.
     The notice lives here rather than in the train script so `make_suite` stays the
-    only place that knows which suite is running."""
+    only place that knows which suite is running.
+
+    Training negatives follow TGB's hist_rnd rule at `--hist-negative-ratio` (0 is uniform), so
+    training can see the kind of negative TGB evaluates with: a node the source linked to before."""
+
+    supports_hist_negatives = True
 
     def _load(self) -> Loaded:
         return load_tgb(self.name, self.root)
+
+    def negative_sampler(self, pool: np.ndarray, k: int, seed: int,
+                         edges: SplitData) -> NegativeSampler:
+        return HistoricalNegativeSampler(num_neg_per_pos=k, dst_pool=pool, edges=edges,
+                                         hist_ratio=self.hist_negative_ratio, seed=seed)
 
     def make_evaluator(self, split_mode: str) -> Evaluator:
         loaded = self.load()

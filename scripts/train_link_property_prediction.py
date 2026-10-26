@@ -60,6 +60,9 @@ def parse_args() -> argparse.Namespace:
                    help="Per-query training negatives.")
     p.add_argument("--k-eval", default=100, type=int,
                    help="Eval negatives per positive (tgb-seq val only).")
+    p.add_argument("--hist-negative-ratio", default=0.0, type=float,
+                   help="TGB only: fraction of each query's training negatives drawn from the "
+                        "source's own past destinations (TGB's hist_rnd rule, causal). 0 is uniform.")
 
     # ── Optimisation / training ─────────────────────────────────────
     p.add_argument("--lr", default=1e-3, type=float,
@@ -120,7 +123,7 @@ def main() -> Dict[str, Any]:
     suite = make_suite(
         args.data_suite,
         name=args.dataset, root=args.data_root, is_bipartite=args.is_bipartite,
-        k_eval=args.k_eval, seed=args.seed,
+        k_eval=args.k_eval, seed=args.seed, hist_negative_ratio=args.hist_negative_ratio,
     )
     loaded: Loaded = suite.load()
     print(f"loaded ({args.data_suite}) in {time.time() - t0:.1f}s")

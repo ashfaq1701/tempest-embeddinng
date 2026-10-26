@@ -42,12 +42,19 @@ class DataSuite(abc.ABC):
     """Benchmark adapter: native load + native evaluator construction. One instance
     per run."""
 
-    def __init__(self, name: str, root: str, is_bipartite: bool, k_eval: int, seed: int):
+    #: Whether the suite trains with historical negatives (`--hist-negative-ratio`).
+    supports_hist_negatives = False
+
+    def __init__(self, name: str, root: str, is_bipartite: bool, k_eval: int, seed: int,
+                 hist_negative_ratio: float = 0.0):
+        if hist_negative_ratio and not self.supports_hist_negatives:
+            raise ValueError(f"--hist-negative-ratio is not implemented for {type(self).__name__}")
         self.name = name
         self.root = root
         self.is_bipartite = bool(is_bipartite)
         self.k_eval = int(k_eval)
         self.seed = seed
+        self.hist_negative_ratio = float(hist_negative_ratio)
         self._loaded: Optional[Loaded] = None
 
     def load(self) -> Loaded:
