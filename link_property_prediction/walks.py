@@ -100,6 +100,16 @@ class WalkGenerator:
         return np.asarray(self.tempest.get_node_participation_counts(
             node_arr, cutoff_times=cutoff_arr, direction="Backward_In_Time"), dtype=np.int64)
 
+    def past_partners(self, nodes: np.ndarray, cutoff_times: np.ndarray, n: int) -> np.ndarray:
+        """[Q, n] nodes each of `nodes` interacted with strictly before its cutoff: the far end of n
+        one-hop backward walks with a Uniform start (each past timestamp equally likely). -1 where the
+        node has no edge before its cutoff."""
+        walks = self.walks_for_nodes(nodes, max_walk_len=2, num_walks_per_node=n,
+                                     start_bias="Uniform", walk_bias="Uniform",
+                                     cutoff_times=cutoff_times)
+        partner = walks.nodes[:, 0].numpy()                                  # [Q*n] seed sits at lens-1 = 1
+        return np.where(walks.lens.numpy() == 2, partner, -1).reshape(len(nodes), n)
+
     def walks_for_nodes(self, seeds: np.ndarray, max_walk_len: Optional[int] = None,
                         num_walks_per_node: Optional[int] = None,
                         start_bias: Optional[str] = None,

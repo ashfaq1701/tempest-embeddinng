@@ -4,7 +4,7 @@
   - UniformNegativeSampler  : random over a destination pool; used for training and
                               to build TGB-Seq's and DyGLib's fixed eval negatives.
   - CollisionFreeNegativeSampler : CRAFT's DyGLib rule (see the class).
-  - HistoricalNegativeSampler : TGB's hist_rnd rule, made causal for training (see the class).
+  - HistoricalNegativeSampler : TGB's hist_rnd idea for training, from Tempest walks (see the class).
 
 Eval-time negatives are suite-native and live behind `Evaluator.sample_negatives`
 (`tgb_seq_eval.py`, `tgb_eval.py`), not here: that interface allows a variable K
@@ -17,6 +17,7 @@ from typing import Optional
 import numpy as np
 
 from .data import Batch, SplitData
+from .walks import WalkGenerator
 
 
 class NegativeSampler(abc.ABC):
@@ -133,14 +134,13 @@ class CollisionFreeNegativeSampler(UniformNegativeSampler):
 
 
 class HistoricalNegativeSampler(UniformNegativeSampler):
-    """TGB's hist_rnd idea for training negatives, made causal and kept simple.
+    """TGB's hist_rnd idea for training negatives, from Tempest walks.
 
-    For each query (s, t) the first floor(hist_ratio * K) slots are drawn uniformly from s's distinct
-    past destinations -- nodes s first linked strictly before t in `edges` (the train split) -- so a
-    frequent partner is no likelier than a one-off one. The remaining slots keep the uniform draw.
-    No clash check beyond the query's own positive: a draw equal to it, or a query with no past,
-    keeps the uniform draw; repeats within a row are allowed. hist_ratio = 0 is
-    UniformNegativeSampler exactly."""
+    For each query (s, t) the first floor(hist_ratio * K) slots are nodes s interacted with
+    strictly before t, one per uniform one-hop backward walk over `edges` (the train split). A
+    query with no past, or a draw equal to its own positive, keeps the uniform draw. The walker is
+    the sampler's own, on CPU, so the model's walks are untouched. hist_ratio = 0 builds no walker
+    and is UniformNegativeSampler exactly."""
 
     def __init__(
         self,
@@ -156,43 +156,18 @@ class HistoricalNegativeSampler(UniformNegativeSampler):
         self.n_hist = int(hist_ratio * num_neg_per_pos)                      # floor: explicit, not round()
         self.rule = f"{hist_ratio:g} historical + uniform"
         if self.n_hist:
-            self._index_first_links(edges)
+            self.walker = WalkGenerator(use_gpu=False, seed=seed)
+            self.walker.add_edges(edges.sources, edges.destinations, edges.timestamps)
 
     def __repr__(self) -> str:
         return (f"{type(self).__name__}(k={self.num_neg_per_pos}, hist={self.n_hist}, "
                 f"pool={len(self.dst_pool):,})")
 
-    def _index_first_links(self, edges: SplitData) -> None:
-        """Each distinct (src, dst) pair once, at the time src first linked dst, sorted by
-        (src, time) so a source's past before any t is a prefix of its block."""
-        num_nodes = int(max(edges.sources.max(), edges.destinations.max())) + 1
-        self._times = np.unique(edges.timestamps)
-        rank = np.searchsorted(self._times, edges.timestamps)                # time -> dense rank
-        pair = edges.sources.astype(np.int64) * num_nodes + edges.destinations
-        order = np.lexsort((rank, pair))                                     # by pair, then time
-        first = np.r_[True, pair[order][1:] != pair[order][:-1]]             # each pair's earliest link
-        pair, rank = pair[order][first], rank[order][first]
-        keys = (pair // num_nodes) * len(self._times) + rank                 # (src, rank) as one int64
-        by_key = np.argsort(keys, kind="stable")
-        self._keys = keys[by_key]
-        self._past_dst = (pair % num_nodes)[by_key].astype(self.dst_pool.dtype)
-
-    def _past_block(self, src: np.ndarray, ts: np.ndarray):
-        """For each query: where s's block starts and how many destinations s first linked before t."""
-        base = src.astype(np.int64) * len(self._times)
-        start = np.searchsorted(self._keys, base)
-        end = np.searchsorted(self._keys, base + np.searchsorted(self._times, ts))  # ranks strictly < t
-        return start, end - start
-
     def sample(self, batch: Batch) -> np.ndarray:
         neg = super().sample(batch)                                          # [B, K] the uniform draw
         if self.n_hist == 0:
             return neg
-
-        start, n_past = self._past_block(batch.src, batch.ts)               # [B], [B]
-        offsets = (self.rng.random((len(start), self.n_hist)) * np.maximum(n_past, 1)[:, None]).astype(np.int64)
-        hist = self._past_dst[np.minimum(start[:, None] + offsets, len(self._past_dst) - 1)]  # [B, n_hist]
-
-        use = (n_past[:, None] > 0) & (hist != batch.tgt[:, None])          # never the query's own positive
+        hist = self.walker.past_partners(batch.src, batch.ts, self.n_hist)  # [B, n_hist], -1 = none
+        use = (hist >= 0) & (hist != batch.tgt[:, None])                     # never the query's own positive
         neg[:, :self.n_hist] = np.where(use, hist, neg[:, :self.n_hist])
         return neg
