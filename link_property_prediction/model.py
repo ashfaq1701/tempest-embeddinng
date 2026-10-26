@@ -101,10 +101,11 @@ class LinkPredHead(nn.Module):
         return r_mean.clamp_min(torch.finfo(r_mean.dtype).tiny)
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Logits: minus the distance between the two pooled points in units of the table's mean
-        radius. No learned scale: the loss can fall only by better relative separation."""
-        r_mean = self.mean_radius()                                          # []
+        """Logits: minus the log distance between the two pooled points, so a candidate's odds are
+        inversely proportional to its distance. Scale-free (a rescaled table shifts every logit
+        of a query equally) and parameter-free: the loss can fall only by better distance ratios."""
+        r_mean = self.mean_radius()                                          # [] (the pooler's own units)
         pooled_u = self.bag_weights(src_tokens, r_mean)                      # [b, d]
         pooled_v = self.bag_weights(cand_tokens, r_mean)                     # [b*c, d]
         pooled_v = pooled_v.view(pooled_u.shape[0], -1, pooled_u.shape[-1])  # [b, c, d]
-        return -dist(pooled_u.unsqueeze(1), pooled_v) / r_mean               # [b, c]
+        return -torch.log(dist(pooled_u.unsqueeze(1), pooled_v))             # [b, c]
