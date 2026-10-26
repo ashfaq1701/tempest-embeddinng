@@ -95,7 +95,7 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
-        self.w = nn.Parameter(torch.tensor([1.0]))
+        self.temp = nn.Parameter(torch.tensor([1.0]))                       # score temperature
 
     def mean_radius(self) -> torch.Tensor:
         """Mean norm of the table (its distance from the origin), detached."""
@@ -108,4 +108,4 @@ class LinkPredHead(nn.Module):
         pooled_u = self.bag_weights(src_tokens, r_mean)                      # [b, d]
         pooled_v = self.bag_weights(cand_tokens, r_mean)                     # [b*c, d]
         pooled_v = pooled_v.view(pooled_u.shape[0], -1, pooled_u.shape[-1])  # [b, c, d]
-        return self.w * -dist(pooled_u.unsqueeze(1), pooled_v)               # [b, c]
+        return self.temp * -dist(pooled_u.unsqueeze(1), pooled_v)            # [b, c]

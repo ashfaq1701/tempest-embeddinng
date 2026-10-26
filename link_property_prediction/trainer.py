@@ -186,13 +186,10 @@ class Trainer:
     @torch.no_grad()
     def _head_probe(self) -> str:
         """The head's scalar parameters, for the epoch line. Read via hasattr so a head with a different
-        set of knobs degrades to a shorter line rather than raising. w weights the score terms."""
+        set of knobs degrades to a shorter line rather than raising. temp scales the score."""
         parts = []
-        if hasattr(self.model, "temperature"):
-            parts.append(f"temp={float(self.model.temperature):.3f}")
-        if hasattr(self.model, "w"):
-            w = self.model.w.detach().flatten().tolist()
-            parts.append("w=[" + ",".join(f"{x:+.4f}" for x in w) + "]")
+        if hasattr(self.model, "temp"):
+            parts.append(f"temp={float(self.model.temp):+.4f}")
         if hasattr(self.model, "beta"):
             parts.append(f"beta={float(self.model.beta):+.4f}")
         return ("  " + "  ".join(parts)) if parts else ""
