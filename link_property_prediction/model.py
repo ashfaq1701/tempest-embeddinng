@@ -59,11 +59,13 @@ class BagWeights(nn.Module):
 
         tiny = torch.finfo(fixed.dtype).tiny
 
-        d_tok_mid = dist(fixed, mid.unsqueeze(-2))                           # [Q, T]
+        # Distances on a log scale, each over its own normaliser: 0 is typical, +-log 2 is twice or
+        # half. Logs are taken before masking, since padding's finite values are zeroed afterwards.
+        d_tok_mid = dist(fixed, mid.unsqueeze(-2))                           # [Q, T]  >= dist's floor
         d_mid_mean = (d_tok_mid * valid_f).sum(-1, keepdim=True) / valid_f.sum(-1, keepdim=True)  # [Q, 1]
-        d_mid = d_tok_mid * valid_f / d_mid_mean.clamp_min(tiny)             # [Q, T]
+        d_mid = torch.log(d_tok_mid / d_mid_mean.clamp_min(tiny)) * valid_f  # [Q, T]  0 = the bag's mean spread
 
-        d_0 = fixed.norm(dim=-1) * valid_f / r_mean                          # [Q, T]
+        d_0 = torch.log(fixed.norm(dim=-1).clamp_min(tiny) / r_mean) * valid_f  # [Q, T]  0 = the table's mean radius
 
         feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
