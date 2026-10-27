@@ -57,8 +57,8 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. Two Adam param groups: the embedding table E steps at
-    # `lr_embedding` (None = `lr`); the distance temperature and the NN pooler step at `lr`.
+    # Constant lr, no weight decay. The embedding table E steps under SparseAdam at `lr_embedding`
+    # (None = `lr`); the distance temperature and the NN pooler step under Adam at `lr`.
     lr: float = 1e-3
     lr_embedding: Optional[float] = None
 
@@ -101,13 +101,13 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # Plain Adam, two param groups: everything but E at lr (group 0), E at lr_embedding (group 1).
+        # Two optimisers. E's gradient is sparse (only looked-up rows), so SparseAdam updates the
+        # moments of those rows alone: an absent row's state stays frozen instead of decaying.
+        # The head's parameters get a gradient every step, so they take plain Adam.
         lr_embedding = config.lr if config.lr_embedding is None else config.lr_embedding
         head_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
-        self.opt = torch.optim.Adam([
-            {"params": head_params, "lr": float(config.lr)},
-            {"params": [self.model.E.weight], "lr": float(lr_embedding)},
-        ])
+        self.opt = torch.optim.Adam(head_params, lr=float(config.lr))
+        self.opt_embedding = torch.optim.SparseAdam([self.model.E.weight], lr=float(lr_embedding))
 
     # Full-graph ingestion (once, up front)
 
@@ -172,8 +172,10 @@ class Trainer:
         link_loss = F.cross_entropy(logits, target)
 
         self.opt.zero_grad(set_to_none=True)
+        self.opt_embedding.zero_grad(set_to_none=True)
         link_loss.backward()
         self.opt.step()
+        self.opt_embedding.step()
 
         return {
             "link": float(link_loss.detach()),
@@ -292,7 +294,7 @@ class Trainer:
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
                 f"lr={self.opt.param_groups[0]['lr']:.0e}  "
-                f"lr_E={self.opt.param_groups[1]['lr']:.0e}  "
+                f"lr_E={self.opt_embedding.param_groups[0]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
 

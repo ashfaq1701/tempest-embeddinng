@@ -47,7 +47,7 @@ class BagWeights(nn.Module):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
 
-        points = F.embedding(nodes, self.E.weight)                           # [Q, T, d]
+        points = F.embedding(nodes, self.E.weight, sparse=True)              # [Q, T, d]  sparse grad: SparseAdam
         # Features see positions only; E's gradient flows through `points`.
         fixed = points.detach()                                              # [Q, T, d]
 
