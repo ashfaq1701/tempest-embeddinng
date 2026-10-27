@@ -84,12 +84,11 @@ class LinkPredHead(nn.Module):
         self.d_emb = int(d_emb)
         torch.manual_seed(seed)
 
-        # Uniform inside the unit ball: isotropic direction, radius U^(1/d) (uniform by volume).
+        # Isotropic Gaussian, rescaled to unit mean radius.
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
-            direction = F.normalize(torch.randn(self.num_nodes, self.d_emb), dim=-1)
-            radius = torch.rand(self.num_nodes, 1).pow(1.0 / self.d_emb)
-            self.E.weight.copy_(direction * radius)
+            self.E.weight.normal_()
+            self.E.weight.div_(self.mean_radius())
 
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
