@@ -1,5 +1,5 @@
 """Frozen link-prediction encoder -> 5 causal features per interaction (u, t):
-|E[u]|, |p_u|, d(E[u], p_u) / r_mean, log1p(#prior edges), log1p(t - last edge time)."""
+|E[u]|, |p_u|, d(E[u], p_u), log1p(#prior edges), log1p(t - last edge time)."""
 import hashlib
 
 import numpy as np
@@ -81,13 +81,12 @@ class FrozenEncoder:
     def _geometry(self, tokens: WalkTokens, src: torch.Tensor) -> torch.Tensor:
         """u's own radius, its pooled point's radius, and the distance between the two."""
         model = self.model
-        r_mean = model.mean_radius()                                         # []
-        pooled = model.bag_weights(tokens, r_mean)                           # [Q, d]
+        pooled = model.bag_weights(tokens)                                   # [Q, d]
         e_u = model.E.weight[src]                                            # [Q, d]
         geometry = [
             e_u.norm(dim=-1),
             pooled.norm(dim=-1),
-            dist(e_u, pooled) / r_mean,
+            dist(e_u, pooled),
         ]
         return torch.stack(geometry, dim=-1)                                 # [Q, 3]
 

@@ -38,7 +38,7 @@ class BagWeights(nn.Module):
         layers.append(nn.Linear(self.hidden, 1))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, tokens: WalkTokens, r_mean: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens: WalkTokens) -> torch.Tensor:
         """The bag's pooled point: the weighted midpoint of its tokens [Q, d]."""
         nodes = tokens.nodes.flatten(1).clamp_min(0).clone()                 # [Q, T]
         valid = tokens.mask.flatten(1).clone()                               # [Q, T]
@@ -65,7 +65,7 @@ class BagWeights(nn.Module):
         d_mid_mean = (d_tok_mid * valid_f).sum(-1, keepdim=True) / valid_f.sum(-1, keepdim=True)  # [Q, 1]
         d_mid = d_tok_mid * valid_f / d_mid_mean.clamp_min(tiny)             # [Q, T]
 
-        d_0 = fixed.norm(dim=-1) * valid_f / r_mean                          # [Q, T]
+        d_0 = fixed.norm(dim=-1) * valid_f                                   # [Q, T]  the table's mean radius is 1
 
         feats = torch.stack([age, pos, d_mid, d_0], dim=-1)                  # [Q, T, 4]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
@@ -88,12 +88,17 @@ class LinkPredHead(nn.Module):
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
         with torch.no_grad():
             self.E.weight.normal_()
-            self.E.weight.div_(self.mean_radius())
+        self.project_()
 
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
         self.temp = nn.Parameter(torch.tensor([1.0]))                       # score temperature
+
+    @torch.no_grad()
+    def project_(self) -> None:
+        """Rescale the table to unit mean radius; called after every optimiser step."""
+        self.E.weight.div_(self.mean_radius())
 
     def mean_radius(self) -> torch.Tensor:
         """Mean norm of the table (its distance from the origin), detached."""
@@ -102,8 +107,7 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Score candidates by the raw distance between the two pooled points."""
-        r_mean = self.mean_radius()                                          # [] (the pooler's own units)
-        pooled_u = self.bag_weights(src_tokens, r_mean)                      # [b, d]
-        pooled_v = self.bag_weights(cand_tokens, r_mean)                     # [b*c, d]
+        pooled_u = self.bag_weights(src_tokens)                              # [b, d]
+        pooled_v = self.bag_weights(cand_tokens)                             # [b*c, d]
         pooled_v = pooled_v.view(pooled_u.shape[0], -1, pooled_u.shape[-1])  # [b, c, d]
         return self.temp * -dist(pooled_u.unsqueeze(1), pooled_v)            # [b, c]

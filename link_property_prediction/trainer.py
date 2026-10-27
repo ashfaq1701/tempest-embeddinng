@@ -168,20 +168,12 @@ class Trainer:
         self.opt.zero_grad(set_to_none=True)
         link_loss.backward()
         self.opt.step()
+        self.model.project_()                                                 # r_mean := 1
 
         return {
             "link": float(link_loss.detach()),
             "lr": float(self.opt.param_groups[0]["lr"]),
         }
-
-    # Geometry probe
-
-    @torch.no_grad()
-    def _geometry_probe(self) -> Dict[str, float]:
-        """Spread watch: mean and max Euclidean norm of E (its distance from the origin), logged
-        as r_mean/r_max."""
-        r = self.model.E.weight.detach().norm(dim=-1)
-        return {"max_norm": float(r.max()), "mean_norm": float(r.mean())}
 
     @torch.no_grad()
     def _head_probe(self) -> str:
@@ -289,9 +281,6 @@ class Trainer:
                 f"train {train_dt:.1f}s"
             )
 
-            # Geometry watch: boundary radius (|E|mean vs |E|max).
-            g = self._geometry_probe()
-            line += f"  r_mean={g['mean_norm']:.3f}  r_max={g['max_norm']:.3f}"
             line += self._head_probe()
 
             if val_evaluator is not None and val_batches_factory is not None:
