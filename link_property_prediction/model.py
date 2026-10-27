@@ -84,11 +84,9 @@ class LinkPredHead(nn.Module):
         self.d_emb = int(d_emb)
         torch.manual_seed(seed)
 
-        # Isotropic Gaussian, rescaled to unit mean radius.
+        # N(0, 1/d): row norm ~1 at any width (Flax / fairseq embedding init).
         self.E = nn.Embedding(self.num_nodes, self.d_emb)
-        with torch.no_grad():
-            self.E.weight.normal_()
-            self.E.weight.div_(self.mean_radius())
+        nn.init.normal_(self.E.weight, std=self.d_emb ** -0.5)
 
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
