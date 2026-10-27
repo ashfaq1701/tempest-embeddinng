@@ -30,7 +30,7 @@ from .walks import WalkGenerator
 class TrainerConfig:
     # Dataset-derived.
     num_nodes: int
-    median_inter_event_time: float
+    T_train: int
     train_negative_sampler: NegativeSampler
 
     # Embedding dimension.
@@ -80,7 +80,7 @@ class Trainer:
         # Owns the Euclidean node embeddings and the monotone metric score.
         self.model = LinkPredHead(
             num_nodes=config.num_nodes,
-            median_inter_event_time=config.median_inter_event_time,
+            T_train=config.T_train,
             max_walk_len=config.max_walk_len,
             d_emb=int(config.d_emb),
             hidden_dim=int(config.hidden_dim),
