@@ -1,5 +1,3 @@
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,11 +19,11 @@ def weighted_midpoint(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 class BagWeights(nn.Module):
 
-    def __init__(self, E: nn.Embedding, T_train: int, max_walk_len: int,
+    def __init__(self, E: nn.Embedding, median_inter_event_time: float, max_walk_len: int,
                  hidden_dim: int = 32, n_layers: int = 2):
         super().__init__()
         self.E = E
-        self.log_T_train = math.log1p(T_train)
+        self.age_scale = float(median_inter_event_time)
         self.max_walk_len = int(max_walk_len)
         self.hidden = int(hidden_dim)
         self.n_layers = int(n_layers)
@@ -56,7 +54,7 @@ class BagWeights(nn.Module):
 
         age = tokens.ages.flatten(1).clamp_min(0).to(fixed.dtype)            # [Q, T]
         pos = tokens.positions.flatten(1).to(fixed.dtype)                    # [Q, T]
-        age = torch.log1p(age) / self.log_T_train                            # [Q, T]
+        age = torch.log1p(age / self.age_scale)                              # [Q, T]  unit-free
         pos = pos / self.max_walk_len                                        # [Q, T]
 
         tiny = torch.finfo(fixed.dtype).tiny
@@ -75,11 +73,11 @@ class BagWeights(nn.Module):
 
 class LinkPredHead(nn.Module):
 
-    def __init__(self, num_nodes: int, T_train: int, max_walk_len: int, d_emb: int,
+    def __init__(self, num_nodes: int, median_inter_event_time: float, max_walk_len: int, d_emb: int,
                  hidden_dim: int = 32, n_layers_pooler: int = 2, seed: int = 42):
         super().__init__()
         self.num_nodes = int(num_nodes)
-        self.T_train = int(T_train)
+        self.median_inter_event_time = float(median_inter_event_time)
         self.max_walk_len = int(max_walk_len)
         self.d_emb = int(d_emb)
         torch.manual_seed(seed)
@@ -91,7 +89,7 @@ class LinkPredHead(nn.Module):
             radius = torch.rand(self.num_nodes, 1).pow(1.0 / self.d_emb)
             self.E.weight.copy_(direction * radius)
 
-        self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
+        self.bag_weights = BagWeights(self.E, self.median_inter_event_time, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
         self.temp = nn.Parameter(torch.tensor([1.0]))                       # score temperature

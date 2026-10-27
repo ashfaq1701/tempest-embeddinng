@@ -29,10 +29,17 @@ class Loaded(NamedTuple):
     max_node_count: int
 
     @property
-    def T_train(self) -> int:
-        """Length of the training period: latest minus earliest train-edge timestamp."""
-        ts = self.train.timestamps
-        return int(ts.max() - ts.min())
+    def median_inter_event_time(self) -> float:
+        """Median gap between a node's consecutive train interactions (positive gaps only): the
+        dataset's own time scale, in which walk-token ages are read."""
+        train = self.train
+        nodes = np.concatenate([train.sources, train.destinations])
+        ts = np.concatenate([train.timestamps, train.timestamps])
+        order = np.lexsort((ts, nodes))                                      # by node, then time
+        nodes, ts = nodes[order], ts[order]
+        gaps = np.diff(ts)[nodes[1:] == nodes[:-1]]                          # within-node gaps only
+        gaps = gaps[gaps > 0]
+        return float(np.median(gaps)) if len(gaps) else 1.0
 
 
 def concat_splits(*splits: SplitData) -> SplitData:

@@ -133,7 +133,7 @@ def main() -> Dict[str, Any]:
     train_negative_pool = suite.train_negative_pool
 
     print(f"  num_nodes:     {num_nodes:,}")
-    print(f"  T_train:       {loaded.T_train:,}")
+    print(f"  median gap:    {loaded.median_inter_event_time:,.1f} (per-node, train; the age scale)")
     print(f"  neg_pool:      {len(train_negative_pool):,} train {suite.candidate_kind} "
           f"(training negatives)")
     print(f"  train edges:   {len(loaded.train.sources):,}")
@@ -159,7 +159,7 @@ def main() -> Dict[str, Any]:
     # ─── Build TrainerConfig ───────────────────────────────────────
     config = TrainerConfig(
         num_nodes=num_nodes,
-        T_train=loaded.T_train,
+        median_inter_event_time=loaded.median_inter_event_time,
         train_negative_sampler=suite.train_negative_sampler(args.k_train),
 
         d_emb=args.d_emb,
@@ -242,7 +242,7 @@ def main() -> Dict[str, Any]:
         torch.save({
             "state_dict": trainer.model.state_dict(),
             "args": vars(args),
-            "T_train": loaded.T_train,
+            "median_inter_event_time": loaded.median_inter_event_time,
             "best_epoch": result["stopped_at_epoch"],
             "best_val_mrr": result["best_val_mrr"],
             "r_mean": float(radius.mean()),
