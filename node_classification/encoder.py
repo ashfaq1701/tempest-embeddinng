@@ -82,7 +82,7 @@ class FrozenEncoder:
         """u's own radius, its pooled point's radius, and the distance between the two."""
         model = self.model
         r_mean = model.mean_radius()                                         # []
-        pooled = model.bag_weights(tokens, r_mean)                           # [Q, d]
+        pooled = model.bag_weights(tokens)                                   # [Q, d]
         e_u = model.E.weight[src]                                            # [Q, d]
         geometry = [
             e_u.norm(dim=-1),
