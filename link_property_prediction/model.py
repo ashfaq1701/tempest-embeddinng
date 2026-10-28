@@ -84,7 +84,7 @@ class LinkPredHead(nn.Module):
         torch.manual_seed(seed)
 
         # N(0, 1/d): row norm ~1 at any width (Flax / fairseq embedding init).
-        self.E = nn.Embedding(self.num_nodes, self.d_emb, sparse=True)      # sparse grad: SparseAdam
+        self.E = nn.Embedding(self.num_nodes, self.d_emb)                   # dense grad: Adam
         nn.init.normal_(self.E.weight, std=self.d_emb ** -0.5)
 
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,

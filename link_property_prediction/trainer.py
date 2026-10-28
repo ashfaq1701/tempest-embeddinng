@@ -57,8 +57,8 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. The embedding table E steps under SparseAdam at `lr_embedding`;
-    # the distance temperature and the NN pooler step under Adam at `lr`.
+    # Constant lr, no weight decay. One Adam, two param groups: E at `lr_embedding` with
+    # betas = (0.0, 0.999) and eps = 1e-5; the temperature and the NN pooler at `lr` on defaults.
     lr: float = 1e-3
     lr_embedding: float = 1e-4
 
@@ -101,12 +101,19 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # Two optimisers. E's gradient is sparse (only looked-up rows), so SparseAdam updates the
-        # moments of those rows alone: an absent row's state stays frozen instead of decaying.
-        # The head's parameters get a gradient every step, so they take plain Adam.
+        # One Adam, two param groups: group 0 the head on Adam's defaults, group 1 E with no
+        # momentum and a large eps. Absent rows do not move (beta1 = 0 makes m exactly 0), but
+        # their v decays, so on return m rebuilds from the fresh gradient against a v that is too
+        # small and the step is inflated -- 12x after 5,000 absent steps, capped at 1/sqrt(1-beta2)
+        # = 32x. eps = 1e-5 bounds that: at |g| ~ 1e-5 on E it dominates sqrt(v) once v is stale,
+        # so the step cannot exceed ~lr. It also halves a HEALTHY row's step, since eps is then
+        # comparable to sqrt(v) there too.
         head_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
-        self.opt = torch.optim.Adam(head_params, lr=float(config.lr))
-        self.opt_embedding = torch.optim.SparseAdam([self.model.E.weight], lr=float(config.lr_embedding))
+        self.opt = torch.optim.Adam([
+            {"params": head_params, "lr": float(config.lr)},
+            {"params": [self.model.E.weight], "lr": float(config.lr_embedding),
+             "betas": (0.0, 0.999), "eps": 1e-5},
+        ])
 
     # Full-graph ingestion (once, up front)
 
@@ -171,10 +178,8 @@ class Trainer:
         link_loss = F.cross_entropy(logits, target)
 
         self.opt.zero_grad(set_to_none=True)
-        self.opt_embedding.zero_grad(set_to_none=True)
         link_loss.backward()
         self.opt.step()
-        self.opt_embedding.step()
 
         return {
             "link": float(link_loss.detach()),
@@ -293,7 +298,7 @@ class Trainer:
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
                 f"lr={self.opt.param_groups[0]['lr']:.0e}  "
-                f"lr_E={self.opt_embedding.param_groups[0]['lr']:.0e}  "
+                f"lr_E={self.opt.param_groups[1]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
 
