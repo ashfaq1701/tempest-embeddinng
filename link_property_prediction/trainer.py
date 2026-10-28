@@ -175,6 +175,7 @@ class Trainer:
         link_loss.backward()
         self.opt.step()
         self.opt_embedding.step()
+        self.model.project_()                                                 # keep beta >= 0
 
         return {
             "link": float(link_loss.detach()),
