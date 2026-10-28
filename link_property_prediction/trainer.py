@@ -57,11 +57,11 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # No weight decay. One Adagrad, two param groups: the embedding table E at `lr_embedding`; the
-    # distance temperature and the NN pooler at `lr`. Adagrad's own lr / sqrt(sum g^2) is the
-    # schedule, so both rates set the FIRST step on a coordinate, not the sustained one.
-    lr: float = 1e-1
-    lr_embedding: float = 1e-2
+    # No weight decay, no momentum. One SGD, two param groups: the embedding table E at
+    # `lr_embedding`; the distance temperature and the NN pooler at `lr`. SGD's step is lr * g, so
+    # these rates are in units of 1 / gradient and do not transfer from a normalised optimiser.
+    lr: float = 1e-2
+    lr_embedding: float = 1e-1
 
     # Run control.
     num_epochs: int = 100
@@ -102,11 +102,11 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # One Adagrad, two param groups: the head (temperature + pooler) at lr (group 0), E at
-        # lr_embedding (group 1). E's gradient is sparse (only looked-up rows), and Adagrad's
-        # accumulator is a sum, so an absent row's state is exactly what it left.
+        # One SGD, two param groups: the head (temperature + pooler) at lr (group 0), E at
+        # lr_embedding (group 1). No momentum, so there is no state to go stale while a row is
+        # absent, and the step is proportional to the gradient rather than normalised by it.
         head_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
-        self.opt = torch.optim.Adagrad([
+        self.opt = torch.optim.SGD([
             {"params": head_params, "lr": float(config.lr)},
             {"params": [self.model.E.weight], "lr": float(config.lr_embedding)},
         ])
