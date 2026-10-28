@@ -2,7 +2,6 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .walk_tokens import WalkTokens
 
@@ -47,7 +46,7 @@ class BagWeights(nn.Module):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
 
-        points = F.embedding(nodes, self.E.weight, sparse=True)              # [Q, T, d]  sparse grad: Adagrad
+        points = self.E(nodes)                                               # [Q, T, d]  sparse grad: Adagrad
         # Features see positions only; E's gradient flows through `points`.
         fixed = points.detach()                                              # [Q, T, d]
 
@@ -84,8 +83,9 @@ class LinkPredHead(nn.Module):
         self.d_emb = int(d_emb)
         torch.manual_seed(seed)
 
-        # N(0, 1/d): row norm ~1 at any width (Flax / fairseq embedding init).
-        self.E = nn.Embedding(self.num_nodes, self.d_emb)
+        # N(0, 1/d): row norm ~1 at any width (Flax / fairseq embedding init). sparse=True belongs
+        # here, not at the call site: E.sparse then describes the table every caller sees.
+        self.E = nn.Embedding(self.num_nodes, self.d_emb, sparse=True)
         nn.init.normal_(self.E.weight, std=self.d_emb ** -0.5)
 
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,

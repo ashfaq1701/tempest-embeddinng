@@ -105,11 +105,13 @@ class Trainer:
         # One Adagrad, two param groups: the head (temperature + pooler) at lr (group 0), E at
         # lr_embedding (group 1). E's gradient is sparse (only looked-up rows), and Adagrad's
         # accumulator is a sum, so an absent row's state is exactly what it left.
+        # initial_accumulator_value=1.0 (GloVe's gradsq) makes the first step on a coordinate
+        # lr*g rather than a full lr*sign(g); at 0 the table gains 0.23 of r_mean in epoch 1 alone.
         head_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
         self.opt = torch.optim.Adagrad([
             {"params": head_params, "lr": float(config.lr)},
             {"params": [self.model.E.weight], "lr": float(config.lr_embedding)},
-        ])
+        ], initial_accumulator_value=1.0)
 
     # Full-graph ingestion (once, up front)
 
