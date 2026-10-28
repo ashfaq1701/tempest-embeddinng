@@ -58,9 +58,10 @@ class TrainerConfig:
     t2nv_q: float = 0.25   # node2vec in-out param
 
     # No weight decay. One Adagrad, two param groups: the embedding table E at `lr_embedding`; the
-    # distance temperature and the NN pooler at `lr`. Adagrad's own lr / sqrt(sum g^2) is the schedule.
-    lr: float = 1e-2
-    lr_embedding: float = 1e-3
+    # distance temperature and the NN pooler at `lr`. Adagrad's own lr / sqrt(sum g^2) is the
+    # schedule, so both rates set the FIRST step on a coordinate, not the sustained one.
+    lr: float = 1e-1
+    lr_embedding: float = 1e-2
 
     # Run control.
     num_epochs: int = 100
