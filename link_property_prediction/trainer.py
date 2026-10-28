@@ -102,23 +102,11 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # Two optimisers, matched to what each group needs.
-        #
-        # E's gradient is sparse (only looked-up rows). Adagrad's accumulator is a SUM over a row's
-        # own updates and never decays, so an absent row's state is exactly what it left -- the
-        # absence-invariance SparseAdam buys by skipping updates, obtained structurally instead --
-        # and the per-coordinate step is lr / sqrt(n) after n updates, an implicit annealing
-        # schedule. `initial_accumulator_value` stays at torch's 0, which makes the first step on
-        # each coordinate a full lr * sign(g); measured harmless here (r_mean 1.06 after one epoch
-        # at lr 1e-2 against an init norm of 1.0), but it is the first thing to suspect if the
-        # table inflates at ep1, and GloVe's gradsq = 1.0 is the fix.
-        #
-        # The head keeps Adam. Adagrad's cumulative travel is bounded by ~2 * lr * sqrt(N), sqrt in
-        # the step count where Adam's is linear, and the temperature has to cross a long distance
-        # and stay there (measured requirements 1.5-29 across datasets, +17.4 by ep7 on tgbl-coin).
-        # Folding the head into one Adagrad pinned temp at 3-4 on all three datasets -- 65-78% of
-        # that ceiling, i.e. against the limit, not under-driven -- and cost 0.076 / 0.108 / 0.128
-        # of test MRR on coin / comment / flight, ordered by how much temp each one needs.
+        # Two optimisers. E's gradient is sparse (only looked-up rows), and Adagrad's accumulator
+        # is a sum over a row's own updates that never decays, so an absent row's state is exactly
+        # what it left; its step is lr / sqrt(n) after n updates, an implicit schedule.
+        # The head keeps Adam: Adagrad's travel is bounded by ~2 * lr * sqrt(N), and the
+        # temperature has to cross a long distance (+17.4 by ep7 on tgbl-coin) and stay there.
         head_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
         self.opt = torch.optim.Adam(head_params, lr=float(config.lr))
         self.opt_embedding = torch.optim.Adagrad([self.model.E.weight], lr=float(config.lr_embedding))
