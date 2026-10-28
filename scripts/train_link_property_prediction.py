@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
                    help="Eval negatives per positive (tgb-seq val only).")
 
     # ── Optimisation / training ─────────────────────────────────────
-    p.add_argument("--lr", default=1e-2, type=float,
+    p.add_argument("--lr", default=1e-1, type=float,
                    help="SGD learning rate of the distance temperature and the NN pooler.")
     p.add_argument("--lr-embedding", default=1e-1, type=float,
                    help="SGD learning rate of the embedding table E.")

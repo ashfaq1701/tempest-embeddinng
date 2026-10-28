@@ -60,7 +60,7 @@ class TrainerConfig:
     # No weight decay, no momentum. One SGD, two param groups: the embedding table E at
     # `lr_embedding`; the distance temperature and the NN pooler at `lr`. SGD's step is lr * g, so
     # these rates are in units of 1 / gradient and do not transfer from a normalised optimiser.
-    lr: float = 1e-2
+    lr: float = 1e-1
     lr_embedding: float = 1e-1
 
     # Run control.
