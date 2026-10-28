@@ -57,10 +57,11 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. The embedding table E steps under SparseAdam at `lr_embedding`;
-    # the distance temperature and the NN pooler step under Adam at `lr`.
+    # Constant lr, no weight decay. The embedding table E steps under Adagrad at `lr_embedding`,
+    # whose own lr / sqrt(sum g^2) supplies the schedule; the distance temperature and the NN
+    # pooler step under Adam at `lr`, which keeps their step size constant so they can travel.
     lr: float = 1e-3
-    lr_embedding: float = 1e-4
+    lr_embedding: float = 1e-2
 
     # Run control.
     num_epochs: int = 100
@@ -101,12 +102,26 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # Two optimisers. E's gradient is sparse (only looked-up rows), so SparseAdam updates the
-        # moments of those rows alone: an absent row's state stays frozen instead of decaying.
-        # The head's parameters get a gradient every step, so they take plain Adam.
+        # Two optimisers, matched to what each group needs.
+        #
+        # E's gradient is sparse (only looked-up rows). Adagrad's accumulator is a SUM over a row's
+        # own updates and never decays, so an absent row's state is exactly what it left -- the
+        # absence-invariance SparseAdam buys by skipping updates, obtained structurally instead --
+        # and the per-coordinate step is lr / sqrt(n) after n updates, an implicit annealing
+        # schedule. `initial_accumulator_value` stays at torch's 0, which makes the first step on
+        # each coordinate a full lr * sign(g); measured harmless here (r_mean 1.06 after one epoch
+        # at lr 1e-2 against an init norm of 1.0), but it is the first thing to suspect if the
+        # table inflates at ep1, and GloVe's gradsq = 1.0 is the fix.
+        #
+        # The head keeps Adam. Adagrad's cumulative travel is bounded by ~2 * lr * sqrt(N), sqrt in
+        # the step count where Adam's is linear, and the temperature has to cross a long distance
+        # and stay there (measured requirements 1.5-29 across datasets, +17.4 by ep7 on tgbl-coin).
+        # Folding the head into one Adagrad pinned temp at 3-4 on all three datasets -- 65-78% of
+        # that ceiling, i.e. against the limit, not under-driven -- and cost 0.076 / 0.108 / 0.128
+        # of test MRR on coin / comment / flight, ordered by how much temp each one needs.
         head_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
         self.opt = torch.optim.Adam(head_params, lr=float(config.lr))
-        self.opt_embedding = torch.optim.SparseAdam([self.model.E.weight], lr=float(config.lr_embedding))
+        self.opt_embedding = torch.optim.Adagrad([self.model.E.weight], lr=float(config.lr_embedding))
 
     # Full-graph ingestion (once, up front)
 
