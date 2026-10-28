@@ -59,8 +59,8 @@ class TrainerConfig:
 
     # No weight decay. One Adagrad, two param groups: the embedding table E at `lr_embedding`; the
     # distance temperature and the NN pooler at `lr`. Adagrad's own lr / sqrt(sum g^2) is the schedule.
-    lr: float = 1e-1
-    lr_embedding: float = 1e-2
+    lr: float = 1e-2
+    lr_embedding: float = 1e-3
 
     # Run control.
     num_epochs: int = 100
