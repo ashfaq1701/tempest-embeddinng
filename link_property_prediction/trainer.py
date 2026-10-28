@@ -57,10 +57,10 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. The embedding table E steps under SparseAdam at `lr_embedding`
-    # (None = `lr`); the distance temperature and the NN pooler step under Adam at `lr`.
+    # Constant lr, no weight decay. The embedding table E steps under SparseAdam at `lr_embedding`;
+    # the distance temperature and the NN pooler step under Adam at `lr`.
     lr: float = 1e-3
-    lr_embedding: Optional[float] = None
+    lr_embedding: float = 1e-4
 
     # Run control.
     num_epochs: int = 100
@@ -104,10 +104,9 @@ class Trainer:
         # Two optimisers. E's gradient is sparse (only looked-up rows), so SparseAdam updates the
         # moments of those rows alone: an absent row's state stays frozen instead of decaying.
         # The head's parameters get a gradient every step, so they take plain Adam.
-        lr_embedding = config.lr if config.lr_embedding is None else config.lr_embedding
         head_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
         self.opt = torch.optim.Adam(head_params, lr=float(config.lr))
-        self.opt_embedding = torch.optim.SparseAdam([self.model.E.weight], lr=float(lr_embedding))
+        self.opt_embedding = torch.optim.SparseAdam([self.model.E.weight], lr=float(config.lr_embedding))
 
     # Full-graph ingestion (once, up front)
 

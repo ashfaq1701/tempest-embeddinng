@@ -63,10 +63,9 @@ def parse_args() -> argparse.Namespace:
 
     # ── Optimisation / training ─────────────────────────────────────
     p.add_argument("--lr", default=1e-3, type=float,
-                   help="Learning rate of the distance temperature and the NN pooler (and of "
-                        "the embedding table unless --lr-embedding is set).")
-    p.add_argument("--lr-embedding", default=None, type=float,
-                   help="Learning rate of the embedding table E (SparseAdam). Default: --lr.")
+                   help="Learning rate of the distance temperature and the NN pooler (Adam).")
+    p.add_argument("--lr-embedding", default=1e-4, type=float,
+                   help="Learning rate of the embedding table E (SparseAdam).")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
