@@ -104,7 +104,8 @@ class Trainer:
 
         # One SGD, two param groups: the head (temperature + pooler) at lr (group 0), E at
         # lr_embedding (group 1). No momentum, so there is no state to go stale while a row is
-        # absent, and the step is proportional to the gradient rather than normalised by it.
+        # absent, and the step is proportional to the gradient rather than normalised by it --
+        # which is why the lookup count has to be divided out in the forward (see model.py).
         head_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
         self.opt = torch.optim.SGD([
             {"params": head_params, "lr": float(config.lr)},

@@ -47,7 +47,10 @@ class BagWeights(nn.Module):
             nodes[cold, 0] = tokens.seeds[cold]
             valid[cold, 0] = True
 
-        points = F.embedding(nodes, self.E.weight, sparse=True)              # [Q, T, d]  sparse grad: SGD
+        # scale_grad_by_freq divides a row's gradient by how many times it was looked up in the
+        # batch, so SGD's step is per row-appearance rather than per lookup. It rules out a
+        # sparse gradient (torch raises), hence the dense grad on E.
+        points = F.embedding(nodes, self.E.weight, scale_grad_by_freq=True)  # [Q, T, d]
         # Features see positions only; E's gradient flows through `points`.
         fixed = points.detach()                                              # [Q, T, d]
 
