@@ -57,10 +57,12 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. One Adam, two param groups differing only in lr: E at
-    # `lr_embedding`, the temperature and the NN pooler at `lr`. Adam's defaults throughout.
+    # Constant lr. One Adam, three param groups: the NN pooler at `lr`, the temperature at `lr`
+    # with weight decay `wd_temp` (which caps it at temp ~ |grad| / wd_temp), E at `lr_embedding`.
+    # Adam's default betas throughout.
     lr: float = 1e-3
     lr_embedding: float = 1e-4
+    wd_temp: float = 1e-4
 
     # Run control.
     num_epochs: int = 100
@@ -101,12 +103,19 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # One Adam, two param groups differing only in lr. No betas override, so E keeps Adam's
+        # One Adam, three param groups. No betas override anywhere, so E keeps Adam's
         # (0.9, 0.999): momentum is on, and an absent row keeps moving because m decays over
-        # wall-clock steps rather than over the row's own touches.
-        head_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
+        # wall-clock steps rather than over the row's own touches. The temperature is split off
+        # into its own group so that `wd_temp` reaches it and nothing else; the decay is coupled
+        # (it enters the gradient), so the balance wd*temp = |grad| is one Adam cannot evade.
+        if sum(1 for n, _ in self.model.named_parameters() if n == "temp") != 1:
+            raise RuntimeError("expected exactly one parameter named 'temp'; wd_temp would be inert")
+        pooler_params = [p for name, p in self.model.named_parameters()
+                         if name not in ("E.weight", "temp")]
         self.opt = torch.optim.Adam([
-            {"params": head_params, "lr": float(config.lr)},
+            {"params": pooler_params, "lr": float(config.lr)},
+            {"params": [self.model.temp], "lr": float(config.lr),
+             "weight_decay": float(config.wd_temp)},
             {"params": [self.model.E.weight], "lr": float(config.lr_embedding)},
         ])
 
