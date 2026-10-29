@@ -6,11 +6,18 @@ import torch.nn as nn
 from .walk_tokens import WalkTokens
 
 _SQ_DIST_FLOOR = 1e-12
+_SPREAD_FLOOR = 1e-6
 
 
 def dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Euclidean distance over the last axis; the floor keeps the gradient finite at x == y."""
     return ((x - y) ** 2).sum(-1).clamp_min(_SQ_DIST_FLOOR).sqrt()
+
+
+def standardise(x: torch.Tensor) -> torch.Tensor:
+    """Centre and scale to unit spread over the last axis; the floor only bites when a query's
+    candidates are exactly equidistant, i.e. a pool of one repeated node."""
+    return (x - x.mean(-1, keepdim=True)) / x.std(-1, keepdim=True, correction=0).clamp_min(_SPREAD_FLOOR)
 
 
 def weighted_midpoint(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -98,10 +105,11 @@ class LinkPredHead(nn.Module):
         return r_mean.clamp_min(torch.finfo(r_mean.dtype).tiny)
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Score candidates by the log distance between the two pooled points: a candidate's
-        probability ~ d^-temp, so the table's overall scale cancels within each query."""
+        """Score candidates by the standardised distance between the two pooled points: the
+        distances are centred and unit-scaled within each query, so the table's overall scale
+        cancels and `temp` sets sharpness in units of that query's own spread."""
         r_mean = self.mean_radius()                                          # [] (the pooler's own units)
         pooled_u = self.bag_weights(src_tokens, r_mean)                      # [b, d]
         pooled_v = self.bag_weights(cand_tokens, r_mean)                     # [b*c, d]
         pooled_v = pooled_v.view(pooled_u.shape[0], -1, pooled_u.shape[-1])  # [b, c, d]
-        return self.temp * -torch.log(dist(pooled_u.unsqueeze(1), pooled_v))  # [b, c]
+        return self.temp * -standardise(dist(pooled_u.unsqueeze(1), pooled_v))  # [b, c]
