@@ -58,7 +58,7 @@ class TrainerConfig:
     t2nv_q: float = 0.25   # node2vec in-out param
 
     # Constant lr, no weight decay. One Adam, two param groups: E at `lr_embedding` with
-    # betas = (0.0, 0.999) and eps = 1e-5; the temperature and the NN pooler at `lr` on defaults.
+    # betas = (0.0, 0.999); the temperature and the NN pooler at `lr` on Adam's defaults.
     lr: float = 1e-3
     lr_embedding: float = 1e-4
 
@@ -102,17 +102,14 @@ class Trainer:
         self.neg_sampler_train = config.train_negative_sampler
 
         # One Adam, two param groups: group 0 the head on Adam's defaults, group 1 E with no
-        # momentum and a large eps. Absent rows do not move (beta1 = 0 makes m exactly 0), but
-        # their v decays, so on return m rebuilds from the fresh gradient against a v that is too
-        # small and the step is inflated -- 12x after 5,000 absent steps, capped at 1/sqrt(1-beta2)
-        # = 32x. eps = 1e-5 bounds that: at |g| ~ 1e-5 on E it dominates sqrt(v) once v is stale,
-        # so the step cannot exceed ~lr. It also halves a HEALTHY row's step, since eps is then
-        # comparable to sqrt(v) there too.
+        # momentum. beta1 = 0 because an absent row then does not move at all (m = 0*m + 1*g = 0).
+        # What this does NOT yet address: with a row touched every k steps, v settles at g^2/k, so
+        # every row's step is inflated by ~sqrt(k) -- 10x on tgbl-coin, where k = 108 measured.
         head_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
         self.opt = torch.optim.Adam([
             {"params": head_params, "lr": float(config.lr)},
             {"params": [self.model.E.weight], "lr": float(config.lr_embedding),
-             "betas": (0.0, 0.999), "eps": 1e-5},
+             "betas": (0.0, 0.999)},
         ])
 
     # Full-graph ingestion (once, up front)
