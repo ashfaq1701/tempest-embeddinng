@@ -57,10 +57,12 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. The embedding table E steps under SparseAdam at `lr_embedding`;
-    # the distance temperature and the NN pooler step under Adam at `lr`.
+    # Constant lr. The embedding table E steps under SparseAdam at `lr_embedding`; the distance
+    # temperature and the NN pooler step under Adam at `lr`, the temperature with weight decay
+    # `wd_temp`, which caps it at temp ~ |grad| / wd_temp.
     lr: float = 1e-3
     lr_embedding: float = 1e-4
+    wd_temp: float = 1e-4
 
     # Run control.
     num_epochs: int = 100
@@ -101,11 +103,19 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # Two optimisers. E's gradient is sparse (only looked-up rows), so SparseAdam updates the
-        # moments of those rows alone: an absent row's state stays frozen instead of decaying.
-        # The head's parameters get a gradient every step, so they take plain Adam.
-        head_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
-        self.opt = torch.optim.Adam(head_params, lr=float(config.lr))
+        # Two optimisers, three param groups. E's gradient is sparse (only looked-up rows), so
+        # SparseAdam updates the moments of those rows alone: an absent row's state stays frozen
+        # instead of decaying. The head's parameters get a gradient every step, so they take plain
+        # Adam, split into two groups so that `wd_temp` reaches the temperature and nothing else.
+        if sum(1 for n, _ in self.model.named_parameters() if n == "temp") != 1:
+            raise RuntimeError("expected exactly one parameter named 'temp'; wd_temp would be inert")
+        pooler_params = [p for name, p in self.model.named_parameters()
+                         if name not in ("E.weight", "temp")]
+        self.opt = torch.optim.Adam([
+            {"params": pooler_params, "lr": float(config.lr)},
+            {"params": [self.model.temp], "lr": float(config.lr),
+             "weight_decay": float(config.wd_temp)},
+        ])
         self.opt_embedding = torch.optim.SparseAdam([self.model.E.weight], lr=float(config.lr_embedding))
 
     # Full-graph ingestion (once, up front)

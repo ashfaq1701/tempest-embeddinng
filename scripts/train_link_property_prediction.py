@@ -66,6 +66,10 @@ def parse_args() -> argparse.Namespace:
                    help="Learning rate of the distance temperature and the NN pooler (Adam).")
     p.add_argument("--lr-embedding", default=1e-4, type=float,
                    help="Learning rate of the embedding table E (SparseAdam).")
+    p.add_argument("--wd-temp", default=1e-4, type=float,
+                   help="Weight decay on the distance temperature only (plain Adam, so the decay "
+                        "enters the gradient); the pooler and E are never decayed. It caps the "
+                        "temperature at roughly |grad| / --wd-temp.")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
@@ -177,6 +181,7 @@ def main() -> Dict[str, Any]:
         t2nv_q=args.t2nv_q,
         lr=args.lr,
         lr_embedding=args.lr_embedding,
+        wd_temp=args.wd_temp,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 
