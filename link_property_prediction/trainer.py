@@ -103,12 +103,8 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # Two optimisers, three param groups. E's gradient is sparse (only looked-up rows), so
-        # SparseAdam updates the moments of those rows alone: an absent row's state stays frozen
-        # instead of decaying. The head's parameters get a gradient every step, so they take plain
-        # Adam, split into two groups so that `wd_temp` reaches the temperature and nothing else.
-        if sum(1 for n, _ in self.model.named_parameters() if n == "temp") != 1:
-            raise RuntimeError("expected exactly one parameter named 'temp'; wd_temp would be inert")
+        # Two optimisers, three param groups: E's sparse gradient needs SparseAdam, and the head
+        # splits so that `wd_temp` reaches the temperature and nothing else.
         pooler_params = [p for name, p in self.model.named_parameters()
                          if name not in ("E.weight", "temp")]
         self.opt = torch.optim.Adam([
