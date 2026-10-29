@@ -1,0 +1,121 @@
+# LANE lds (feature/log-distance-score 9db8d58): ONE commit on master 16cedd9, ONE line:
+#     temp * -dist(p_u, p_v)   ->   temp * -log(dist(p_u, p_v))
+#   Everything else is master's: SparseAdam on E at --lr-embedding 1e-4, Adam on the
+#   temperature + pooler at --lr 1e-3 (both branch defaults, nothing on the cmd line),
+#   N(0,1/d) init, sparse F.embedding via nn.Embedding(..., sparse=True).
+# COMPARED WITH: master SparseAdam on the same dataset/seed/flags -> logs/spa_689b4ba cell
+#   tgb_spa_..._lrE1e-4_... : max test 0.7505 at ep7, val-selected 0.7505, rc=0, sel 7/17,
+#   final temp +17.44, r_mean 1.227, r_max 5.128. That run is commit 689b4ba with lrE 1e-4
+#   passed explicitly, which is numerically master's default; master then moved 190a07c ->
+#   16cedd9, whose only change is the sparse=True constructor move (asserted inert, and
+#   being determinism-checked right now in logs/aw2_1996a49 against logs/agp_ag1_8ca58c7).
+# WHAT THE CHANGE DOES. log(c*d) = log c + log d, and the -temp*log c term is identical for
+#   every candidate in a query, so it cancels in the softmax: the LOSS becomes exactly
+#   degree-0 homogeneous in E. Master's score is degree-1, where Euler gives
+#   <E, grad_E f> = f != 0, i.e. a real radial gradient. Here <E, grad_E L> = 0 EXACTLY.
+# THAT CUTS BOTH WAYS, and the optimistic half is only half. The loss no longer REWARDS
+#   inflating the table -- but it no longer PENALISES it either, so the radial direction
+#   becomes an exactly flat direction that drift fills. It also means the scale-invariance
+#   literature (van Laarhoven; Arora, Li & Lyu auto-rate-tuning) now applies to E: the
+#   effective rate becomes lr/||E||^2 and ||E|| grows monotonically under a gradient that
+#   is orthogonal to it.
+# WE HAVE RUN THIS EXACT SCORER BEFORE, and it is why the radius line matters most here.
+#   logs/ldt0502d88 (feature/log-distance-logit-temp 0502d88, three commits on master
+#   a8fab28) is the same one-line change in the PRE-SparseAdam, PRE-N(0,1/d) era: dense
+#   Adam at lr 1e-3 for everything, INIT_RADIUS 1e-3. On tgbl-coin it closed rc=0 with
+#   best_val 0.6739 / best_test 0.6955 at ep8 of 18, and over those 18 epochs:
+#     link  0.3699 -> 0.0506      (train loss driven 7x down)
+#     r_mean   1.369 -> 12.520    (+0.65/epoch, near-linear, never levelling)
+#     r_max    5.493 -> 69.410
+#     temp    +7.52 -> +19.09
+#   That header also records the gauge measurement directly: a 100x rescale of E left the
+#   loss unchanged to 9 s.f. and cos(grad, E) = 4e-9. So the flat radial direction is not a
+#   theory, it was measured, and the table duly ran to r_max 69.
+#   Those absolute numbers are NOT comparable with this run (different init, different
+#   optimiser, different era) -- the point is the SHAPE: train loss collapses, radius runs,
+#   val peaks early. Watch r_mean/r_max first and the MRR second.
+# ONE MORE THING THAT MAKES THIS A DYNAMICS EXPERIMENT, NOT AN EXPRESSIVENESS ONE: at FIXED
+#   weights -temp*log d is strictly monotone in d, so it induces exactly master's ranking
+#   and therefore exactly master's MRR. Any difference measured here comes from the
+#   optimisation path, not from what the scorer can express.
+# INIT STATS (seed 5, N(0,1/d), 638,486 rows): r_mean 0.9981  r_max 1.2919  r_min 0.7122
+# tgbl-coin REFERENCES (max test, same seed/scorer-family/flags): SparseAdam lrE1e-4 0.7505
+#   (ep7, rc=0) <- THE BAR | dense Adam lrE3e-5 0.7456 (ep9, rc=0) | one SGD freq-normed
+#   0.7424 (ep14, live) | Adagrad E + Adam head 0.7398 (ep7, floor) | one Adagrad 0.7396
+#   (ep6) | SGD plain head1e-1 0.7372 (ep13, live) | dense Adam b1=0 0.7346 | frozen E
+#   0.7256 (ep1) | dense Adam lrE1e-3 0.6915 (the control)
+# config from default_conf_variations.txt: tgbl-coin: --n-layers-pooler 1  -> pat=10 nl=1 eb=1000
+# experiment=lds_9db8d58 cell=tgb_lds_d128_k5_keval100_wpn10_mwl5_lr1e-3_lrE1e-4_pat10_h32_nl1 tag=run_1_seed5  dataset=tgbl-coin suite=tgb  lr=1e-3 lr_embedding=1e-4 (branch defaults)
+# code=/its/home/ms2420/tempest-wt-lds branch=feature/log-distance-score commit=9db8d58 tree=clean
+# host=artemis-rtx-01.local job=11629934 gpu=NVIDIA RTX PRO 6000 Blackwell Server Edition
+# started=2026-10-28 22:03:15
+# cmd: /mnt/nfs2/inf/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb --dataset tgbl-coin --n-layers-pooler 1 --data-root /mnt/nfs2/inf/ms2420/tempest-embeddinng/datasets --seed 5 --use-gpu --use-gpu-tempest
+
+=== tempest-embedding training ===
+dataset: tgbl-coin
+device:  cuda
+seed:    5
+loaded (tgb) in 5.2s
+  num_nodes:     638,486
+  T_train:       13,284,796
+  neg_pool:      574,791 train nodes (training negatives)
+  train edges:   15,966,659
+  val edges:     3,421,416
+  test edges:    3,421,411
+  [tgb] val negatives: TGB's pre-generated set (--k-eval=100 ignored)
+  [tgb] test negatives: TGB's pre-generated set (--k-eval=100 ignored)
+
+=== Config ===
+  num_nodes: 638486
+  T_train: 13284796
+  train_negative_sampler: UniformNegativeSampler(k=5, pool=574,791)
+  d_emb: 128
+  hidden_dim: 32
+  n_layers_pooler: 1
+  K_train: 5
+  num_walks_per_node: 10
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  lr_embedding: 0.0001
+  num_epochs: 100
+  early_stop_patience: 10
+  seed: 5
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:           81,726,208
+  head params:              194
+  TOTAL trainable:   81,726,402
+
+=== Training ===
+  Ingested full graph into Tempest: 22,809,486 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=0.4360  lr=1e-03  lr_E=1e-04  train 594.7s  r_mean=1.073  r_max=2.314  temp=+8.2457  val 0.7151  test 0.7412 (new best)  eval 167.3s
+epoch 2/100  link=0.3045  lr=1e-03  lr_E=1e-04  train 593.9s  r_mean=1.082  r_max=2.469  temp=+9.9792  val 0.7230  test 0.7487 (new best)  eval 165.4s
+epoch 3/100  link=0.2695  lr=1e-03  lr_E=1e-04  train 598.1s  r_mean=1.089  r_max=2.841  temp=+11.0033  val 0.7259  test 0.7506 (new best)  eval 166.4s
+epoch 4/100  link=0.2443  lr=1e-03  lr_E=1e-04  train 591.4s  r_mean=1.096  r_max=3.085  temp=+11.8728  val 0.7289  test 0.7523 (new best)  eval 167.6s
+epoch 5/100  link=0.2237  lr=1e-03  lr_E=1e-04  train 586.7s  r_mean=1.102  r_max=3.308  temp=+12.7067  val 0.7287  patience 1/10  eval 164.6s
+epoch 6/100  link=0.2062  lr=1e-03  lr_E=1e-04  train 586.0s  r_mean=1.109  r_max=3.484  temp=+13.5115  val 0.7317  test 0.7529 (new best)  eval 165.6s
+epoch 7/100  link=0.1899  lr=1e-03  lr_E=1e-04  train 592.9s  r_mean=1.115  r_max=3.674  temp=+14.3263  val 0.7314  patience 1/10  eval 163.5s
+epoch 8/100  link=0.1761  lr=1e-03  lr_E=1e-04  train 588.7s  r_mean=1.122  r_max=3.910  temp=+15.1215  val 0.7257  patience 2/10  eval 163.4s
+epoch 9/100  link=0.1641  lr=1e-03  lr_E=1e-04  train 585.2s  r_mean=1.128  r_max=4.135  temp=+15.8460  val 0.7300  patience 3/10  eval 165.7s
+epoch 10/100  link=0.1541  lr=1e-03  lr_E=1e-04  train 591.2s  r_mean=1.134  r_max=4.341  temp=+16.5701  val 0.7281  patience 4/10  eval 170.5s
+epoch 11/100  link=0.1450  lr=1e-03  lr_E=1e-04  train 600.9s  r_mean=1.140  r_max=4.534  temp=+17.2261  val 0.7230  patience 5/10  eval 152.7s
+epoch 12/100  link=0.1367  lr=1e-03  lr_E=1e-04  train 561.4s  r_mean=1.146  r_max=4.690  temp=+17.9627  val 0.7288  patience 6/10  eval 155.0s
+epoch 13/100  link=0.1287  lr=1e-03  lr_E=1e-04  train 561.7s  r_mean=1.152  r_max=4.772  temp=+18.7199  val 0.7263  patience 7/10  eval 151.7s
+epoch 14/100  link=0.1217  lr=1e-03  lr_E=1e-04  train 562.5s  r_mean=1.157  r_max=4.858  temp=+19.3889  val 0.7238  patience 8/10  eval 153.4s
+epoch 15/100  link=0.1153  lr=1e-03  lr_E=1e-04  train 557.3s  r_mean=1.163  r_max=4.917  temp=+20.1154  val 0.7231  patience 9/10  eval 151.6s
+epoch 16/100  link=0.1095  lr=1e-03  lr_E=1e-04  train 557.0s  r_mean=1.168  r_max=4.902  temp=+20.8873  val 0.7202  patience 10/10  eval 167.7s
+  restored best weights from epoch 6 (val 0.7317, test 0.7529)
+
+=== Final results ===
+  dataset:           tgbl-coin
+  seed:              5
+  stopped_at_epoch:  6
+  best_val_mrr:      0.7317
+  best_test_mrr:     0.7529
+=== rc=0 finished=2026-10-29 01:36:10 ===

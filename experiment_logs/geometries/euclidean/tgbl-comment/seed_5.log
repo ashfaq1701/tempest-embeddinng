@@ -1,0 +1,118 @@
+# LANE lds (feature/log-distance-score 9db8d58): score = temp * -log(dist(p_u, p_v)). Optimiser: SparseAdam on E (master's), Adam on the head.
+#   --lr 1e-3 (head) and --lr-embedding 1e-4 (E), branch defaults, nothing on the cmd line.
+# THE PAIR. lds and ald carry the SAME scorer and differ ONLY in the optimiser on E:
+#   lds = master 16cedd9 + the log line, so SparseAdam (lazy v: an absent row's second
+#         moment is untouched, so a returning row steps at exactly lr).
+#   ald = the same log line on dense Adam with beta1 = 0, where v decays on wall-clock
+#         steps. With a row touched every k steps v settles at g^2/k, so sqrt(v_hat) ~
+#         |g|/sqrt(k) and EVERY row's step is inflated by ~sqrt(k).
+#   On tgbl-coin that inflation is MEASURED, not assumed: 5,932 distinct rows touched per
+#   step out of 638,486 gives k = 108 and sqrt(k) = 10.4, and the probe read g_rms 3.785e-05
+#   against sqvh 4.210e-06, a ratio of 9.0. Neither beta2 -> 1 nor amsgrad removes it (both
+#   leave sqrt(k) intact in the periodic steady state); only lazy updating does.
+# k IS THE DATASET VARIABLE, and it is why these two datasets are worth running.
+#   rows / rows-touched-per-step:  flight 18,143 rows and ~18,000 touched -> k ~ 1, so ald's
+#   inflation should be ~1.0x and the two lanes should MATCH there. comment 994,790 rows
+#   and ~6,000 touched -> k ~ 166, sqrt(k) = 12.9, the largest inflation of the three, so
+#   that is where lds should beat ald by the most. Flat across both datasets would mean the
+#   sqrt(k) story does not govern the outcome.
+# WHAT COIN SAYS SO FAR (ep1, matched): ald 0.7421 vs lds 0.7412 -- the optimiser swap cost
+#   NOTHING at ep1 despite the 10x inflation, while E moved 2.3x further (r_mean +0.17 vs
+#   +0.075 from init). lds peaked 0.7529 at ep6 and is at patience 4/10 by ep10.
+# READ r_max BEFORE THE MRR, on both lanes. log(c*d) = log c + log d and the -temp*log c
+#   term is the same for every candidate in a query, so it cancels in the softmax: the LOSS
+#   is exactly degree-0 homogeneous in E and <E, grad_E L> = 0. The radial direction
+#   therefore carries NO gradient and nothing restrains it -- on logs/lds_9db8d58 r_max
+#   grows a near-perfectly linear +0.21/epoch (3.484 -> 4.341 over ep6-10) while r_mean
+#   stays flat at 1.13. The pre-init-era version of this scorer (logs/ldt0502d88, dense Adam
+#   at lr 1e-3 on everything) reached r_max 69.4 by ep18 while losing 0.03 of val. A run
+#   whose r_max climbs linearly while val is flat can be stopped.
+# NOT AN EXPRESSIVENESS TEST: at fixed weights -temp*log d is strictly monotone in d, so it
+#   induces exactly master's ranking and master's MRR. Every difference is optimisation.
+# CAVEAT ON COMMENT: the current N(0,1/d) init regressed this dataset badly -- master
+#   0207bc4 scored 0.5712 at ep1 against the old near-origin control's 0.6733 -- so
+#   comment's absolute numbers are NOT comparable with anything pre-init-change. Only the
+#   lds-vs-ald contrast and the SparseAdam/dense references below are clean there.
+# config from default_conf_variations.txt: tgbl-comment: --n-layers-pooler 1  -> pat=10 nl=1 eb=1000
+# REFERENCES on tgbl-comment (max test, same seed/flags, RAW-dist scorer):
+#   SparseAdam lrE1e-4 0.7500 (ep15, killed at ep19 pat 4/10 -- a floor)
+#   dense Adam b1=0 lrE1e-4 0.7143 (ep3, rc=0, sel 4/14) <- ald's optimiser control
+#   SparseAdam advantage there was +0.0357, the largest of the three datasets
+# experiment=lf_lds_9db8d58 cell=tgb_lds_d128_k5_keval100_wpn10_mwl5_lr1e-3_lrE1e-4_pat10_h32_nl1 tag=run_1_seed5  dataset=tgbl-comment suite=tgb  lr=1e-3 lr_embedding=1e-4 (branch defaults)
+# code=/its/home/ms2420/tempest-wt-lds branch=feature/log-distance-score commit=9db8d58 tree=clean
+# host=artemis-rtx-01.local job=11630050 gpu=NVIDIA RTX PRO 6000 Blackwell Server Edition
+# started=2026-10-29 00:31:10
+# cmd: /mnt/nfs2/inf/ms2420/tempest-embeddinng/venv/bin/python -u scripts/train_link_property_prediction.py --data-suite tgb --dataset tgbl-comment --n-layers-pooler 1 --data-root /mnt/nfs2/inf/ms2420/tempest-embeddinng/datasets --seed 5 --use-gpu --use-gpu-tempest
+
+=== tempest-embedding training ===
+dataset: tgbl-comment
+device:  cuda
+seed:    5
+loaded (tgb) in 14.1s
+  num_nodes:     994,790
+  T_train:       148,504,096
+  neg_pool:      731,964 train nodes (training negatives)
+  train edges:   31,020,155
+  val edges:     6,647,176
+  test edges:    6,647,176
+  [tgb] val negatives: TGB's pre-generated set (--k-eval=100 ignored)
+  [tgb] test negatives: TGB's pre-generated set (--k-eval=100 ignored)
+
+=== Config ===
+  num_nodes: 994790
+  T_train: 148504096
+  train_negative_sampler: UniformNegativeSampler(k=5, pool=731,964)
+  d_emb: 128
+  hidden_dim: 32
+  n_layers_pooler: 1
+  K_train: 5
+  num_walks_per_node: 10
+  max_walk_len: 5
+  walk_bias: ExponentialWeight
+  start_bias: ExponentialWeight
+  t2nv_p: 4.0
+  t2nv_q: 0.25
+  lr: 0.001
+  lr_embedding: 0.0001
+  num_epochs: 100
+  early_stop_patience: 10
+  seed: 5
+  use_gpu: True
+  use_gpu_tempest: True
+
+=== Parameter counts ===
+  model.E:          127,333,120
+  head params:              194
+  TOTAL trainable:  127,333,314
+
+=== Training ===
+  Ingested full graph into Tempest: 44,314,507 edges (once; per-query cutoff enforces causality)
+epoch 1/100  link=0.1750  lr=1e-03  lr_E=1e-04  train 1422.8s  r_mean=1.079  r_max=2.807  temp=+9.7049  val 0.6377  test 0.6880 (new best)  eval 318.3s
+epoch 2/100  link=0.1301  lr=1e-03  lr_E=1e-04  train 1397.3s  r_mean=1.090  r_max=3.253  temp=+10.0444  val 0.6424  test 0.6914 (new best)  eval 315.9s
+epoch 3/100  link=0.1254  lr=1e-03  lr_E=1e-04  train 1496.0s  r_mean=1.099  r_max=3.702  temp=+10.3323  val 0.6455  test 0.6952 (new best)  eval 336.5s
+epoch 4/100  link=0.1218  lr=1e-03  lr_E=1e-04  train 1478.2s  r_mean=1.106  r_max=4.002  temp=+10.6241  val 0.6505  test 0.7008 (new best)  eval 326.6s
+epoch 5/100  link=0.1187  lr=1e-03  lr_E=1e-04  train 1470.8s  r_mean=1.113  r_max=4.278  temp=+10.9214  val 0.6548  test 0.7065 (new best)  eval 310.6s
+epoch 6/100  link=0.1157  lr=1e-03  lr_E=1e-04  train 1452.0s  r_mean=1.119  r_max=4.600  temp=+11.2750  val 0.6584  test 0.7113 (new best)  eval 322.2s
+epoch 7/100  link=0.1130  lr=1e-03  lr_E=1e-04  train 1459.3s  r_mean=1.125  r_max=4.838  temp=+11.7912  val 0.6687  test 0.7206 (new best)  eval 303.8s
+epoch 8/100  link=0.1099  lr=1e-03  lr_E=1e-04  train 1461.1s  r_mean=1.130  r_max=5.017  temp=+13.2646  val 0.6947  test 0.7454 (new best)  eval 323.0s
+epoch 9/100  link=0.1058  lr=1e-03  lr_E=1e-04  train 1448.7s  r_mean=1.136  r_max=5.153  temp=+14.5268  val 0.7015  test 0.7502 (new best)  eval 318.9s
+epoch 10/100  link=0.1016  lr=1e-03  lr_E=1e-04  train 1423.7s  r_mean=1.141  r_max=5.168  temp=+15.4755  val 0.7043  test 0.7523 (new best)  eval 310.6s
+epoch 11/100  link=0.0978  lr=1e-03  lr_E=1e-04  train 1426.3s  r_mean=1.146  r_max=5.247  temp=+16.3089  val 0.6990  patience 1/10  eval 319.6s
+epoch 12/100  link=0.0943  lr=1e-03  lr_E=1e-04  train 1447.2s  r_mean=1.151  r_max=5.188  temp=+16.9944  val 0.6975  patience 2/10  eval 312.7s
+epoch 13/100  link=0.0914  lr=1e-03  lr_E=1e-04  train 1426.3s  r_mean=1.156  r_max=5.083  temp=+17.6118  val 0.6965  patience 3/10  eval 309.1s
+epoch 14/100  link=0.0885  lr=1e-03  lr_E=1e-04  train 1427.7s  r_mean=1.161  r_max=4.996  temp=+18.2874  val 0.6920  patience 4/10  eval 308.5s
+epoch 15/100  link=0.0861  lr=1e-03  lr_E=1e-04  train 1400.4s  r_mean=1.165  r_max=4.894  temp=+18.8177  val 0.6980  patience 5/10  eval 283.6s
+epoch 16/100  link=0.0836  lr=1e-03  lr_E=1e-04  train 1389.6s  r_mean=1.170  r_max=4.730  temp=+19.3802  val 0.6963  patience 6/10  eval 291.6s
+epoch 17/100  link=0.0813  lr=1e-03  lr_E=1e-04  train 1415.9s  r_mean=1.174  r_max=4.624  temp=+19.8392  val 0.6961  patience 7/10  eval 295.8s
+epoch 18/100  link=0.0791  lr=1e-03  lr_E=1e-04  train 1428.4s  r_mean=1.178  r_max=4.598  temp=+20.3195  val 0.6919  patience 8/10  eval 307.4s
+epoch 19/100  link=0.0773  lr=1e-03  lr_E=1e-04  train 1414.8s  r_mean=1.183  r_max=4.568  temp=+20.7991  val 0.6939  patience 9/10  eval 301.4s
+epoch 20/100  link=0.0752  lr=1e-03  lr_E=1e-04  train 1408.8s  r_mean=1.187  r_max=4.489  temp=+21.3398  val 0.6921  patience 10/10  eval 299.2s
+  restored best weights from epoch 10 (val 0.7043, test 0.7523)
+
+=== Final results ===
+  dataset:           tgbl-comment
+  seed:              5
+  stopped_at_epoch:  10
+  best_val_mrr:      0.7043
+  best_test_mrr:     0.7523
+=== rc=0 finished=2026-10-29 11:12:05 ===
