@@ -57,10 +57,11 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. One Adam, two param groups: E at `lr_embedding` with
-    # betas = (0.0, 0.999); the temperature and the NN pooler at `lr` on Adam's defaults.
+    # Constant lr. One AdamW, two param groups: E at `lr_embedding` with betas = (0.0, 0.999)
+    # and decoupled weight decay `wd`; the temperature and the NN pooler at `lr`, never decayed.
     lr: float = 1e-3
     lr_embedding: float = 1e-4
+    wd: float = 1e-3
 
     # Run control.
     num_epochs: int = 100
@@ -101,15 +102,16 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # One Adam, two param groups: group 0 the head on Adam's defaults, group 1 E with no
-        # momentum. beta1 = 0 because an absent row then does not move at all (m = 0*m + 1*g = 0).
-        # What this does NOT yet address: with a row touched every k steps, v settles at g^2/k, so
-        # every row's step is inflated by ~sqrt(k) -- 10x on tgbl-coin, where k = 108 measured.
+        # One AdamW, two param groups: group 0 the head on Adam's defaults and no decay, group 1
+        # E with no momentum (beta1 = 0, so an absent row's step is exactly 0) and decoupled decay.
+        # AdamW, not Adam: coupled decay passes wd*p through m/sqrt(v_hat), and a row whose loss
+        # gradient is zero then moves a constant lr per step regardless of its size. Decoupled
+        # decay is p *= (1 - lr_embedding * wd), so the rate is the product, not wd alone.
         head_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
-        self.opt = torch.optim.Adam([
-            {"params": head_params, "lr": float(config.lr)},
+        self.opt = torch.optim.AdamW([
+            {"params": head_params, "lr": float(config.lr), "weight_decay": 0.0},
             {"params": [self.model.E.weight], "lr": float(config.lr_embedding),
-             "betas": (0.0, 0.999)},
+             "betas": (0.0, 0.999), "weight_decay": float(config.wd)},
         ])
 
     # Full-graph ingestion (once, up front)

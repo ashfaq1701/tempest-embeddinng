@@ -63,9 +63,13 @@ def parse_args() -> argparse.Namespace:
 
     # ── Optimisation / training ─────────────────────────────────────
     p.add_argument("--lr", default=1e-3, type=float,
-                   help="Learning rate of the distance temperature and the NN pooler (Adam).")
+                   help="Learning rate of the distance temperature and the NN pooler (AdamW, undecayed).")
     p.add_argument("--lr-embedding", default=1e-4, type=float,
-                   help="Learning rate of the embedding table E (Adam, betas 0.0/0.999).")
+                   help="Learning rate of the embedding table E (AdamW, betas 0.0/0.999).")
+    p.add_argument("--wd", default=1e-3, type=float,
+                   help="Decoupled weight decay (AdamW) on the embedding table E only; the "
+                        "temperature and the NN pooler are never decayed. The decay rate is "
+                        "--lr-embedding * --wd, so it moves with --lr-embedding.")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
@@ -177,6 +181,7 @@ def main() -> Dict[str, Any]:
         t2nv_q=args.t2nv_q,
         lr=args.lr,
         lr_embedding=args.lr_embedding,
+        wd=args.wd,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 
