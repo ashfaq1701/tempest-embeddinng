@@ -103,13 +103,8 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # One Adam, three param groups. No betas override anywhere, so E keeps Adam's
-        # (0.9, 0.999): momentum is on, and an absent row keeps moving because m decays over
-        # wall-clock steps rather than over the row's own touches. The temperature is split off
-        # into its own group so that `wd_temp` reaches it and nothing else; the decay is coupled
-        # (it enters the gradient), so the balance wd*temp = |grad| is one Adam cannot evade.
-        if sum(1 for n, _ in self.model.named_parameters() if n == "temp") != 1:
-            raise RuntimeError("expected exactly one parameter named 'temp'; wd_temp would be inert")
+        # One Adam, three param groups. No betas override, so E keeps Adam's (0.9, 0.999); the
+        # temperature splits off so that `wd_temp` reaches it and nothing else.
         pooler_params = [p for name, p in self.model.named_parameters()
                          if name not in ("E.weight", "temp")]
         self.opt = torch.optim.Adam([
