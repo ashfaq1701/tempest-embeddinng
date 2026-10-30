@@ -61,8 +61,9 @@ class TrainerConfig:
     # pooler under Adam, but both read `lr`. There is no score temperature.
     lr: float = 1e-4
 
-    # Run control.
-    num_epochs: int = 100
+    # Run control. The epoch cap is high enough that patience, not the cap, ends every run:
+    # a cell that prints 200 epochs is a floor, not a result.
+    num_epochs: int = 200
     early_stop_patience: int = 10
 
     # System.
