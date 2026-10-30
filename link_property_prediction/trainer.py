@@ -57,10 +57,9 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. The embedding table E steps under SparseAdam at `lr_embedding`;
-    # the NN pooler steps under Adam at `lr`. There is no score temperature.
+    # One constant lr for every parameter, no weight decay. E steps under SparseAdam and the
+    # pooler under Adam, but both read `lr`. There is no score temperature.
     lr: float = 1e-3
-    lr_embedding: float = 1e-4
 
     # Run control.
     num_epochs: int = 100
@@ -103,10 +102,11 @@ class Trainer:
 
         # Two optimisers. E's gradient is sparse (only looked-up rows), so SparseAdam updates the
         # moments of those rows alone: an absent row's state stays frozen instead of decaying.
-        # The pooler's parameters get a gradient every step, so they take plain Adam.
+        # The pooler's parameters get a gradient every step, so they take plain Adam. Two
+        # optimisers, one lr: the split is forced, since SparseAdam rejects dense gradients.
         pooler_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
         self.opt = torch.optim.Adam(pooler_params, lr=float(config.lr))
-        self.opt_embedding = torch.optim.SparseAdam([self.model.E.weight], lr=float(config.lr_embedding))
+        self.opt_embedding = torch.optim.SparseAdam([self.model.E.weight], lr=float(config.lr))
 
     # Full-graph ingestion (once, up front)
 
@@ -291,7 +291,6 @@ class Trainer:
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
                 f"lr={self.opt.param_groups[0]['lr']:.0e}  "
-                f"lr_E={self.opt_embedding.param_groups[0]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
 
