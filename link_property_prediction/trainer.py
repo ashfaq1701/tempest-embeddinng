@@ -58,7 +58,7 @@ class TrainerConfig:
     t2nv_q: float = 0.25   # node2vec in-out param
 
     # Constant lr, no weight decay. The embedding table E steps under SparseAdam at `lr_embedding`;
-    # the distance temperature and the NN pooler step under Adam at `lr`.
+    # the radial weight `gamma` and the NN pooler step under Adam at `lr`.
     lr: float = 1e-3
     lr_embedding: float = 1e-4
 
@@ -192,11 +192,11 @@ class Trainer:
 
     @torch.no_grad()
     def _head_probe(self) -> str:
-        """The head's scalar parameters, for the epoch line. Read via hasattr so a head with a different
-        set of knobs degrades to a shorter line rather than raising. temp scales the score."""
+        """The head's learned scalars, for the epoch line. Read via hasattr so a head with a different
+        set of knobs degrades to a shorter line rather than raising. gamma weights the radial channel."""
         parts = []
-        if hasattr(self.model, "temp"):
-            parts.append(f"temp={float(self.model.temp):+.4f}")
+        if hasattr(self.model, "gamma"):
+            parts.append(f"gamma={float(self.model.gamma):+.4f}")
         if hasattr(self.model, "beta"):
             parts.append(f"beta={float(self.model.beta):+.4f}")
         return ("  " + "  ".join(parts)) if parts else ""

@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .walk_tokens import WalkTokens
 
@@ -90,7 +91,8 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
-        self.temp = nn.Parameter(torch.tensor([1.0]))                       # score temperature
+        self.temp = 2.0 * self.d_emb ** 0.5                                 # fixed: 2*sqrt(d)
+        self.gamma = nn.Parameter(torch.zeros(1))                           # radial weight, off at init
 
     def mean_radius(self) -> torch.Tensor:
         """Mean norm of the table (its distance from the origin), detached."""
@@ -98,10 +100,16 @@ class LinkPredHead(nn.Module):
         return r_mean.clamp_min(torch.finfo(r_mean.dtype).tiny)
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Score candidates by the log distance between the two pooled points: a candidate's
-        probability ~ d^-temp, so the table's overall scale cancels within each query."""
+        """Two channels: the log distance between the unit-normalised pooled points at the fixed
+        `temp`, plus `gamma` times the log radius of the candidate's pooled point. Normalising per
+        point is what makes `temp` derivable: it removes each candidate's own radius, whose spread
+        across a query's candidates is set by the bag sizes rather than by d."""
         r_mean = self.mean_radius()                                          # [] (the pooler's own units)
         pooled_u = self.bag_weights(src_tokens, r_mean)                      # [b, d]
         pooled_v = self.bag_weights(cand_tokens, r_mean)                     # [b*c, d]
         pooled_v = pooled_v.view(pooled_u.shape[0], -1, pooled_u.shape[-1])  # [b, c, d]
-        return self.temp * -torch.log(dist(pooled_u.unsqueeze(1), pooled_v))  # [b, c]
+        r_v = pooled_v.norm(dim=-1)                                          # [b, c]
+        angular = -torch.log(dist(F.normalize(pooled_u, dim=-1).unsqueeze(1),
+                                  F.normalize(pooled_v, dim=-1)))            # [b, c]
+        return self.temp * angular + self.gamma * r_v.clamp_min(
+            torch.finfo(r_v.dtype).tiny).log()                               # [b, c]
