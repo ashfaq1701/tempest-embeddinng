@@ -90,7 +90,8 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
-        self.temp = nn.Parameter(torch.tensor([1.0]))                       # score temperature
+        # Unit logit std at init: Var(log d) = 3/(8d) for N(0, 1/d) rows, so temp = sqrt(8d/3).
+        self.temp = nn.Parameter(torch.tensor([(8.0 * self.d_emb / 3.0) ** 0.5]))
 
     def mean_radius(self) -> torch.Tensor:
         """Mean norm of the table (its distance from the origin), detached."""

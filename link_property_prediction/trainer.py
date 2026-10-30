@@ -62,7 +62,7 @@ class TrainerConfig:
     # `wd_temp`, which caps it at temp ~ |grad| / wd_temp.
     lr: float = 1e-3
     lr_embedding: float = 1e-4
-    wd_temp: float = 1e-3
+    wd_temp: float = 1e-4
 
     # Run control.
     num_epochs: int = 100
