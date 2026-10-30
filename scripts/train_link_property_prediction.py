@@ -62,10 +62,11 @@ def parse_args() -> argparse.Namespace:
                    help="Eval negatives per positive (tgb-seq val only).")
 
     # ── Optimisation / training ─────────────────────────────────────
-    p.add_argument("--lr", default=1e-3, type=float,
-                   help="Learning rate of the distance temperature and the NN pooler (Adam).")
-    p.add_argument("--lr-embedding", default=1e-4, type=float,
-                   help="Learning rate of the embedding table E (SparseAdam).")
+    p.add_argument("--lr-pooler", default=1e-3, type=float,
+                   help="Learning rate of the NN pooler (Adam).")
+    p.add_argument("--lr-geometry", default=1e-4, type=float,
+                   help="Learning rate of the distance channel: the embedding table E "
+                        "(SparseAdam) and the score temperature (Adam).")
     p.add_argument("--batch-size", default=1000, type=int,
                    help="Train batch size.")
     p.add_argument("--eval-batch-size", default=1000, type=int,
@@ -175,8 +176,8 @@ def main() -> Dict[str, Any]:
         start_bias=args.start_bias,
         t2nv_p=args.t2nv_p,
         t2nv_q=args.t2nv_q,
-        lr=args.lr,
-        lr_embedding=args.lr_embedding,
+        lr_pooler=args.lr_pooler,
+        lr_geometry=args.lr_geometry,
         num_epochs=args.num_epochs,
         early_stop_patience=args.early_stop_patience,
 

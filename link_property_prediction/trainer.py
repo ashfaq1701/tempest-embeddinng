@@ -57,10 +57,11 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # Constant lr, no weight decay. The embedding table E steps under SparseAdam at `lr_embedding`;
-    # the distance temperature and the NN pooler step under Adam at `lr`.
-    lr: float = 1e-3
-    lr_embedding: float = 1e-4
+    # Two timescales, no weight decay. The distance channel -- the embedding table E and the score
+    # temperature, the two factors of the logit spread temp * std(log d) -- steps at `lr_geometry`;
+    # the NN pooler, the only parameter outside that channel, steps at `lr_pooler`.
+    lr_pooler: float = 1e-3
+    lr_geometry: float = 1e-4
 
     # Run control.
     num_epochs: int = 100
@@ -101,12 +102,18 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # Two optimisers. E's gradient is sparse (only looked-up rows), so SparseAdam updates the
-        # moments of those rows alone: an absent row's state stays frozen instead of decaying.
-        # The head's parameters get a gradient every step, so they take plain Adam.
-        head_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
-        self.opt = torch.optim.Adam(head_params, lr=float(config.lr))
-        self.opt_embedding = torch.optim.SparseAdam([self.model.E.weight], lr=float(config.lr_embedding))
+        # Two optimisers, three param groups. E's gradient is sparse (only looked-up rows), so
+        # SparseAdam updates the moments of those rows alone: an absent row's state stays frozen
+        # instead of decaying. temp cannot join it, because SparseAdam rejects dense gradients, so
+        # it takes Adam at `lr_geometry`: the two share the lr VALUE, not the optimiser.
+        pooler_params = [p for name, p in self.model.named_parameters()
+                         if name not in ("E.weight", "temp")]
+        self.opt = torch.optim.Adam([
+            {"params": pooler_params, "lr": float(config.lr_pooler)},
+            {"params": [self.model.temp], "lr": float(config.lr_geometry)},
+        ])
+        self.opt_embedding = torch.optim.SparseAdam([self.model.E.weight],
+                                                    lr=float(config.lr_geometry))
 
     # Full-graph ingestion (once, up front)
 
@@ -176,10 +183,7 @@ class Trainer:
         self.opt.step()
         self.opt_embedding.step()
 
-        return {
-            "link": float(link_loss.detach()),
-            "lr": float(self.opt.param_groups[0]["lr"]),
-        }
+        return {"link": float(link_loss.detach())}
 
     # Geometry probe
 
@@ -292,8 +296,8 @@ class Trainer:
             line = (
                 f"epoch {ep}/{n_epochs}  "
                 f"link={link_sum / max(n_batches, 1):.4f}  "
-                f"lr={self.opt.param_groups[0]['lr']:.0e}  "
-                f"lr_E={self.opt_embedding.param_groups[0]['lr']:.0e}  "
+                f"lr_pool={self.opt.param_groups[0]['lr']:.0e}  "
+                f"lr_geo={self.opt_embedding.param_groups[0]['lr']:.0e}  "
                 f"train {train_dt:.1f}s"
             )
 
