@@ -58,7 +58,7 @@ class TrainerConfig:
     t2nv_q: float = 0.25   # node2vec in-out param
 
     # Constant lr, no weight decay. The embedding table E steps under SparseAdam at `lr_embedding`;
-    # the distance temperature and the NN pooler step under Adam at `lr`.
+    # the NN pooler steps under Adam at `lr`. There is no score temperature.
     lr: float = 1e-3
     lr_embedding: float = 1e-4
 
@@ -103,9 +103,9 @@ class Trainer:
 
         # Two optimisers. E's gradient is sparse (only looked-up rows), so SparseAdam updates the
         # moments of those rows alone: an absent row's state stays frozen instead of decaying.
-        # The head's parameters get a gradient every step, so they take plain Adam.
-        head_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
-        self.opt = torch.optim.Adam(head_params, lr=float(config.lr))
+        # The pooler's parameters get a gradient every step, so they take plain Adam.
+        pooler_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
+        self.opt = torch.optim.Adam(pooler_params, lr=float(config.lr))
         self.opt_embedding = torch.optim.SparseAdam([self.model.E.weight], lr=float(config.lr_embedding))
 
     # Full-graph ingestion (once, up front)
@@ -193,10 +193,8 @@ class Trainer:
     @torch.no_grad()
     def _head_probe(self) -> str:
         """The head's scalar parameters, for the epoch line. Read via hasattr so a head with a different
-        set of knobs degrades to a shorter line rather than raising. temp scales the score."""
+        set of knobs degrades to a shorter line rather than raising."""
         parts = []
-        if hasattr(self.model, "temp"):
-            parts.append(f"temp={float(self.model.temp):+.4f}")
         if hasattr(self.model, "beta"):
             parts.append(f"beta={float(self.model.beta):+.4f}")
         return ("  " + "  ".join(parts)) if parts else ""
