@@ -59,7 +59,7 @@ class TrainerConfig:
 
     # One constant lr for every parameter, no weight decay. E steps under SparseAdam and the
     # pooler under Adam, but both read `lr`. There is no score temperature.
-    lr: float = 1e-3
+    lr: float = 1e-4
 
     # Run control.
     num_epochs: int = 100

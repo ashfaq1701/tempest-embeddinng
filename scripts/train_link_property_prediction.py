@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
                    help="Eval negatives per positive (tgb-seq val only).")
 
     # ── Optimisation / training ─────────────────────────────────────
-    p.add_argument("--lr", default=1e-3, type=float,
+    p.add_argument("--lr", default=1e-4, type=float,
                    help="Learning rate of every parameter: the embedding table E (SparseAdam) "
                         "and the NN pooler (Adam).")
     p.add_argument("--batch-size", default=1000, type=int,
