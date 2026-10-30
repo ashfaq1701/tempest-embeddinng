@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
                    help="Learning rate of the distance temperature and the NN pooler (Adam).")
     p.add_argument("--lr-embedding", default=1e-4, type=float,
                    help="Learning rate of the embedding table E (SparseAdam).")
-    p.add_argument("--wd-temp", default=1e-4, type=float,
+    p.add_argument("--wd-temp", default=1e-3, type=float,
                    help="Weight decay on the distance temperature only (plain Adam, so the decay "
                         "enters the gradient); the pooler and E are never decayed. It caps the "
                         "temperature at roughly |grad| / --wd-temp.")
