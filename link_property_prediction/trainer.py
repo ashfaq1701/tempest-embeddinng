@@ -57,8 +57,8 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # One constant lr for every parameter, no weight decay. E steps under SparseAdam and the
-    # pooler under Adam, but both read `lr`. There is no score temperature.
+    # One constant lr for every parameter, no weight decay, and ONE Adam over all of them --
+    # E's embedding is dense here, so no SparseAdam. There is no score temperature.
     lr: float = 1e-4
 
     # Run control. The epoch cap is high enough that patience, not the cap, ends every run:
@@ -101,13 +101,11 @@ class Trainer:
         )
         self.neg_sampler_train = config.train_negative_sampler
 
-        # Two optimisers. E's gradient is sparse (only looked-up rows), so SparseAdam updates the
-        # moments of those rows alone: an absent row's state stays frozen instead of decaying.
-        # The pooler's parameters get a gradient every step, so they take plain Adam. Two
-        # optimisers, one lr: the split is forced, since SparseAdam rejects dense gradients.
-        pooler_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
-        self.opt = torch.optim.Adam(pooler_params, lr=float(config.lr))
-        self.opt_embedding = torch.optim.SparseAdam([self.model.E.weight], lr=float(config.lr))
+        # ONE optimiser over every parameter, E included. E's embedding is dense (sparse=False),
+        # so its whole table gets a gradient every step and Adam's second moment decays on every
+        # row rather than only the rows looked up: an absent row's step is sqrt(k) * lr, where k is
+        # the table's rows per rows-touched-per-step, instead of SparseAdam's exact lr per touch.
+        self.opt = torch.optim.Adam(self.model.parameters(), lr=float(config.lr))
 
     # Full-graph ingestion (once, up front)
 
@@ -172,10 +170,8 @@ class Trainer:
         link_loss = F.cross_entropy(logits, target)
 
         self.opt.zero_grad(set_to_none=True)
-        self.opt_embedding.zero_grad(set_to_none=True)
         link_loss.backward()
         self.opt.step()
-        self.opt_embedding.step()
 
         return {
             "link": float(link_loss.detach()),
