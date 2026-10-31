@@ -58,13 +58,9 @@ class BagWeights(nn.Module):
         age = torch.log1p(age) / self.log_T_train                            # [Q, T]
         pos = pos / self.max_walk_len                                        # [Q, T]
 
-        tiny = torch.finfo(fixed.dtype).tiny
-
-        d_tok_mid = dist(fixed, mid.unsqueeze(-2))                           # [Q, T]
-        d_mid_mean = (d_tok_mid * valid_f).sum(-1, keepdim=True) / valid_f.sum(-1, keepdim=True)  # [Q, 1]
-        d_mid = d_tok_mid * valid_f / d_mid_mean.clamp_min(tiny)             # [Q, T]
-
         # Mask after the log: log of a padded token's 0 is -inf, and 0 * nan poisons net's backward.
+        # `dist` already floors, so its log needs no clamp of its own.
+        d_mid = torch.log(dist(fixed, mid.unsqueeze(-2))) * valid_f          # [Q, T]
         r_tok = fixed.norm(dim=-1).clamp_min(_SQ_DIST_FLOOR ** 0.5)          # [Q, T]
         d0 = torch.log(r_tok) * valid_f                                      # [Q, T]
 
