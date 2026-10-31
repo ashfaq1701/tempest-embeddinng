@@ -18,27 +18,6 @@ def weighted_midpoint(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return (w.unsqueeze(-1) * x).sum(-2)                                     # [..., d]
 
 
-class RunningNorm(nn.Module):
-    """Standardises x with an EMA of the mean/var of past training batches.
-    A batch is never scored with its own stats: standardise first, then fold the batch in.
-    Eval reads the frozen buffers. Stats are buffers: no gradient, saved in state_dict."""
-
-    def __init__(self, momentum: float = 0.01, eps: float = 1e-5):
-        super().__init__()
-        self.momentum = momentum
-        self.eps = eps
-        self.register_buffer("running_mean", torch.zeros(()))
-        self.register_buffer("running_var", torch.ones(()))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = (x - self.running_mean) / (self.running_var + self.eps).sqrt()
-        if self.training:
-            with torch.no_grad():
-                self.running_mean.lerp_(x.mean(), self.momentum)
-                self.running_var.lerp_(x.var(unbiased=False), self.momentum)
-        return out
-
-
 class BagWeights(nn.Module):
 
     def __init__(self, E: nn.Embedding, T_train: int, max_walk_len: int,
@@ -111,7 +90,6 @@ class LinkPredHead(nn.Module):
         self.bag_weights = BagWeights(self.E, self.T_train, self.max_walk_len,
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
-        self.dist_norm = RunningNorm()
         self.temp = nn.Parameter(torch.tensor([1.0]))                       # score temperature
 
     def mean_radius(self) -> torch.Tensor:
@@ -120,16 +98,11 @@ class LinkPredHead(nn.Module):
         return r_mean.clamp_min(torch.finfo(r_mean.dtype).tiny)
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
-        """Score candidates by the negated LOG distance between the two pooled points, standardised
-        by a running estimate of its mean and variance over past training batches, then scaled by the
-        learned `temp`. Because the standardisation pins the score's spread at 1, `temp` IS the logit
-        spread -- it is the only sharpness channel left, where previously the product temp*std(log d)
-        let the geometry sharpen instead. The log makes the
-        score exactly invariant to the table's overall scale (E -> cE shifts log d by a constant,
-        which the running mean absorbs) and keeps the gradient wrt distance proportional to 1/d, so
-        candidates already far away are pushed no further."""
+        """Score candidates by the negated log distance between the two pooled points, scaled by the
+        learned `temp`: a candidate's probability ~ d^-temp, so the table's overall scale cancels
+        within each query."""
         r_mean = self.mean_radius()                                          # [] (the pooler's own units)
         pooled_u = self.bag_weights(src_tokens, r_mean)                      # [b, d]
         pooled_v = self.bag_weights(cand_tokens, r_mean)                     # [b*c, d]
         pooled_v = pooled_v.view(pooled_u.shape[0], -1, pooled_u.shape[-1])  # [b, c, d]
-        return self.temp * -self.dist_norm(torch.log(dist(pooled_u.unsqueeze(1), pooled_v)))  # [b, c]
+        return self.temp * -torch.log(dist(pooled_u.unsqueeze(1), pooled_v))  # [b, c]

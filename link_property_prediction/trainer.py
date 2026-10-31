@@ -103,10 +103,10 @@ class Trainer:
 
         # Two optimisers. E's gradient is sparse (only looked-up rows), so SparseAdam updates the
         # moments of those rows alone: an absent row's state stays frozen instead of decaying.
-        # The pooler's parameters get a gradient every step, so they take plain Adam. Two
+        # The pooler and the temperature get a gradient every step, so they take plain Adam. Two
         # optimisers, one lr: the split is forced, since SparseAdam rejects dense gradients.
-        pooler_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
-        self.opt = torch.optim.Adam(pooler_params, lr=float(config.lr))
+        head_params = [p for name, p in self.model.named_parameters() if name != "E.weight"]
+        self.opt = torch.optim.Adam(head_params, lr=float(config.lr))
         self.opt_embedding = torch.optim.SparseAdam([self.model.E.weight], lr=float(config.lr))
 
     # Full-graph ingestion (once, up front)
