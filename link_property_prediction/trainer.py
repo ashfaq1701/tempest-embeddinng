@@ -57,8 +57,8 @@ class TrainerConfig:
     t2nv_p: float = 4.0    # node2vec return param (used only when a bias is TemporalNode2Vec)
     t2nv_q: float = 0.25   # node2vec in-out param
 
-    # One constant lr for every parameter, no weight decay. E steps under SparseAdam and the
-    # pooler under Adam, but both read `lr`. There is no score temperature.
+    # One constant lr for every parameter, no weight decay. E steps under SparseAdam; the pooler
+    # and the score temperature step under Adam; all of them read `lr`.
     lr: float = 1e-4
 
     # Run control. The epoch cap is high enough that patience, not the cap, ends every run:
@@ -194,8 +194,10 @@ class Trainer:
     @torch.no_grad()
     def _head_probe(self) -> str:
         """The head's scalar parameters, for the epoch line. Read via hasattr so a head with a different
-        set of knobs degrades to a shorter line rather than raising."""
+        set of knobs degrades to a shorter line rather than raising. temp scales the score."""
         parts = []
+        if hasattr(self.model, "temp"):
+            parts.append(f"temp={float(self.model.temp):+.4f}")
         if hasattr(self.model, "beta"):
             parts.append(f"beta={float(self.model.beta):+.4f}")
         return ("  " + "  ".join(parts)) if parts else ""

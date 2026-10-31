@@ -112,6 +112,7 @@ class LinkPredHead(nn.Module):
                                       hidden_dim=hidden_dim, n_layers=n_layers_pooler)
 
         self.dist_norm = RunningNorm()
+        self.temp = nn.Parameter(torch.tensor([1.0]))                       # score temperature
 
     def mean_radius(self) -> torch.Tensor:
         """Mean norm of the table (its distance from the origin), detached."""
@@ -120,7 +121,10 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Score candidates by the negated LOG distance between the two pooled points, standardised
-        by a running estimate of its mean and variance over past training batches. The log makes the
+        by a running estimate of its mean and variance over past training batches, then scaled by the
+        learned `temp`. Because the standardisation pins the score's spread at 1, `temp` IS the logit
+        spread -- it is the only sharpness channel left, where previously the product temp*std(log d)
+        let the geometry sharpen instead. The log makes the
         score exactly invariant to the table's overall scale (E -> cE shifts log d by a constant,
         which the running mean absorbs) and keeps the gradient wrt distance proportional to 1/d, so
         candidates already far away are pushed no further."""
@@ -128,4 +132,4 @@ class LinkPredHead(nn.Module):
         pooled_u = self.bag_weights(src_tokens, r_mean)                      # [b, d]
         pooled_v = self.bag_weights(cand_tokens, r_mean)                     # [b*c, d]
         pooled_v = pooled_v.view(pooled_u.shape[0], -1, pooled_u.shape[-1])  # [b, c, d]
-        return -self.dist_norm(torch.log(dist(pooled_u.unsqueeze(1), pooled_v)))  # [b, c]
+        return self.temp * -self.dist_norm(torch.log(dist(pooled_u.unsqueeze(1), pooled_v)))  # [b, c]
