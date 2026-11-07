@@ -1,11 +1,11 @@
-"""Frozen link-prediction encoder -> 4 causal features per interaction (u, t)."""
+"""Frozen link-prediction encoder -> 5 causal features per interaction (u, t)."""
 import hashlib
 
 import numpy as np
 import torch
 
 from link_property_prediction.data import SplitData, create_batches
-from link_property_prediction.model import LinkPredHead
+from link_property_prediction.model import LinkPredHead, dist
 from link_property_prediction.walk_tokens import WalkTokens, build_query_walk_tokens
 from link_property_prediction.walks import WalkGenerator
 
@@ -73,18 +73,19 @@ class FrozenEncoder:
             geometry = self._geometry(tokens, src.to(self.device))
             history = self._history(walker, batch.src, batch.ts)
             out.append(torch.cat([geometry, history.to(self.device)], dim=1))
-        return torch.cat(out)                                                # [N, 4]
+        return torch.cat(out)                                                # [N, 5]
 
     def _geometry(self, tokens: WalkTokens, src: torch.Tensor) -> torch.Tensor:
-        """u's own radius and its pooled point's radius."""
+        """u's radius, its pooled point's radius, and the pooled point's gap from the bag mid."""
         model = self.model
-        pooled = model.bag_weights(tokens)                                   # [Q, d]
+        pooled, mid = model.bag_weights.centres(tokens)                      # [Q, d], [Q, d]
         e_u = model.E.weight[src]                                            # [Q, d]
         geometry = [
             e_u.norm(dim=-1),
             pooled.norm(dim=-1),
+            dist(pooled, mid),
         ]
-        return torch.stack(geometry, dim=-1)                                 # [Q, 2]
+        return torch.stack(geometry, dim=-1)                                 # [Q, 3]
 
     def _history(self, walker: WalkGenerator, src: np.ndarray, ts: np.ndarray) -> torch.Tensor:
         src = src.astype(np.int64)
