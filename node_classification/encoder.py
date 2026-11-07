@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from link_property_prediction.data import SplitData, create_batches
-from link_property_prediction.model import LinkPredHead, dist
+from link_property_prediction.model import LinkPredHead
 from link_property_prediction.walk_tokens import WalkTokens, build_query_walk_tokens
 from link_property_prediction.walks import WalkGenerator
 
@@ -76,14 +76,14 @@ class FrozenEncoder:
         return torch.cat(out)                                                # [N, 5]
 
     def _geometry(self, tokens: WalkTokens, src: torch.Tensor) -> torch.Tensor:
-        """u's radius, its pooled point's radius, and the pooled point's gap from the bag mid."""
+        """u's radius, its pooled point's radius, and the bag's mean distance from its midpoint."""
         model = self.model
-        pooled, mid = model.bag_weights(tokens)                              # [Q, d], [Q, d]
+        pooled, spread = model.bag_weights(tokens)                           # [Q, d], [Q]
         e_u = model.E.weight[src]                                            # [Q, d]
         geometry = [
             e_u.norm(dim=-1),
             pooled.norm(dim=-1),
-            dist(pooled, mid),
+            spread,
         ]
         return torch.stack(geometry, dim=-1)                                 # [Q, 3]
 

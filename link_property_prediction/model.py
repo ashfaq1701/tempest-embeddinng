@@ -51,31 +51,33 @@ class BagWeights(nn.Module):
         return nodes, valid
 
     def _token_features(self, tokens: WalkTokens, fixed: torch.Tensor,
-                        valid_f: torch.Tensor, mid: torch.Tensor) -> torch.Tensor:
+                        valid_f: torch.Tensor, r_mid: torch.Tensor) -> torch.Tensor:
         """Per-token features [Q, T, 4]: age, hop, log distance to the bag centre, log radius."""
         age = tokens.ages.flatten(1).clamp_min(0).to(fixed.dtype)            # [Q, T]
         pos = tokens.positions.flatten(1).to(fixed.dtype)                    # [Q, T]
         age = torch.log1p(age) / self.log_T_train                            # [Q, T]
         pos = pos / self.max_walk_len                                        # [Q, T]
 
-        d_mid = torch.log(dist(fixed, mid.unsqueeze(-2))) * valid_f          # [Q, T]
+        d_mid = torch.log(r_mid) * valid_f                                   # [Q, T]
         r_tok = fixed.norm(dim=-1).clamp_min(_SQ_DIST_FLOOR ** 0.5)          # [Q, T]
         d0 = torch.log(r_tok) * valid_f                                      # [Q, T]
 
         return torch.stack([age, pos, d_mid, d0], dim=-1)                    # [Q, T, 4]
 
     def forward(self, tokens: WalkTokens) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Pooled point [Q, d] (weighted bag midpoint) and the unweighted bag midpoint [Q, d]."""
+        """Pooled point [Q, d] and the bag's mean distance from its unweighted midpoint [Q]."""
         nodes, valid = self._bag_nodes(tokens)                               # [Q, T]
         points = self.E(nodes)                                               # [Q, T, d]
         fixed = points.detach()                                              # [Q, T, d]  features only
         valid_f = valid.to(fixed.dtype)                                      # [Q, T]
         mid = weighted_midpoint(fixed, valid_f / valid_f.sum(-1, keepdim=True))  # [Q, d]
+        r_mid = dist(fixed, mid.unsqueeze(-2))                               # [Q, T]
+        spread = (r_mid * valid_f).sum(-1) / valid_f.sum(-1)                 # [Q]
 
-        feats = self._token_features(tokens, fixed, valid_f, mid)            # [Q, T, 4]
+        feats = self._token_features(tokens, fixed, valid_f, r_mid)          # [Q, T, 4]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         log_weights = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T]
-        return weighted_midpoint(points, log_weights.exp()), mid             # [Q, d], [Q, d]
+        return weighted_midpoint(points, log_weights.exp()), spread          # [Q, d], [Q]
 
 
 class LinkPredHead(nn.Module):
