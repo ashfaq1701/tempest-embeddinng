@@ -64,8 +64,8 @@ class BagWeights(nn.Module):
 
         return torch.stack([age, pos, d_mid, d0], dim=-1)                    # [Q, T, 4]
 
-    def _bag(self, tokens: WalkTokens) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Bag points [Q, T, d], unweighted bag midpoint [Q, d], pooling weights [Q, T]."""
+    def forward(self, tokens: WalkTokens) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pooled point [Q, d] (weighted bag midpoint) and the unweighted bag midpoint [Q, d]."""
         nodes, valid = self._bag_nodes(tokens)                               # [Q, T]
         points = self.E(nodes)                                               # [Q, T, d]
         fixed = points.detach()                                              # [Q, T, d]  features only
@@ -75,17 +75,7 @@ class BagWeights(nn.Module):
         feats = self._token_features(tokens, fixed, valid_f, mid)            # [Q, T, 4]
         logits = self.net(feats).squeeze(-1)                                 # [Q, T]
         log_weights = torch.log_softmax(logits.masked_fill(~valid, float("-inf")), dim=-1)  # [Q, T]
-        return points, mid, log_weights.exp()
-
-    def forward(self, tokens: WalkTokens) -> torch.Tensor:
-        """Pooled point [Q, d]: the weighted midpoint of the bag's tokens."""
-        points, _, weights = self._bag(tokens)
-        return weighted_midpoint(points, weights)                            # [Q, d]
-
-    def centres(self, tokens: WalkTokens) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Pooled point and unweighted bag midpoint, each [Q, d]."""
-        points, mid, weights = self._bag(tokens)
-        return weighted_midpoint(points, weights), mid
+        return weighted_midpoint(points, log_weights.exp()), mid             # [Q, d], [Q, d]
 
 
 class LinkPredHead(nn.Module):
@@ -112,8 +102,8 @@ class LinkPredHead(nn.Module):
 
     def forward(self, src_tokens: WalkTokens, cand_tokens: WalkTokens) -> torch.Tensor:
         """Logits [b, c]: -log distance between pooled points, standardised per query row."""
-        pooled_u = self.bag_weights(src_tokens)                              # [b, d]
-        pooled_v = self.bag_weights(cand_tokens)                             # [b*c, d]
+        pooled_u, _ = self.bag_weights(src_tokens)                           # [b, d]
+        pooled_v, _ = self.bag_weights(cand_tokens)                          # [b*c, d]
         pooled_v = pooled_v.view(pooled_u.shape[0], -1, pooled_u.shape[-1])  # [b, c, d]
         s = -torch.log(dist(pooled_u.unsqueeze(1), pooled_v))                # [b, c]
         return F.layer_norm(s, s.shape[-1:])                                 # [b, c]

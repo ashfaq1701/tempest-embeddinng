@@ -78,7 +78,7 @@ class FrozenEncoder:
     def _geometry(self, tokens: WalkTokens, src: torch.Tensor) -> torch.Tensor:
         """u's radius, its pooled point's radius, and the pooled point's gap from the bag mid."""
         model = self.model
-        pooled, mid = model.bag_weights.centres(tokens)                      # [Q, d], [Q, d]
+        pooled, mid = model.bag_weights(tokens)                              # [Q, d], [Q, d]
         e_u = model.E.weight[src]                                            # [Q, d]
         geometry = [
             e_u.norm(dim=-1),
